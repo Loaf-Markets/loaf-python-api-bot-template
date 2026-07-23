@@ -102,3 +102,25 @@ class MarketResource(Resource):
     def info_documents(self, token_name: str) -> Any:
         """``GET /info/{token_name}/documents`` — public document list (title + URL)."""
         return self._client.get(f"/info/{token_name}/documents", auth=False)
+
+    def info_documents_private(
+        self, token_name: str, password: str, *, lang: str | None = None
+    ) -> Any:
+        """``GET /info/{token_name}/documents/private/{password}`` — password-gated documents.
+
+        Args:
+            token_name: lowercase property token symbol.
+            password: the document access password (sent as a path segment,
+                not as an API key — this is unrelated to ``LOAF_API_KEY``).
+            lang: optional document language, ``"en"`` (default) or ``"cn"``.
+
+        Returns the same shape as :meth:`info_documents` for the private
+        document set. Raises :class:`~loaf.exceptions.LoafNotFoundError` (404)
+        or :class:`~loaf.exceptions.LoafAuthError`-style rejection if the
+        password is wrong, depending on how the backend reports it.
+        """
+        return self._client.get(
+            f"/info/{token_name}/documents/private/{password}",
+            params={"lang": lang},
+            auth=False,
+        )
