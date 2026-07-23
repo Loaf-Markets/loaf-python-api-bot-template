@@ -93,6 +93,7 @@ market.iter_candles(token, res)       (auto-paginate candle history)
 market.info_header(token)             GET    /info/{token}/header
 market.info_overview(token)           GET    /info/{token}/overview
 market.info_documents(token)          GET    /info/{token}/documents
+market.info_documents_private(...)    GET    /info/{token}/documents/private/{password}
 
 offerings.list()                      GET    /offerings
 offerings.get(token)                  GET    /offerings/{token}
