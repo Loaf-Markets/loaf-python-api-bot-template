@@ -309,7 +309,24 @@ def test_competition_endpoints():
     with pytest.raises(loaf.LoafValidationError):
         client.competition.submit_payout_details(wallet_address="0xabc", email="a@b.c")
 
+    def test_info_documents_private():
+    seen = {}
 
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["params"] = dict(request.url.params)
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"documents": []})
+
+    client = make_client(handler)
+    client.market.info_documents_private("sunset-villa", "secret123")
+    assert seen["path"].endswith("/info/sunset-villa/documents/private/secret123")
+    assert seen["params"] == {}  # lang omitted -> not sent
+    assert seen["auth"] is None  # password-gated, not API-key auth
+
+    client.market.info_documents_private("sunset-villa", "secret123", lang="cn")
+    assert seen["params"] == {"lang": "cn"}
+    
 def test_ws_new_channel_helpers():
     ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
     ws.subscribe_volume(7)
