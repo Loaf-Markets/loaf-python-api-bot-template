@@ -31,11 +31,16 @@ class CompetitionResource(Resource):
     def queue_position(self) -> Any:
         """``GET /competition/queue-position`` — your own competition standing.
 
-        Returns ``{position, queueCount, finalPlacement, referralCount,
-        priorityBoostPlaces, maxBoostsPerUser}``. ``position`` and
-        ``finalPlacement`` are mutually exclusive: still queued -> ``position``
-        set; a past participant between rounds -> ``finalPlacement`` set. An
-        admitted user (able to trade) has neither.
+        Returns ``{position, queueCount, leaderboardPosition, referralCount,
+        priorityBoostPlaces, maxBoostsPerUser}``. ``leaderboardPosition`` is
+        your rank on the board currently being served — live while a round is
+        ``ACTIVE``, your final placement in the round that just ended during
+        the break. It ranks you against the FULL board, so it is set even when
+        you place below the cut ``leaderboard.get()`` serves, and is ``None``
+        when you are not on the board at all. ``position`` is your place in the
+        admission queue. Usually only one of the two is set (an admitted trader
+        is not queued), but both are during the break if you were bottom-culled
+        — back in the queue and still on the frozen board.
         """
         return self._client.get("/competition/queue-position")
 

@@ -205,7 +205,7 @@ Channels:
 | `markprice:{tokenName}` | public | `on_mark_price` | canonical mark price (1s, on change) |
 | `volume:{tokenName}` | public | `on_volume` | session volume (replaces `volume24h`) |
 | `ipo:{ipoId}` | public | `on_ipo` | primary-market allocation progress |
-| `leaderboard` | public | `on_leaderboard` | full competition leaderboard, on change |
+| `leaderboard` | public | `on_leaderboard` | competition leaderboard (top entries), on change |
 | `portfolio:{userId}` | **private** | `on_balances`, `on_position`, `on_order_status`, `on_order_update`, `on_trade`, `on_lifetime_volume`, `on_transfer`, `on_offering_order` | your account deltas |
 
 The private channel requires authentication and a `user_id` matching your

@@ -147,21 +147,22 @@ class LeaderboardEntry(TypedDict, total=False):
     rank: int
     handle: Optional[str]
     walletAddress: str
-    points: float
-    volume: float  # whole USDC
-    pnl: float  # whole USDC
+    points: float  # rounded to 2 decimals
 
 
 class QueuePosition(TypedDict, total=False):
     """Response to ``GET /competition/queue-position``.
 
-    ``position`` and ``finalPlacement`` are mutually exclusive; an admitted
-    (currently trading) user has neither.
+    ``leaderboardPosition`` is your rank on the currently-served board (live
+    while a round is ACTIVE, your final placement during the break) and
+    ``position`` is your place in the admission queue. Usually only one is set,
+    but both are during the break if you were bottom-culled — back in the queue
+    and still on the frozen board.
     """
 
     position: Optional[int]  # place in the admission queue, if still queued
     queueCount: int
-    finalPlacement: Optional[int]  # last round's result, between rounds
+    leaderboardPosition: Optional[int]  # your rank on the served board
     referralCount: int
     priorityBoostPlaces: int
     maxBoostsPerUser: int

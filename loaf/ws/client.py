@@ -32,7 +32,7 @@ chart:{tokenName}      public    OHLCV candle updates (note: singular "chart")
 markprice:{tokenName}  public    canonical mark price (1s, on change)
 volume:{tokenName}     public    session volume replacing ``volume24h``
 ipo:{ipoId}            public    primary-market allocation progress
-leaderboard            public    full competition leaderboard on change
+leaderboard            public    competition leaderboard (top entries) on change
 portfolio:{userId}     PRIVATE   your balances/positions/orders/trades deltas
 =====================  ========  ===========================================
 
@@ -167,7 +167,8 @@ class LoafWebSocketClient:
 
     def on_leaderboard(self, handler: Handler | None = None) -> Any:
         """The competition leaderboard changed (``leaderboard_update``:
-        ``{leaderboard}`` — the full board, same shape as ``GET /leaderboard``)."""
+        ``{leaderboard}`` — the same board ``GET /leaderboard`` serves, top
+        entries only, so churn below the served cut does not wake you)."""
         return self.on(WSMessageType.LEADERBOARD_UPDATE, handler)
 
     # private portfolio deltas
