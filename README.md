@@ -190,7 +190,7 @@ def on_fill(msg):
 
 ws.subscribe_orderbook("opera")
 ws.subscribe_trades("opera")
-ws.subscribe_portfolio(user_id=3)   # your private stream (your numeric Loaf user id)
+ws.subscribe_portfolio()            # your private stream
 
 ws.run_forever()                # blocking; or `with loaf.websocket() as ws:` for background
 ```
@@ -206,10 +206,11 @@ Channels:
 | `volume:{tokenName}` | public | `on_volume` | session volume (replaces `volume24h`) |
 | `ipo:{ipoId}` | public | `on_ipo` | primary-market allocation progress |
 | `leaderboard` | public | `on_leaderboard` | competition leaderboard (top entries), on change |
-| `portfolio:{userId}` | **private** | `on_balances`, `on_position`, `on_order_status`, `on_order_update`, `on_trade`, `on_lifetime_volume`, `on_transfer`, `on_offering_order` | your account deltas |
+| `portfolio` | **private** | `on_balances`, `on_position`, `on_order_status`, `on_order_update`, `on_trade`, `on_lifetime_volume`, `on_transfer`, `on_offering_order` | your account deltas |
 
-The private channel requires authentication and a `user_id` matching your
-account (find your numeric id in the Loaf web app). It is a **delta stream** —
+The private channel carries no id: the server resolves it from the account
+your API key authenticated as, so an anonymous connection is refused with an
+`error` frame. It is a **delta stream** —
 you receive `balances_update`, `position_update`, `order_status`, etc. as
 separate frames. To value positions live, combine `position_update` with the
 `markprice` channel (the server does not push recomputed portfolio totals on
@@ -265,7 +266,7 @@ re-issue it with a fresh nonce rather than risk reusing a stale one. Tune with
 | `examples/02_market_data.py` | properties, order book, candle history (public) |
 | `examples/03_place_order.py` | place → inspect → cancel a limit order |
 | `examples/04_realtime_market.py` | stream order book + trades + mark price |
-| `examples/05_portfolio_stream.py` | stream your private portfolio events (needs `LOAF_USER_ID`) |
+| `examples/05_portfolio_stream.py` | stream your private portfolio events |
 | `bot.py` | full strategy-loop template |
 
 ## Tests
@@ -287,8 +288,8 @@ pagination, error mapping, and retry behaviour.
   shareable image cards (`/portfolio/position/{tokenName}/pnl-card`,
   `/leaderboard/card`, `/competition/queue-position/card`) are **not** wrapped —
   do those in the Loaf web app.
-- Create your API key and find your numeric user id (for the private WebSocket
-  channel) in the web app.
+- Create your API key in the web app. Nothing else is needed for the private
+  WebSocket channel — the key identifies the account it streams.
 - The default base URL is the **production API** (`https://api.loafmarkets.com/api`).
   For local dev, set `LOAF_API_BASE_URL` to your dev server (e.g.
   `http://localhost:8005/api`). For a local server using a self-signed cert, pass

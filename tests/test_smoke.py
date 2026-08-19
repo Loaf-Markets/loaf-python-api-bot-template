@@ -314,7 +314,8 @@ def test_ws_new_channel_helpers():
     ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
     ws.subscribe_volume("opera")
     ws.subscribe_leaderboard()
-    assert ws._channels == {"volume:opera", "leaderboard"}
+    ws.subscribe_portfolio()
+    assert ws._channels == {"volume:opera", "leaderboard", "portfolio"}
 
 
 def test_rate_limit_headers_recorded():

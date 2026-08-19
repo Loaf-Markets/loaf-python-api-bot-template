@@ -1,16 +1,14 @@
-"""05 — Stream your PRIVATE portfolio events (requires an API key + user id).
+"""05 — Stream your PRIVATE portfolio events (requires an API key).
 
 Receives balance changes, position updates, order transitions, your fills,
 transfers, and IPO order updates in real time.
 
-    LOAF_USER_ID=<your numeric user id> python examples/05_portfolio_stream.py
+    python examples/05_portfolio_stream.py
 
-Your numeric user id is shown in the Loaf web app.
+The channel carries no id — your API key tells the server whose events to send.
 """
 
 from __future__ import annotations
-
-import os
 
 from loaf import LoafClient
 
@@ -23,10 +21,6 @@ except ImportError:
 
 
 def main() -> None:
-    user_id = os.environ.get("LOAF_USER_ID")
-    if not user_id:
-        raise SystemExit("Set LOAF_USER_ID to your numeric Loaf user id (see the web app).")
-
     client = LoafClient()  # needs LOAF_API_KEY for the private channel
 
     ws = client.websocket()
@@ -44,7 +38,7 @@ def main() -> None:
     ws.on_error(lambda m: print(f"ERROR {m.get('message')}"))
 
     # Subscribe to your own private channel.
-    ws.subscribe_portfolio(int(user_id))
+    ws.subscribe_portfolio()
     print("Listening for portfolio events. Trade in another window to see updates. "
           "Ctrl-C to stop.\n")
 

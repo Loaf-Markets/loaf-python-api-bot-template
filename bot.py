@@ -5,8 +5,7 @@ A runnable starting point that:
   1. loads your credentials from the environment (or a .env file),
   2. verifies the connection and trading prerequisites,
   3. prints your balances and positions,
-  4. opens the real-time feed (order book; plus your private portfolio
-     stream when LOAF_USER_ID is set),
+  4. opens the real-time feed (order book plus your private portfolio stream),
   5. runs a simple strategy loop you can replace with your own logic.
 
 Run it:
@@ -43,10 +42,6 @@ except ImportError:
 # The property this template watches/trades. Set to a tokenName from
 # `loaf.market.properties()` (lowercase letters), e.g. "opera".
 TARGET_TOKEN_NAME = os.environ.get("LOAF_TARGET_TOKEN", "")
-
-# Your numeric Loaf user id (find it in the Loaf web app). Only needed to
-# subscribe to the PRIVATE portfolio WebSocket channel; leave unset to skip it.
-USER_ID = os.environ.get("LOAF_USER_ID", "")
 
 
 def build_client() -> LoafClient:
@@ -215,10 +210,7 @@ def main() -> None:
     ws.subscribe_orderbook(target.tokenName)
     ws.subscribe_mark_price(target.tokenName)
     ws.subscribe_trades(target.tokenName)
-    if USER_ID:
-        ws.subscribe_portfolio(int(USER_ID))  # your private fills/balances stream
-    else:
-        print("  (set LOAF_USER_ID to also stream your private portfolio events)")
+    ws.subscribe_portfolio()  # your private fills/balances stream (keyed by your API key)
 
     ws.start()  # background thread
     ws.wait_until_connected(timeout=10)

@@ -17,11 +17,11 @@ Or run it in the background and keep using the REST client::
 
     with loaf.websocket() as ws:          # starts a background thread
         ws.on_trade(lambda m: ...)        # your own fills (private channel)
-        ws.subscribe_portfolio()          # uses your authenticated userId
+        ws.subscribe_portfolio()          # your own account's private stream
         ...                               # do other work; handlers fire live
 
-Channels (``"type:key"`` strings — market-data channels key by ``tokenName``,
-``portfolio`` by your numeric userId; ``leaderboard`` has no key):
+Channels (``"type:key"`` strings — market-data channels key by ``tokenName``;
+``portfolio`` and ``leaderboard`` have no key):
 
 =====================  ========  ===========================================
 Channel                Auth      What you receive
@@ -33,7 +33,7 @@ markprice:{tokenName}  public    canonical mark price (1s, on change)
 volume:{tokenName}     public    session volume replacing ``volume24h``
 ipo:{ipoId}            public    primary-market allocation progress
 leaderboard            public    competition leaderboard (top entries) on change
-portfolio:{userId}     PRIVATE   your balances/positions/orders/trades deltas
+portfolio              PRIVATE   your balances/positions/orders/trades deltas
 =====================  ========  ===========================================
 
 All values are already human units (dollars / tokens); timestamps are unix
@@ -253,14 +253,13 @@ class LoafWebSocketClient:
         """Live competition-leaderboard updates (no id — one global channel)."""
         return self.subscribe("leaderboard")
 
-    def subscribe_portfolio(self, user_id: int) -> LoafWebSocketClient:
+    def subscribe_portfolio(self) -> LoafWebSocketClient:
         """Subscribe to your PRIVATE portfolio channel.
 
-        Requires the connection to be authenticated (an ``api_key`` was
-        provided) AND ``user_id`` to match that authenticated account. Pass your
-        numeric Loaf user id (find it in the Loaf web app).
+        Requires an ``api_key`` on the client. An anonymous connection is
+        refused with an ``error`` frame (:meth:`on_error`).
         """
-        return self.subscribe(f"portfolio:{int(user_id)}")
+        return self.subscribe("portfolio")
 
     # ------------------------------------------------------------------ #
     # Lifecycle
