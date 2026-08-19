@@ -36,6 +36,12 @@ class MarketResource(Resource):
         ``paymentTokenAddress``, ``maxSlippageBps`` and market-hours metadata.
         ``token_name`` is lowercase letters only. Candle history is NOT included
         — fetch it from the dedicated :meth:`candles` endpoint.
+
+        ``property.isHalted`` is the effective trading-halt flag (this
+        property's own state OR'd with the platform-wide kill switch); it is
+        served here but NOT on the :meth:`properties` list. Seed from it, then
+        keep it live with the ``property:{tokenName}`` WebSocket channel
+        (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_property_status`).
         """
         return self._client.get(f"/trade/{token_name}", auth=False)
 

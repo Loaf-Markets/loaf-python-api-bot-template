@@ -314,8 +314,20 @@ def test_ws_new_channel_helpers():
     ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
     ws.subscribe_volume("opera")
     ws.subscribe_leaderboard()
+    ws.subscribe_property_status("opera")
     ws.subscribe_portfolio()
-    assert ws._channels == {"volume:opera", "leaderboard", "portfolio"}
+    assert ws._channels == {"volume:opera", "leaderboard", "property:opera", "portfolio"}
+
+
+def test_ws_property_halt_dispatch():
+    ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
+    seen = []
+    ws.on_property_halt(seen.append)
+    ws._dispatch(json.dumps({
+        "type": "property_halt", "propertyId": 1, "tokenName": "opera",
+        "isHalted": True, "timestamp": 0,
+    }))
+    assert seen[0].tokenName == "opera" and seen[0].isHalted is True
 
 
 def test_rate_limit_headers_recorded():

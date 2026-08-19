@@ -1,4 +1,4 @@
-"""04 — Stream live market data (public order book + trades + mark price).
+"""04 — Stream live market data (public order book + trades + mark price + halts).
 
     python examples/04_realtime_market.py
 
@@ -43,9 +43,14 @@ def main() -> None:
     def on_mark(msg):
         print(f"MARK  {msg.price}")
 
+    @ws.on_property_halt
+    def on_halt(msg):
+        print(f"HALT  {msg.tokenName} -> {'HALTED' if msg.isHalted else 'RESUMED'}")
+
     ws.subscribe_orderbook(prop.tokenName)
     ws.subscribe_trades(prop.tokenName)
     ws.subscribe_mark_price(prop.tokenName)
+    ws.subscribe_property_status(prop.tokenName)
 
     ws.run_forever()  # blocking until Ctrl-C
 

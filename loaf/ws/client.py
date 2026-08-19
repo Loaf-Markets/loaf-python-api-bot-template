@@ -31,6 +31,7 @@ trades:{tokenName}     public    rolling recent-trades batches
 chart:{tokenName}      public    OHLCV candle updates (note: singular "chart")
 markprice:{tokenName}  public    canonical mark price (1s, on change)
 volume:{tokenName}     public    session volume replacing ``volume24h``
+property:{tokenName}   public    halt / resume status for one property
 ipo:{ipoId}            public    primary-market allocation progress
 leaderboard            public    competition leaderboard (top entries) on change
 portfolio              PRIVATE   your balances/positions/orders/trades deltas
@@ -162,6 +163,17 @@ class LoafWebSocketClient:
         ``{propertyId, volume24h}``). Replaces the REST ``volume24h``."""
         return self.on(WSMessageType.VOLUME_UPDATE, handler)
 
+    def on_property_halt(self, handler: Handler | None = None) -> Any:
+        """A property was halted or resumed (``property_halt``:
+        ``{propertyId, tokenName, isHalted}``).
+
+        ``isHalted`` is the EFFECTIVE state — the property's own flag OR'd with
+        the platform-wide kill switch — so assign it straight over the
+        ``isHalted`` you seeded from REST. While it is true, order placement on
+        that property raises :class:`~loaf.exceptions.TradingHaltedError`.
+        """
+        return self.on(WSMessageType.PROPERTY_HALT, handler)
+
     def on_ipo(self, handler: Handler | None = None) -> Any:
         return self.on(WSMessageType.IPO_ALLOCATION_UPDATE, handler)
 
@@ -245,6 +257,13 @@ class LoafWebSocketClient:
         """Session-volume pushes for a property (seed from the REST
         ``volume24h``, then let ``volume_update`` frames replace it)."""
         return self.subscribe(f"volume:{token_name}")
+
+    def subscribe_property_status(self, token_name: str) -> LoafWebSocketClient:
+        """Halt/resume pushes for a property (the ``property:{tokenName}``
+        channel — property status, not market data). Seed from the REST
+        ``market.property(token).property.isHalted``, then let
+        ``property_halt`` frames replace it."""
+        return self.subscribe(f"property:{token_name}")
 
     def subscribe_ipo(self, ipo_id: int) -> LoafWebSocketClient:
         return self.subscribe(f"ipo:{int(ipo_id)}")

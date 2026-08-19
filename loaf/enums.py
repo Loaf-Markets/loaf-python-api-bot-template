@@ -132,6 +132,7 @@ class WSMessageType(_StrEnum):
     IPO_ALLOCATION_UPDATE = "ipo_allocation_update"
     VOLUME_UPDATE = "volume_update"
     LEADERBOARD_UPDATE = "leaderboard_update"
+    PROPERTY_HALT = "property_halt"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"
     POSITION_UPDATE = "position_update"

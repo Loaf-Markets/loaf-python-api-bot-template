@@ -5,7 +5,8 @@ A runnable starting point that:
   1. loads your credentials from the environment (or a .env file),
   2. verifies the connection and trading prerequisites,
   3. prints your balances and positions,
-  4. opens the real-time feed (order book plus your private portfolio stream),
+  4. opens the real-time feed (order book, halt status, and your private
+     portfolio stream),
   5. runs a simple strategy loop you can replace with your own logic.
 
 Run it:
@@ -112,7 +113,7 @@ class Strategy:
     helpers you need are commented inline.
     """
 
-    def __init__(self, client: LoafClient, token_name: str) -> None:
+    def __init__(self, client: LoafClient, token_name: str, is_halted: bool = False) -> None:
         self.client = client
         self.token_name = token_name
         self._lock = threading.Lock()
@@ -120,6 +121,7 @@ class Strategy:
         self.best_ask: float | None = None
         self.mark_price: float | None = None
         self.last_trade: dict | None = None
+        self.is_halted = is_halted
 
     # -- WebSocket handlers (called on the WS thread) --------------------- #
 
@@ -131,6 +133,13 @@ class Strategy:
     def on_mark_price(self, msg) -> None:
         with self._lock:
             self.mark_price = msg.price
+
+    def on_halt(self, msg) -> None:
+        # `isHalted` is the effective state (this property's own flag OR a
+        # platform-wide halt), so it replaces the value seeded from REST.
+        with self._lock:
+            self.is_halted = msg.isHalted
+        print(f"  *** {msg.tokenName} {'HALTED' if msg.isHalted else 'RESUMED'}")
 
     def on_trade_tick(self, msg) -> None:
         trades = msg.get("trades") or []
@@ -155,8 +164,13 @@ class Strategy:
     def on_tick(self) -> None:
         with self._lock:
             bid, ask, mark = self.best_bid, self.best_ask, self.mark_price
+            halted = self.is_halted
         spread = (ask - bid) if (bid is not None and ask is not None) else None
-        print(f"[{self.token_name}] bid={bid} ask={ask} spread={spread} mark={mark}")
+        print(f"[{self.token_name}] bid={bid} ask={ask} spread={spread} mark={mark}"
+              f"{' [HALTED]' if halted else ''}")
+
+        if halted:
+            return  # orders would be rejected with loaf.TradingHaltedError
 
         # ----------------------------------------------------------------- #
         # YOUR STRATEGY GOES HERE. Examples (uncomment & adapt):
@@ -195,12 +209,17 @@ def main() -> None:
         return
     print(f"\nFollowing property {target.tokenName} (id {target.propertyId}).\n")
 
-    strategy = Strategy(client, target.tokenName)
+    # `isHalted` is only on the property DETAIL response, not the list above.
+    detail = client.market.property(target.tokenName)
+    strategy = Strategy(client, target.tokenName, is_halted=bool(detail.property.isHalted))
+    if strategy.is_halted:
+        print("  Trading is currently HALTED for this property.")
 
     # Wire up the real-time feed.
     ws = client.websocket()
     ws.on_orderbook(strategy.on_orderbook)
     ws.on_mark_price(strategy.on_mark_price)
+    ws.on_property_halt(strategy.on_halt)     # public: halt/resume for this property
     ws.on_trades(strategy.on_trade_tick)
     ws.on_trade(strategy.on_my_fill)          # private: your fills
     ws.on_order_status(strategy.on_my_order)  # private: your order transitions
@@ -210,6 +229,7 @@ def main() -> None:
     ws.subscribe_orderbook(target.tokenName)
     ws.subscribe_mark_price(target.tokenName)
     ws.subscribe_trades(target.tokenName)
+    ws.subscribe_property_status(target.tokenName)
     ws.subscribe_portfolio()  # your private fills/balances stream (keyed by your API key)
 
     ws.start()  # background thread

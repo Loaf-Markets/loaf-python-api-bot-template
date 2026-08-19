@@ -158,6 +158,22 @@ your standing with `loaf.competition.queue_position()`). Outside an active
 round trading is unrestricted. If trading is halted platform-wide,
 order placement/cancels raise `TradingHaltedError` (403).
 
+To see a halt coming instead of discovering it on a rejected order, subscribe to
+the property's status channel:
+
+```python
+ws.subscribe_property_status("opera")
+
+@ws.on_property_halt
+def on_halt(msg):
+    print(msg.tokenName, "halted" if msg.isHalted else "resumed")
+```
+
+`isHalted` is the **effective** state — the property's own flag OR'd with the
+platform-wide kill switch — so assign it straight over the `isHalted` you seeded
+from `market.property("opera").property.isHalted`. Note a global halt lifting does
+not resume a property that is individually halted; the frame accounts for that.
+
 ---
 
 ## Money & units
@@ -204,6 +220,7 @@ Channels:
 | `chart:{tokenName}` | public | `on_candle` | OHLCV candle updates |
 | `markprice:{tokenName}` | public | `on_mark_price` | canonical mark price (1s, on change) |
 | `volume:{tokenName}` | public | `on_volume` | session volume (replaces `volume24h`) |
+| `property:{tokenName}` | public | `on_property_halt` | halt / resume status for that property |
 | `ipo:{ipoId}` | public | `on_ipo` | primary-market allocation progress |
 | `leaderboard` | public | `on_leaderboard` | competition leaderboard (top entries), on change |
 | `portfolio` | **private** | `on_balances`, `on_position`, `on_order_status`, `on_order_update`, `on_trade`, `on_lifetime_volume`, `on_transfer`, `on_offering_order` | your account deltas |
@@ -265,7 +282,7 @@ re-issue it with a fresh nonce rather than risk reusing a stale one. Tune with
 | `examples/01_quickstart.py` | confirm credentials, read balances + market |
 | `examples/02_market_data.py` | properties, order book, candle history (public) |
 | `examples/03_place_order.py` | place → inspect → cancel a limit order |
-| `examples/04_realtime_market.py` | stream order book + trades + mark price |
+| `examples/04_realtime_market.py` | stream order book + trades + mark price + halts |
 | `examples/05_portfolio_stream.py` | stream your private portfolio events |
 | `bot.py` | full strategy-loop template |
 
