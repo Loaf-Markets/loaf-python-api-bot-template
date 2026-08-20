@@ -154,7 +154,14 @@ class Strategy:
               f"(fee {t.fee})")
 
     def on_my_order(self, msg) -> None:
+        # `order_status` is the transition only (FILLED / CANCELLED / ...).
         print(f"  order #{msg.orderId} -> {msg.status} (left {msg.get('quantityLeft')})")
+
+    def on_my_order_accepted(self, msg) -> None:
+        # `order_update` carries the whole order, and is what arrives when the
+        # exchange accepts a new one — `order_status` does not fire for that.
+        o = msg.order
+        print(f"  order #{o.id} {o.side} {o.quantity} {o.tokenName} @ {o.price} -> {o.status}")
 
     def on_balances(self, msg) -> None:
         print(f"  balance update: cash {msg.cash:,.2f}  frozen {msg.frozen:,.2f}")
@@ -222,6 +229,7 @@ def main() -> None:
     ws.on_property_halt(strategy.on_halt)     # public: halt/resume for this property
     ws.on_trades(strategy.on_trade_tick)
     ws.on_trade(strategy.on_my_fill)          # private: your fills
+    ws.on_order_update(strategy.on_my_order_accepted)  # private: your new orders
     ws.on_order_status(strategy.on_my_order)  # private: your order transitions
     ws.on_balances(strategy.on_balances)      # private: your balance changes
     ws.on_error(lambda m: print(f"  WS error: {m.get('message')}"))
