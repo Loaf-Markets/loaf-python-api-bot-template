@@ -27,6 +27,15 @@ class LeaderboardResource(Resource):
         that ranks you against the full board, so it is set even when you place
         below the served cut.
 
+        ``totalParticipants`` can be ABSENT between rounds. The break-period
+        board is the round's snapshot replayed as it was frozen, so a round
+        frozen before the field existed has no such key — read it defensively
+        and treat a miss as unknown, NOT as ``len(entries)`` (which is the
+        served cut, not the field's meaning)::
+
+            board = loaf.leaderboard.get()
+            total = board.get("totalParticipants")   # None on such a snapshot
+
         For live updates, prefer subscribing to the ``leaderboard`` WebSocket
         channel (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_leaderboard`)
         over polling — the server pushes a ``leaderboard_update`` whenever the
