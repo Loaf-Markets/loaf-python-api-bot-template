@@ -109,6 +109,7 @@ class CompetitionRoundStatus(_StrEnum):
     PENDING = "PENDING"
     PREPARED = "PREPARED"
     ACTIVE = "ACTIVE"
+    ENDING = "ENDING"
     ENDED = "ENDED"
 
 

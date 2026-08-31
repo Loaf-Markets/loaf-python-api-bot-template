@@ -150,6 +150,70 @@ class LeaderboardEntry(TypedDict, total=False):
     points: float  # rounded to 2 decimals
 
 
+class PrizePoolEntry(TypedDict, total=False):
+    """One row of a round's ``prizePool``.
+
+    A row is either a single place or a BAND: when ``toPlace`` is present the
+    row covers ``place``..``toPlace`` INCLUSIVE, and ``amount`` is what EACH
+    participant in that band receives (not the band's total). Test a finishing
+    place with ``e["place"] <= place <= e.get("toPlace", e["place"])`` — an
+    equality check on ``place`` misses everyone inside a band. Rows never
+    overlap. Display only: the backend does not distribute prizes.
+    """
+
+    place: int  # first paid place in this row (1 = winner)
+    toPlace: int  # inclusive last place of the band; absent for a single place
+    amount: float  # whole USDC, per participant
+
+
+class VolumeMultiplierTier(TypedDict, total=False):
+    """A traded-volume tier of the competition points formula."""
+
+    minVolume: float  # dollars traded to reach this tier
+    multiplier: float
+
+
+class CompetitionRoundWinner(TypedDict, total=False):
+    """A paid place on a finished round's frozen final leaderboard."""
+
+    place: int
+    handle: Optional[str]
+    walletAddress: str
+
+
+class CompetitionRound(TypedDict, total=False):
+    """One round in ``competition.info()['rounds']`` (newest first).
+
+    Every round is listed whatever its ``status`` — including ones that have
+    not started — so select by ``status``, not by position.
+    """
+
+    roundNumber: int
+    name: str
+    rules: str
+    startsAt: Optional[int]  # unix seconds; None until the round starts
+    endsAt: Optional[int]
+    startingBalanceUsdl: float  # whole USDC seeded per participant
+    participantBatchSize: int  # how many the queue admits into the round
+    status: str  # CompetitionRoundStatus
+    newAssetProperty: Optional[dict[str, Any]]  # the round's headline property
+    prizePool: list[PrizePoolEntry]
+    volumeMultiplierTiers: list[VolumeMultiplierTier]
+    bottomCullPercent: float  # 0-100, lowest-ranked share dropped at round end
+    # Top 10 paid places only (a podium, not the full paid list); None until the
+    # round is ENDING/ENDED, and while a finished round's results are pending.
+    winners: Optional[list[CompetitionRoundWinner]]
+
+
+class CompetitionInfo(TypedDict, total=False):
+    """Response to ``GET /competition`` (see ``competition.info``)."""
+
+    nextRoundSoon: bool  # operator's "a round is coming" announcement flag
+    rounds: Optional[list[CompetitionRound]]  # None when no round exists yet
+    makerFeeBps: int  # base (lowest volume tier) fees
+    takerFeeBps: int
+
+
 class QueuePosition(TypedDict, total=False):
     """Response to ``GET /competition/queue-position``.
 
@@ -164,8 +228,7 @@ class QueuePosition(TypedDict, total=False):
     queueCount: int
     leaderboardPosition: Optional[int]  # your rank on the served board
     referralCount: int
-    priorityBoostPlaces: int
-    maxBoostsPerUser: int
+    estimatedRoundEntry: Optional[int]  # round that position is on track to enter
 
 
 __all__ = [
@@ -183,5 +246,10 @@ __all__ = [
     "PortfolioComponent",
     "IpoSubscribeResult",
     "LeaderboardEntry",
+    "PrizePoolEntry",
+    "VolumeMultiplierTier",
+    "CompetitionRoundWinner",
+    "CompetitionRound",
+    "CompetitionInfo",
     "QueuePosition",
 ]

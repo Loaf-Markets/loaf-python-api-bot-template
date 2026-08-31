@@ -116,6 +116,7 @@ leaderboard.get()                     GET    /leaderboard
 
 competition.info()                    GET    /competition
 competition.queue_position()          GET    /competition/queue-position
+competition.payout_details()          GET    /competition/payout-details
 competition.submit_payout_details()   POST   /competition/payout-details
 ```
 

@@ -299,6 +299,10 @@ def test_competition_endpoints():
     assert seen["path"].endswith("/competition/queue-position")
     assert seen["auth"] == "Bearer testkey"
 
+    client.competition.payout_details()
+    assert seen["path"].endswith("/competition/payout-details")
+    assert seen["auth"] == "Bearer testkey"
+
     client.competition.submit_payout_details(email="win@example.com")
     assert seen["path"].endswith("/competition/payout-details")
     assert seen["body"] == {"email": "win@example.com"}  # None wallet dropped
