@@ -35,7 +35,8 @@ def main() -> None:
     ws.on_order_status(lambda m: print(f"ORDER #{m.orderId} -> {m.status} "
                                        f"(left {m.get('quantityLeft')})"))
     ws.on_trade(lambda m: print(f"FILL {m.trade.side} {m.trade.quantity} "
-                                f"{m.trade.tokenName} @ {m.trade.price}"))
+                                f"{m.trade.tokenName} @ {m.trade.price} "
+                                f"[{m.trade.status}] #{m.trade.tradeId}"))
     ws.on_transfer(lambda m: print(f"TRANSFER {m.transfer.type} {m.transfer.amount} "
                                    f"-> {m.transfer.status}"))
     ws.on_offering_order(lambda m: print(f"IPO ORDER #{m.order.ipoOrderId} -> {m.order.status}"))

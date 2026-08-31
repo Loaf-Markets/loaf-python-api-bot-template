@@ -148,10 +148,10 @@ class Strategy:
                 self.last_trade = trades[0]
 
     def on_my_fill(self, msg) -> None:
-        # A fill on YOUR orders (private portfolio channel).
+        # A fill on YOUR orders.
         t = msg.trade
         print(f"  *** FILLED: {t.side} {t.quantity} {t.tokenName} @ {t.price} "
-              f"(fee {t.fee})")
+              f"(fee {t.fee}) [{t.status}]")
 
     def on_my_order(self, msg) -> None:
         # `order_status` is the transition only (FILLED / CANCELLED / ...).

@@ -153,6 +153,15 @@ loaf.orders.cancel_all()      # flatten everything
 Fills and cancellations arrive asynchronously on your private `portfolio`
 WebSocket channel (see below).
 
+Three checks run server-side that the SDK cannot pre-validate, so handle their
+rejections rather than trying to avoid them:
+
+| Rejection | Rule |
+| --- | --- |
+| `LoafValidationError` (400) | **Minimum order value** — `price x quantity` must be at least 10 USDL. A SELL closing your *entire* available position is exempt, so dust can always be flattened. |
+| `LoafValidationError` (400) | **Limit price deviation** — a LIMIT price too far from the current market reference is refused. The ceiling is a deployment setting; the message quotes it and the reference used. MARKET orders skip this — they are slippage-bounded instead. |
+| `LoafBusinessRuleError` (422) | **Daily price band** — a per-property band around the daily reference price. The message carries the side, limit, reference and band width. |
+
 While a trading-competition round is **ACTIVE**, only accounts admitted to the
 round may place orders — otherwise you get `CompetitionEligibilityError` (check
 your standing with `loaf.competition.queue_position()`). Outside an active
@@ -230,9 +239,10 @@ The private channel carries no id: the server resolves it from the account
 your API key authenticated as, so an anonymous connection is refused with an
 `error` frame. It is a **delta stream** —
 you receive `balances_update`, `position_update`, `order_status`, etc. as
-separate frames. To value positions live, combine `position_update` with the
-`markprice` channel (the server does not push recomputed portfolio totals on
-every price tick).
+separate frames. Each fill is delivered twice under one `tradeId` (`SETTLING`,
+then `SETTLED`), so dedupe on it before accumulating anything. To value
+positions live, combine `position_update` with the `markprice` channel (the
+server does not push recomputed portfolio totals on every price tick).
 
 ---
 

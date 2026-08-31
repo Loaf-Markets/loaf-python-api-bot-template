@@ -197,7 +197,11 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.ORDER_UPDATE, handler)
 
     def on_trade(self, handler: Handler | None = None) -> Any:
-        """Your own fills on the private portfolio channel (``trade_new``)."""
+        """Your own fills on the private portfolio channel (``trade_new``).
+
+        Each fill is pushed twice under one ``tradeId`` — ``status="SETTLING"``,
+        then ``status="SETTLED"`` with the on-chain ``txHash``.
+        """
         return self.on(WSMessageType.TRADE_NEW, handler)
 
     def on_lifetime_volume(self, handler: Handler | None = None) -> Any:

@@ -14,6 +14,20 @@ Order placement can be rejected with a 403 when:
 * trading is halted platform-wide
   (:class:`~loaf.exceptions.TradingHaltedError`).
 
+Three server-side checks reject an order the SDK cannot pre-validate for you:
+
+* **Minimum order value** — price x quantity must be at least 10 USD (400,
+  :class:`~loaf.exceptions.LoafValidationError`). A SELL closing your ENTIRE
+  available position in a property is exempt, so a dust position can always be
+  flattened.
+* **Limit price deviation** — a LIMIT price too far from the current market
+  reference is refused (400). The ceiling is a deployment setting; the message
+  quotes the limit and the reference it used. MARKET orders skip this check —
+  their price is slippage-bounded server-side instead.
+* **Daily price band** — a separate per-property band around the daily
+  reference price (422, :class:`~loaf.exceptions.LoafBusinessRuleError`), whose
+  message carries the side, the limit, the reference and the band width.
+
 These endpoints are also per-account rate limited (429 on abuse), on top of the
 per-IP limit.
 
