@@ -7,13 +7,9 @@ still need retail KYC).
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from .base import Resource
-
-#: Default signature-deadline horizon for a subscription (seconds from now).
-_DEFAULT_SUBSCRIBE_DEADLINE_HORIZON = 600
 
 
 class OfferingsResource(Resource):
@@ -38,8 +34,6 @@ class OfferingsResource(Resource):
         ipo_id: int,
         quantity: int,
         *,
-        deadline: int | None = None,
-        nonce: str | None = None,
         allow_partial: bool = True,
     ) -> Any:
         """``POST /offerings/subscribe`` — subscribe to (buy into) an offering.
@@ -47,10 +41,6 @@ class OfferingsResource(Resource):
         Args:
             ipo_id: the offering id (``ipoId``).
             quantity: whole units to subscribe for (integer; fractional rejected).
-            deadline: unix-seconds signature deadline for the on-chain purchase.
-                Defaults to ~10 minutes from now.
-            nonce: a nonce from :meth:`loaf.resources.orders.OrdersResource.nonce`;
-                fetched automatically if omitted.
             allow_partial: if ``True`` (default) and the offering is near full,
                 proceed with the clamped (smaller) amount; if ``False``, a
                 shortfall raises a 400.
@@ -61,15 +51,9 @@ class OfferingsResource(Resource):
         ``portfolio`` WebSocket channel (``offering_order_update``), keyed by
         ``subscriptionId``.
         """
-        if deadline is None:
-            deadline = int(time.time()) + _DEFAULT_SUBSCRIBE_DEADLINE_HORIZON
-        if nonce is None:
-            nonce = self._client.orders.nonce()["nonce"]
         body = {
             "ipoId": int(ipo_id),
             "quantity": int(quantity),
-            "deadline": int(deadline),
-            "nonce": nonce,
             "allowPartial": allow_partial,
         }
         return self._client.post("/offerings/subscribe", json=body)

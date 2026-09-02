@@ -40,7 +40,6 @@ def main() -> None:
     print(f"Placing LIMIT BUY 1 {prop.tokenName} @ {price} (best bid {best_bid})")
 
     try:
-        # create() fetches a nonce for you automatically.
         result = client.orders.limit_buy(prop.tokenName, quantity=1, price=price)
     except loaf.CompetitionEligibilityError:
         raise SystemExit(

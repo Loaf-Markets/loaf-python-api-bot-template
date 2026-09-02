@@ -115,7 +115,7 @@ class LoafClient:
         self.market: MarketResource = MarketResource(self)
         #: Primary market (IPO offerings): list, detail, subscribe, approve.
         self.offerings: OfferingsResource = OfferingsResource(self)
-        #: Trading: nonce, place/cancel orders, pre-approve.
+        #: Trading: place/cancel orders, pre-approve.
         self.orders: OrdersResource = OrdersResource(self)
         #: Balances, positions, and PnL.
         self.portfolio: PortfolioResource = PortfolioResource(self)
@@ -198,9 +198,8 @@ class LoafClient:
                 return self._parse_body(response)
 
             # Error path — decide whether to retry. Only idempotent (read) requests
-            # are retried: re-sending a non-idempotent POST (e.g. /orders) could act
-            # on a stale single-use nonce, so we surface the error and let the caller
-            # re-issue it with a fresh nonce.
+            # are retried: re-sending a non-idempotent POST (e.g. /orders) could place
+            # the order twice, so we surface the error and let the caller decide.
             should_retry = (
                 attempt < self.max_retries
                 and idempotent

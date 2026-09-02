@@ -122,8 +122,6 @@ def test_order_create_flow():
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/orders/nonce"):
-            return httpx.Response(200, json={"nonce": "a" * 32, "deadline": 123})
         if request.url.path.endswith("/orders"):
             captured["body"] = json.loads(request.content)
             return httpx.Response(200, json={"success": True, "orderId": 99})
@@ -133,7 +131,7 @@ def test_order_create_flow():
     res = client.orders.limit_buy("opera", quantity=10, price=167.49)
     assert res.orderId == 99
     body = captured["body"]
-    # Sent as plain human units, correct enum strings, auto-fetched nonce.
+    # Sent as plain human units, correct enum strings.
     assert body == {
         "tokenName": "opera",
         "price": 167.49,
@@ -142,7 +140,6 @@ def test_order_create_flow():
         "type": "LIMIT",
         "timeInForce": "GTC",
         "deadline": 0,
-        "nonce": "a" * 32,
     }
 
 
@@ -150,8 +147,6 @@ def test_market_order_forces_zero_price():
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/orders/nonce"):
-            return httpx.Response(200, json={"nonce": "b" * 32, "deadline": 1})
         captured["body"] = json.loads(request.content)
         return httpx.Response(200, json={"success": True, "orderId": 1})
 
@@ -218,7 +213,7 @@ def test_rate_limit_not_retried_for_non_idempotent_post():
         calls["n"] += 1
         return httpx.Response(429, json={"error": "slow"}, headers={"RateLimit-Reset": "0"})
 
-    # A 429 on a POST must surface, not silently retry with a stale single-use nonce.
+    # A 429 on a POST must surface, not silently retry (a retry could place the order twice).
     client = make_client(handler, max_retries=3)
     with pytest.raises(loaf.LoafRateLimitError):
         client.orders.cancel(1)

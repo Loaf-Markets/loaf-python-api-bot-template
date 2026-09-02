@@ -63,11 +63,6 @@ class OrderResult(TypedDict, total=False):
     errorMessage: str
 
 
-class OrderNonce(TypedDict):
-    nonce: str  # 32 hex chars
-    deadline: int  # unix seconds (nonce expiry hint, NOT the order deadline)
-
-
 class CancelAllResult(TypedDict, total=False):
     requestedCount: int
     cancelledOrderIds: list[int]
@@ -238,7 +233,6 @@ __all__ = [
     "CandleHistory",
     "TradeTick",
     "OrderResult",
-    "OrderNonce",
     "CancelAllResult",
     "OrderHistoryItem",
     "TradeHistoryItem",

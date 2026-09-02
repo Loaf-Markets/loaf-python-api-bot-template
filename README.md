@@ -69,7 +69,7 @@ Create one `LoafClient` and reach everything through grouped resources:
 | --- | --- |
 | `loaf.market` | properties, property detail, candle history, info pages (all public) |
 | `loaf.offerings` | IPO offerings: list, detail, subscribe, pre-approve |
-| `loaf.orders` | nonce, place / cancel / cancel-all orders, pre-approve |
+| `loaf.orders` | place / cancel / cancel-all orders, pre-approve |
 | `loaf.portfolio` | balances, positions, PnL |
 | `loaf.history` | paginated order & trade history, cancelled & active orders |
 | `loaf.leaderboard` | competition leaderboard |
@@ -99,7 +99,6 @@ offerings.get(token)                  GET    /offerings/{token}
 offerings.subscribe(ipo_id, qty)      POST   /offerings/subscribe
 offerings.approve(ipo_id)             POST   /offerings/approve
 
-orders.nonce()                        POST   /orders/nonce
 orders.create(...) / limit_buy / ...  POST   /orders
 orders.cancel(order_id)               POST   /orders/cancel
 orders.cancel_all()                   POST   /orders/cancel-all
@@ -133,7 +132,7 @@ older = loaf.market.candles("opera", "1h", to=h.oldestTs)  # page back while h.h
 
 ## Placing orders
 
-Orders use a two-step nonce protocol; the SDK handles it for you:
+Placing an order is a single call:
 
 ```python
 # Orders are addressed by tokenName (list the tradeable ones via loaf.market.properties()):
@@ -281,7 +280,7 @@ automatically retries transient failures (429, 503, network errors) on
 idempotent (read) requests, with backoff that honours `RateLimit-Reset` /
 `Retry-After`. Non-idempotent calls (e.g. placing an order) are never
 auto-retried — a rate-limited order raises `LoafRateLimitError` so you can
-re-issue it with a fresh nonce rather than risk reusing a stale one. Tune with
+decide whether to re-issue it. Tune with
 `LoafClient(max_retries=...)`.
 
 ---

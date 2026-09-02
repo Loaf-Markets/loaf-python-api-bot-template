@@ -1,8 +1,6 @@
 """Trading: place, cancel, and pre-approve orders.
 
-Placing an order is a two-step protocol — fetch a single-use ``nonce``, then
-submit the order with it. :meth:`OrdersResource.create` does both for you by
-default, so the common case is a one-liner::
+Placing an order is a single ``POST /orders``; the common case is a one-liner::
 
     loaf.orders.limit_buy("opera", quantity=10, price=167.49)
 
@@ -49,15 +47,6 @@ from .base import Resource
 
 
 class OrdersResource(Resource):
-    def nonce(self) -> Any:
-        """``POST /orders/nonce`` — mint a single-use nonce (+ expiry hint).
-
-        Returns ``{"nonce": "<32 hex>", "deadline": <unix s>}``. The nonce is
-        bound to your user, single-use, and expires ~20s later — place the order
-        promptly. :meth:`create` calls this automatically.
-        """
-        return self._client.post("/orders/nonce")
-
     def create(
         self,
         token_name: str,
@@ -68,7 +57,6 @@ class OrdersResource(Resource):
         price: float | None = None,
         time_in_force: str = TimeInForce.GTC,
         deadline: int = DEFAULT_ORDER_DEADLINE,
-        nonce: str | None = None,
     ) -> Any:
         """``POST /orders`` — place a trading order.
 
@@ -84,7 +72,6 @@ class OrdersResource(Resource):
             time_in_force: ``GTC`` (default), ``IOC``, ``FOK``, or ``GTD``.
             deadline: unix seconds. Must be ``0`` for non-GTD; a future
                 timestamp for ``GTD``.
-            nonce: a nonce from :meth:`nonce`. Fetched automatically if omitted.
 
         Notes:
             * Minimum order value is 10 USDL (``price * quantity``), waived only
@@ -118,9 +105,6 @@ class OrdersResource(Resource):
                 f"Non-GTD orders must use deadline={DEFAULT_ORDER_DEADLINE}"
             )
 
-        if nonce is None:
-            nonce = self.nonce()["nonce"]
-
         body = {
             "tokenName": token_name,
             "price": price,
@@ -129,7 +113,6 @@ class OrdersResource(Resource):
             "type": otype,
             "timeInForce": tif,
             "deadline": int(deadline),
-            "nonce": nonce,
         }
         return self._client.post("/orders", json=body)
 
