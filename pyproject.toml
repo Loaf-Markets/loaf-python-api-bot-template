@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "loaf-bot"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Python SDK and bot template for the Loaf trading platform API"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -29,6 +29,10 @@ Homepage = "https://loafmarkets.com"
 
 [tool.setuptools.packages.find]
 include = ["loaf*"]
+
+# The version lives only in loaf/_version.py; setuptools reads it from there.
+[tool.setuptools.dynamic]
+version = { attr = "loaf._version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
