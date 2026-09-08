@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Your own strategy (see "Copy it before you edit it" in the README)
+my_bot.py
+
 # Python
 __pycache__/
 *.py[cod]

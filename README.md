@@ -59,6 +59,46 @@ feed (order book + your private portfolio stream), and runs a 5-second strategy
 loop with clearly-marked `# YOUR STRATEGY GOES HERE` hooks. It only *observes*
 the market out of the box — drop your logic into `Strategy.on_tick`.
 
+> **Copy it before you edit it.** `bot.py` is tracked by this repo and ships
+> alongside the SDK, so it changes when the SDK does. Strategy code written into
+> it directly will collide with the next `git pull`. Work in a copy:
+>
+> ```bash
+> cp bot.py my_bot.py   # then run: python my_bot.py
+> ```
+
+## 4. Updating
+
+```bash
+git pull
+```
+
+Step 1 installs the SDK in editable mode, so the working tree *is* the installed
+package — a pull is enough for code changes and the next run picks them up with
+no reinstall.
+
+Re-run the install after a pull that changes `pyproject.toml`, because an
+editable install tracks code but not metadata:
+
+```bash
+pip install -e .          # only needed when dependencies change
+```
+
+That also refreshes what `pip show loaf-bot` reports. Until you re-run it, `pip`
+keeps naming the version you first installed even though the SDK itself is
+current — `loaf.__version__` and the `User-Agent` the client sends are always
+read from the working tree, so they stay accurate either way.
+
+To pin to a release rather than track `main`:
+
+```bash
+git checkout v0.3.0
+```
+
+Releases are tagged from `v0.3.0` onward. While the SDK is pre-1.0, a breaking
+change bumps the **minor** version — so `0.3.x` → `0.4.0` is the signal to
+re-read this README before upgrading.
+
 ---
 
 ## The client
