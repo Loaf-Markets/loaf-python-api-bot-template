@@ -31,5 +31,8 @@ class PortfolioResource(Resource):
         bps), and recent ``offeringOrders`` / ``openOrders`` / ``tradeHistory``
         / ``orderHistory`` / ``transfers``. ``lifetimeVolume`` also streams on
         the private WS channel as ``lifetime_volume_update``.
+
+        ``openOrders`` interleaves live booked orders with your ``PENDING`` /
+        ``ARMED`` conditionals, newest first, before the list is capped.
         """
         return self._client.get("/portfolio/component")

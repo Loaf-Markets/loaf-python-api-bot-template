@@ -109,7 +109,7 @@ Create one `LoafClient` and reach everything through grouped resources:
 | --- | --- |
 | `loaf.market` | properties, property detail, candle history, info pages (all public) |
 | `loaf.offerings` | IPO offerings: list, detail, subscribe, pre-approve |
-| `loaf.orders` | place / cancel / cancel-all orders, pre-approve |
+| `loaf.orders` | place / cancel / cancel-all orders, stop & take (conditional) orders, pre-approve |
 | `loaf.portfolio` | balances, positions, PnL |
 | `loaf.history` | paginated order & trade history, cancelled & active orders |
 | `loaf.leaderboard` | competition leaderboard |
@@ -140,7 +140,11 @@ offerings.subscribe(ipo_id, qty)      POST   /offerings/subscribe
 offerings.approve(ipo_id)             POST   /offerings/approve
 
 orders.create(...) / limit_buy / ...  POST   /orders
+orders.create_conditional(...)        POST   /orders/conditional
+orders.stop_loss / take_profit(...)   POST   /orders/conditional
 orders.cancel(order_id)               POST   /orders/cancel
+orders.cancel_conditional(order_id)   POST   /orders/conditional/cancel
+orders.cancel_row(order)              (routes a row to the right cancel)
 orders.cancel_all()                   POST   /orders/cancel-all
 orders.approve(token_name)            POST   /orders/approve
 
@@ -198,14 +202,16 @@ rejections rather than trying to avoid them:
 | Rejection | Rule |
 | --- | --- |
 | `LoafValidationError` (400) | **Minimum order value** — `price x quantity` must be at least 10 USDL. A SELL closing your *entire* available position is exempt, so dust can always be flattened. |
-| `LoafValidationError` (400) | **Limit price deviation** — a LIMIT price too far from the current market reference is refused. The ceiling is a deployment setting; the message quotes it and the reference used. MARKET orders skip this — they are slippage-bounded instead. |
+| `LoafValidationError` (400) | **Limit price deviation** — a LIMIT price too far from the current midprice is refused. The ceiling is a deployment setting; the message quotes it and the midprice used. MARKET orders skip this — they are slippage-bounded instead. |
 | `LoafBusinessRuleError` (422) | **Daily price band** — a per-property band around the daily reference price. The message carries the side, limit, reference and band width. |
 
 While a trading-competition round is **ACTIVE**, only accounts admitted to the
 round may place orders — otherwise you get `CompetitionEligibilityError` (check
 your standing with `loaf.competition.queue_position()`). Outside an active
 round trading is unrestricted. If trading is halted platform-wide,
-order placement/cancels raise `TradingHaltedError` (403).
+order placement and cancels raise `TradingHaltedError` (403) — except
+`orders.cancel_conditional()`, which is database-only and stays available (see
+**Stop & take orders** below).
 
 To see a halt coming instead of discovering it on a rejected order, subscribe to
 the property's status channel:
@@ -222,6 +228,97 @@ def on_halt(msg):
 platform-wide kill switch — so assign it straight over the `isHalted` you seeded
 from `market.property("opera").property.isHalted`. Note a global halt lifting does
 not resume a property that is individually halted; the frame accounts for that.
+
+### Stop & take orders
+
+A stop or take order rests in the backend until the mark price reaches your
+trigger, then books as an ordinary limit order signed when you placed it.
+Nothing is frozen until it books, but it does occupy an open-order slot.
+
+```python
+# Protect a long: SELL 5 if the mark falls to 90, take profit if it rises to 120.
+sl = loaf.orders.stop_loss("opera", quantity=5, trigger_price=90)
+tp = loaf.orders.take_profit("opera", quantity=5, trigger_price=120)
+
+# Any of the eight type x side combinations, spelled out:
+loaf.orders.create_conditional("opera", "BUY", quantity=2,
+                               type="STOP_MARKET", trigger_price=130)   # breakout
+loaf.orders.create_conditional("opera", "SELL", quantity=5,
+                               type="STOP_LIMIT", trigger_price=90, price=89.5)
+
+# The same two legs attached to a BUY — these ARE OCO, one firing cancels the other:
+loaf.orders.limit_buy("opera", quantity=10, price=100, sl_price=90, tp_price=120)
+
+loaf.orders.cancel_conditional(sl.orderId)   # while PENDING / ARMED
+```
+
+Direction comes from the type **and** the side, not the type alone:
+
+| Type | A BUY fires when the mark | A SELL fires when the mark |
+| --- | --- | --- |
+| `STOP_MARKET` / `STOP_LIMIT` | **rises** to the trigger | **falls** to the trigger |
+| `TAKE_MARKET` / `TAKE_LIMIT` | **falls** to the trigger | **rises** to the trigger |
+
+**A 200 means the row is ARMED — not that it will ever book.** Every
+trigger-time failure (holding gone, cash gone, price band, limit deviation,
+minimum value *again*, engine rejection) raises nothing; it arrives as
+`status: "FAILED"` with a `rejectionReason` on your `portfolio` channel. A
+`rejectionReason` on a row that is still `ARMED` means deferred-and-retrying,
+not dead.
+
+| Rejection | Rule |
+| --- | --- |
+| `LoafValidationError` (400) | **Already through the trigger** — refused if the mark has reached your level. Triggering is level-based, so a trigger *equal* to the mark is refused too. Compare your trigger against the mark yourself (`markprice:{tokenName}`); if the mark is already there, place a plain order. |
+| `LoafValidationError` (400) | **Holding / cash** — checked against your **total** balance, not the available one, because a firing trigger frees funds from your own resting orders first. Nothing is frozen until it books. |
+| `LoafValidationError` (400) | **Open-order caps** — resting conditionals count against the same caps as booked orders. |
+| `LoafValidationError` (400) | **Minimum order value** — the same floor as a plain order, but measured at the price the row will *book* at. For a `*_MARKET` type that is the trigger adjusted by the server's slippage cap, not the trigger you passed, so a value that clears the bar on your own arithmetic can still be refused. A SELL for your whole holding is exempt. Re-checked when the row fires. |
+
+A `*_MARKET` type is a **protected limit, not a market order**. Its price is
+derived from the trigger at placement and fixed for life, so after a gap the
+booked order can rest away from the market instead of executing. The quantity
+is fixed too and is never clamped — a SELL whose holding shrank below it FAILS
+rather than selling what is left.
+
+**Legs on a MARKET parent are measured against the midprice, not against your
+fill.** The server checks `sl_price` / `tp_price` against the midprice taken
+*before* slippage, which is the floor the entry's slippage cap is built on — so
+a `tp_price` just above it can sit below the price the BUY actually fills at.
+The leg then arms already through its trigger and sells at a loss on the next
+evaluation; the trigger you passed is a level, not a minimum sale price, and it
+is never re-derived from the fill. Leave the take-profit clear of the mark, or
+place the leg yourself once you can see the fill.
+
+**Two ids, two cancel routes.** A `PENDING` / `ARMED` row is cancelled with
+`loaf.orders.cancel_conditional(row.id)`; once it reaches `PLACED` the trigger
+has booked an ordinary order, which you cancel with
+`loaf.orders.cancel(row.placedOrderId)`. Unsure which you are holding? Hand the
+row to `loaf.orders.cancel_row(row)` and it picks. `cancel_conditional` still
+works during a platform-wide halt while `cancel` and `cancel_all` do not, so it
+is your only lever if you don't want stops firing into the reopen.
+
+**Reading rows.** `loaf.portfolio.component().openOrders` and
+`loaf.history.orders()` now mix both kinds — narrow with
+`loaf.is_conditional_order(row)` before touching `filledQuantity`, which a
+conditional does not carry. `loaf.history.active_orders()` and
+`loaf.history.cancelled_orders()` are booked-orders-only and never show them.
+
+**Round switches wipe every conditional row** — real-market and competition
+properties alike — while real-market positions survive. They simply vanish:
+no `CANCELLED` status and no `order_update` frame tells you, so re-arm after a
+round change. Poll `loaf.competition.info()`, or watch the transition live on
+the public `competition` channel, which has no `subscribe_*` helper but is
+reachable with the generic pair:
+
+```python
+ws.subscribe("competition")
+
+@ws.on("round_update")
+def on_round(msg):
+    print(msg.roundNumber, msg.status)   # re-arm your stops here
+```
+
+Derive triggers with `round(mark * 0.95, 2)`: an unrounded float product carries
+17 decimals and the SDK rejects it locally before the request goes out.
 
 ---
 
@@ -281,7 +378,12 @@ you receive `balances_update`, `position_update`, `order_status`, etc. as
 separate frames. Each fill is delivered twice under one `tradeId` (`SETTLING`,
 then `SETTLED`), so dedupe on it before accumulating anything. To value
 positions live, combine `position_update` with the `markprice` channel (the
-server does not push recomputed portfolio totals on every price tick).
+server does not push recomputed portfolio totals on every price tick). Stop and
+take orders ride the same `order_update` frame as booked orders, so narrow with
+`loaf.is_conditional_order(msg.order)` before reading `filledQuantity`. A firing
+conditional also cancels your own resting orders on that side of that property
+to free its funds, so `CANCELLED` frames can arrive for orders you never
+cancelled.
 
 ---
 
@@ -334,6 +436,7 @@ decide whether to re-issue it. Tune with
 | `examples/03_place_order.py` | place → inspect → cancel a limit order |
 | `examples/04_realtime_market.py` | stream order book + trades + mark price + halts |
 | `examples/05_portfolio_stream.py` | stream your private portfolio events |
+| `examples/06_stop_and_take.py` | arm a stop far from the mark, read it back, cancel it |
 | `bot.py` | full strategy-loop template |
 
 ## Tests
@@ -344,8 +447,8 @@ pytest
 ```
 
 The suite runs fully offline against an in-memory mock transport (no live
-server, no real key) and covers auth, the order flow, input validation,
-pagination, error mapping, and retry behaviour.
+server, no real key) and covers auth, the order flow, stop & take orders, input
+validation, pagination, error mapping, and retry behaviour.
 
 ## Notes / intentionally excluded
 

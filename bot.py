@@ -190,6 +190,11 @@ class Strategy:
         #   # Market sell 0.5 tokens:
         #   self.client.orders.market_sell(self.token_name, quantity=0.5)
         #
+        #   # Arm a protected stop-loss 5% below the mark (rests server-side):
+        #   if mark:
+        #       trigger = round(mark * 0.95, 2)
+        #       self.client.orders.stop_loss(self.token_name, quantity=1, trigger_price=trigger)
+        #
         #   # Flatten everything:
         #   self.client.orders.cancel_all()
         #

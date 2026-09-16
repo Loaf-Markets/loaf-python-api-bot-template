@@ -23,8 +23,11 @@ from .constants import (
     MAX_QUANTITY_DECIMALS,
 )
 from .enums import (
+    CONDITIONAL_ORDER_TYPES,
     CandleResolution,
     CompetitionRoundStatus,
+    ConditionalOrderStatus,
+    ConditionalOrderType,
     IpoStatus,
     OfferingOrderStatus,
     OrderSide,
@@ -36,6 +39,7 @@ from .enums import (
     TransferStatus,
     TransferType,
     WSMessageType,
+    is_conditional_order,
 )
 from .exceptions import (
     CompetitionEligibilityError,
@@ -72,8 +76,10 @@ __all__ = [
     # enums
     "OrderSide",
     "OrderType",
+    "ConditionalOrderType",
     "TimeInForce",
     "OrderStatus",
+    "ConditionalOrderStatus",
     "TradeStatus",
     "OfferingOrderStatus",
     "PropertyStatus",
@@ -83,6 +89,9 @@ __all__ = [
     "CandleResolution",
     "CompetitionRoundStatus",
     "WSMessageType",
+    # order-row helpers
+    "CONDITIONAL_ORDER_TYPES",
+    "is_conditional_order",
     # unit helpers
     "bps_to_fraction",
     "fraction_to_bps",

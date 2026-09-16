@@ -15,6 +15,7 @@ You can always pass a plain string instead of an enum member.
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any, Mapping
 
 
 class _StrEnum(str, Enum):
@@ -30,6 +31,13 @@ class OrderSide(_StrEnum):
 class OrderType(_StrEnum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
+
+
+class ConditionalOrderType(_StrEnum):
+    STOP_LIMIT = "STOP_LIMIT"
+    STOP_MARKET = "STOP_MARKET"
+    TAKE_LIMIT = "TAKE_LIMIT"
+    TAKE_MARKET = "TAKE_MARKET"
 
 
 class TimeInForce(_StrEnum):
@@ -49,6 +57,17 @@ class OrderStatus(_StrEnum):
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
+
+
+class ConditionalOrderStatus(_StrEnum):
+    #: An attached TP/SL leg waiting on its parent BUY to fill COMPLETELY.
+    PENDING = "PENDING"
+    #: Watching the mark; fires the moment it sits at or through the trigger.
+    ARMED = "ARMED"
+    #: Triggered and booked — follow ``placedOrderId`` from here for the fills.
+    PLACED = "PLACED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class TradeStatus(_StrEnum):
@@ -143,3 +162,11 @@ class WSMessageType(_StrEnum):
     LIFETIME_VOLUME_UPDATE = "lifetime_volume_update"
     TRANSFER_UPDATE = "transfer_update"
     OFFERING_ORDER_UPDATE = "offering_order_update"
+
+
+#: The four ``type`` values that mark an order row as a conditional (stop / take).
+CONDITIONAL_ORDER_TYPES = frozenset(t.value for t in ConditionalOrderType)
+
+
+def is_conditional_order(order: Mapping[str, Any]) -> bool:
+    return order.get("type") in CONDITIONAL_ORDER_TYPES

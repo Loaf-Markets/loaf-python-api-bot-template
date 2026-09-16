@@ -25,6 +25,11 @@ class HistoryResource(Resource):
 
         Returns ``{orders, total, page, pageSize, nextCursor}``. ``page_size``
         max is 100 (default 20).
+
+        Conditionals appear here in EVERY status, including the live
+        ``PENDING`` / ``ARMED`` ones, so a resting stop shows up in history and
+        in ``openOrders`` at once. ``total`` now counts both tables and only
+        one is capped — another reason not to derive "has more" from it.
         """
         return self._client.get(
             "/history/orders",
@@ -51,7 +56,8 @@ class HistoryResource(Resource):
     def cancelled_orders(self) -> Any:
         """``GET /history/orders/cancelled`` — all cancel events, newest first (not paginated).
 
-        Returns ``{"cancelledOrders": [{orderId, cancelledAt}]}``.
+        Returns ``{"cancelledOrders": [{orderId, cancelledAt}]}``. Cancelled
+        BOOKED orders only; a cancelled conditional never appears here.
         """
         return self._client.get("/history/orders/cancelled")
 
@@ -60,6 +66,10 @@ class HistoryResource(Resource):
 
         Returns ``{"activeOrders": [{orderId, quantityLeft, createdAt}]}`` where
         ``quantityLeft`` is the remaining quantity in tokens.
+
+        Booked orders only, and these rows carry no ``type`` to narrow on, so do
+        not use this as your "what is live" source once you place stops — use
+        ``portfolio.component().openOrders``.
         """
         return self._client.get("/history/orders/active")
 

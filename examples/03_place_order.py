@@ -4,10 +4,6 @@ This DOES place a real (limit) order, priced far from the market so it rests on
 the book rather than filling. Review it before running against a live account.
 
     python examples/03_place_order.py
-
-Requires: competition admission when a round is ACTIVE (check
-`client.competition.queue_position()`); outside an active round trading is
-unrestricted.
 """
 
 from __future__ import annotations

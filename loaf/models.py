@@ -70,21 +70,36 @@ class CancelAllResult(TypedDict, total=False):
 
 
 class OrderHistoryItem(TypedDict, total=False):
+    """One row of ``openOrders`` / ``orderHistory`` / ``history.orders()``.
+
+    A row is either a booked order or a resting conditional (stop / take), and
+    ``type`` is the discriminator — use
+    :func:`loaf.enums.is_conditional_order`. A conditional carries
+    ``triggerPrice`` and a ``status`` from
+    :class:`~loaf.enums.ConditionalOrderStatus`, and has NO ``filledQuantity``
+    and NO ``filledAt``: the keys are absent, not null, so reading either one
+    off a conditional row raises. Narrow before you touch them.
+    """
+
     id: int
     propertyId: int
-    tokenName: str
+    tokenName: str  # "" on a conditional for a delisted/uncached property — key on propertyId
     side: str  # OrderSide
-    type: str  # OrderType
+    type: str  # OrderType, or ConditionalOrderType — THIS is the discriminator
     timeInForce: str
     quantity: float
-    price: Optional[float]  # None for market orders
-    status: str  # OrderStatus
-    filledQuantity: float
-    rejectionReason: Optional[str]
+    price: Optional[float]  # None for market orders; on a conditional, the SIGNED limit price
+    status: str  # OrderStatus, or ConditionalOrderStatus on a conditional
+    filledQuantity: float  # booked orders only — absent on a conditional
+    rejectionReason: Optional[str]  # on a live ARMED row: the last deferred attempt, not a failure
     deadline: int
-    filledAt: Optional[int]
+    filledAt: Optional[int]  # booked orders only — absent on a conditional
     cancelledAt: Optional[int]
     createdAt: int
+    triggerPrice: float  # conditional only; dollars; the mark level that fires the row
+    parentOrderId: Optional[int]  # conditional only; the BUY a TP/SL leg arms on
+    placedOrderId: Optional[int]  # conditional only; the booked order id once PLACED — cancel THIS
+    triggeredAt: Optional[int]  # conditional only; unix seconds
 
 
 class TradeHistoryItem(TypedDict, total=False):
@@ -125,9 +140,9 @@ class PortfolioComponent(TypedDict, total=False):
     positions: list[Position]
     applicableFees: dict[str, int]  # {takerFeeBps, makerFeeBps}
     offeringOrders: list[dict[str, Any]]
-    openOrders: list[OrderHistoryItem]
+    openOrders: list[OrderHistoryItem]  # booked orders + PENDING/ARMED conditionals, merged
     tradeHistory: list[TradeHistoryItem]
-    orderHistory: list[OrderHistoryItem]
+    orderHistory: list[OrderHistoryItem]  # newest rows of both kinds, ANY status
     transfers: list[dict[str, Any]]
 
 

@@ -10,7 +10,7 @@ Every error the API can return is mapped to a specific exception so a bot can
         ├── LoafAuthError                 401  bad/expired/missing credentials
         ├── LoafForbiddenError            403  generic forbidden
         │   ├── KycRequiredError          403  retail/wholesale KYC required
-        │   ├── TradingHaltedError        403  "Trading is currently halted" (emergency kill switch)
+        │   ├── TradingHaltedError        403  "Trading is currently halted" (platform-wide or per-property)
         │   └── CompetitionEligibilityError 403 code=NOT_COMPETITION_PARTICIPANT
         ├── LoafValidationError           400  body/query/param validation failed
         ├── LoafNotFoundError             404
@@ -89,10 +89,15 @@ class KycRequiredError(LoafForbiddenError):
 
 
 class TradingHaltedError(LoafForbiddenError):
-    """403 "Trading is currently halted" — the platform emergency kill switch is on.
+    """403 "Trading is currently halted" — a platform-wide or per-property halt.
 
-    Order placement, cancels, and offering subscriptions all reject while the
-    halt lasts. Back off and retry later; there is no client-side fix.
+    Order placement and offering subscriptions reject while the halt lasts, as
+    do :meth:`~loaf.resources.orders.OrdersResource.cancel` and ``cancel_all``.
+    The one exception is
+    :meth:`~loaf.resources.orders.OrdersResource.cancel_conditional`, which is
+    database-only and stays available — during a platform halt it is your only
+    way to pull a resting stop before the reopen. Otherwise back off and retry
+    later; there is no client-side fix.
     """
 
 

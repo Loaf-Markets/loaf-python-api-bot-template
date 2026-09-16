@@ -191,9 +191,22 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.POSITION_UPDATE, handler)
 
     def on_order_status(self, handler: Handler | None = None) -> Any:
+        """A booked order's status/quantity changed (``order_status``).
+
+        Booked orders only; a conditional never reaches this frame.
+        """
         return self.on(WSMessageType.ORDER_STATUS, handler)
 
     def on_order_update(self, handler: Handler | None = None) -> Any:
+        """One of your orders changed (``order_update``: ``{order}``).
+
+        ``order`` is a booked order OR a conditional (stop / take) row — narrow
+        with :func:`loaf.is_conditional_order` before reading ``filledQuantity``,
+        which a conditional does not carry. Every conditional transition
+        publishes one of these. A firing conditional also cancels your own
+        resting orders on that side of that property to free its funds, so you
+        can receive ``CANCELLED`` frames for orders you never cancelled.
+        """
         return self.on(WSMessageType.ORDER_UPDATE, handler)
 
     def on_trade(self, handler: Handler | None = None) -> Any:

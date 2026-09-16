@@ -85,6 +85,15 @@ def test_error_mapping():
     assert isinstance(error_from_response(503, {"error": "down"}), loaf.LoafServiceUnavailableError)
 
 
+def test_is_conditional_order():
+    # `type` is the discriminator: `status` is not (CANCELLED belongs to both spaces).
+    for t in ("STOP_LIMIT", "STOP_MARKET", "TAKE_LIMIT", "TAKE_MARKET"):
+        assert loaf.is_conditional_order({"type": t}) is True
+    assert loaf.is_conditional_order({"type": "LIMIT"}) is False
+    assert loaf.is_conditional_order({"type": "MARKET"}) is False
+    assert loaf.is_conditional_order({}) is False
+
+
 # --------------------------------------------------------------------------- #
 # Client behaviour
 # --------------------------------------------------------------------------- #
@@ -340,3 +349,169 @@ def test_rate_limit_headers_recorded():
     client = make_client(handler)
     client.market.properties()
     assert client.last_rate_limit == {"limit": 100.0, "remaining": 97.0, "reset": 873.0}
+
+
+def test_conditional_order_create_flow():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"success": True, "orderId": 4242})
+
+    client = make_client(handler)
+    res = client.orders.create_conditional(
+        "opera", "SELL", 5, type="STOP_MARKET", trigger_price=90
+    )
+    assert res.orderId == 4242
+    assert captured["path"].endswith("/orders/conditional")
+    # *_MARKET forces price 0; GTC and deadline 0 are the only accepted values.
+    expected = {
+        "tokenName": "opera",
+        "price": 0,
+        "quantity": 5,
+        "side": "SELL",
+        "type": "STOP_MARKET",
+        "timeInForce": "GTC",
+        "deadline": 0,
+        "triggerPrice": 90,
+    }
+    assert captured["body"] == expected
+
+    # The wrapper spells the same call out — same route, same body.
+    client.orders.stop_loss("opera", quantity=5, trigger_price=90)
+    assert captured["path"].endswith("/orders/conditional")
+    assert captured["body"] == expected
+
+    # A *_LIMIT carries its own signed price; the schema is strict, so nothing else.
+    client.orders.create_conditional(
+        "opera", "BUY", 2, type="TAKE_LIMIT", trigger_price=70, price=70.5
+    )
+    assert captured["body"] == {
+        "tokenName": "opera",
+        "price": 70.5,
+        "quantity": 2,
+        "side": "BUY",
+        "type": "TAKE_LIMIT",
+        "timeInForce": "GTC",
+        "deadline": 0,
+        "triggerPrice": 70,
+    }
+
+
+def test_conditional_order_validation_local():
+    client = make_client(lambda r: httpx.Response(200, json={}))
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.create_conditional(
+            "opera", "SELL", 5, type="STOP_LIMIT", trigger_price=90
+        )  # *_LIMIT with no price
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.create_conditional(
+            "opera", "SELL", 5, type="STOP_MARKET", trigger_price=90, price=89.5
+        )  # *_MARKET given a price
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.create_conditional(
+            "opera", "SELL", 5, type="STOP_MARKET", trigger_price=90.123
+        )  # 3 dp trigger
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.create_conditional(
+            "opera", "SELL", 5, type="STOP_MARKET", trigger_price=0
+        )  # non-positive trigger
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.create_conditional(
+            "opera", "SELL", 5, type="LIMIT", trigger_price=90
+        )  # not a conditional type — refused locally, never sent
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.stop_loss(
+            "opera", quantity=5, trigger_price=90, price=89.5
+        )  # the wrapper is *_MARKET only, so a stray price= fails loudly
+
+
+def test_attached_legs():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"success": True, "orderId": 7})
+
+    client = make_client(handler)
+    client.orders.limit_buy("opera", quantity=10, price=100, sl_price=90.0, tp_price=120.0)
+    assert captured["path"].endswith("/orders")
+    # Legs ride the plain order route as two extra keys — the legs' own ids never come back.
+    assert captured["body"] == {
+        "tokenName": "opera",
+        "price": 100,
+        "quantity": 10,
+        "side": "BUY",
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "deadline": 0,
+        "tpPrice": 120.0,
+        "slPrice": 90.0,
+    }
+
+    # Without legs the body is byte-identical to what it has always been: None keys are dropped.
+    client.orders.limit_buy("opera", quantity=10, price=100)
+    assert "tpPrice" not in captured["body"] and "slPrice" not in captured["body"]
+    assert captured["body"] == {
+        "tokenName": "opera",
+        "price": 100,
+        "quantity": 10,
+        "side": "BUY",
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "deadline": 0,
+    }
+
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.limit_sell("opera", 5, 120, sl_price=110)  # legs are BUY-only
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.limit_buy("opera", 1, 100, tp_price=90, sl_price=95)  # tp below sl
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.limit_buy("opera", 1, 100, sl_price=110)  # sl above a LIMIT entry
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.limit_buy("opera", 1, 100, tp_price=90)  # tp below a LIMIT entry
+
+
+def test_conditional_cancel_routing():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"success": True})
+
+    client = make_client(handler)
+
+    client.orders.cancel_conditional(1)
+    assert seen["path"].endswith("/orders/conditional/cancel")
+    assert seen["body"] == {"orderId": 1}
+
+    client.orders.cancel_row({"id": 7, "type": "LIMIT", "status": "OPEN"})
+    assert seen["path"].endswith("/orders/cancel")
+    assert seen["body"] == {"orderId": 7}
+
+    # An active_orders() row: no `type` to narrow on, and its id lives under `orderId`.
+    client.orders.cancel_row({"orderId": 11, "quantityLeft": 2})
+    assert seen["path"].endswith("/orders/cancel")
+    assert seen["body"] == {"orderId": 11}
+
+    client.orders.cancel_row({"id": 8, "type": "STOP_MARKET", "status": "ARMED"})
+    assert seen["path"].endswith("/orders/conditional/cancel")
+    assert seen["body"] == {"orderId": 8}
+
+    # Once PLACED the row is an ordinary order in the book, under a different id.
+    client.orders.cancel_row(
+        {"id": 9, "type": "STOP_MARKET", "status": "PLACED", "placedOrderId": 42}
+    )
+    assert seen["path"].endswith("/orders/cancel")
+    assert seen["body"] == {"orderId": 42}
+
+    # A terminal row is forwarded — the server, not the snapshot, decides.
+    client.orders.cancel_row({"id": 10, "type": "STOP_MARKET", "status": "FAILED"})
+    assert seen["path"].endswith("/orders/conditional/cancel")
+    assert seen["body"] == {"orderId": 10}
+
+    with pytest.raises(loaf.LoafValidationError):
+        client.orders.cancel_row({"type": "LIMIT"})  # no id anywhere in the row
