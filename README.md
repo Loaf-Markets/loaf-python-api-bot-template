@@ -5,6 +5,14 @@ trading platform. It wraps the trading-facing REST endpoints and the real-time
 WebSocket feed so you can build a bot that reads market data, tracks a
 portfolio, and places trades in a few lines.
 
+> [!IMPORTANT]
+> **This SDK is experimental and moves fast.** Loaf is in testnet development,
+> so expect heavy changes while it is — breaking ones included. Track `main`, or
+> pin a tag deliberately and re-read this README before you move off the pin;
+> [§4 Updating](#4-updating) has the versioning contract. A stable SDK lands
+> with mainnet, and release notes go out on
+> [@CohenLoaf](https://x.com/CohenLoaf).
+
 ```python
 from loaf import LoafClient
 
@@ -97,7 +105,8 @@ git checkout v0.3.0
 
 Releases are tagged from `v0.3.0` onward. While the SDK is pre-1.0, a breaking
 change bumps the **minor** version — so `0.3.x` → `0.4.0` is the signal to
-re-read this README before upgrading.
+re-read this README before upgrading. Expect that signal often while Loaf is on
+testnet; an old pin is the most common reason a bot stops matching these docs.
 
 ---
 
