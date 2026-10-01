@@ -3,6 +3,9 @@
 This DOES place a real conditional order, triggered far from the market so it
 never fires. Review it before running against a live account.
 
+It needs both keys: LOAF_AGENT_PRIVATE_KEY signs the order, and LOAF_API_KEY
+reads it back and cancels it.
+
     python examples/06_stop_and_take.py
 """
 
@@ -21,12 +24,25 @@ except ImportError:
 
 def main() -> None:
     client = LoafClient()
+    if client.agent_address is None:
+        raise SystemExit("Set LOAF_AGENT_PRIVATE_KEY to place orders (see README §2).")
+    if not client.api_key:
+        raise SystemExit("Set LOAF_API_KEY too, to cancel the order again (see README §2).")
 
-    # Pick a property to trade.
-    properties = client.market.properties().get("properties") or []
-    if not properties:
-        raise SystemExit("No properties available.")
-    prop = properties[0]
+    # Pick a property you can trade now: LIVE, with a deployed token, and in the
+    # market that is open (competition properties trade only during a round).
+    listing = client.market.properties()
+    competition = bool(listing.get("competitionModeActive"))
+    tradeable = [
+        p
+        for p in listing.get("properties") or []
+        if p.get("status") == "LIVE"
+        and bool(p.get("isCompetition")) == competition
+        and p.get("contractAddress")
+    ]
+    if not tradeable:
+        raise SystemExit("No tradeable properties right now.")
+    prop = tradeable[0]
     detail = client.market.property(prop.tokenName)
     book = detail.get("orderBook")
     mark = book.bids[0].price if book and book.get("bids") else (prop.marketPrice or 1.0)
@@ -34,7 +50,13 @@ def main() -> None:
     # A STOP BUY fires when the mark RISES to the trigger, so a trigger 50%
     # above the market just rests. (A stop SELL would need a holding to sell.)
     trigger = round(mark * 1.50, 2)
-    print(f"Arming STOP_MARKET BUY 1 {prop.tokenName} @ trigger {trigger} (mark {mark})")
+    # When it fires it books a LIMIT BUY at the trigger plus the client's max
+    # slippage ($LOAF_MAX_SLIPPAGE_BPS, default 2%). Placing it needs total USDC
+    # of at least that price x quantity plus the taker fee, and that value must
+    # be at least 10 USDC.
+    books_at = loaf.worst_price(trigger, "BUY", client.max_slippage_bps)
+    print(f"Arming STOP_MARKET BUY 1 {prop.tokenName} @ trigger {trigger} "
+          f"(books at up to {books_at}; mark {mark})")
 
     try:
         result = client.orders.create_conditional(
@@ -49,13 +71,23 @@ def main() -> None:
             "Not admitted to the active competition round — check "
             "client.competition.queue_position() for your place in the queue."
         )
-    except loaf.TradingHaltedError:
-        raise SystemExit("Trading is currently halted platform-wide. Try again later.")
+    except loaf.LoafAuthError as exc:
+        raise SystemExit(
+            f"Order signature refused: {exc.message}. Is LOAF_AGENT_PRIVATE_KEY "
+            "the agent key of a current API key?"
+        )
     except loaf.LoafValidationError as exc:
         raise SystemExit(
             f"Refused: {exc}. If this says 'would trigger immediately', the trigger "
             "was too close to the mark."
         )
+    except loaf.LoafAPIError as exc:  # halted, market closed, rate limited
+        raise SystemExit(f"Refused: {exc}")
+    except loaf.OrderOutcomeUnknownError as exc:
+        # Unsure whether it was armed: re-send the same signed order to find out (the
+        # same row if it landed, armed now if not), then cancel it below. If this raises
+        # again, look for the row in client.history.orders() and cancel_conditional it.
+        result = client.orders.resubmit(exc.signed_body)
 
     order_id = result.orderId
     print(f"Armed. orderId={order_id} — ARMED only means it rests, not that it will book.")

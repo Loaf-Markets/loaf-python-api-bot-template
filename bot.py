@@ -10,8 +10,9 @@ A runnable starting point that:
   5. runs a simple strategy loop you can replace with your own logic.
 
 Run it:
-    cp .env.example .env          # then edit .env to set LOAF_API_KEY etc.
-    pip install -e .              # or: pip install httpx websockets
+    cp .env.example .env          # then set LOAF_API_KEY, and LOAF_AGENT_PRIVATE_KEY
+                                  # to place orders
+    pip install -e ".[dotenv]"    # the dotenv extra loads .env; or export the variables yourself
     python bot.py
 
 Stop with Ctrl-C.
@@ -40,9 +41,10 @@ try:
 except ImportError:
     pass
 
-# The property this template watches/trades. Set to a tokenName from
-# `loaf.market.properties()` (lowercase letters), e.g. "opera".
-TARGET_TOKEN_NAME = os.environ.get("LOAF_TARGET_TOKEN", "")
+# The property this template watches/trades: a tokenName from
+# `loaf.market.properties()` (lowercase letters), e.g. "opera". Leave it empty to
+# follow the first listed property.
+TARGET_TOKEN_NAME = ""
 
 
 def build_client() -> LoafClient:
@@ -51,12 +53,18 @@ def build_client() -> LoafClient:
     if not api_key:
         sys.exit(
             "No LOAF_API_KEY set.\n"
-            "  1. Log in to the Loaf web app and mint an API key "
-            "(Settings -> API keys).\n"
-            "  2. cp .env.example .env  and put the key in LOAF_API_KEY.\n"
+            "  1. Create an API key in the Loaf web app (Settings -> API keys).\n"
+            "  2. cp .env.example .env  and put its two values in LOAF_API_KEY\n"
+            "     and LOAF_AGENT_PRIVATE_KEY.\n"
+            "  .env is read only when python-dotenv is installed\n"
+            "  (pip install -e \".[dotenv]\"); otherwise export both variables.\n"
         )
-    # base_url / ws_url are read from $LOAF_API_BASE_URL / $LOAF_WS_URL if set.
-    return LoafClient(api_key=api_key)
+    # The agent key is read from $LOAF_AGENT_PRIVATE_KEY, and base_url / ws_url
+    # from $LOAF_API_BASE_URL / $LOAF_WS_URL, if set.
+    try:
+        return LoafClient(api_key=api_key)
+    except loaf.LoafConfigError as exc:  # a bad key or LOAF_MAX_SLIPPAGE_BPS, or no eth-account
+        sys.exit(str(exc))
 
 
 # --------------------------------------------------------------------------- #
@@ -71,7 +79,7 @@ def preflight(client: LoafClient) -> None:
     except loaf.LoafAuthError as exc:
         sys.exit(f"Authentication failed — check your API key. ({exc.message})")
 
-    print(f"  Cash: {comp.cash:,.2f} USDL  (frozen {comp.frozen:,.2f})  "
+    print(f"  Cash: {comp.cash:,.2f} USDC  (frozen {comp.frozen:,.2f})  "
           f"Portfolio value: {comp.portfolioValue:,.2f}  PnL: {comp.portfolioPnl:,.2f}")
     positions = comp.get("positions") or []
     if positions:
@@ -79,6 +87,12 @@ def preflight(client: LoafClient) -> None:
         for p in positions:
             print(f"    {p.tokenName}: {p.quantity} @ avg {p.averageEntryPrice} "
                   f"(mkt {p.marketPrice}, PnL {p.propertyPnl})")
+    if client.agent_address:
+        bps = client.max_slippage_bps  # $LOAF_MAX_SLIPPAGE_BPS, default 200
+        print(f"  Orders are signed by agent {client.agent_address}")
+        print(f"  Max slippage: {bps} bps ({bps / 100:g}%) for MARKET orders, stops and TP/SL legs")
+    else:
+        print("  No LOAF_AGENT_PRIVATE_KEY: watching only (placing orders needs it).")
     print(
         "  Note: while a competition round is ACTIVE, placing orders requires\n"
         "        admission to the round (loaf.competition.queue_position() shows\n"
@@ -134,6 +148,13 @@ class Strategy:
         with self._lock:
             self.mark_price = msg.price
 
+    def on_feed_reset(self, _msg) -> None:
+        # The socket dropped or reconnected: forget the mark until a fresh frame
+        # arrives (the server sends one on every (re)subscribe), so no order is
+        # priced off a dead feed. Meanwhile the SDK fetches the reference itself.
+        with self._lock:
+            self.mark_price = None
+
     def on_halt(self, msg) -> None:
         # `isHalted` is the effective state (this property's own flag OR a
         # platform-wide halt), so it replaces the value seeded from REST.
@@ -151,15 +172,16 @@ class Strategy:
         # A fill on YOUR orders.
         t = msg.trade
         print(f"  *** FILLED: {t.side} {t.quantity} {t.tokenName} @ {t.price} "
-              f"(fee {t.fee}) [{t.status}]")
+              f"(fee {t.fee}) #{t.tradeId}")
 
     def on_my_order(self, msg) -> None:
         # `order_status` is the transition only (FILLED / CANCELLED / ...).
         print(f"  order #{msg.orderId} -> {msg.status} (left {msg.get('quantityLeft')})")
 
     def on_my_order_accepted(self, msg) -> None:
-        # `order_update` carries the whole order, and is what arrives when the
-        # exchange accepts a new one — `order_status` does not fire for that.
+        # `order_update` carries the whole committed order. It arrives when the
+        # exchange accepts a new order, and for one that trades immediately it
+        # can come AFTER its fill frames, already FILLED.
         o = msg.order
         print(f"  order #{o.id} {o.side} {o.quantity} {o.tokenName} @ {o.price} -> {o.status}")
 
@@ -187,10 +209,17 @@ class Strategy:
         #       price = round(bid * 0.99, 2)
         #       self.client.orders.limit_buy(self.token_name, quantity=1, price=price)
         #
-        #   # Market sell 0.5 tokens:
-        #   self.client.orders.market_sell(self.token_name, quantity=0.5)
+        #   # Market sell 0.5 tokens at no worse than mark x (1 - max slippage);
+        #   # with no mark yet (None) the SDK fetches the reference itself. The
+        #   # unfilled rest RESTS at that price — cancel it if you don't want it
+        #   # on the book:
+        #   res = self.client.orders.market_sell(self.token_name, quantity=0.5,
+        #                                        reference_price=mark)
+        #   if res.status in ("OPEN", "PARTIALLY_FILLED"):
+        #       self.client.orders.cancel(res.orderId)
         #
-        #   # Arm a protected stop-loss 5% below the mark (rests server-side):
+        #   # Arm a stop-loss 5% below the mark (STOP_MARKET SELL; rests
+        #   # server-side, and books at up to the max slippage below the trigger):
         #   if mark:
         #       trigger = round(mark * 0.95, 2)
         #       self.client.orders.stop_loss(self.token_name, quantity=1, trigger_price=trigger)
@@ -200,8 +229,14 @@ class Strategy:
         #
         # During an ACTIVE competition round, order placement requires admission
         # (loaf.CompetitionEligibilityError otherwise; loaf.TradingHaltedError
-        # while a platform-wide halt is on).
+        # while this property or the whole platform is halted).
         # Wrap calls in try/except loaf.LoafAPIError to handle rejections.
+        # On loaf.LoafAuthError from a placement, stop trading and alert: your
+        # agent key was refused (expired or deleted API key).
+        # On loaf.OrderOutcomeUnknownError the order may be live or already
+        # filled. If you still want it, resubmit(e.signed_body) (the same order
+        # if it landed, placed now if not); otherwise check history.orders()
+        # (not openOrders) before placing again.
         # ----------------------------------------------------------------- #
 
 
@@ -221,9 +256,12 @@ def main() -> None:
         return
     print(f"\nFollowing property {target.tokenName} (id {target.propertyId}).\n")
 
-    # `isHalted` is only on the property DETAIL response, not the list above.
+    # `isHalted` is only on the property DETAIL response, not the list above. Its
+    # book seeds bid/ask too: the order-book channel only pushes on change.
     detail = client.market.property(target.tokenName)
     strategy = Strategy(client, target.tokenName, is_halted=bool(detail.property.isHalted))
+    if detail.get("orderBook"):
+        strategy.on_orderbook(detail.orderBook)
     if strategy.is_halted:
         print("  Trading is currently HALTED for this property.")
 
@@ -231,6 +269,8 @@ def main() -> None:
     ws = client.websocket()
     ws.on_orderbook(strategy.on_orderbook)
     ws.on_mark_price(strategy.on_mark_price)
+    ws.on_connect(strategy.on_feed_reset)            # drop the mark until a fresh one arrives
+    ws.on_transport_error(strategy.on_feed_reset)
     ws.on_property_halt(strategy.on_halt)     # public: halt/resume for this property
     ws.on_trades(strategy.on_trade_tick)
     ws.on_trade(strategy.on_my_fill)          # private: your fills
