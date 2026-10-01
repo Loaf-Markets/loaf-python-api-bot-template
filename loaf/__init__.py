@@ -7,7 +7,7 @@ Quick start::
     loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_AGENT_PRIVATE_KEY
     print(loaf.portfolio.component().cash)
     print(loaf.market.properties())
-    loaf.orders.limit_buy("opera", quantity=10, price=167.49)   # signed with your agent key
+    loaf.orders.limit_buy("OPRA", quantity=10, price=167.49)   # signed with your agent key
 
 See the README for the full guide.
 """

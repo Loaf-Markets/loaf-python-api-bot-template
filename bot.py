@@ -41,10 +41,10 @@ try:
 except ImportError:
     pass
 
-# The property this template watches/trades: a tokenName from
-# `loaf.market.properties()` (lowercase letters), e.g. "opera". Leave it empty to
-# follow the first listed property.
-TARGET_TOKEN_NAME = ""
+# The property this template watches/trades: a ticker from
+# `loaf.market.properties()`, exactly as listed (uppercase), e.g. "OPRA". Leave it
+# empty to follow the first listed property.
+TARGET_TICKER = ""
 
 
 def build_client() -> LoafClient:
@@ -85,7 +85,7 @@ def preflight(client: LoafClient) -> None:
     if positions:
         print("  Positions:")
         for p in positions:
-            print(f"    {p.tokenName}: {p.quantity} @ avg {p.averageEntryPrice} "
+            print(f"    {p.ticker}: {p.quantity} @ avg {p.averageEntryPrice} "
                   f"(mkt {p.marketPrice}, PnL {p.propertyPnl})")
     if client.agent_address:
         bps = client.max_slippage_bps  # $LOAF_MAX_SLIPPAGE_BPS, default 200
@@ -106,11 +106,11 @@ def resolve_target(client: LoafClient) -> Any:
     if not listing:
         print("No properties available on this environment.")
         return None
-    if TARGET_TOKEN_NAME:
+    if TARGET_TICKER:
         for prop in listing:
-            if prop.tokenName == TARGET_TOKEN_NAME:
+            if prop.ticker == TARGET_TICKER:
                 return prop
-        print(f"Token {TARGET_TOKEN_NAME!r} not found; falling back to first listed.")
+        print(f"Ticker {TARGET_TICKER!r} not found; falling back to first listed.")
     return listing[0]
 
 
@@ -127,9 +127,9 @@ class Strategy:
     helpers you need are commented inline.
     """
 
-    def __init__(self, client: LoafClient, token_name: str, is_halted: bool = False) -> None:
+    def __init__(self, client: LoafClient, ticker: str, is_halted: bool = False) -> None:
         self.client = client
-        self.token_name = token_name
+        self.ticker = ticker
         self._lock = threading.Lock()
         self.best_bid: float | None = None
         self.best_ask: float | None = None
@@ -160,7 +160,7 @@ class Strategy:
         # platform-wide halt), so it replaces the value seeded from REST.
         with self._lock:
             self.is_halted = msg.isHalted
-        print(f"  *** {msg.tokenName} {'HALTED' if msg.isHalted else 'RESUMED'}")
+        print(f"  *** {msg.ticker} {'HALTED' if msg.isHalted else 'RESUMED'}")
 
     def on_trade_tick(self, msg) -> None:
         trades = msg.get("trades") or []
@@ -171,7 +171,7 @@ class Strategy:
     def on_my_fill(self, msg) -> None:
         # A fill on YOUR orders.
         t = msg.trade
-        print(f"  *** FILLED: {t.side} {t.quantity} {t.tokenName} @ {t.price} "
+        print(f"  *** FILLED: {t.side} {t.quantity} {t.ticker} @ {t.price} "
               f"(fee {t.fee}) #{t.tradeId}")
 
     def on_my_order(self, msg) -> None:
@@ -183,7 +183,7 @@ class Strategy:
         # exchange accepts a new order, and for one that trades immediately it
         # can come AFTER its fill frames, already FILLED.
         o = msg.order
-        print(f"  order #{o.id} {o.side} {o.quantity} {o.tokenName} @ {o.price} -> {o.status}")
+        print(f"  order #{o.id} {o.side} {o.quantity} {o.ticker} @ {o.price} -> {o.status}")
 
     def on_balances(self, msg) -> None:
         print(f"  balance update: cash {msg.cash:,.2f}  frozen {msg.frozen:,.2f}")
@@ -195,7 +195,7 @@ class Strategy:
             bid, ask, mark = self.best_bid, self.best_ask, self.mark_price
             halted = self.is_halted
         spread = (ask - bid) if (bid is not None and ask is not None) else None
-        print(f"[{self.token_name}] bid={bid} ask={ask} spread={spread} mark={mark}"
+        print(f"[{self.ticker}] bid={bid} ask={ask} spread={spread} mark={mark}"
               f"{' [HALTED]' if halted else ''}")
 
         if halted:
@@ -207,13 +207,13 @@ class Strategy:
         #   # Place a limit buy 1% below the best bid:
         #   if bid:
         #       price = round(bid * 0.99, 2)
-        #       self.client.orders.limit_buy(self.token_name, quantity=1, price=price)
+        #       self.client.orders.limit_buy(self.ticker, quantity=1, price=price)
         #
         #   # Market sell 0.5 tokens at no worse than mark x (1 - max slippage);
         #   # with no mark yet (None) the SDK fetches the reference itself. The
         #   # unfilled rest RESTS at that price — cancel it if you don't want it
         #   # on the book:
-        #   res = self.client.orders.market_sell(self.token_name, quantity=0.5,
+        #   res = self.client.orders.market_sell(self.ticker, quantity=0.5,
         #                                        reference_price=mark)
         #   if res.status in ("OPEN", "PARTIALLY_FILLED"):
         #       self.client.orders.cancel(res.orderId)
@@ -222,7 +222,7 @@ class Strategy:
         #   # server-side, and books at up to the max slippage below the trigger):
         #   if mark:
         #       trigger = round(mark * 0.95, 2)
-        #       self.client.orders.stop_loss(self.token_name, quantity=1, trigger_price=trigger)
+        #       self.client.orders.stop_loss(self.ticker, quantity=1, trigger_price=trigger)
         #
         #   # Flatten everything:
         #   self.client.orders.cancel_all()
@@ -254,12 +254,12 @@ def main() -> None:
     if target is None:
         client.close()
         return
-    print(f"\nFollowing property {target.tokenName} (id {target.propertyId}).\n")
+    print(f"\nFollowing property {target.ticker} ({target.tokenName}, id {target.propertyId}).\n")
 
     # `isHalted` is only on the property DETAIL response, not the list above. Its
     # book seeds bid/ask too: the order-book channel only pushes on change.
-    detail = client.market.property(target.tokenName)
-    strategy = Strategy(client, target.tokenName, is_halted=bool(detail.property.isHalted))
+    detail = client.market.property(target.ticker)
+    strategy = Strategy(client, target.ticker, is_halted=bool(detail.property.isHalted))
     if detail.get("orderBook"):
         strategy.on_orderbook(detail.orderBook)
     if strategy.is_halted:
@@ -279,10 +279,10 @@ def main() -> None:
     ws.on_balances(strategy.on_balances)      # private: your balance changes
     ws.on_error(lambda m: print(f"  WS error: {m.get('message')}"))
 
-    ws.subscribe_orderbook(target.tokenName)
-    ws.subscribe_mark_price(target.tokenName)
-    ws.subscribe_trades(target.tokenName)
-    ws.subscribe_property_status(target.tokenName)
+    ws.subscribe_orderbook(target.ticker)
+    ws.subscribe_mark_price(target.ticker)
+    ws.subscribe_trades(target.ticker)
+    ws.subscribe_property_status(target.ticker)
     ws.subscribe_portfolio()  # your private fills/balances stream (keyed by your API key)
 
     ws.start()  # background thread

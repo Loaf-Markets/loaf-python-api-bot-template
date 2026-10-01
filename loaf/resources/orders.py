@@ -2,7 +2,7 @@
 
 Placing an order is a single ``POST /orders``; the common case is a one-liner::
 
-    loaf.orders.limit_buy("opera", quantity=10, price=167.49)
+    loaf.orders.limit_buy("OPRA", quantity=10, price=167.49)
 
 **Signing.** Every placement is signed on your machine with your agent key
 (``agent_private_key=`` / ``$LOAF_AGENT_PRIVATE_KEY``) and authenticated by that
@@ -110,7 +110,7 @@ if TYPE_CHECKING:
     from ..client import LoafClient
     from ..signing import OrderSigner
 
-_TOKEN_NAME_RE = re.compile(r"[a-z]{1,20}")
+_TICKER_RE = re.compile(r"[A-Z0-9]{1,4}")
 _NONCE_RE = re.compile(r"[0-9a-f]{32}")
 
 # The signer 401s a stale token contract produces: it recovers a stranger's address.
@@ -125,13 +125,13 @@ _LIMIT_CONDITIONALS = (ConditionalOrderType.STOP_LIMIT, ConditionalOrderType.TAK
 class OrdersResource(Resource):
     def __init__(self, client: LoafClient) -> None:
         super().__init__(client)
-        #: tokenName -> the property's token contract, as served. Filled lazily; healed on a
+        #: ticker -> the property's token contract, as served. Filled lazily; healed on a
         #: signer 401 (competition rounds redeploy the contracts).
         self._contracts: dict[str, str] = {}
 
     def create(
         self,
-        token_name: str,
+        ticker: str,
         side: str,
         quantity: float,
         *,
@@ -146,8 +146,8 @@ class OrdersResource(Resource):
         """``POST /orders`` — place a trading order, signed with your agent key.
 
         Args:
-            token_name: the property's public ``tokenName`` (lowercase letters,
-                e.g. ``"opera"``); pick one from
+            ticker: the property's ``ticker``, exactly as listed (1-4
+                uppercase letters or digits, e.g. ``"OPRA"``); pick one from
                 :meth:`loaf.resources.market.MarketResource.properties` (not
                 every listed row is tradeable; see its docstring).
             side: ``BUY`` or ``SELL`` (:class:`~loaf.enums.OrderSide`).
@@ -161,7 +161,7 @@ class OrdersResource(Resource):
                 mid, else last trade, else last candle close, else IPO price),
                 read with one extra public request that is served from a shared
                 cache, so it can trail the live market by tens of seconds. Pass
-                the ``markprice:{tokenName}`` WebSocket value for a fresher
+                the ``markprice:{ticker}`` WebSocket value for a fresher
                 reference (it also saves the request).
             max_slippage_bps: ``MARKET`` only: the most the price may move
                 against you, in basis points (default: the client's
@@ -212,7 +212,7 @@ class OrdersResource(Resource):
             * A duplicate re-send ignores changed legs.
         """
         signer = self._client._require_signer()
-        _check_token_name(token_name)
+        _check_ticker(ticker)
         side = _check_side(side)
         otype = str(type)
         if otype not in (OrderType.LIMIT, OrderType.MARKET):
@@ -270,13 +270,13 @@ class OrdersResource(Resource):
         else:
             bps = self._tolerance(max_slippage_bps)
             if reference_price is None:
-                reference_price = _reference_from(self._fetch_property(token_name), token_name)
+                reference_price = _reference_from(self._fetch_property(ticker), ticker)
                 fetched = True
             price_d = _worst_price(reference_price, side, bps)
 
         def build(contract: str) -> dict:
             body = {
-                "tokenName": token_name,
+                "ticker": ticker,
                 "price": float(price_d),
                 "quantity": float(qty_d),
                 "side": side,
@@ -293,13 +293,13 @@ class OrdersResource(Resource):
                 }
             return body
 
-        return self._place("/orders", token_name, build, fetched=fetched)
+        return self._place("/orders", ticker, build, fetched=fetched)
 
     # -- Convenience wrappers --------------------------------------------- #
 
     def limit_buy(
         self,
-        token_name: str,
+        ticker: str,
         quantity: float,
         price: float,
         *,
@@ -309,7 +309,7 @@ class OrdersResource(Resource):
     ) -> Any:
         """Place a LIMIT BUY, optionally with take-profit / stop-loss legs (see :meth:`create`)."""
         return self.create(
-            token_name,
+            ticker,
             OrderSide.BUY,
             quantity,
             type=OrderType.LIMIT,
@@ -319,13 +319,13 @@ class OrdersResource(Resource):
             leg_max_slippage_bps=leg_max_slippage_bps,
         )
 
-    def limit_sell(self, token_name: str, quantity: float, price: float) -> Any:
+    def limit_sell(self, ticker: str, quantity: float, price: float) -> Any:
         """Place a LIMIT SELL (see :meth:`create`)."""
-        return self.create(token_name, OrderSide.SELL, quantity, type=OrderType.LIMIT, price=price)
+        return self.create(ticker, OrderSide.SELL, quantity, type=OrderType.LIMIT, price=price)
 
     def market_buy(
         self,
-        token_name: str,
+        ticker: str,
         quantity: float,
         *,
         reference_price: float | None = None,
@@ -342,7 +342,7 @@ class OrdersResource(Resource):
         remainder rests at that price. See :meth:`create`.
         """
         return self.create(
-            token_name,
+            ticker,
             OrderSide.BUY,
             quantity,
             type=OrderType.MARKET,
@@ -355,7 +355,7 @@ class OrdersResource(Resource):
 
     def market_sell(
         self,
-        token_name: str,
+        ticker: str,
         quantity: float,
         *,
         reference_price: float | None = None,
@@ -369,7 +369,7 @@ class OrdersResource(Resource):
         remainder rests at that price. See :meth:`create`.
         """
         return self.create(
-            token_name,
+            ticker,
             OrderSide.SELL,
             quantity,
             type=OrderType.MARKET,
@@ -381,7 +381,7 @@ class OrdersResource(Resource):
 
     def create_conditional(
         self,
-        token_name: str,
+        ticker: str,
         side: str,
         quantity: float,
         *,
@@ -396,8 +396,8 @@ class OrdersResource(Resource):
         order the moment the mark price sits at or through ``trigger_price``.
 
         Args:
-            token_name: the property's public ``tokenName`` (e.g. ``"opera"``);
-                pick one from
+            ticker: the property's ``ticker``, exactly as listed (e.g.
+                ``"OPRA"``); pick one from
                 :meth:`loaf.resources.market.MarketResource.properties` (not
                 every listed row is tradeable; see its docstring).
             side: ``BUY`` or ``SELL`` (:class:`~loaf.enums.OrderSide`).
@@ -451,7 +451,7 @@ class OrdersResource(Resource):
               (:meth:`cancel_row` picks for you).
         """
         signer = self._client._require_signer()
-        _check_token_name(token_name)
+        _check_ticker(ticker)
         side = _check_side(side)
         otype = str(type)
         if otype not in CONDITIONAL_ORDER_TYPES:
@@ -478,7 +478,7 @@ class OrdersResource(Resource):
 
         def build(contract: str) -> dict:
             return {
-                "tokenName": token_name,
+                "ticker": ticker,
                 "price": float(price_d),
                 "quantity": float(qty_d),
                 "side": side,
@@ -489,11 +489,11 @@ class OrdersResource(Resource):
                 **_signed(signer, contract, side, price_d, qty_d),
             }
 
-        return self._place("/orders/conditional", token_name, build)
+        return self._place("/orders/conditional", ticker, build)
 
     def stop_loss(
         self,
-        token_name: str,
+        ticker: str,
         quantity: float,
         trigger_price: float,
         *,
@@ -514,7 +514,7 @@ class OrdersResource(Resource):
         attach ``tp_price`` / ``sl_price`` to the BUY (:meth:`create`).
         """
         return self.create_conditional(
-            token_name,
+            ticker,
             OrderSide.SELL,
             quantity,
             type=ConditionalOrderType.STOP_MARKET,
@@ -524,7 +524,7 @@ class OrdersResource(Resource):
 
     def take_profit(
         self,
-        token_name: str,
+        ticker: str,
         quantity: float,
         trigger_price: float,
         *,
@@ -544,7 +544,7 @@ class OrdersResource(Resource):
         (:meth:`create`).
         """
         return self.create_conditional(
-            token_name,
+            ticker,
             OrderSide.SELL,
             quantity,
             type=ConditionalOrderType.TAKE_MARKET,
@@ -697,21 +697,21 @@ class OrdersResource(Resource):
             )
         return validate_slippage_bps(max_slippage_bps, field)
 
-    def _fetch_property(self, token_name: str) -> Any:
+    def _fetch_property(self, ticker: str) -> Any:
         # market.property(), minus waiting out a 429 (a late order is stale); a 404 propagates.
-        detail = self._client._request("GET", f"/trade/{token_name}", auth=False, before_order=True)
-        self._contracts[token_name] = _contract_from(detail, token_name)
+        detail = self._client._request("GET", f"/trade/{ticker}", auth=False, before_order=True)
+        self._contracts[ticker] = _contract_from(detail, ticker)
         return detail
 
     def _place(
-        self, path: str, token_name: str, build: Callable[[str], dict], *, fetched: bool = False
+        self, path: str, ticker: str, build: Callable[[str], dict], *, fetched: bool = False
     ) -> Any:
         """Sign with the property's contract and send. ``fetched``: the caller read the
         property during this call, so its cached contract is fresh."""
-        if token_name not in self._contracts:
-            self._fetch_property(token_name)
+        if ticker not in self._contracts:
+            self._fetch_property(ticker)
             fetched = True
-        contract = self._contracts[token_name]
+        contract = self._contracts[ticker]
         try:
             return self._client._send_signed(path, build(contract))
         except LoafAuthError as exc:
@@ -721,41 +721,41 @@ class OrdersResource(Resource):
             # OrderOutcomeUnknownError instead (even for a 401), which must never be caught here.
             if fetched or exc.message not in _STALE_CONTRACT_401S:
                 raise
-            self._fetch_property(token_name)
-            current = self._contracts[token_name]
+            self._fetch_property(ticker)
+            current = self._contracts[ticker]
             if current.lower() == contract.lower():
                 raise
             return self._client._send_signed(path, build(current))
 
 
-def _check_token_name(token_name: Any) -> None:
-    if not isinstance(token_name, str) or not _TOKEN_NAME_RE.fullmatch(token_name):
+def _check_ticker(ticker: Any) -> None:
+    if not isinstance(ticker, str) or not _TICKER_RE.fullmatch(ticker):
         raise _client_validation_error(
-            "token_name must be 1-20 lowercase letters (a property's tokenName, e.g. 'opera'), "
-            f"got {token_name!r}"
+            "ticker must be 1-4 uppercase letters or digits (a property's ticker, e.g. 'OPRA'), "
+            f"got {ticker!r}"
         )
 
 
-def _contract_from(detail: Any, token_name: str) -> str:
+def _contract_from(detail: Any, ticker: str) -> str:
     prop = detail.get("property") if isinstance(detail, dict) else None
     address = prop.get("contractAddress") if isinstance(prop, dict) else None
     if not address:
         raise _client_validation_error(
-            f"Trading unavailable: {token_name!r} has no deployed token contract yet, "
+            f"Trading unavailable: {ticker!r} has no deployed token contract yet, "
             "so an order for it cannot be signed"
         )
     return str(address)
 
 
-def _reference_from(detail: Any, token_name: str) -> Any:
+def _reference_from(detail: Any, ticker: str) -> Any:
     for item in detail.get("propertyList") or []:
-        if item.get("tokenName") == token_name:
+        if item.get("ticker") == ticker:
             price = item.get("marketPrice")
             if isinstance(price, (int, float)) and not isinstance(price, bool) and price > 0:
                 return price
             break
     raise _client_validation_error(
-        f"No market reference price for {token_name!r} right now; pass reference_price= "
+        f"No market reference price for {ticker!r} right now; pass reference_price= "
         "(e.g. the markprice WebSocket value) or place a LIMIT order"
     )
 

@@ -252,14 +252,36 @@ def test_candles_params_and_no_auth():
         )
 
     client = make_client(handler)
-    res = client.market.candles("opera", "1h", count_back=24)
-    assert seen["path"].endswith("/trade/opera/candles")
+    res = client.market.candles("OPRA", "1h", count_back=24)
+    assert seen["path"].endswith("/trade/OPRA/candles")
     assert seen["params"] == {"resolution": "1h", "countBack": "24"}  # `to` omitted
     assert seen["auth"] is None  # public endpoint
     assert res.hasMore is False
 
-    client.market.candles("opera", loaf.CandleResolution.ONE_DAY, to=1_700_000_000)
+    client.market.candles("OPRA", loaf.CandleResolution.ONE_DAY, to=1_700_000_000)
     assert seen["params"] == {"resolution": "1d", "to": "1700000000"}
+
+
+@pytest.mark.parametrize(
+    "call, path",
+    [
+        (lambda c: c.market.property("OPRA"), "/api/trade/OPRA"),
+        (lambda c: c.market.info_header("OPRA"), "/api/info/OPRA/header"),
+        (lambda c: c.market.info_overview("OPRA"), "/api/info/OPRA/overview"),
+        (lambda c: c.market.info_documents("OPRA"), "/api/info/OPRA/documents"),
+        (lambda c: c.offerings.get("OPRA"), "/api/offerings/OPRA"),
+    ],
+)
+def test_property_routes_take_the_ticker(call, path):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={})
+
+    call(make_client(handler))
+    assert seen == {"path": path, "auth": None}  # sent as given, and public
 
 
 def test_candles_busy_503_retried_then_raises():
@@ -275,7 +297,7 @@ def test_candles_busy_503_retried_then_raises():
 
     client = make_client(handler, max_retries=2)
     with pytest.raises(loaf.LoafServiceUnavailableError) as info:
-        client.market.candles("opera", "1h")
+        client.market.candles("OPRA", "1h")
     assert info.value.message == "Candle history is busy. Please try again shortly."
     assert calls["n"] == 3  # the first try + 2 retries
 
@@ -291,7 +313,7 @@ def test_iter_candles_pages_backwards():
         return httpx.Response(200, json=pages[request.url.params.get("to")])
 
     client = make_client(handler)
-    times = [c.time for c in client.market.iter_candles("x", "1m")]
+    times = [c.time for c in client.market.iter_candles("OPRA", "1m")]
     assert times == [160, 100, 40]  # newest -> oldest across pages
 
 
@@ -329,13 +351,20 @@ def test_competition_endpoints():
         client.competition.submit_payout_details(wallet_address="0xabc", email="a@b.c")
 
 
-def test_ws_new_channel_helpers():
+def test_ws_channel_helpers():
     ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
-    ws.subscribe_volume("opera")
+    ws.subscribe_orderbook("OPRA")
+    ws.subscribe_trades("OPRA")
+    ws.subscribe_chart("OPRA")
+    ws.subscribe_mark_price("OPRA")
+    ws.subscribe_volume("OPRA")
+    ws.subscribe_property_status("OPRA")
     ws.subscribe_leaderboard()
-    ws.subscribe_property_status("opera")
     ws.subscribe_portfolio()
-    assert ws._channels == {"volume:opera", "leaderboard", "property:opera", "portfolio"}
+    assert ws._channels == {
+        "orderbook:OPRA", "trades:OPRA", "chart:OPRA", "markprice:OPRA", "volume:OPRA",
+        "property:OPRA", "leaderboard", "portfolio",
+    }
 
 
 def test_ws_property_halt_dispatch():
@@ -343,10 +372,10 @@ def test_ws_property_halt_dispatch():
     seen = []
     ws.on_property_halt(seen.append)
     ws._dispatch(json.dumps({
-        "type": "property_halt", "propertyId": 1, "tokenName": "opera",
+        "type": "property_halt", "propertyId": 1, "ticker": "OPRA",
         "isHalted": True, "timestamp": 0,
     }))
-    assert seen[0].tokenName == "opera" and seen[0].isHalted is True
+    assert seen[0].ticker == "OPRA" and seen[0].isHalted is True
 
 
 def test_trade_new_dispatches():
@@ -357,7 +386,7 @@ def test_trade_new_dispatches():
     ws._dispatch(json.dumps({
         "type": "trade_new",
         "trade": {
-            "tradeId": 1, "propertyId": 1, "tokenName": "opera", "txHash": "", "side": "BUY",
+            "tradeId": 1, "propertyId": 1, "ticker": "OPRA", "txHash": "", "side": "BUY",
             "quantity": 1, "price": 100, "executedAt": 0, "fee": 0.1,
         },
         "timestamp": 0,

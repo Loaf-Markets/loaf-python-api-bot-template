@@ -36,7 +36,7 @@ class Candle(TypedDict):
 
 
 class CandleHistory(TypedDict, total=False):
-    """Response to ``GET /trade/{token}/candles`` (see ``market.candles``)."""
+    """Response to ``GET /trade/{ticker}/candles`` (see ``market.candles``)."""
 
     resolution: str  # CandleResolution
     candles: list[Candle]  # oldest -> newest
@@ -93,7 +93,7 @@ class OrderHistoryItem(TypedDict, total=False):
 
     id: int
     propertyId: int
-    tokenName: str  # "" on a conditional for a delisted/uncached property — key on propertyId
+    ticker: str  # "" on a conditional for a delisted/uncached property — key on propertyId
     side: str  # OrderSide
     type: str  # OrderType, or ConditionalOrderType — THIS is the discriminator
     timeInForce: str
@@ -119,7 +119,7 @@ class OrderHistoryItem(TypedDict, total=False):
 class TradeHistoryItem(TypedDict, total=False):
     tradeId: int
     propertyId: int
-    tokenName: str
+    ticker: str
     txHash: str  # '' until a batch proof covers the trade; trades are final at match
     side: str  # OrderSide, relative to this user
     quantity: float
@@ -130,9 +130,8 @@ class TradeHistoryItem(TypedDict, total=False):
 
 class Position(TypedDict, total=False):
     propertyId: int
-    tokenName: str
-    assetName: str
     ticker: str
+    tokenName: str  # display name
     quantity: float  # tradeable (total minus frozen)
     totalQuantity: float
     totalTokens: float  # the property's total token supply

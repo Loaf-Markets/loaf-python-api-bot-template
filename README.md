@@ -20,7 +20,7 @@ loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_AGENT_PRIVATE_KEY (see §2
 
 print(loaf.portfolio.component().cash)                     # available USDC
 print(loaf.market.properties())                            # listed properties
-loaf.orders.limit_buy("opera", quantity=10, price=167.49)  # signed locally with your agent key
+loaf.orders.limit_buy("OPRA", quantity=10, price=167.49)   # signed locally with your agent key
 ```
 
 ---
@@ -93,8 +93,8 @@ feed (order book + your private portfolio stream), and runs a 5-second strategy
 loop with clearly-marked `# YOUR STRATEGY GOES HERE` hooks. It only *observes*
 the market out of the box — drop your logic into `Strategy.on_tick`.
 
-It follows the property named by `TARGET_TOKEN_NAME` at the top of the file — a
-tokenName such as `opera` — or the first listed property when that is empty.
+It follows the property named by `TARGET_TICKER` at the top of the file — a
+ticker such as `OPRA` — or the first listed property when that is empty.
 
 > **Copy it before you edit it.** `bot.py` is tracked by this repo and ships
 > alongside the SDK, so it changes when the SDK does. Strategy code written into
@@ -137,28 +137,6 @@ change bumps the **minor** version — so `0.3.x` → `0.4.0` is the signal to
 re-read this README before upgrading. Expect that signal often while Loaf is on
 testnet; an old pin is the most common reason a bot stops matching these docs.
 
-**0.4.0 adds a dependency (eth-account), so re-run `pip install -e .` after
-pulling it.** Until you do, reads keep working, and a client given an agent key
-raises `LoafConfigError` saying so.
-
-### Upgrading from 0.3
-
-| 0.3 | 0.4 |
-| --- | --- |
-| `api_key` placed orders | Placing needs `agent_private_key` / `$LOAF_AGENT_PRIVATE_KEY` instead. `api_key` is for reads, cancels and the WebSocket. |
-| MARKET orders were bounded by a server-side slippage cap | Still no price: the SDK signs a worst price, reference ± your max slippage (`LOAF_MAX_SLIPPAGE_BPS` / `max_slippage_bps=`, default 2%). **An unfilled remainder rests on the book** — check `status` and cancel it if you don't want it. |
-| `stop_loss` / `*_MARKET` prices were derived by the server | The SDK signs `trigger ± max slippage` (default 2%). |
-| `tp_price` / `sl_price` | Same meaning (the triggers). Each leg sells no lower than `trigger − max slippage` (the client's; `leg_max_slippage_bps=` per order). |
-| `orders.approve()`, `offerings.approve()`, `offerings.subscribe()` | Removed: signed orders need no approval, and IPO subscriptions are not available through the API. |
-| `time_in_force=`, `deadline=`, `TimeInForce.IOC` / `FOK` / `GTD` | Removed: every order is good-til-cancelled. |
-| Wrappers (`limit_buy`, `stop_loss`, …) forwarded any keyword to `create` | Each takes only its own keywords; anything else is a `TypeError`. |
-| `MARKET_ORDER_PRICE` | Removed: a MARKET order signs a real worst price, not 0. |
-| `TradeStatus`, `trade.status` | Removed: a fill is final when it matches and arrives once. |
-| A timed-out order raised `LoafConnectionError` | Placements are re-sent unchanged on timeouts and 5xx. If the SDK still can't tell, it raises `OrderOutcomeUnknownError`. |
-| `LoafBusinessRuleError` | Removed: no SDK endpoint answers 422. The daily price band is a `LoafValidationError` (400). |
-| `KycRequiredError` | Removed: no SDK endpoint has a KYC gate; such a 403 is a plain `LoafForbiddenError`. |
-| Existing API keys | No longer work. Create a new key (§2). |
-
 ---
 
 ## The client
@@ -187,15 +165,15 @@ and fiat ramps are not part of this SDK):
 
 ```
 market.properties()                   GET    /trade
-market.property(token)                GET    /trade/{token}
-market.candles(token, resolution)     GET    /trade/{token}/candles
-market.iter_candles(token, res)       (auto-paginate candle history)
-market.info_header(token)             GET    /info/{token}/header
-market.info_overview(token)           GET    /info/{token}/overview
-market.info_documents(token)          GET    /info/{token}/documents
+market.property(ticker)               GET    /trade/{ticker}
+market.candles(ticker, resolution)    GET    /trade/{ticker}/candles
+market.iter_candles(ticker, res)      (auto-paginate candle history)
+market.info_header(ticker)            GET    /info/{ticker}/header
+market.info_overview(ticker)          GET    /info/{ticker}/overview
+market.info_documents(ticker)         GET    /info/{ticker}/documents
 
 offerings.list()                      GET    /offerings
-offerings.get(token)                  GET    /offerings/{token}
+offerings.get(ticker)                 GET    /offerings/{ticker}
 
 orders.create(...) / limit_buy / ...  POST   /orders                (signed; no API key)
 orders.create_conditional(...)        POST   /orders/conditional    (signed; no API key)
@@ -225,9 +203,9 @@ Candle history is a dedicated, paginated endpoint (the property detail response
 does not include it):
 
 ```python
-h = loaf.market.candles("opera", "1h", count_back=200)   # 1m|5m|15m|1h|4h|1d|1w
+h = loaf.market.candles("OPRA", "1h", count_back=200)   # 1m|5m|15m|1h|4h|1d|1w
 print(h.candles[-1])                  # latest {time, open, high, low, close, volume}
-older = loaf.market.candles("opera", "1h", to=h.oldestTs)  # page back while h.hasMore
+older = loaf.market.candles("OPRA", "1h", to=h.oldestTs)  # page back while h.hasMore
 ```
 
 ---
@@ -237,16 +215,16 @@ older = loaf.market.candles("opera", "1h", to=h.oldestTs)  # page back while h.h
 Placing an order is a single call:
 
 ```python
-# Orders are addressed by tokenName. Pick a tradeable one from loaf.market.properties():
+# Orders are addressed by ticker. Pick a tradeable one from loaf.market.properties():
 # status "LIVE", isCompetition == competitionModeActive, and a contractAddress.
 
 # LIMIT order (price in dollars, <=2 dp; quantity in tokens, <=1 dp):
-res = loaf.orders.limit_buy("opera", quantity=10, price=167.49)
+res = loaf.orders.limit_buy("OPRA", quantity=10, price=167.49)
 print(res.orderId, res.status, res.quantityLeft)   # e.g. 991 OPEN 10
 
 # MARKET order: no price. The SDK signs reference x (1 ± max slippage) as your worst fill price:
-res = loaf.orders.market_buy("opera", quantity=2)          # reference fetched; client's max slippage
-res = loaf.orders.market_sell("opera", quantity=2,
+res = loaf.orders.market_buy("OPRA", quantity=2)           # reference fetched; client's max slippage
+res = loaf.orders.market_sell("OPRA", quantity=2,
                               reference_price=mark, max_slippage_bps=50)   # mark: your markprice; 0.5%
 if res.status in ("OPEN", "PARTIALLY_FILLED"):     # the unfilled rest is RESTING at the worst price
     loaf.orders.cancel(res.orderId)
@@ -262,7 +240,7 @@ cancels arrive on your private `portfolio` WebSocket channel (see below).
 
 **MARKET orders take no price: the SDK works out your worst price.**
 
-- You pass the token and quantity. Unless you pass `reference_price`, the SDK
+- You pass the ticker and quantity. Unless you pass `reference_price`, the SDK
   reads the market reference (the order-book mid when both sides exist, else
   the last trade, else the last candle close, else the IPO price) and signs
   `reference × (1 ± max slippage)` (+ for a BUY, − for a SELL) as your worst
@@ -279,7 +257,7 @@ cancels arrive on your private `portfolio` WebSocket channel (see below).
 - The reference read is one extra public request, served from a shared cache,
   so it can trail the live market by tens of seconds and may not yet show a
   trade you just made. For price-sensitive orders pass the
-  `markprice:{tokenName}` value you stream as `reference_price` (it also saves
+  `markprice:{ticker}` value you stream as `reference_price` (it also saves
   the request).
 - If the exchange has no market price yet, the SDK refuses the order locally
   rather than sign it off zero.
@@ -294,7 +272,7 @@ comp = loaf.portfolio.component()
 worst = worst_price(mark, "BUY", loaf.max_slippage_bps)  # what market_buy(..., reference_price=mark) signs
 fee = bps_to_fraction(comp.applicableFees.takerFeeBps)
 qty = math.floor(comp.cash / (worst * (1 + fee)) * 10) / 10
-res = loaf.orders.market_buy("opera", quantity=qty, reference_price=mark)  # same reference
+res = loaf.orders.market_buy("OPRA", quantity=qty, reference_price=mark)  # same reference
 ```
 
 A few checks run server-side that the SDK cannot pre-validate, so handle their
@@ -322,16 +300,16 @@ To see a halt coming instead of discovering it on a rejected order, subscribe to
 the property's status channel:
 
 ```python
-ws.subscribe_property_status("opera")
+ws.subscribe_property_status("OPRA")
 
 @ws.on_property_halt
 def on_halt(msg):
-    print(msg.tokenName, "halted" if msg.isHalted else "resumed")
+    print(msg.ticker, "halted" if msg.isHalted else "resumed")
 ```
 
 `isHalted` is the **effective** state — the property's own flag OR'd with the
 platform-wide kill switch — so assign it straight over the `isHalted` you seeded
-from `market.property("opera").property.isHalted`. Note a global halt lifting does
+from `market.property("OPRA").property.isHalted`. Note a global halt lifting does
 not resume a property that is individually halted; the frame accounts for that.
 
 ### Signing & retries
@@ -357,7 +335,7 @@ not resume a property that is individually halted; the frame accounts for that.
     the answer is that same order if it landed; if not, it is placed now, at
     the price and quantity you signed then.
   - **Otherwise** find it in `loaf.history.orders()` (every status; match
-    token, side, quantity, price and a `createdAt` near when you placed it).
+    ticker, side, quantity, price and a `createdAt` near when you placed it).
     `openOrders` shows only resting orders, so one that already filled is not
     there.
   - **A `resubmit` that fails** raises `OrderOutcomeUnknownError` again (the
@@ -379,7 +357,7 @@ not resume a property that is individually halted; the frame accounts for that.
 from loaf import OrderOutcomeUnknownError
 
 try:
-    res = loaf.orders.market_buy("opera", quantity=2)
+    res = loaf.orders.market_buy("OPRA", quantity=2)
 except OrderOutcomeUnknownError as e:
     res = loaf.orders.resubmit(e.signed_body)   # the same order: placed at most once
     # (raises OrderOutcomeUnknownError again if this re-send can't tell either)
@@ -394,21 +372,21 @@ Nothing is frozen until it books, but it does occupy an open-order slot.
 ```python
 # Protect a long: SELL 5 if the mark falls to 90, take profit if it rises to 120.
 # (Booking prices here assume the default 2% max slippage.)
-sl = loaf.orders.stop_loss("opera", quantity=5, trigger_price=90)      # books a SELL at 88.20
-tp = loaf.orders.take_profit("opera", quantity=5, trigger_price=120)   # books a SELL at 117.60
+sl = loaf.orders.stop_loss("OPRA", quantity=5, trigger_price=90)      # books a SELL at 88.20
+tp = loaf.orders.take_profit("OPRA", quantity=5, trigger_price=120)   # books a SELL at 117.60
 
 # Any of the eight type x side combinations, spelled out:
-loaf.orders.create_conditional("opera", "BUY", quantity=2,
+loaf.orders.create_conditional("OPRA", "BUY", quantity=2,
                                type="STOP_MARKET", trigger_price=130)   # breakout; books at 132.60
-loaf.orders.create_conditional("opera", "SELL", quantity=5,
+loaf.orders.create_conditional("OPRA", "SELL", quantity=5,
                                type="STOP_LIMIT", trigger_price=90, price=89.5)
 
 # The same two legs attached to a BUY — these ARE OCO, one firing cancels the other
 # (they sell no lower than 117.60 / 88.20):
-loaf.orders.limit_buy("opera", quantity=10, price=100, tp_price=120, sl_price=90)
+loaf.orders.limit_buy("OPRA", quantity=10, price=100, tp_price=120, sl_price=90)
 
 # More room below the trigger than the client's max slippage, for this order only:
-loaf.orders.stop_loss("opera", quantity=5, trigger_price=90, max_slippage_bps=500)   # books at 85.50
+loaf.orders.stop_loss("OPRA", quantity=5, trigger_price=90, max_slippage_bps=500)   # books at 85.50
 
 loaf.orders.cancel_conditional(sl.orderId)   # while PENDING / ARMED
 ```
@@ -429,7 +407,7 @@ not dead.
 
 | Rejection | Rule |
 | --- | --- |
-| `LoafValidationError` (400) | **Already through the trigger** — refused if the mark has reached your level. Triggering is level-based, so a trigger *equal* to the mark is refused too. Compare your trigger against the mark yourself (`markprice:{tokenName}`); if the mark is already there, place a plain order. |
+| `LoafValidationError` (400) | **Already through the trigger** — refused if the mark has reached your level. Triggering is level-based, so a trigger *equal* to the mark is refused too. Compare your trigger against the mark yourself (`markprice:{ticker}`); if the mark is already there, place a plain order. |
 | `LoafValidationError` (400) | **Holding / cash** — checked against your **total** balance, not the available one, because a firing trigger frees funds from your own resting orders first (only those on the same property and side). Nothing is frozen until it books. |
 | `LoafValidationError` (400) | **Open-order caps** — resting conditionals count against the same caps as booked orders. |
 | `LoafValidationError` (400) | **Minimum order value** — the same floor as a plain order, measured at the price the row will *book* at — for a `*_MARKET` type the trigger moved by your max slippage. A SELL for your whole holding is exempt. Re-checked when the row fires. |
@@ -523,8 +501,8 @@ def on_book(msg):
 def on_fill(msg):
     print("filled", msg.trade.side, msg.trade.quantity, "@", msg.trade.price)
 
-ws.subscribe_orderbook("opera")
-ws.subscribe_trades("opera")
+ws.subscribe_orderbook("OPRA")
+ws.subscribe_trades("OPRA")
 ws.subscribe_portfolio()            # your private stream
 
 ws.run_forever()                # blocking; or `with loaf.websocket() as ws:` for background
@@ -541,12 +519,12 @@ Channels:
 
 | Channel | Auth | Handler | Payload |
 | --- | --- | --- | --- |
-| `orderbook:{tokenName}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (at most every 500 ms); no initial frame — seed from `market.property(token).orderBook` |
-| `trades:{tokenName}` | public | `on_trades` | rolling recent-trades batch |
-| `chart:{tokenName}` | public | `on_candle` | OHLCV candle updates |
-| `markprice:{tokenName}` | public | `on_mark_price` | canonical mark price (1s, on change) |
-| `volume:{tokenName}` | public | `on_volume` | rolling-24h traded volume (replaces `volume24h`) |
-| `property:{tokenName}` | public | `on_property_halt` | halt / resume status for that property |
+| `orderbook:{ticker}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (at most every 500 ms); no initial frame — seed from `market.property(ticker).orderBook` |
+| `trades:{ticker}` | public | `on_trades` | rolling recent-trades batch |
+| `chart:{ticker}` | public | `on_candle` | OHLCV candle updates |
+| `markprice:{ticker}` | public | `on_mark_price` | canonical mark price (1s, on change) |
+| `volume:{ticker}` | public | `on_volume` | rolling-24h traded volume (replaces `volume24h`) |
+| `property:{ticker}` | public | `on_property_halt` | halt / resume status for that property |
 | `ipo:{ipoId}` | public | `on_ipo` | primary-market allocation progress |
 | `leaderboard` | public | `on_leaderboard` | competition leaderboard (top entries), on change |
 | `portfolio` | **private** | `on_balances`, `on_position`, `on_order_status`, `on_order_update`, `on_trade`, `on_lifetime_volume`, `on_transfer`, `on_offering_order` | your account deltas |
@@ -585,7 +563,7 @@ from loaf import LoafClient
 
 client = LoafClient()
 try:
-    client.orders.limit_buy("opera", quantity=1, price=167.49)
+    client.orders.limit_buy("OPRA", quantity=1, price=167.49)
 except loaf.OrderOutcomeUnknownError as e:
     ...   # may be live or filled: resubmit(e.signed_body) if still wanted, else check history.orders()
 except loaf.CompetitionEligibilityError:
@@ -658,7 +636,7 @@ input validation, pagination, error mapping, and retry behaviour.
 - This SDK is the **trading-facing** surface. Account management, KYC, referrals
   (`/auth/*`), the featured-offering home feed (`/home`), fiat on/off-ramps
   (`/portfolio/onramp|offramp`), and the shareable image cards
-  (`/portfolio/position/{tokenName}/pnl-card`, `/leaderboard/card`,
+  (`/portfolio/position/{ticker}/pnl-card`, `/leaderboard/card`,
   `/competition/queue-position/card`) are **not** wrapped — do those in the
   Loaf web app.
 - Create your API key (and its agent) in the web app. Nothing else is needed

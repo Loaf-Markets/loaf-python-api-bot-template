@@ -27,7 +27,8 @@ class MarketResource(Resource):
 
         Returns ``{"properties": [...], "paymentTokenAddress": "0x...",
         "competitionModeActive": bool}``. Each item has ``propertyId``,
-        ``tokenName``, ``assetName``, ``ticker``, ``contractAddress``,
+        ``ticker`` (the identifier every other call takes), ``tokenName``
+        (the display name), ``contractAddress``,
         ``propertyType``, ``marketPrice``, ``dailyReferencePrice``,
         ``volume24h``, ``status``, ``isCompetition``, ``candlesticks``
         (trailing-24h hourly OHLCV sparkline only — use :meth:`candles` for
@@ -40,42 +41,43 @@ class MarketResource(Resource):
         """
         return self._client.get("/trade", auth=False)
 
-    def property(self, token_name: str) -> Any:
-        """``GET /trade/{token_name}`` — full detail for one property.
+    def property(self, ticker: str) -> Any:
+        """``GET /trade/{ticker}`` — full detail for one property.
 
         Returns the ``property``, a ``propertyList`` selector, current
         ``orderBook`` snapshot (``bids``/``asks`` price levels), ``recentTrades``,
         ``volume24h``, ``dailyReferencePrice``, ``paymentTokenAddress``,
         ``liquidity``, ``competitionModeActive`` and market-hours metadata.
-        ``token_name`` is lowercase letters only. Candle history is NOT included
+        ``ticker`` is 1-4 uppercase letters or digits, sent exactly as given
+        (``"opra"`` is a 400; pass ``"OPRA"``). Candle history is NOT included
         — fetch it from the dedicated :meth:`candles` endpoint.
 
         ``property.contractAddress`` is the token contract orders are signed
         over; the SDK reads it for you. ``property`` has no ``marketPrice``: the
         reference MARKET orders are priced from is the ``propertyList`` entry
-        with the same ``tokenName``. ``orderBook`` is ``None`` when the property
+        with the same ``ticker``. ``orderBook`` is ``None`` when the property
         is not LIVE, and can be ``None`` briefly after an exchange restart until
         the book next changes: treat ``None`` as unknown, not empty.
 
         ``property.isHalted`` is the effective trading-halt flag (this
         property's own state OR'd with the platform-wide kill switch); it is
         served here but NOT on the :meth:`properties` list. Seed from it, then
-        keep it live with the ``property:{tokenName}`` WebSocket channel
+        keep it live with the ``property:{ticker}`` WebSocket channel
         (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_property_status`).
         """
-        return self._client.get(f"/trade/{token_name}", auth=False)
+        return self._client.get(f"/trade/{ticker}", auth=False)
 
     # -- Candles (chart history) -------------------------------------------- #
 
     def candles(
         self,
-        token_name: str,
+        ticker: str,
         resolution: str,
         *,
         to: int | None = None,
         count_back: int | None = None,
     ) -> Any:
-        """``GET /trade/{token_name}/candles`` — paginated OHLCV candle history.
+        """``GET /trade/{ticker}/candles`` — paginated OHLCV candle history.
 
         Candles are aggregated server-side to ``resolution``, so the payload
         stays small regardless of range.
@@ -99,15 +101,15 @@ class MarketResource(Resource):
         :class:`~loaf.exceptions.LoafServiceUnavailableError`.
         """
         return self._client.get(
-            f"/trade/{token_name}/candles",
+            f"/trade/{ticker}/candles",
             params={"resolution": str(resolution), "to": to, "countBack": count_back},
             auth=False,
         )
 
     def iter_candles(
-        self, token_name: str, resolution: str, *, page_size: int = 1000
+        self, ticker: str, resolution: str, *, page_size: int = 1000
     ) -> Iterator[Any]:
-        """Yield every candle for ``token_name``, newest first, paging via ``to``.
+        """Yield every candle for ``ticker``, newest first, paging via ``to``.
 
         Note the ordering: pages are walked backwards in time and each page is
         yielded newest -> oldest, so the stream is strictly reverse-chronological.
@@ -116,7 +118,7 @@ class MarketResource(Resource):
         """
         to: int | None = None
         while True:
-            page = self.candles(token_name, resolution, to=to, count_back=page_size)
+            page = self.candles(ticker, resolution, to=to, count_back=page_size)
             for candle in reversed(page.get("candles") or []):
                 yield candle
             if not page.get("hasMore") or page.get("oldestTs") is None:
@@ -125,14 +127,14 @@ class MarketResource(Resource):
 
     # -- Info pages -------------------------------------------------------- #
 
-    def info_header(self, token_name: str) -> Any:
-        """``GET /info/{token_name}/header`` — address, hero image, bed/bath/car, offering valuation."""
-        return self._client.get(f"/info/{token_name}/header", auth=False)
+    def info_header(self, ticker: str) -> Any:
+        """``GET /info/{ticker}/header`` — address, hero image, bed/bath/car, offering valuation."""
+        return self._client.get(f"/info/{ticker}/header", auth=False)
 
-    def info_overview(self, token_name: str) -> Any:
-        """``GET /info/{token_name}/overview`` — description, media, metrics, amenities."""
-        return self._client.get(f"/info/{token_name}/overview", auth=False)
+    def info_overview(self, ticker: str) -> Any:
+        """``GET /info/{ticker}/overview`` — description, media, metrics, amenities."""
+        return self._client.get(f"/info/{ticker}/overview", auth=False)
 
-    def info_documents(self, token_name: str) -> Any:
-        """``GET /info/{token_name}/documents`` — public document list (title + URL)."""
-        return self._client.get(f"/info/{token_name}/documents", auth=False)
+    def info_documents(self, ticker: str) -> Any:
+        """``GET /info/{ticker}/documents`` — public document list (title + URL)."""
+        return self._client.get(f"/info/{ticker}/documents", auth=False)

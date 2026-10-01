@@ -13,7 +13,7 @@ own::
                       nonce=new_order_nonce())
 
 What is signed is an ``Order`` in the ``LoafSettlement`` domain over the
-property's token contract (``market.property(token).property.contractAddress``):
+property's token contract (``market.property(ticker).property.contractAddress``):
 the nonce's keccak hash, the quantity in token wei, the payment in USDC wei,
 deadline 0 and the side. A TP/SL leg is signed the same way as a SELL of the
 parent's quantity at the leg's price; trigger prices are not signed.

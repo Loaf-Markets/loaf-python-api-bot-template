@@ -28,6 +28,7 @@ from loaf.signing import new_order_nonce
 
 from conftest import (
     BASE,
+    CONTRACT,
     CONTRACT_B,
     HARDHAT_ADDRESS,
     HARDHAT_KEY,
@@ -38,7 +39,7 @@ from conftest import (
 )
 
 # The SDK sends the keys in this fixed order.
-ORDER_KEYS = "tokenName price quantity side type timeInForce deadline nonce signature".split()
+ORDER_KEYS = "ticker price quantity side type timeInForce deadline nonce signature".split()
 CONDITIONAL_KEYS = ORDER_KEYS[:5] + ["triggerPrice"] + ORDER_KEYS[5:]
 
 NOT_CONFIRMED = (
@@ -97,11 +98,11 @@ def unsigned(body: dict) -> dict:
 
 
 def test_limit_body_signed_no_bearer(exchange, trading_client):
-    res = trading_client().orders.limit_buy("opera", quantity=10, price=167.49)
+    res = trading_client().orders.limit_buy("OPRA", quantity=10, price=167.49)
     request = exchange.requests[-1]
     body = json.loads(request.content)
     assert list(body) == ORDER_KEYS
-    assert [body[k] for k in ORDER_KEYS[:7]] == ["opera", 167.49, 10.0, "BUY", "LIMIT", "GTC", 0]
+    assert [body[k] for k in ORDER_KEYS[:7]] == ["OPRA", 167.49, 10.0, "BUY", "LIMIT", "GTC", 0]
     assert re.fullmatch(r"[0-9a-f]{32}", body["nonce"])
     # The signature authenticates a placement: the API key is set but not sent.
     assert "authorization" not in request.headers
@@ -112,7 +113,7 @@ def test_limit_body_signed_no_bearer(exchange, trading_client):
 
 def test_vector_end_to_end(exchange, trading_client, monkeypatch):
     monkeypatch.setattr(loaf.signing, "new_order_nonce", lambda now_ms=None: VECTOR_NONCE)
-    trading_client().orders.limit_buy("opera", 1.5, 160)
+    trading_client().orders.limit_buy("OPRA", 1.5, 160)
     (body,) = exchange.bodies("/orders")
     assert body["nonce"] == VECTOR_NONCE
     assert body["signature"] == VECTOR_SIGNATURE
@@ -125,27 +126,37 @@ def test_vector_end_to_end(exchange, trading_client, monkeypatch):
 
 def test_contract_cached_once(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("opera", 10, 167.49)
-    client.orders.limit_buy("opera", 10, 167.49)
-    (get,) = exchange.gets("/trade/opera")
+    client.orders.limit_buy("OPRA", 10, 167.49)
+    client.orders.limit_buy("OPRA", 10, 167.49)
+    (get,) = exchange.gets("/trade/OPRA")
     assert "authorization" not in get.headers  # a public read
     assert len(exchange.posts("/orders")) == 2
 
 
+def test_contract_cached_per_ticker(exchange, trading_client):
+    exchange.details["MUS"] = opera_detail(contract=CONTRACT_B)
+    client = trading_client()
+    for ticker in ("OPRA", "MUS", "OPRA", "MUS"):
+        client.orders.limit_buy(ticker, 10, 100)
+    assert len(exchange.gets("/trade/OPRA")) == len(exchange.gets("/trade/MUS")) == 1
+    for body, contract in zip(exchange.bodies("/orders"), [CONTRACT, CONTRACT_B] * 2):
+        assert recover(body, body["signature"], contract) == HARDHAT_ADDRESS
+
+
 def test_null_contract_local_error(exchange, trading_client):
-    exchange.details["opera"] = opera_detail(contract=None)
+    exchange.details["OPRA"] = opera_detail(contract=None)
     client = trading_client()
     for _ in range(2):
         with pytest.raises(loaf.LoafValidationError, match="no deployed token contract") as info:
-            client.orders.limit_buy("opera", 10, 167.49)
+            client.orders.limit_buy("OPRA", 10, 167.49)
         assert info.value.status_code == 0
     assert exchange.posts("/orders") == []
-    assert len(exchange.gets("/trade/opera")) == 2  # a missing contract is never cached
+    assert len(exchange.gets("/trade/OPRA")) == 2  # a missing contract is never cached
 
 
-def test_unknown_token_404(exchange, trading_client):
+def test_unknown_ticker_404(exchange, trading_client):
     with pytest.raises(loaf.LoafNotFoundError, match="Property not found"):
-        trading_client().orders.limit_buy("atlantis", 10, 167.49)
+        trading_client().orders.limit_buy("ATLS", 10, 167.49)
     assert exchange.posts("/orders") == []
 
 
@@ -156,63 +167,63 @@ def test_unknown_token_404(exchange, trading_client):
 
 def test_market_buy_fetches_reference(exchange, trading_client):
     client = trading_client()
-    client.orders.market_buy("opera", 2)  # reference 160, signs 160 x 1.02
+    client.orders.market_buy("OPRA", 2)  # reference 160, signs 160 x 1.02
     body = exchange.bodies("/orders")[-1]
     assert (body["type"], body["price"], body["quantity"]) == ("MARKET", 163.2, 2.0)
     assert recover(body, body["signature"]) == HARDHAT_ADDRESS
-    assert len(exchange.gets("/trade/opera")) == 1
+    assert len(exchange.gets("/trade/OPRA")) == 1
 
-    client.orders.market_sell("opera", 2)  # 160 x 0.98
+    client.orders.market_sell("OPRA", 2)  # 160 x 0.98
     body = exchange.bodies("/orders")[-1]
     assert (body["side"], body["price"]) == ("SELL", 156.8)
     assert recover(body, body["signature"]) == HARDHAT_ADDRESS
-    assert len(exchange.gets("/trade/opera")) == 2  # the reference is read for every order
+    assert len(exchange.gets("/trade/OPRA")) == 2  # the reference is read for every order
 
 
 def test_market_reference_price_no_reference_get(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("opera", 10, 167.49)  # warms the contract cache
-    client.orders.market_sell("opera", 2, reference_price=100.005, max_slippage_bps=50)
+    client.orders.limit_buy("OPRA", 10, 167.49)  # warms the contract cache
+    client.orders.market_sell("OPRA", 2, reference_price=100.005, max_slippage_bps=50)
     body = exchange.bodies("/orders")[-1]
     assert body["price"] == 99.5  # 99.504975, half-up to the cent
     assert recover(body, body["signature"]) == HARDHAT_ADDRESS
-    client.orders.market_buy("opera", 2, reference_price=100.005, max_slippage_bps=50)
+    client.orders.market_buy("OPRA", 2, reference_price=100.005, max_slippage_bps=50)
     assert exchange.bodies("/orders")[-1]["price"] == 100.51  # 100.505025
-    assert len(exchange.gets("/trade/opera")) == 1
+    assert len(exchange.gets("/trade/OPRA")) == 1
 
 
 @pytest.mark.parametrize(
     "method, args, kwargs, message",
     [
-        ("create", ("opera", "BUY", 1), {"type": "MARKET", "price": 167}, "take no price"),
-        ("create", ("opera", "BUY", 1), {"type": "MARKET", "price": 0}, "take no price"),
-        ("market_buy", ("opera", 1), {"reference_price": 0}, "reference_price must be positive"),
+        ("create", ("OPRA", "BUY", 1), {"type": "MARKET", "price": 167}, "take no price"),
+        ("create", ("OPRA", "BUY", 1), {"type": "MARKET", "price": 0}, "take no price"),
+        ("market_buy", ("OPRA", 1), {"reference_price": 0}, "reference_price must be positive"),
         (
             "create",
-            ("opera", "BUY", 1),
+            ("OPRA", "BUY", 1),
             {"type": "LIMIT", "price": 1, "reference_price": 1},
             "reference_price only applies to MARKET orders",
         ),
         (
             "create",
-            ("opera", "BUY", 1),
+            ("OPRA", "BUY", 1),
             {"type": "LIMIT", "price": 1, "max_slippage_bps": 10},
             "max_slippage_bps only applies to MARKET orders",
         ),
         (
             "market_buy",
-            ("opera", 1),
+            ("OPRA", 1),
             {"max_slippage_bps": 10_000},
             "max_slippage_bps must be a whole number",
         ),
         (
             "market_buy",
-            ("opera", 1),
+            ("OPRA", 1),
             {"reference_price": 100, "sl_price": 90, "leg_max_slippage_bps": 2.5},
             "leg_max_slippage_bps must be a whole number",
         ),
-        ("create", ("opera", "BUY", 1), {"type": "LIMIT"}, "LIMIT orders require a price"),
-        ("create", ("opera", "BUY", 1), {"type": "STOP_MARKET", "price": 1}, "Unknown order type"),
+        ("create", ("OPRA", "BUY", 1), {"type": "LIMIT"}, "LIMIT orders require a price"),
+        ("create", ("OPRA", "BUY", 1), {"type": "STOP_MARKET", "price": 1}, "Unknown order type"),
     ],
 )
 def test_pricing_refusals(exchange, trading_client, method, args, kwargs, message):
@@ -226,13 +237,15 @@ def test_pricing_refusals(exchange, trading_client, method, args, kwargs, messag
     "detail",
     [
         opera_detail(market_price=0),  # the exchange has no reference yet
-        {**opera_detail(), "propertyList": [{"tokenName": "musgrave", "marketPrice": 50}]},
+        {**opera_detail(), "propertyList": [{"ticker": "MUS", "tokenName": "Musgrave", "marketPrice": 50}]},
+        # Matched on the ticker: an entry whose display name happens to read OPRA is not it.
+        {**opera_detail(), "propertyList": [{"ticker": "MUS", "tokenName": "OPRA", "marketPrice": 50}]},
     ],
 )
 def test_market_without_reference_refused(exchange, trading_client, detail):
-    exchange.details["opera"] = detail
+    exchange.details["OPRA"] = detail
     with pytest.raises(loaf.LoafValidationError, match="No market reference price") as info:
-        trading_client().orders.market_buy("opera", 1)
+        trading_client().orders.market_buy("OPRA", 1)
     assert info.value.status_code == 0
     assert exchange.posts("/orders") == []
 
@@ -244,7 +257,7 @@ def test_market_without_reference_refused(exchange, trading_client, detail):
 
 def test_limit_buy_with_legs(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("opera", 10, 100, tp_price=120, sl_price=90)
+    client.orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90)
     body = exchange.bodies("/orders")[-1]
     assert list(body) == ORDER_KEYS + ["tp", "sl"]
     assert list(body["tp"]) == ["triggerPrice", "price", "nonce", "signature"]
@@ -256,14 +269,14 @@ def test_limit_buy_with_legs(exchange, trading_client):
     for leg in ("tp", "sl"):
         assert recover(leg_terms(body, leg), body[leg]["signature"]) == HARDHAT_ADDRESS
 
-    client.orders.limit_buy("opera", 10, 100, tp_price=120, sl_price=90, leg_max_slippage_bps=500)
+    client.orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90, leg_max_slippage_bps=500)
     body = exchange.bodies("/orders")[-1]
     assert (body["tp"]["price"], body["sl"]["price"]) == (114.0, 85.5)
     assert recover(leg_terms(body, "sl"), body["sl"]["signature"]) == HARDHAT_ADDRESS
 
-    client.orders.limit_buy("opera", 10, 100, sl_price=90)
+    client.orders.limit_buy("OPRA", 10, 100, sl_price=90)
     assert list(exchange.bodies("/orders")[-1]) == ORDER_KEYS + ["sl"]
-    client.orders.limit_buy("opera", 10, 100)
+    client.orders.limit_buy("OPRA", 10, 100)
     assert list(exchange.bodies("/orders")[-1]) == ORDER_KEYS  # strict schema: no empty legs
 
 
@@ -286,7 +299,7 @@ def test_limit_buy_with_legs(exchange, trading_client):
 )
 def test_leg_rules(exchange, trading_client, legs, message):
     with pytest.raises(loaf.LoafValidationError, match=message) as info:
-        trading_client().orders.limit_buy("opera", 1, 100, **legs)
+        trading_client().orders.limit_buy("OPRA", 1, 100, **legs)
     assert info.value.status_code == 0
     assert exchange.requests == []
 
@@ -294,16 +307,16 @@ def test_leg_rules(exchange, trading_client, legs, message):
 def test_leg_rules_side_and_market_parent(exchange, trading_client):
     orders = trading_client().orders
     with pytest.raises(loaf.LoafValidationError, match="only be attached to a BUY"):
-        orders.create("opera", "SELL", 1, price=100, sl_price=90)
+        orders.create("OPRA", "SELL", 1, price=100, sl_price=90)
     with pytest.raises(TypeError):
-        orders.limit_sell("opera", 1, 100, sl_price=90)  # legs protect a BUY only
+        orders.limit_sell("OPRA", 1, 100, sl_price=90)  # legs protect a BUY only
     with pytest.raises(loaf.LoafValidationError, match="tp_price must be above sl_price"):
-        orders.market_buy("opera", 1, tp_price=90, sl_price=95)
+        orders.market_buy("OPRA", 1, tp_price=90, sl_price=95)
     assert exchange.requests == []
 
     # On a MARKET parent the exchange checks the triggers against its own reference. The legs
     # keep the client's max slippage (2% here) whatever the entry's max_slippage_bps is.
-    orders.market_buy("opera", 1, max_slippage_bps=50, tp_price=120, sl_price=90)
+    orders.market_buy("OPRA", 1, max_slippage_bps=50, tp_price=120, sl_price=90)
     body = exchange.bodies("/orders")[-1]
     assert (body["price"], body["tp"]["price"], body["sl"]["price"]) == (160.8, 117.6, 88.2)
     assert recover(body, body["signature"]) == HARDHAT_ADDRESS
@@ -318,12 +331,12 @@ def test_leg_rules_side_and_market_parent(exchange, trading_client):
 
 def test_conditional_market_price_derived(exchange, trading_client):
     orders = trading_client().orders
-    res = orders.create_conditional("opera", "SELL", 5, type="STOP_MARKET", trigger_price=90)
+    res = orders.create_conditional("OPRA", "SELL", 5, type="STOP_MARKET", trigger_price=90)
     assert res.orderId == 1
     body = exchange.bodies("/orders/conditional")[-1]
     assert list(body) == CONDITIONAL_KEYS
     assert unsigned(body) == {
-        "tokenName": "opera",
+        "ticker": "OPRA",
         "price": 88.2,  # books at up to 2% below the trigger
         "quantity": 5.0,
         "side": "SELL",
@@ -335,16 +348,16 @@ def test_conditional_market_price_derived(exchange, trading_client):
     assert recover(body, body["signature"]) == HARDHAT_ADDRESS
     assert exchange.posts("/orders") == []
 
-    orders.create_conditional("opera", "BUY", 2, type="STOP_MARKET", trigger_price=130)
+    orders.create_conditional("OPRA", "BUY", 2, type="STOP_MARKET", trigger_price=130)
     body = exchange.bodies("/orders/conditional")[-1]
     assert body["price"] == 132.6  # a BUY books above its trigger
     assert recover(body, body["signature"]) == HARDHAT_ADDRESS
 
-    orders.stop_loss("opera", 5, 90)
+    orders.stop_loss("OPRA", 5, 90)
     stop = exchange.bodies("/orders/conditional")[-1]
     assert unsigned(stop) == unsigned(exchange.bodies("/orders/conditional")[0])
 
-    orders.take_profit("opera", 5, 120, max_slippage_bps=100)
+    orders.take_profit("OPRA", 5, 120, max_slippage_bps=100)
     take = exchange.bodies("/orders/conditional")[-1]
     assert (take["type"], take["side"]) == ("TAKE_MARKET", "SELL")
     assert (take["triggerPrice"], take["price"]) == (120.0, 118.8)  # 1% below the trigger
@@ -353,7 +366,7 @@ def test_conditional_market_price_derived(exchange, trading_client):
 
 def test_conditional_limit(exchange, trading_client):
     trading_client().orders.create_conditional(
-        "opera", "BUY", 2, type="TAKE_LIMIT", trigger_price=70, price=70.5
+        "OPRA", "BUY", 2, type="TAKE_LIMIT", trigger_price=70, price=70.5
     )
     (body,) = exchange.bodies("/orders/conditional")
     assert (body["type"], body["price"], body["triggerPrice"]) == ("TAKE_LIMIT", 70.5, 70.0)
@@ -379,14 +392,14 @@ def test_conditional_limit(exchange, trading_client):
 )
 def test_conditional_refusals(exchange, trading_client, kwargs, message):
     with pytest.raises(loaf.LoafValidationError, match=message) as info:
-        trading_client().orders.create_conditional("opera", "SELL", 5, **kwargs)
+        trading_client().orders.create_conditional("OPRA", "SELL", 5, **kwargs)
     assert info.value.status_code == 0
     assert exchange.requests == []
 
 
 def test_stop_loss_takes_no_price(trading_client):
     with pytest.raises(TypeError):
-        trading_client().orders.stop_loss("opera", quantity=5, trigger_price=90, price=89.5)
+        trading_client().orders.stop_loss("OPRA", quantity=5, trigger_price=90, price=89.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -441,28 +454,28 @@ def test_client_max_slippage_prices_every_derived_price(exchange, trading_client
         body = exchange.bodies(path)[-1]
         return [body["price"]] + [body[leg]["price"] for leg in ("tp", "sl") if leg in body]
 
-    orders.market_buy("opera", 2)  # reference 160 x 1.01
+    orders.market_buy("OPRA", 2)  # reference 160 x 1.01
     assert prices() == [161.6]
-    orders.market_sell("opera", 2)
+    orders.market_sell("OPRA", 2)
     assert prices() == [158.4]
-    orders.market_sell("opera", 2, reference_price=100)  # your own reference, same tolerance
+    orders.market_sell("OPRA", 2, reference_price=100)  # your own reference, same tolerance
     assert prices() == [99.0]
-    orders.market_buy("opera", 2, max_slippage_bps=0)  # this order only
+    orders.market_buy("OPRA", 2, max_slippage_bps=0)  # this order only
     assert prices() == [160.0]
-    orders.limit_buy("opera", 10, 100, tp_price=120, sl_price=90)  # each leg 1% below its trigger
+    orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90)  # each leg 1% below its trigger
     assert prices() == [100.0, 118.8, 89.1]
     # An entry's max_slippage_bps moves only the entry; leg_max_slippage_bps only the legs.
-    orders.market_buy("opera", 1, max_slippage_bps=0, tp_price=200, sl_price=90)
+    orders.market_buy("OPRA", 1, max_slippage_bps=0, tp_price=200, sl_price=90)
     assert prices() == [160.0, 198.0, 89.1]
-    orders.market_buy("opera", 1, leg_max_slippage_bps=500, tp_price=200, sl_price=90)
+    orders.market_buy("OPRA", 1, leg_max_slippage_bps=500, tp_price=200, sl_price=90)
     assert prices() == [161.6, 190.0, 85.5]
 
-    orders.stop_loss("opera", 5, 90)
-    orders.take_profit("opera", 5, 120)
-    orders.create_conditional("opera", "BUY", 2, type="STOP_MARKET", trigger_price=130)
-    orders.create_conditional("opera", "BUY", 2, type="TAKE_MARKET", trigger_price=70)
-    orders.stop_loss("opera", 5, 90, max_slippage_bps=500)  # this order only
-    orders.take_profit("opera", 5, 120)
+    orders.stop_loss("OPRA", 5, 90)
+    orders.take_profit("OPRA", 5, 120)
+    orders.create_conditional("OPRA", "BUY", 2, type="STOP_MARKET", trigger_price=130)
+    orders.create_conditional("OPRA", "BUY", 2, type="TAKE_MARKET", trigger_price=70)
+    orders.stop_loss("OPRA", 5, 90, max_slippage_bps=500)  # this order only
+    orders.take_profit("OPRA", 5, 120)
     sent = [body["price"] for body in exchange.bodies("/orders/conditional")]
     assert sent == [89.1, 118.8, 131.3, 70.7, 85.5, 118.8]
 
@@ -470,12 +483,12 @@ def test_client_max_slippage_prices_every_derived_price(exchange, trading_client
 def test_client_max_slippage_read_per_order(exchange, trading_client):
     client = trading_client()
     client.max_slippage_bps = 100  # a public attribute: later orders use the new value
-    client.orders.market_buy("opera", 1)
+    client.orders.market_buy("OPRA", 1)
     assert exchange.bodies("/orders")[-1]["price"] == 161.6
     sent = len(exchange.requests)
     client.max_slippage_bps = 2.5
     with pytest.raises(loaf.LoafValidationError, match="LoafClient.max_slippage_bps must be"):
-        client.orders.market_buy("opera", 1)
+        client.orders.market_buy("OPRA", 1)
     assert len(exchange.requests) == sent
 
 
@@ -488,13 +501,13 @@ def test_no_agent_key(exchange, trading_client):
     client = trading_client(agent_key=None)
     assert client.agent_address is None
     with pytest.raises(loaf.LoafConfigError, match="LOAF_AGENT_PRIVATE_KEY"):
-        client.orders.limit_buy("opera", 10, 167.49)
+        client.orders.limit_buy("OPRA", 10, 167.49)
     assert exchange.requests == []
 
 
 def test_agent_only_client(trading_client):
     client = trading_client(api_key=None)
-    assert client.orders.limit_buy("opera", 10, 167.49).orderId == 1
+    assert client.orders.limit_buy("OPRA", 10, 167.49).orderId == 1
     with pytest.raises(loaf.LoafConfigError):
         client.orders.cancel(1)  # cancels still need the API key
 
@@ -517,7 +530,7 @@ def test_agent_only_client(trading_client):
 )
 def test_transient_failure_resent_identically(exchange, trading_client, failure):
     exchange.queue("/orders", failure(), duplicate_reply())
-    res = trading_client().orders.limit_buy("opera", 10, 167.49)
+    res = trading_client().orders.limit_buy("OPRA", 10, 167.49)
     first, second = exchange.posts("/orders")
     assert second == first
     assert res.orderId == 7 and res.duplicate is True
@@ -535,7 +548,7 @@ def test_transient_failure_resent_identically(exchange, trading_client, failure)
 def test_503_not_placed_exhausted(exchange, trading_client, message):
     exchange.queue("/orders", *(error_reply(503, message) for _ in range(3)))
     with pytest.raises(loaf.LoafServiceUnavailableError) as info:
-        trading_client(max_retries=2).orders.limit_buy("opera", 10, 167.49)
+        trading_client(max_retries=2).orders.limit_buy("OPRA", 10, 167.49)
     assert info.value.message == message
     posts = exchange.posts("/orders")
     assert len(posts) == 3 and len(set(posts)) == 1
@@ -555,7 +568,7 @@ def test_timeouts_exhausted_unknown(exchange, trading_client, failure):
     # Anything past connecting may have reached the exchange.
     exchange.queue("/orders", *(failure("timed out") for _ in range(4)))
     with pytest.raises(OrderOutcomeUnknownError) as info:
-        trading_client().orders.limit_buy("opera", 10, 167.49)
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
     error = info.value
     posts = exchange.posts("/orders")
     assert len(posts) == 4 and len(set(posts)) == 1
@@ -572,7 +585,7 @@ def test_timeouts_exhausted_unknown(exchange, trading_client, failure):
 def test_ambiguous_then_4xx_is_unknown(exchange, trading_client):
     exchange.queue("/orders", httpx.ReadTimeout("timed out"), error_reply(400, OPEN_ORDER_CAP))
     with pytest.raises(OrderOutcomeUnknownError) as info:
-        trading_client().orders.limit_buy("opera", 10, 167.49)
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
     # The cap may be counting the first attempt itself: the refusal settles nothing.
     assert isinstance(info.value.last_error, loaf.LoafValidationError)
     assert info.value.last_error.message == OPEN_ORDER_CAP
@@ -586,7 +599,7 @@ def test_ambiguous_then_not_placed_503s_is_unknown(exchange, trading_client):
         *(error_reply(503, NOT_PLACED) for _ in range(3)),
     )
     with pytest.raises(OrderOutcomeUnknownError) as info:
-        trading_client().orders.limit_buy("opera", 10, 167.49)
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
     # "Not placed" describes the re-send, not the first attempt.
     assert info.value.attempts == 4
     assert isinstance(info.value.last_error, loaf.LoafServiceUnavailableError)
@@ -596,7 +609,7 @@ def test_ambiguous_then_not_placed_503s_is_unknown(exchange, trading_client):
 def test_connect_errors_exhausted(exchange, trading_client, failure):
     exchange.queue("/orders", *(failure("unreachable") for _ in range(4)))
     with pytest.raises(loaf.LoafConnectionError):  # never sent, so never placed
-        trading_client().orders.limit_buy("opera", 10, 167.49)
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
     assert len(exchange.posts("/orders")) == 4
 
 
@@ -604,7 +617,7 @@ def test_429_not_retried(exchange, trading_client):
     too_many = "Too many requests for this account. Please slow down."
     exchange.queue("/orders", error_reply(429, too_many, headers={"Retry-After": "3"}))
     with pytest.raises(loaf.LoafRateLimitError) as info:
-        trading_client().orders.limit_buy("opera", 10, 167.49)
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
     assert info.value.retry_after == 3.0
     assert len(exchange.posts("/orders")) == 1
 
@@ -615,7 +628,7 @@ def test_400_not_retried(exchange, trading_client):
         "/orders", httpx.Response(400, json={"error": "Validation failed", "details": details})
     )
     with pytest.raises(loaf.LoafValidationError) as info:
-        trading_client().orders.limit_buy("opera", 10, 167.49)
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
     assert info.value.status_code == 400 and info.value.details == details
     assert len(exchange.posts("/orders")) == 1
 
@@ -630,7 +643,7 @@ def test_400_not_retried(exchange, trading_client):
 def test_5xx_exhausted_unknown(exchange, trading_client, status, message, error):
     exchange.queue("/orders", *(error_reply(status, message) for _ in range(4)))
     with pytest.raises(OrderOutcomeUnknownError) as info:
-        trading_client().orders.limit_buy("opera", 10, 167.49)
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
     assert info.value.attempts == 4
     assert type(info.value.last_error) is error
 
@@ -649,7 +662,7 @@ def test_5xx_exhausted_unknown(exchange, trading_client, status, message, error)
 def test_200_without_order_id_is_unknown(exchange, trading_client, reply):
     exchange.queue("/orders", reply())
     with pytest.raises(OrderOutcomeUnknownError) as info:
-        trading_client().orders.limit_buy("opera", 10, 167.49)
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
     assert info.value.attempts == 1
     assert info.value.__cause__ is info.value.last_error
     assert isinstance(info.value.last_error, loaf.LoafServerError)
@@ -669,7 +682,7 @@ def test_undecodable_reply_is_unknown(exchange, trading_client, status):
         ),
     )
     with pytest.raises(OrderOutcomeUnknownError) as info:
-        trading_client(max_retries=0).orders.limit_buy("opera", 10, 167.49)
+        trading_client(max_retries=0).orders.limit_buy("OPRA", 10, 167.49)
     assert isinstance(info.value.last_error.__cause__, httpx.DecodingError)
     assert len(exchange.posts("/orders")) == 1
 
@@ -678,34 +691,34 @@ def test_max_retries_zero(exchange, trading_client):
     client = trading_client(max_retries=0)
     exchange.queue("/orders", httpx.ReadTimeout("timed out"))
     with pytest.raises(OrderOutcomeUnknownError) as info:
-        client.orders.limit_buy("opera", 10, 167.49)
+        client.orders.limit_buy("OPRA", 10, 167.49)
     assert info.value.attempts == 1
 
     exchange.queue("/orders", error_reply(503, NOT_PLACED))
     with pytest.raises(loaf.LoafServiceUnavailableError):
-        client.orders.limit_buy("opera", 10, 167.49)
+        client.orders.limit_buy("OPRA", 10, 167.49)
     assert len(exchange.posts("/orders")) == 2  # one attempt each
 
 
 def test_conditional_timeout_resent_identically(exchange, trading_client):
     exchange.queue("/orders/conditional", httpx.ReadTimeout("timed out"))
-    assert trading_client().orders.stop_loss("opera", 5, 90).orderId == 1
+    assert trading_client().orders.stop_loss("OPRA", 5, 90).orderId == 1
     first, second = exchange.posts("/orders/conditional")
     assert second == first
 
 
 def test_placement_timeout(exchange, trading_client):
-    trading_client().orders.limit_buy("opera", 10, 167.49)
+    trading_client().orders.limit_buy("OPRA", 10, 167.49)
     get, post = exchange.requests
     assert get.extensions["timeout"]["read"] == 30.0  # reads keep the client's timeout
     assert post.extensions["timeout"]["read"] == 45.0  # placements wait out the engine
 
-    trading_client(timeout=60.0).orders.limit_buy("opera", 10, 167.49)
+    trading_client(timeout=60.0).orders.limit_buy("OPRA", 10, 167.49)
     assert exchange.requests[-1].extensions["timeout"]["read"] == 60.0
 
 
 def test_placement_timeout_none_and_object(exchange, trading_client):
-    trading_client(timeout=None).orders.limit_buy("opera", 10, 167.49)
+    trading_client(timeout=None).orders.limit_buy("OPRA", 10, 167.49)
     assert exchange.requests[-1].extensions["timeout"]["read"] is None
     # Any form httpx accepts; only the read (answer) wait is raised, never connect/write/pool.
     for timeout, expected in (
@@ -713,7 +726,7 @@ def test_placement_timeout_none_and_object(exchange, trading_client):
         ((5.0, 30.0, 30.0, 5.0), (5.0, 45.0, 30.0, 5.0)),
         (5, (5, 45.0, 5, 5)),
     ):
-        trading_client(timeout=timeout).orders.limit_buy("opera", 10, 167.49)
+        trading_client(timeout=timeout).orders.limit_buy("OPRA", 10, 167.49)
         t = exchange.requests[-1].extensions["timeout"]
         assert (t["connect"], t["read"], t["write"], t["pool"]) == expected
 
@@ -727,7 +740,7 @@ def test_placement_timeout_ignores_injected_clients_timeout(exchange):
         timeout=httpx.Timeout(120.0, connect=20.0),
     )
     client = LoafClient(base_url=BASE, agent_private_key=HARDHAT_KEY, http_client=http)
-    client.orders.limit_buy("opera", 10, 167.49)
+    client.orders.limit_buy("OPRA", 10, 167.49)
     get, post = exchange.requests
     read_timeout = get.extensions["timeout"]
     assert (read_timeout["connect"], read_timeout["read"]) == (20.0, 120.0)
@@ -746,7 +759,7 @@ def test_placement_backoff_ignores_rate_limit_headers(exchange, trading_client, 
         error_reply(500, "boom", headers={"RateLimit-Reset": "60"}),
         error_reply(503, NOT_CONFIRMED, headers={"RateLimit-Reset": "59"}),
     )
-    assert trading_client().orders.limit_buy("opera", 10, 167.49).orderId == 1
+    assert trading_client().orders.limit_buy("OPRA", 10, 167.49).orderId == 1
     # A signed price goes stale: re-sends wait only the jittered 0.5 / 1 / 2 s.
     assert len(sleeps) == 3 and all(0 <= s <= 2.0 for s in sleeps)
 
@@ -764,27 +777,27 @@ def test_placement_backoff_ignores_rate_limit_headers(exchange, trading_client, 
 @pytest.mark.parametrize(
     "place",
     [
-        lambda orders: orders.limit_buy("opera", 10, 167.49),  # the contract read
-        lambda orders: orders.market_buy("opera", 2),  # the reference read
-        lambda orders: orders.market_buy("opera", 2, reference_price=160),
-        lambda orders: orders.stop_loss("opera", 5, 90),
+        lambda orders: orders.limit_buy("OPRA", 10, 167.49),  # the contract read
+        lambda orders: orders.market_buy("OPRA", 2),  # the reference read
+        lambda orders: orders.market_buy("OPRA", 2, reference_price=160),
+        lambda orders: orders.stop_loss("OPRA", 5, 90),
     ],
 )
 def test_pre_signing_read_429_not_waited_out(exchange, trading_client, monkeypatch, place):
     sleeps: list = []
     monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=sleeps.append))
     limited = error_reply(429, "Too many requests", headers={"RateLimit-Reset": "58"})
-    exchange.queue("/trade/opera", limited)
+    exchange.queue("/trade/OPRA", limited)
     # Waiting out the window would place the order a minute late, at a stale price.
     with pytest.raises(loaf.LoafRateLimitError) as info:
         place(trading_client().orders)
     assert info.value.retry_after == 58.0
     assert sleeps == []
-    assert len(exchange.gets("/trade/opera")) == 1
+    assert len(exchange.gets("/trade/OPRA")) == 1
     assert exchange.posts("/orders") == [] and exchange.posts("/orders/conditional") == []
 
     # A 503 there is retried, after the short jittered pause only (every reply carries the hint).
-    exchange.queue("/trade/opera", error_reply(503, "busy", headers={"RateLimit-Reset": "57"}))
+    exchange.queue("/trade/OPRA", error_reply(503, "busy", headers={"RateLimit-Reset": "57"}))
     assert place(trading_client().orders).orderId == 1
     assert len(sleeps) == 1 and 0 <= sleeps[0] <= 0.5
 
@@ -797,10 +810,10 @@ def test_pre_signing_read_429_not_waited_out(exchange, trading_client, monkeypat
 def test_resubmit(exchange, trading_client):
     exchange.queue("/orders", httpx.ReadTimeout("timed out"))
     with pytest.raises(OrderOutcomeUnknownError) as order:
-        trading_client(max_retries=0).orders.limit_buy("opera", 10, 100, tp_price=120, sl_price=90)
+        trading_client(max_retries=0).orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90)
     exchange.queue("/orders/conditional", httpx.ReadTimeout("timed out"))
     with pytest.raises(OrderOutcomeUnknownError) as stop:
-        trading_client(max_retries=0).orders.stop_loss("opera", 5, 90)
+        trading_client(max_retries=0).orders.stop_loss("OPRA", 5, 90)
 
     # The body carries its own signature: neither key is needed to re-send it.
     bare = trading_client(api_key=None, agent_key=None)
@@ -850,7 +863,7 @@ def test_resubmit(exchange, trading_client):
 def test_resubmit_failure_stays_unknown(exchange, trading_client, replies, reason):
     exchange.queue("/orders", httpx.ReadTimeout("timed out"))
     with pytest.raises(OrderOutcomeUnknownError) as first:
-        trading_client(max_retries=0).orders.limit_buy("opera", 10, 167.49)
+        trading_client(max_retries=0).orders.limit_buy("OPRA", 10, 167.49)
     queued = replies()
     exchange.queue("/orders", *queued)
     # The first attempt may be live, so nothing but a 200 settles the re-send either.
@@ -871,33 +884,33 @@ def test_resubmit_failure_stays_unknown(exchange, trading_client, replies, reaso
 @pytest.mark.parametrize(
     "path, place",
     [
-        ("/orders", lambda orders: orders.limit_buy("opera", 10, 167.49)),
-        ("/orders/conditional", lambda orders: orders.stop_loss("opera", 5, 90)),
+        ("/orders", lambda orders: orders.limit_buy("OPRA", 10, 167.49)),
+        ("/orders/conditional", lambda orders: orders.stop_loss("OPRA", 5, 90)),
     ],
 )
 def test_contract_heal(exchange, trading_client, path, place):
     client = trading_client()
     place(client.orders)  # caches CONTRACT
-    exchange.details["opera"] = opera_detail(contract=CONTRACT_B)
+    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
     exchange.queue(path, error_reply(401, STALE_SIGNER))
     assert place(client.orders).orderId == 2
     stale, healed = exchange.bodies(path)[1:]
     assert healed["nonce"] != stale["nonce"]  # re-signed with fresh nonces, not re-sent
     assert recover(healed, healed["signature"], CONTRACT_B) == HARDHAT_ADDRESS
-    assert len(exchange.gets("/trade/opera")) == 2
+    assert len(exchange.gets("/trade/OPRA")) == 2
 
     place(client.orders)  # the new contract is cached
     latest = exchange.bodies(path)[-1]
     assert recover(latest, latest["signature"], CONTRACT_B) == HARDHAT_ADDRESS
-    assert len(exchange.gets("/trade/opera")) == 2
+    assert len(exchange.gets("/trade/OPRA")) == 2
 
 
 def test_contract_heal_with_legs(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("opera", 10, 167.49)
-    exchange.details["opera"] = opera_detail(contract=CONTRACT_B)
+    client.orders.limit_buy("OPRA", 10, 167.49)
+    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
     exchange.queue("/orders", error_reply(401, MIXED_SIGNERS))
-    client.orders.limit_buy("opera", 10, 100, tp_price=120, sl_price=90)
+    client.orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90)
     healed = exchange.bodies("/orders")[-1]
     assert len(exchange.posts("/orders")) == 3
     assert recover(healed, healed["signature"], CONTRACT_B) == HARDHAT_ADDRESS
@@ -908,73 +921,73 @@ def test_contract_heal_with_legs(exchange, trading_client):
 
 def test_contract_heal_only_once(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("opera", 10, 167.49)
-    exchange.details["opera"] = opera_detail(contract=CONTRACT_B)
+    client.orders.limit_buy("OPRA", 10, 167.49)
+    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
     exchange.queue("/orders", error_reply(401, STALE_SIGNER), error_reply(401, STALE_SIGNER))
     with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):
-        client.orders.limit_buy("opera", 10, 167.49)
+        client.orders.limit_buy("OPRA", 10, 167.49)
     assert len(exchange.posts("/orders")) == 3
 
 
 def test_no_heal_when_contract_unchanged(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("opera", 10, 167.49)
+    client.orders.limit_buy("OPRA", 10, 167.49)
     exchange.queue("/orders", error_reply(401, STALE_SIGNER))
     with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):  # the agent key itself is refused
-        client.orders.limit_buy("opera", 10, 167.49)
+        client.orders.limit_buy("OPRA", 10, 167.49)
     assert len(exchange.posts("/orders")) == 2
-    assert len(exchange.gets("/trade/opera")) == 2  # re-read once, found unchanged
+    assert len(exchange.gets("/trade/OPRA")) == 2  # re-read once, found unchanged
 
 
 def test_no_heal_when_contract_differs_only_in_case(exchange, trading_client):
     mixed_case = "0x" + "aB" * 20
-    exchange.details["opera"] = opera_detail(contract=mixed_case)
+    exchange.details["OPRA"] = opera_detail(contract=mixed_case)
     client = trading_client()
-    client.orders.limit_buy("opera", 10, 167.49)
-    exchange.details["opera"] = opera_detail(contract=mixed_case.lower())  # the same address
+    client.orders.limit_buy("OPRA", 10, 167.49)
+    exchange.details["OPRA"] = opera_detail(contract=mixed_case.lower())  # the same address
     exchange.queue("/orders", error_reply(401, STALE_SIGNER))
     with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):
-        client.orders.limit_buy("opera", 10, 167.49)
+        client.orders.limit_buy("OPRA", 10, 167.49)
     assert len(exchange.posts("/orders")) == 2  # nothing to re-sign
 
 
 def test_no_heal_for_other_401s(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("opera", 10, 167.49)
-    exchange.details["opera"] = opera_detail(contract=CONTRACT_B)
+    client.orders.limit_buy("OPRA", 10, 167.49)
+    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
     exchange.queue("/orders", error_reply(401, "Invalid signature"))
     with pytest.raises(loaf.LoafAuthError, match="Invalid signature"):
-        client.orders.limit_buy("opera", 10, 167.49)
+        client.orders.limit_buy("OPRA", 10, 167.49)
     assert len(exchange.posts("/orders")) == 2
-    assert len(exchange.gets("/trade/opera")) == 1
+    assert len(exchange.gets("/trade/OPRA")) == 1
 
 
 def test_no_heal_on_freshly_read_contract(exchange, trading_client):
     client = trading_client()
     exchange.queue("/orders", error_reply(401, STALE_SIGNER))
     with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):
-        client.orders.limit_buy("opera", 10, 167.49)
+        client.orders.limit_buy("OPRA", 10, 167.49)
     assert len(exchange.posts("/orders")) == 1
-    assert len(exchange.gets("/trade/opera")) == 1
+    assert len(exchange.gets("/trade/OPRA")) == 1
 
     # A MARKET order's reference read is as fresh, even with the contract already cached.
     exchange.queue("/orders", error_reply(401, STALE_SIGNER))
     with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):
-        client.orders.market_buy("opera", 2)
+        client.orders.market_buy("OPRA", 2)
     assert len(exchange.posts("/orders")) == 2
-    assert len(exchange.gets("/trade/opera")) == 2  # the reference read, no re-read
+    assert len(exchange.gets("/trade/OPRA")) == 2  # the reference read, no re-read
 
 
 @pytest.mark.parametrize(
     "path, place, stale",
     [
-        ("/orders", lambda orders: orders.limit_buy("opera", 10, 167.49), STALE_SIGNER),
+        ("/orders", lambda orders: orders.limit_buy("OPRA", 10, 167.49), STALE_SIGNER),
         (
             "/orders",
-            lambda orders: orders.limit_buy("opera", 10, 100, tp_price=120, sl_price=90),
+            lambda orders: orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90),
             MIXED_SIGNERS,
         ),
-        ("/orders/conditional", lambda orders: orders.stop_loss("opera", 5, 90), STALE_SIGNER),
+        ("/orders/conditional", lambda orders: orders.stop_loss("OPRA", 5, 90), STALE_SIGNER),
     ],
 )
 @pytest.mark.parametrize(
@@ -988,7 +1001,7 @@ def test_no_heal_on_freshly_read_contract(exchange, trading_client):
 def test_no_heal_after_ambiguous_attempt(exchange, trading_client, path, place, stale, ambiguous):
     client = trading_client()
     place(client.orders)  # caches CONTRACT
-    exchange.details["opera"] = opera_detail(contract=CONTRACT_B)
+    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
     exchange.queue(path, ambiguous(), error_reply(401, stale))
     # The first attempt may be live: re-signing now would place a second order.
     with pytest.raises(OrderOutcomeUnknownError) as info:
@@ -997,20 +1010,20 @@ def test_no_heal_after_ambiguous_attempt(exchange, trading_client, path, place, 
     assert info.value.last_error.message == stale
     first, again = exchange.posts(path)[1:]
     assert again == first  # re-sent unchanged: one nonce
-    assert len(exchange.gets("/trade/opera")) == 1  # no heal re-read
+    assert len(exchange.gets("/trade/OPRA")) == 1  # no heal re-read
 
 
 def test_heal_after_definite_503(exchange, trading_client):
     # "Your order was not placed" settles the first attempt, so the heal may still run.
     client = trading_client()
-    client.orders.limit_buy("opera", 10, 167.49)
-    exchange.details["opera"] = opera_detail(contract=CONTRACT_B)
+    client.orders.limit_buy("OPRA", 10, 167.49)
+    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
     exchange.queue("/orders", error_reply(503, NOT_PLACED), error_reply(401, STALE_SIGNER))
-    assert client.orders.limit_buy("opera", 10, 167.49).orderId == 2
+    assert client.orders.limit_buy("OPRA", 10, 167.49).orderId == 2
     _, not_placed, stale, healed = exchange.bodies("/orders")
     assert stale == not_placed and healed["nonce"] != stale["nonce"]
     assert recover(healed, healed["signature"], CONTRACT_B) == HARDHAT_ADDRESS
-    assert len(exchange.gets("/trade/opera")) == 2
+    assert len(exchange.gets("/trade/OPRA")) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -1019,33 +1032,45 @@ def test_heal_after_definite_503(exchange, trading_client):
 
 
 @pytest.mark.parametrize(
-    "token_name, side",
+    "ticker, side",
     [
-        ("Opera", "BUY"),
-        ("op3ra", "BUY"),
+        ("opra", "BUY"),  # sent exactly as given: never upper-cased for you
+        ("Opra", "BUY"),
+        ("OPERA", "BUY"),  # at most 4
         ("", "BUY"),
-        ("a" * 21, "BUY"),
-        ("op/era", "BUY"),
-        ("opera\n", "BUY"),
+        ("OP-1", "BUY"),
+        ("OP/R", "BUY"),
+        (" OPR", "BUY"),
+        ("OPRA\n", "BUY"),
+        ("ＯＰＲ", "BUY"),  # fullwidth letters are not A-Z
         (None, "BUY"),
-        ("opera", "buy"),
+        ("OPRA", "buy"),
     ],
 )
-def test_token_and_side_validation(exchange, trading_client, token_name, side):
+def test_ticker_and_side_validation(exchange, trading_client, ticker, side):
     orders = trading_client().orders
     with pytest.raises(loaf.LoafValidationError) as info:
-        orders.create(token_name, side, 1, price=100)
+        orders.create(ticker, side, 1, price=100)
     assert info.value.status_code == 0
     with pytest.raises(loaf.LoafValidationError):
         orders.create_conditional(
-            token_name, side, 1, type="STOP_LIMIT", trigger_price=90, price=89
+            ticker, side, 1, type="STOP_LIMIT", trigger_price=90, price=89
         )
     assert exchange.requests == []
 
 
+@pytest.mark.parametrize("ticker", ["A", "MUS", "OPRA", "X1", "1234"])
+def test_ticker_accepted(exchange, trading_client, ticker):
+    exchange.details[ticker] = opera_detail()
+    trading_client().orders.limit_buy(ticker, 1, 100)
+    (body,) = exchange.bodies("/orders")
+    assert body["ticker"] == ticker
+    assert len(exchange.gets(f"/trade/{ticker}")) == 1
+
+
 def test_wire_normalization(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("opera", Decimal("2.0"), Decimal("167.490"))
+    client.orders.limit_buy("OPRA", Decimal("2.0"), Decimal("167.490"))
     (content,) = exchange.posts("/orders")
     body = json.loads(content)
     assert (body["price"], body["quantity"]) == (167.49, 2.0)
@@ -1053,7 +1078,7 @@ def test_wire_normalization(exchange, trading_client):
     assert recover(body, body["signature"]) == HARDHAT_ADDRESS
 
     # 2.01 * 1000 == 2009.9999999999998 in floating point: the scaling must stay exact.
-    client.orders.limit_buy("opera", 10, 2.01)
+    client.orders.limit_buy("OPRA", 10, 2.01)
     body = exchange.bodies("/orders")[-1]
     assert body["price"] == 2.01
     assert recover(body, body["signature"]) == HARDHAT_ADDRESS
@@ -1141,8 +1166,8 @@ def test_env_key_not_in_traceback_locals(monkeypatch):
 def test_order_math_ignores_callers_decimal_context(exchange, trading_client):
     client = trading_client()
     with localcontext(Context(prec=6, traps=[Inexact, Rounded, InvalidOperation])):
-        client.orders.limit_buy("opera", 10, 12345.67)
-        client.orders.market_sell("opera", 2, reference_price=100.005, max_slippage_bps=50)
+        client.orders.limit_buy("OPRA", 10, 12345.67)
+        client.orders.market_sell("OPRA", 2, reference_price=100.005, max_slippage_bps=50)
         assert loaf.worst_price(167.49, "BUY", 200) == 170.84
         with pytest.raises(loaf.LoafValidationError, match="at most 2 decimal places"):
             loaf.money.validate_price(1.234)

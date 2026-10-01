@@ -58,17 +58,18 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def opera_detail(contract: str | None = CONTRACT, market_price: float = 160) -> dict:
-    """A ``GET /trade/opera`` body with just the fields order placement reads."""
+    """A ``GET /trade/OPRA`` body with just the fields order placement reads."""
     return {
         "property": {
-            "tokenName": "opera",
+            "ticker": "OPRA",
+            "tokenName": "Opera",
             "contractAddress": contract,
             "status": "LIVE",
             "isHalted": False,
         },
         "propertyList": [
-            {"tokenName": "opera", "marketPrice": market_price},
-            {"tokenName": "musgrave", "marketPrice": 50},
+            {"ticker": "MUS", "tokenName": "Musgrave", "marketPrice": 50},
+            {"ticker": "OPRA", "tokenName": "Opera", "marketPrice": market_price},
         ],
     }
 
@@ -76,8 +77,8 @@ def opera_detail(contract: str | None = CONTRACT, market_price: float = 160) -> 
 class FakeExchange:
     """The order routes of the exchange, in memory, for ``httpx.MockTransport``.
 
-    * ``GET /trade/{token}`` pops the next reply queued for it, else serves
-      ``details[token]``; an unknown token is a 404 ``Property not found``.
+    * ``GET /trade/{ticker}`` pops the next reply queued for it, else serves
+      ``details[ticker]``; an unknown ticker is a 404 ``Property not found``.
       Replace an entry to change what it serves.
     * ``POST /orders`` and ``/orders/conditional`` pop the next queued reply
       (an ``httpx.Response``, or an exception to raise); an empty queue answers
@@ -90,7 +91,7 @@ class FakeExchange:
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
-        self.details: dict[str, dict] = {"opera": opera_detail()}
+        self.details: dict[str, dict] = {"OPRA": opera_detail()}
         self._queues: dict[str, list[Any]] = {path: [] for path in self._ORDER_ROUTES}
         self._order_id = 0
 

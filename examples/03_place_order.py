@@ -43,16 +43,16 @@ def main() -> None:
     if not tradeable:
         raise SystemExit("No tradeable properties right now.")
     prop = tradeable[0]
-    detail = client.market.property(prop.tokenName)
+    detail = client.market.property(prop.ticker)
     book = detail.get("orderBook")
     best_bid = book.bids[0].price if book and book.get("bids") else (prop.marketPrice or 1.0)
 
     # A passive limit BUY well below the best bid (unlikely to fill immediately).
     price = round(best_bid * 0.80, 2)
-    print(f"Placing LIMIT BUY 1 {prop.tokenName} @ {price} (best bid {best_bid})")
+    print(f"Placing LIMIT BUY 1 {prop.ticker} @ {price} (best bid {best_bid})")
 
     try:
-        result = client.orders.limit_buy(prop.tokenName, quantity=1, price=price)
+        result = client.orders.limit_buy(prop.ticker, quantity=1, price=price)
     except loaf.CompetitionEligibilityError:
         raise SystemExit(
             "Not admitted to the active competition round — check "

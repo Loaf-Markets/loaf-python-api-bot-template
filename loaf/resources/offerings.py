@@ -16,15 +16,16 @@ class OfferingsResource(Resource):
     def list(self) -> Any:
         """``GET /offerings`` — every visible offering as a card. (public)
 
-        Returns ``{"ipos": [...]}`` with ``ipoId``, ``tokenName``, ``unitPrice``,
-        ``totalUnits``, ``unitsAllocated``, ``status``, ``opensAt``/``closesAt``, etc.
+        Returns ``{"ipos": [...]}`` with ``ipoId``, ``ticker``, ``tokenName``
+        (the display name), ``unitPrice``, ``totalUnits``, ``unitsAllocated``,
+        ``status``, ``opensAt``/``closesAt``, etc.
         """
         return self._client.get("/offerings", auth=False)
 
-    def get(self, token_name: str) -> Any:
-        """``GET /offerings/{token_name}`` — full offering page for a property. (public)
+    def get(self, ticker: str) -> Any:
+        """``GET /offerings/{ticker}`` — full offering page for a property. (public)
 
         Includes pricing, ``feeBps`` (raw basis points), allocation stats,
         ``recentOrders`` and an ``ipoList`` selector.
         """
-        return self._client.get(f"/offerings/{token_name}", auth=False)
+        return self._client.get(f"/offerings/{ticker}", auth=False)

@@ -43,7 +43,7 @@ def main() -> None:
     if not tradeable:
         raise SystemExit("No tradeable properties right now.")
     prop = tradeable[0]
-    detail = client.market.property(prop.tokenName)
+    detail = client.market.property(prop.ticker)
     book = detail.get("orderBook")
     mark = book.bids[0].price if book and book.get("bids") else (prop.marketPrice or 1.0)
 
@@ -55,12 +55,12 @@ def main() -> None:
     # of at least that price x quantity plus the taker fee, and that value must
     # be at least 10 USDC.
     books_at = loaf.worst_price(trigger, "BUY", client.max_slippage_bps)
-    print(f"Arming STOP_MARKET BUY 1 {prop.tokenName} @ trigger {trigger} "
+    print(f"Arming STOP_MARKET BUY 1 {prop.ticker} @ trigger {trigger} "
           f"(books at up to {books_at}; mark {mark})")
 
     try:
         result = client.orders.create_conditional(
-            prop.tokenName,
+            prop.ticker,
             "BUY",
             quantity=1,
             type="STOP_MARKET",

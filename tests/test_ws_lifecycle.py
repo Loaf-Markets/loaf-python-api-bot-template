@@ -75,7 +75,7 @@ def test_ws_connect_subscribe_stop_is_clean():
         received: list[str] = []
         ws.on_message(lambda m: received.append(m.get("type")))
 
-        ws.subscribe_orderbook("opera")
+        ws.subscribe_orderbook("OPRA")
         ws.start()
         assert ws.wait_until_connected(timeout=5)
 

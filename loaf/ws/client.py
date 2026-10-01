@@ -9,8 +9,8 @@ Typical usage::
     def handle_book(msg):
         print(msg.propertyId, msg.bids[0].price)
 
-    ws.subscribe_orderbook("opera")
-    ws.subscribe_trades("opera")
+    ws.subscribe_orderbook("OPRA")
+    ws.subscribe_trades("OPRA")
     ws.run_forever()            # blocking; Ctrl-C to stop
 
 Or run it in the background and keep using the REST client::
@@ -20,22 +20,23 @@ Or run it in the background and keep using the REST client::
         ws.subscribe_portfolio()          # your own account's private stream
         ...                               # do other work; handlers fire live
 
-Channels (``"type:key"`` strings — market-data channels key by ``tokenName``;
-``portfolio`` and ``leaderboard`` have no key):
+Channels (``"type:key"`` strings — market-data channels key by the property's
+``ticker``, exact case: ``orderbook:opra`` is refused; ``portfolio`` and
+``leaderboard`` have no key):
 
-=====================  ========  ===========================================
-Channel                Auth      What you receive
-=====================  ========  ===========================================
-orderbook:{tokenName}  public    full bid/ask book snapshots, on change (no initial frame)
-trades:{tokenName}     public    rolling recent-trades batches
-chart:{tokenName}      public    OHLCV candle updates (note: singular "chart")
-markprice:{tokenName}  public    canonical mark price (1s, on change)
-volume:{tokenName}     public    rolling-24h traded volume (replaces ``volume24h``)
-property:{tokenName}   public    halt / resume status for one property
-ipo:{ipoId}            public    primary-market allocation progress
-leaderboard            public    competition leaderboard (top entries) on change
-portfolio              PRIVATE   your balances/positions/orders/trades deltas
-=====================  ========  ===========================================
+==================  ========  ===========================================
+Channel             Auth      What you receive
+==================  ========  ===========================================
+orderbook:{ticker}  public    full bid/ask book snapshots, on change (no initial frame)
+trades:{ticker}     public    rolling recent-trades batches
+chart:{ticker}      public    OHLCV candle updates (note: singular "chart")
+markprice:{ticker}  public    canonical mark price (1s, on change)
+volume:{ticker}     public    rolling-24h traded volume (replaces ``volume24h``)
+property:{ticker}   public    halt / resume status for one property
+ipo:{ipoId}         public    primary-market allocation progress
+leaderboard         public    competition leaderboard (top entries) on change
+portfolio           PRIVATE   your balances/positions/orders/trades deltas
+==================  ========  ===========================================
 
 All values are already human units (dollars / tokens); timestamps are unix
 seconds.
@@ -171,7 +172,7 @@ class LoafWebSocketClient:
 
     def on_property_halt(self, handler: Handler | None = None) -> Any:
         """A property was halted or resumed (``property_halt``:
-        ``{propertyId, tokenName, isHalted}``).
+        ``{propertyId, ticker, isHalted}``).
 
         ``isHalted`` is the EFFECTIVE state — the property's own flag OR'd with
         the platform-wide kill switch — so assign it straight over the
@@ -293,30 +294,30 @@ class LoafWebSocketClient:
         self._send_now({"type": "unsubscribe", "channels": sorted(gone)})
         return self
 
-    def subscribe_orderbook(self, token_name: str) -> LoafWebSocketClient:
-        return self.subscribe(f"orderbook:{token_name}")
+    def subscribe_orderbook(self, ticker: str) -> LoafWebSocketClient:
+        return self.subscribe(f"orderbook:{ticker}")
 
-    def subscribe_trades(self, token_name: str) -> LoafWebSocketClient:
-        return self.subscribe(f"trades:{token_name}")
+    def subscribe_trades(self, ticker: str) -> LoafWebSocketClient:
+        return self.subscribe(f"trades:{ticker}")
 
-    def subscribe_chart(self, token_name: str) -> LoafWebSocketClient:
+    def subscribe_chart(self, ticker: str) -> LoafWebSocketClient:
         """Candlestick channel (note: the channel name is singular ``chart``)."""
-        return self.subscribe(f"chart:{token_name}")
+        return self.subscribe(f"chart:{ticker}")
 
-    def subscribe_mark_price(self, token_name: str) -> LoafWebSocketClient:
-        return self.subscribe(f"markprice:{token_name}")
+    def subscribe_mark_price(self, ticker: str) -> LoafWebSocketClient:
+        return self.subscribe(f"markprice:{ticker}")
 
-    def subscribe_volume(self, token_name: str) -> LoafWebSocketClient:
+    def subscribe_volume(self, ticker: str) -> LoafWebSocketClient:
         """Rolling-24h traded volume pushes for a property (seed from the REST
         ``volume24h``, then let ``volume_update`` frames replace it)."""
-        return self.subscribe(f"volume:{token_name}")
+        return self.subscribe(f"volume:{ticker}")
 
-    def subscribe_property_status(self, token_name: str) -> LoafWebSocketClient:
-        """Halt/resume pushes for a property (the ``property:{tokenName}``
+    def subscribe_property_status(self, ticker: str) -> LoafWebSocketClient:
+        """Halt/resume pushes for a property (the ``property:{ticker}``
         channel — property status, not market data). Seed from the REST
-        ``market.property(token).property.isHalted``, then let
+        ``market.property(ticker).property.isHalted``, then let
         ``property_halt`` frames replace it."""
-        return self.subscribe(f"property:{token_name}")
+        return self.subscribe(f"property:{ticker}")
 
     def subscribe_ipo(self, ipo_id: int) -> LoafWebSocketClient:
         return self.subscribe(f"ipo:{int(ipo_id)}")
