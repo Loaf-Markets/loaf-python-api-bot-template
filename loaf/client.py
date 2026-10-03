@@ -21,6 +21,7 @@ from .constants import (
     USER_AGENT,
 )
 from .exceptions import (
+    LoafAPIError,
     LoafConfigError,
     LoafConnectionError,
     error_from_response,
@@ -186,11 +187,22 @@ class LoafClient:
                     headers=headers,
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
+                # On a non-idempotent request the server MAY have processed the write
+                # before the response was lost, so we deliberately do not retry (that
+                # could place the order twice). Surface an error that says so, so the
+                # caller reconciles against GET /orders or openOrders instead of blindly
+                # re-sending.
                 if idempotent and attempt < self.max_retries:
                     self._sleep_backoff(attempt)
                     attempt += 1
                     continue
-                raise LoafConnectionError(f"{method} {path} failed: {exc}") from exc
+                if idempotent:
+                    raise LoafConnectionError(f"{method} {path} failed: {exc}") from exc
+                raise LoafConnectionError(
+                    f"{method} {path} failed: {exc}. The request may still have been "
+                    f"processed server-side - reconcile against the order/history "
+                    f"endpoints before retrying, or you may act on it twice."
+                ) from exc
 
             self._record_rate_limit(response)
 
@@ -222,7 +234,18 @@ class LoafClient:
             return None
         ctype = response.headers.get("content-type", "")
         if "application/json" in ctype:
-            return parse(response.json())
+            # A server (or proxy) that promises JSON but sends a malformed body used to
+            # raise a raw httpx/json.JSONDecodeError out of the SDK, breaking the promise
+            # that every failure is a LoafError. Wrap it.
+            try:
+                return parse(response.json())
+            except ValueError as exc:
+                raise LoafAPIError(
+                    f"HTTP {response.status_code}: response claimed JSON but did not parse "
+                    f"({exc})",
+                    status_code=response.status_code,
+                    body=response.text[:2048],
+                ) from exc
         return response.text
 
     def _build_error(self, response: httpx.Response) -> Exception:
@@ -265,14 +288,19 @@ class LoafClient:
         return None
 
     def _sleep_backoff(self, attempt: int, response: httpx.Response | None = None) -> None:
+        # Honour the server's hint first, but only when it is actually positive: a
+        # `RateLimit-Reset: 0` (already-reset window) otherwise collapsed the whole backoff
+        # to zero and the client hammered a rate limiter in a tight loop.
         if response is not None:
             hinted = self._retry_after_seconds(response)
-            if hinted is not None:
+            if hinted is not None and hinted > 0:
                 time.sleep(min(hinted, 60.0))
                 return
-        # Exponential backoff with full jitter, capped at 30s.
+        # Exponential backoff with full jitter, capped at 30s. Full jitter (a uniform
+        # draw from [0, delay]) is what stops a fleet of clients that were throttled
+        # together from retrying in lockstep and re-triggering the limit.
         delay = min(30.0, (2**attempt) * 0.5)
-        time.sleep(random.uniform(0, delay))
+        time.sleep(random.uniform(delay / 2, delay))
 
     # ------------------------------------------------------------------ #
     # WebSocket

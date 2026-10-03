@@ -56,6 +56,7 @@ it filled. Fills and cancellations arrive asynchronously on the private
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Mapping
 
@@ -71,6 +72,38 @@ from ..enums import (
 from ..exceptions import _client_validation_error
 from ..money import validate_price, validate_quantity
 from .base import Resource
+
+#: Valid ``side`` literals, resolved once at import from the enum so the two cannot drift.
+_ORDER_SIDE_VALUES = frozenset(s.value for s in OrderSide)
+#: Valid ``time_in_force`` literals, same rationale.
+_TIME_IN_FORCE_VALUES = frozenset(t.value for t in TimeInForce)
+
+
+def _order_id(value: Any, what: str = "order id") -> int:
+    """Coerce an order id to ``int``, rejecting silent truncation.
+
+    ``int(3.9)`` used to become ``3``, so a caller passing a float (or ``True``) could
+    cancel a DIFFERENT order than the one they meant. Cancelling the wrong resting order
+    is a real-money mistake, so require an exact integer.
+    """
+    if isinstance(value, bool):
+        raise _client_validation_error(f"{what} must be an integer, not a bool")
+    if isinstance(value, int):
+        if value <= 0:
+            raise _client_validation_error(f"{what} must be positive, got {value}")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or value != int(value):
+            raise _client_validation_error(f"{what} must be a whole number, got {value!r}")
+        if value <= 0:
+            raise _client_validation_error(f"{what} must be positive, got {value}")
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        as_int = int(value.strip())
+        if as_int <= 0:
+            raise _client_validation_error(f"{what} must be positive, got {value!r}")
+        return as_int
+    raise _client_validation_error(f"{what} must be an integer, got {type(value).__name__}")
 
 
 class OrdersResource(Resource):
@@ -131,6 +164,19 @@ class OrdersResource(Resource):
         otype = str(type)
         tif = str(time_in_force)
 
+        # An unknown side used to be forwarded to the live endpoint and rejected there;
+        # catch it locally so a typo never reaches the book.
+        if side not in _ORDER_SIDE_VALUES:
+            raise _client_validation_error(
+                f"side must be one of {sorted(_ORDER_SIDE_VALUES)}, got {side!r}"
+            )
+        # Likewise for time_in_force: an unrecognised TIF silently took the `else` branch
+        # below (which only checks the deadline), so "XYZ" reached the exchange.
+        if tif not in _TIME_IN_FORCE_VALUES:
+            raise _client_validation_error(
+                f"time_in_force must be one of {sorted(_TIME_IN_FORCE_VALUES)}, got {tif!r}"
+            )
+
         validate_quantity(quantity)
 
         if otype == OrderType.MARKET:
@@ -147,7 +193,13 @@ class OrdersResource(Resource):
             raise _client_validation_error(f"Unknown order type {otype!r}")
 
         if tif == TimeInForce.GTD:
-            if deadline <= int(time.time()):
+            # `deadline <= int(time.time())` raised a bare TypeError when a caller passed
+            # a float('nan') or a string; compare only once the value is a real number.
+            if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+                raise _client_validation_error(
+                    "deadline must be a unix-seconds number for a GTD order"
+                )
+            if not math.isfinite(float(deadline)) or deadline <= int(time.time()):
                 raise _client_validation_error("GTD orders require a future unix-seconds deadline")
         elif deadline != DEFAULT_ORDER_DEADLINE:
             raise _client_validation_error(
@@ -363,7 +415,7 @@ class OrdersResource(Resource):
         :class:`~loaf.exceptions.LoafConflictError` (409) if the engine no longer
         holds the order (it likely just filled/cancelled).
         """
-        return self._client.post("/orders/cancel", json={"orderId": int(order_id)})
+        return self._client.post("/orders/cancel", json={"orderId": _order_id(order_id)})
 
     def cancel_conditional(self, order_id: int) -> Any:
         """``POST /orders/conditional/cancel`` — cancel one PENDING / ARMED conditional.
@@ -382,7 +434,7 @@ class OrdersResource(Resource):
         triggering is level-based, so a row whose mark sat through its trigger
         for the whole halt fires as soon as trading resumes.
         """
-        return self._client.post("/orders/conditional/cancel", json={"orderId": int(order_id)})
+        return self._client.post("/orders/conditional/cancel", json={"orderId": _order_id(order_id)})
 
     def cancel_row(self, order: Mapping[str, Any]) -> Any:
         """Cancel one ``openOrders`` / ``order_update`` row, whichever kind it is.

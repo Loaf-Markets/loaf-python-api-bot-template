@@ -116,10 +116,18 @@ class LoafWebSocketClient:
         self.ws_url: str = resolved_ws_url
         self._verify = verify if verify is not None else (getattr(client, "_verify", True))
         self.auto_reconnect = auto_reconnect
+        # A zero/negative delay makes the reconnect loop spin with no pause, burning CPU
+        # and hammering the endpoint through an outage; reject it rather than accept it.
+        if reconnect_delay <= 0:
+            raise ValueError("reconnect_delay must be > 0")
         self.reconnect_delay = reconnect_delay
 
         self._handlers: dict[str, list[Handler]] = {}
         self._channels: set[str] = set()
+        # subscribe()/unsubscribe()/on() may be called from any thread while the loop
+        # thread iterates _channels in _on_open and _handlers in _emit. A lock makes the
+        # set and handler-list updates atomic and gives the iteration a stable snapshot.
+        self._lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._run_task: asyncio.Task | None = None
@@ -135,7 +143,8 @@ class LoafWebSocketClient:
         """Register ``handler`` for a message ``type``. Usable as a decorator."""
 
         def register(fn: Handler) -> Handler:
-            self._handlers.setdefault(str(message_type), []).append(fn)
+            with self._lock:
+                self._handlers.setdefault(str(message_type), []).append(fn)
             return fn
 
         return register if handler is None else register(handler)
@@ -247,13 +256,17 @@ class LoafWebSocketClient:
     def subscribe(self, *channels: str) -> LoafWebSocketClient:
         """Subscribe to one or more raw ``"type:id"`` channel strings."""
         new = {str(c) for c in channels}
-        self._channels |= new
+        # Mutate under the lock and send only the sorted NEW channels, so a concurrent
+        # subscribe() cannot interleave between the set update and the frame.
+        with self._lock:
+            self._channels |= new
         self._send_now({"type": "subscribe", "channels": sorted(new)})
         return self
 
     def unsubscribe(self, *channels: str) -> LoafWebSocketClient:
         gone = {str(c) for c in channels}
-        self._channels -= gone
+        with self._lock:
+            self._channels -= gone
         self._send_now({"type": "unsubscribe", "channels": sorted(gone)})
         return self
 
@@ -440,8 +453,12 @@ class LoafWebSocketClient:
     async def _on_open(self, ws: Any) -> None:
         if self.api_key:
             await ws.send(self._frame("auth", token=self.api_key))
-        if self._channels:
-            await ws.send(self._frame("subscribe", channels=sorted(self._channels)))
+        # Snapshot the channel set under the lock: a subscribe() from another thread must
+        # not mutate it while this sorted() is running.
+        with self._lock:
+            channels = sorted(self._channels)
+        if channels:
+            await ws.send(self._frame("subscribe", channels=channels))
         self._connected_event.set()
         self._emit(_ON_CONNECT, None)
 
@@ -458,28 +475,60 @@ class LoafWebSocketClient:
         self._emit("*", obj)
 
     def _emit(self, key: str, payload: Any) -> None:
-        for handler in list(self._handlers.get(key, ())):
+        # Copy the handler list under the lock so a handler registering another handler
+        # from inside a callback does not mutate the list mid-iteration.
+        with self._lock:
+            handlers = list(self._handlers.get(key, ()))
+        for handler in handlers:
             try:
                 handler(payload)
             except Exception:  # noqa: BLE001
                 logger.exception("Loaf WebSocket handler for %r raised", key)
 
     def _send_now(self, message: dict) -> None:
-        """Send immediately if connected; otherwise rely on resubscribe-on-connect."""
-        loop = self._loop
-        ws = self._ws
-        if loop is None or ws is None:
+        """Send a subscribe/unsubscribe frame if connected; otherwise rely on
+        resubscribe-on-connect (the channel set is replayed by :meth:`_on_open`).
+
+        Both ``self._loop`` and ``self._ws`` are cleared from another thread by
+        :meth:`stop` while this runs, and a loop can be *closed* rather than
+        ``None``, so every step re-checks and any race is caught: a dropped frame
+        is always safe here (the resubscribe covers it), whereas raising a raw
+        ``RuntimeError`` out of a public ``subscribe_*`` call is not.
+        """
+        loop, ws = self._loop, self._ws
+        if loop is None or ws is None or loop.is_closed():
             return
         frame = self._frame(message["type"], **{k: v for k, v in message.items() if k != "type"})
-        coro = ws.send(frame)
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
-        if running is loop:
-            loop.create_task(coro)
-        else:
-            asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            if running is loop:
+                handle = loop.create_task(ws.send(frame))
+            else:
+                # run_coroutine_threadsafe returns a concurrent.futures.Future; both it
+                # and the Task must be given a done-callback, otherwise a failed send is
+                # only ever reported as "exception was never retrieved" on garbage
+                # collection and the caller believes the subscribe succeeded.
+                handle = asyncio.run_coroutine_threadsafe(ws.send(frame), loop)
+        except RuntimeError:
+            # The loop closed between the guard above and the dispatch here.
+            logger.debug("Loaf WS loop closed; dropping %s frame", message.get("type"))
+            return
+        handle.add_done_callback(self._log_send_failure)
+
+    @staticmethod
+    def _log_send_failure(handle: Any) -> None:
+        """Surface a dropped frame instead of losing it silently."""
+        if handle.cancelled():
+            return
+        try:
+            exc = handle.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):  # pragma: no cover - defensive
+            return
+        if exc is not None:
+            logger.warning("Loaf WS send failed (frame dropped, will resubscribe on reconnect): %r", exc)
 
     @staticmethod
     def _frame(message_type: str, **fields: Any) -> str:
@@ -489,4 +538,6 @@ class LoafWebSocketClient:
 
     def __repr__(self) -> str:
         state = "connected" if self._connected_event.is_set() else "idle"
-        return f"<LoafWebSocketClient {self.ws_url!r} {state} channels={len(self._channels)}>"
+        with self._lock:
+            n = len(self._channels)
+        return f"<LoafWebSocketClient {self.ws_url!r} {state} channels={n}>"

@@ -37,8 +37,27 @@ def _decimal_places(value: float) -> int:
     return -exponent if isinstance(exponent, int) and exponent < 0 else 0
 
 
+def _as_number(value: object, what: str) -> float:
+    """Coerce ``value`` to a float, rejecting bools and non-numeric types explicitly.
+
+    ``bool`` is a subclass of ``int``, so ``validate_price(True)`` previously slipped
+    through as the number ``1.0``; a ``str`` or ``Decimal`` reached ``math.isfinite``
+    and raised a bare ``TypeError`` from deep inside the standard library instead of the
+    documented :class:`~loaf.exceptions.LoafValidationError`. Callers always want the
+    SDK's own exception type here.
+    """
+    if isinstance(value, bool):
+        raise _client_validation_error(f"{what} must be a number, not a bool")
+    if isinstance(value, (int, float, Decimal)):
+        return float(value)
+    raise _client_validation_error(
+        f"{what} must be a number, got {type(value).__name__}"
+    )
+
+
 def validate_price(price: float) -> None:
     """Raise :class:`LoafValidationError` if ``price`` violates limit-price rules."""
+    price = _as_number(price, "price")
     if not math.isfinite(price):
         raise _client_validation_error("price must be a finite number")
     if price < 0:
@@ -51,6 +70,7 @@ def validate_price(price: float) -> None:
 
 def validate_quantity(quantity: float) -> None:
     """Raise :class:`LoafValidationError` if ``quantity`` violates quantity rules."""
+    quantity = _as_number(quantity, "quantity")
     if not math.isfinite(quantity):
         raise _client_validation_error("quantity must be a finite number")
     if quantity <= 0:

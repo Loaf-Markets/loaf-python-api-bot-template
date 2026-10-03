@@ -7,9 +7,29 @@ All currency values are plain dollars and quantities plain tokens (see
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterator
 
+from ..exceptions import _client_validation_error
 from .base import Resource
+
+#: A property tokenName is lowercase letters only (see the API docs). Anything else is
+#: rejected BEFORE it is interpolated into a URL path, so a value like "../../admin"
+#: cannot walk out of the /trade/ prefix, and a newline or %00 cannot split the request.
+_TOKEN_NAME_RE = re.compile(r"^[a-z]{1,64}$")
+
+
+def _validate_token_name(token_name: Any) -> str:
+    """Validate a property tokenName and return it unchanged."""
+    if not isinstance(token_name, str):
+        raise _client_validation_error(
+            f"token_name must be a string, got {type(token_name).__name__}"
+        )
+    if not _TOKEN_NAME_RE.match(token_name):
+        raise _client_validation_error(
+            f"invalid token_name {token_name!r}: expected 1-64 lowercase letters"
+        )
+    return token_name
 
 
 class MarketResource(Resource):
@@ -43,7 +63,7 @@ class MarketResource(Resource):
         keep it live with the ``property:{tokenName}`` WebSocket channel
         (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_property_status`).
         """
-        return self._client.get(f"/trade/{token_name}", auth=False)
+        return self._client.get(f"/trade/{_validate_token_name(token_name)}", auth=False)
 
     # -- Candles (chart history) -------------------------------------------- #
 
@@ -73,7 +93,7 @@ class MarketResource(Resource):
         ``hasMore`` is true (or use :meth:`iter_candles`).
         """
         return self._client.get(
-            f"/trade/{token_name}/candles",
+            f"/trade/{_validate_token_name(token_name)}/candles",
             params={"resolution": str(resolution), "to": to, "countBack": count_back},
             auth=False,
         )
@@ -99,12 +119,12 @@ class MarketResource(Resource):
 
     def info_header(self, token_name: str) -> Any:
         """``GET /info/{token_name}/header`` — address, hero image, bed/bath/car, offering valuation."""
-        return self._client.get(f"/info/{token_name}/header", auth=False)
+        return self._client.get(f"/info/{_validate_token_name(token_name)}/header", auth=False)
 
     def info_overview(self, token_name: str) -> Any:
         """``GET /info/{token_name}/overview`` — description, media, metrics, amenities."""
-        return self._client.get(f"/info/{token_name}/overview", auth=False)
+        return self._client.get(f"/info/{_validate_token_name(token_name)}/overview", auth=False)
 
     def info_documents(self, token_name: str) -> Any:
         """``GET /info/{token_name}/documents`` — public document list (title + URL)."""
-        return self._client.get(f"/info/{token_name}/documents", auth=False)
+        return self._client.get(f"/info/{_validate_token_name(token_name)}/documents", auth=False)

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..exceptions import _client_validation_error
 from .base import Resource
+from .market import _validate_token_name
 
 
 class OfferingsResource(Resource):
@@ -27,7 +29,7 @@ class OfferingsResource(Resource):
         Includes pricing, ``feeBps`` (raw basis points), allocation stats,
         ``recentOrders`` and an ``ipoList`` selector.
         """
-        return self._client.get(f"/offerings/{token_name}", auth=False)
+        return self._client.get(f"/offerings/{_validate_token_name(token_name)}", auth=False)
 
     def subscribe(
         self,
