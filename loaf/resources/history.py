@@ -28,8 +28,11 @@ class HistoryResource(Resource):
 
         Conditionals appear here in EVERY status, including the live
         ``PENDING`` / ``ARMED`` ones, so a resting stop shows up in history and
-        in ``openOrders`` at once. ``total`` now counts both tables and only
+        in ``openOrders`` at once. ``total`` counts both tables and only
         one is capped — another reason not to derive "has more" from it.
+
+        A MARKET order's ``price`` is the worst price it was signed at, and a
+        resting MARKET remainder shows as ``OPEN`` / ``PARTIALLY_FILLED``.
         """
         return self._client.get(
             "/history/orders",
@@ -47,6 +50,9 @@ class HistoryResource(Resource):
 
         Returns ``{trades, total, page, pageSize, nextCursor}``. ``side`` and
         ``fee`` are reported from this user's perspective.
+
+        Trades are final when they match; ``txHash`` is ``""`` until a batch
+        proof covers the trade.
         """
         return self._client.get(
             "/history/trades",

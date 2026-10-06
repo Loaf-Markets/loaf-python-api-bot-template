@@ -41,14 +41,8 @@ class ConditionalOrderType(_StrEnum):
 
 
 class TimeInForce(_StrEnum):
-    #: Good-til-cancelled. The default; recommended for bots.
+    #: Good-til-cancelled — the only value the exchange accepts; order rows carry it.
     GTC = "GTC"
-    #: Immediate-or-cancel.
-    IOC = "IOC"
-    #: Fill-or-kill.
-    FOK = "FOK"
-    #: Good-til-date. Requires a future unix-seconds ``deadline``.
-    GTD = "GTD"
 
 
 class OrderStatus(_StrEnum):
@@ -56,7 +50,6 @@ class OrderStatus(_StrEnum):
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
-    REJECTED = "REJECTED"
 
 
 class ConditionalOrderStatus(_StrEnum):
@@ -70,19 +63,12 @@ class ConditionalOrderStatus(_StrEnum):
     CANCELLED = "CANCELLED"
 
 
-class TradeStatus(_StrEnum):
-    SETTLING = "SETTLING"
-    SETTLED = "SETTLED"
-    SETTLEMENT_FAILED = "SETTLEMENT_FAILED"
-
-
 class OfferingOrderStatus(_StrEnum):
     """Status of an IPO/offering subscription order."""
 
     PENDING = "PENDING"
     ALLOCATED = "ALLOCATED"
     REJECTED = "REJECTED"
-    CANCELLED = "CANCELLED"
 
 
 class PropertyStatus(_StrEnum):

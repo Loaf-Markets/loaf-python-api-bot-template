@@ -10,12 +10,15 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Loaf Markets" }]
-keywords = ["loaf", "trading", "real-estate", "api", "sdk", "bot", "websocket"]
+keywords = ["loaf", "trading", "real-estate", "api", "sdk", "bot", "websocket", "eip712"]
 
 # Runtime dependencies are intentionally minimal.
 dependencies = [
-    "httpx>=0.27",        # REST client (timeouts, HTTP/2, clean errors)
-    "websockets>=12.0",   # real-time market & portfolio feeds
+    "httpx>=0.27",               # REST client (timeouts, HTTP/2, clean errors)
+    "websockets>=12.0",          # real-time market & portfolio feeds
+    "eth-account>=0.13,<0.15",   # EIP-712 signing of your orders with your agent key
+    "eth-utils>=2",              # keccak / address checksums (installed with eth-account)
+    "eth-keys>=0.4",             # holds the agent key (installed with eth-account)
 ]
 
 [project.optional-dependencies]
@@ -23,6 +26,10 @@ dependencies = [
 dotenv = ["python-dotenv>=1.0"]
 # `pip install -e ".[dev]"` for the test suite.
 dev = ["pytest>=8.0"]
+# `pip install -e ".[fast]"` signs orders with libsecp256k1 instead of pure Python: about 0.2 ms
+# per signature instead of 2-4 ms, identical signatures. Python 3.9-3.13 only: coincurve has no
+# 3.14 build yet, so on 3.14 this extra installs nothing.
+fast = ["coincurve>=21,<22; python_version < '3.14'"]
 
 [project.urls]
 Homepage = "https://loafmarkets.com"

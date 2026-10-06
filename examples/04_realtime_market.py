@@ -24,7 +24,7 @@ def main() -> None:
     if not properties:
         raise SystemExit("No properties available.")
     prop = properties[0]
-    print(f"Streaming {prop.tokenName} (id {prop.propertyId}). Ctrl-C to stop.\n")
+    print(f"Streaming {prop.ticker} (id {prop.propertyId}). Ctrl-C to stop.\n")
 
     ws = client.websocket()
 
@@ -45,12 +45,12 @@ def main() -> None:
 
     @ws.on_property_halt
     def on_halt(msg):
-        print(f"HALT  {msg.tokenName} -> {'HALTED' if msg.isHalted else 'RESUMED'}")
+        print(f"HALT  {msg.ticker} -> {'HALTED' if msg.isHalted else 'RESUMED'}")
 
-    ws.subscribe_orderbook(prop.tokenName)
-    ws.subscribe_trades(prop.tokenName)
-    ws.subscribe_mark_price(prop.tokenName)
-    ws.subscribe_property_status(prop.tokenName)
+    ws.subscribe_orderbook(prop.ticker)
+    ws.subscribe_trades(prop.ticker)
+    ws.subscribe_mark_price(prop.ticker)
+    ws.subscribe_property_status(prop.ticker)
 
     ws.run_forever()  # blocking until Ctrl-C
 

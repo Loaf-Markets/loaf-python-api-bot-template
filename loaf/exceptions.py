@@ -6,16 +6,15 @@ Every error the API can return is mapped to a specific exception so a bot can
     LoafError                       (base — catch this to catch everything)
     ├── LoafConfigError             misconfiguration (e.g. missing API key)
     ├── LoafConnectionError         network failure / timeout (no HTTP response)
+    ├── OrderOutcomeUnknownError    a signed order may be live; the SDK could not confirm it
     └── LoafAPIError                the server returned an HTTP error
-        ├── LoafAuthError                 401  bad/expired/missing credentials
+        ├── LoafAuthError                 401  bad/expired credentials, or an order signature the exchange refused
         ├── LoafForbiddenError            403  generic forbidden
-        │   ├── KycRequiredError          403  retail/wholesale KYC required
-        │   ├── TradingHaltedError        403  "Trading is currently halted" (platform-wide or per-property)
+        │   ├── TradingHaltedError        403  "Trading is currently halted" / "Trading halted for this property"
         │   └── CompetitionEligibilityError 403 code=NOT_COMPETITION_PARTICIPANT
-        ├── LoafValidationError           400  body/query/param validation failed
+        ├── LoafValidationError           400  validation or order-rule refusal (incl. the daily price band)
         ├── LoafNotFoundError             404
-        ├── LoafConflictError             409  (e.g. handle taken, already referred)
-        ├── LoafBusinessRuleError         422  (e.g. price-band violation)
+        ├── LoafConflictError             409  (e.g. a cancel that lost the race, a prize already claimed)
         ├── LoafRateLimitError            429  (carries .retry_after seconds)
         └── LoafServerError               5xx  (503 -> LoafServiceUnavailableError)
             └── LoafServiceUnavailableError 503
@@ -23,19 +22,78 @@ Every error the API can return is mapped to a specific exception so a bot can
 
 from __future__ import annotations
 
+import html
+import re
 from typing import Any
+
+_PRE_RE = re.compile(r"<pre>(.*?)</pre>", re.IGNORECASE | re.DOTALL)
 
 
 class LoafError(Exception):
     """Base class for every error raised by this SDK."""
 
+    def __reduce__(self) -> Any:
+        # The default rebuilds with cls(*args), which keyword-only __init__s refuse; restore the
+        # attributes instead, so errors survive pickle (process pools) and copy.
+        return (_rebuild_error, (type(self), self.args), self.__dict__)
+
+
+def _rebuild_error(cls: type[LoafError], args: tuple) -> LoafError:
+    return cls.__new__(cls, *args)
+
 
 class LoafConfigError(LoafError):
-    """The client is misconfigured (e.g. no API key for an authed request)."""
+    """The client is misconfigured: no API key for an authed request, a
+    missing or malformed agent private key when placing an order, or an
+    invalid ``LoafClient(max_slippage_bps=)`` / ``$LOAF_MAX_SLIPPAGE_BPS``."""
 
 
 class LoafConnectionError(LoafError):
     """The request never received an HTTP response (network error / timeout)."""
+
+
+class OrderOutcomeUnknownError(LoafError):
+    """A signed order may or may not have been placed; the SDK could not find out.
+
+    Raised by order placement after a timeout or a server-side failure that the
+    SDK's own identical re-sends did not settle, and by
+    :meth:`~loaf.resources.orders.OrdersResource.resubmit` on anything but a
+    200. The order may be live, and may already have filled, so never place the
+    same intent afresh. While you still want it, re-send it with
+    ``orders.resubmit(error.signed_body)``: within 24 hours of signing, and
+    never after a competition round switch. Otherwise look for it in
+    ``history.orders()``.
+    :meth:`~loaf.resources.orders.OrdersResource.resubmit` documents what each
+    answer means.
+
+    Deliberately NOT a :class:`LoafConnectionError`: code that re-places an
+    order on a connection error must not catch this one.
+
+    Attributes:
+        signed_body: The exact body that was sent (nonce and signatures; no secrets).
+        attempts: How many times it was sent.
+        last_error: The last attempt's error (also ``__cause__``).
+    """
+
+    def __init__(
+        self, *, signed_body: dict[str, Any], attempts: int, last_error: Exception
+    ) -> None:
+        self.signed_body = signed_body
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(
+            f"Could not confirm whether order {self.nonce} was placed after {attempts} "
+            f"attempt(s) (last error: {last_error}). It may be live, and may already have "
+            "filled: re-send it unchanged with orders.resubmit(error.signed_body) within 24 "
+            "hours of signing and before any round switch (the same order if it landed; if "
+            "not, it is placed now at the signed price), or look for it in "
+            "history.orders(), which lists every status. openOrders shows only resting orders."
+        )
+
+    @property
+    def nonce(self) -> str:
+        """The order's nonce (``signed_body["nonce"]``)."""
+        return str(self.signed_body.get("nonce", ""))
 
 
 class LoafAPIError(LoafError):
@@ -44,7 +102,7 @@ class LoafAPIError(LoafError):
     Attributes:
         status_code: HTTP status code.
         message: Human-readable error message (the API's ``error`` field).
-        code: Machine-readable code when present (e.g. ``REFERRAL_REQUIRED``).
+        code: Machine-readable code when present (e.g. ``NOT_COMPETITION_PARTICIPANT``).
         details: List of field-level messages on a 400 validation error.
         request_id: The ``X-Request-Id`` for support correlation, if any.
         body: The raw parsed response body.
@@ -77,23 +135,31 @@ class LoafAPIError(LoafError):
 
 
 class LoafAuthError(LoafAPIError):
-    """401 — credentials are missing, invalid, or expired."""
+    """401 — credentials or an order signature were refused.
+
+    On reads and cancels: the API key is unknown, expired or deleted
+    (``Invalid credentials``). The WebSocket never raises it: a refused key
+    leaves the socket anonymous, and a ``portfolio`` subscription is refused
+    with an ``error`` frame (code ``UNAUTHORIZED``) sent to ``on_error``.
+
+    On order placement, which never sends the API key: the exchange refused the
+    order's signature. ``Signer is not authorized to trade for any account``
+    means the agent key is not approved for any account; it expires and is
+    revoked together with its API key. Stop placing and alert.
+    """
 
 
 class LoafForbiddenError(LoafAPIError):
     """403 — authenticated but not permitted."""
 
 
-class KycRequiredError(LoafForbiddenError):
-    """403 — retail or wholesale KYC verification is required for this action."""
-
-
 class TradingHaltedError(LoafForbiddenError):
-    """403 "Trading is currently halted" — a platform-wide or per-property halt.
+    """403 "Trading is currently halted" (platform-wide) or "Trading halted for
+    this property".
 
-    Order placement and offering subscriptions reject while the halt lasts, as
-    do :meth:`~loaf.resources.orders.OrdersResource.cancel` and ``cancel_all``.
-    The one exception is
+    Order placement rejects while the halt lasts. A platform-wide halt also
+    blocks :meth:`~loaf.resources.orders.OrdersResource.cancel` and
+    ``cancel_all`` (a single-property halt does not). The one exception is
     :meth:`~loaf.resources.orders.OrdersResource.cancel_conditional`, which is
     database-only and stays available — during a platform halt it is your only
     way to pull a resting stop before the reopen. Otherwise back off and retry
@@ -105,7 +171,9 @@ class CompetitionEligibilityError(LoafForbiddenError):
     """403 ``NOT_COMPETITION_PARTICIPANT`` — not admitted to the active round.
 
     Raised on order placement while a competition round is ACTIVE and your
-    account has not been admitted. Check your standing with
+    account has not been admitted, and also while the market switches modes,
+    while a round is being prepared, and while it is finalizing. Check your
+    standing with
     :meth:`loaf.resources.competition.CompetitionResource.queue_position`.
     """
 
@@ -123,11 +191,9 @@ class LoafNotFoundError(LoafAPIError):
 
 
 class LoafConflictError(LoafAPIError):
-    """409 — conflict (e.g. handle already taken, referral already redeemed)."""
-
-
-class LoafBusinessRuleError(LoafAPIError):
-    """422 — a business rule rejected the request (e.g. price-band violation)."""
+    """409 — conflict (e.g. a cancel that lost the race to a fill, a stop /
+    take nonce already used by a different order, payout details already
+    submitted)."""
 
 
 class LoafRateLimitError(LoafAPIError):
@@ -148,7 +214,12 @@ class LoafServerError(LoafAPIError):
 
 
 class LoafServiceUnavailableError(LoafServerError):
-    """503 — the trading service is temporarily unavailable (transient; retry)."""
+    """503 — a service is temporarily unavailable, e.g. the trading service, or
+    candle history under load (``Candle history is busy…``).
+
+    Transient: the client retries reads, and re-sends signed placements (see
+    :meth:`~loaf.resources.orders.OrdersResource.create`), before raising it.
+    """
 
 
 def _client_validation_error(message: str, details: list[str] | None = None) -> LoafValidationError:
@@ -169,13 +240,15 @@ def error_from_response(
     details: list[str] | None = None
 
     if isinstance(body, dict):
-        message = str(body.get("error") or body.get("message") or message)
+        message = str(body.get("error") or message)
         code = body.get("code")
         raw_details = body.get("details")
         if isinstance(raw_details, list):
             details = [str(d) for d in raw_details]
     elif isinstance(body, str) and body.strip():
-        message = body.strip()
+        # A route that does not exist answers with an HTML page: keep just its <pre> text.
+        pre = _PRE_RE.search(body)
+        message = html.unescape(pre.group(1)).strip() if pre else body.strip()
 
     kwargs: dict[str, Any] = dict(
         status_code=status_code,
@@ -193,8 +266,6 @@ def error_from_response(
         # The halt rejection carries no machine code — match on the message.
         if "halted" in message.lower():
             return TradingHaltedError(message, **kwargs)
-        if "kyc" in message.lower() or "wholesale" in message.lower():
-            return KycRequiredError(message, **kwargs)
         return LoafForbiddenError(message, **kwargs)
     if status_code == 400:
         return LoafValidationError(message, **kwargs)
@@ -202,8 +273,6 @@ def error_from_response(
         return LoafNotFoundError(message, **kwargs)
     if status_code == 409:
         return LoafConflictError(message, **kwargs)
-    if status_code == 422:
-        return LoafBusinessRuleError(message, **kwargs)
     if status_code == 429:
         return LoafRateLimitError(message, retry_after=retry_after, **kwargs)
     if status_code == 503:

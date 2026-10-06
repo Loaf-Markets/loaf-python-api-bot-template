@@ -36,7 +36,7 @@ class Candle(TypedDict):
 
 
 class CandleHistory(TypedDict, total=False):
-    """Response to ``GET /trade/{token}/candles`` (see ``market.candles``)."""
+    """Response to ``GET /trade/{ticker}/candles`` (see ``market.candles``)."""
 
     resolution: str  # CandleResolution
     candles: list[Candle]  # oldest -> newest
@@ -56,11 +56,21 @@ class TradeTick(TypedDict, total=False):
 
 
 class OrderResult(TypedDict, total=False):
-    """Response to ``POST /orders`` and the cancel endpoints (exchange acknowledgement)."""
+    """Response to ``POST /orders`` (``orders.create`` and its wrappers)."""
 
     success: bool
     orderId: int
-    errorMessage: str
+    # OrderStatus as of the commit that admitted it; OPEN / PARTIALLY_FILLED mean it is resting.
+    status: str
+    quantityLeft: float  # tokens not filled (the cancelled remainder on CANCELLED)
+    duplicate: bool  # an order with this nonce already existed (e.g. an SDK re-send)
+
+
+class OrderAck(TypedDict, total=False):
+    """Response to ``POST /orders/conditional`` and the single cancels."""
+
+    success: bool
+    orderId: int
 
 
 class CancelAllResult(TypedDict, total=False):
@@ -83,15 +93,19 @@ class OrderHistoryItem(TypedDict, total=False):
 
     id: int
     propertyId: int
-    tokenName: str  # "" on a conditional for a delisted/uncached property — key on propertyId
+    ticker: str  # "" on a conditional for a delisted/uncached property — key on propertyId
     side: str  # OrderSide
     type: str  # OrderType, or ConditionalOrderType — THIS is the discriminator
     timeInForce: str
     quantity: float
-    price: Optional[float]  # None for market orders; on a conditional, the SIGNED limit price
+    # The signed limit; for a MARKET order the worst price it was signed at; on a
+    # conditional, the price it books at.
+    price: float
     status: str  # OrderStatus, or ConditionalOrderStatus on a conditional
     filledQuantity: float  # booked orders only — absent on a conditional
-    rejectionReason: Optional[str]  # on a live ARMED row: the last deferred attempt, not a failure
+    # Conditionals only: on a live ARMED row the last deferred attempt, not a failure;
+    # always None on booked orders.
+    rejectionReason: Optional[str]
     deadline: int
     filledAt: Optional[int]  # booked orders only — absent on a conditional
     cancelledAt: Optional[int]
@@ -105,21 +119,22 @@ class OrderHistoryItem(TypedDict, total=False):
 class TradeHistoryItem(TypedDict, total=False):
     tradeId: int
     propertyId: int
-    tokenName: str
-    txHash: str
+    ticker: str
+    txHash: str  # '' until a batch proof covers the trade; trades are final at match
     side: str  # OrderSide, relative to this user
     quantity: float
     price: float
     fee: float  # this user's fee, dollars
     executedAt: int
-    status: str  # TradeStatus
 
 
 class Position(TypedDict, total=False):
     propertyId: int
-    tokenName: str
+    ticker: str
+    tokenName: str  # display name
     quantity: float  # tradeable (total minus frozen)
     totalQuantity: float
+    totalTokens: float  # the property's total token supply
     averageEntryPrice: float
     marketPrice: float
     percentChange: float  # plain percent
@@ -128,6 +143,7 @@ class Position(TypedDict, total=False):
     propertyPnlPercent: float
     isIpoAllocation: bool
     imageUrl: str
+    sparkline: list[float]
 
 
 class PortfolioComponent(TypedDict, total=False):
@@ -144,13 +160,6 @@ class PortfolioComponent(TypedDict, total=False):
     tradeHistory: list[TradeHistoryItem]
     orderHistory: list[OrderHistoryItem]  # newest rows of both kinds, ANY status
     transfers: list[dict[str, Any]]
-
-
-class IpoSubscribeResult(TypedDict, total=False):
-    success: bool
-    subscriptionId: int  # the IPO order id to track
-    allocatedQuantity: float  # may be less than requested if partial
-    errorMessage: str
 
 
 class LeaderboardEntry(TypedDict, total=False):
@@ -248,12 +257,12 @@ __all__ = [
     "CandleHistory",
     "TradeTick",
     "OrderResult",
+    "OrderAck",
     "CancelAllResult",
     "OrderHistoryItem",
     "TradeHistoryItem",
     "Position",
     "PortfolioComponent",
-    "IpoSubscribeResult",
     "LeaderboardEntry",
     "PrizePoolEntry",
     "VolumeMultiplierTier",
