@@ -671,19 +671,33 @@ class OrdersResource(Resource):
         return self.cancel_conditional(order_id)
 
     def cancel_all(self) -> Any:
-        """``POST /orders/cancel-all`` — best-effort cancel of every open order.
+        """``POST /orders/cancel-all`` — cancel every open order.
 
-        Returns ``{requestedCount, cancelledOrderIds, failedOrders}``. A 200 can
-        still list ``failedOrders`` (e.g. orders that filled mid-sweep). Your
-        "flatten / panic" button.
+        Returns ``{requestedCount, cancelledOrderIds, failedOrders}``, where
+        ``requestedCount`` is ``len(cancelledOrderIds) + len(failedOrders)``.
+        Your "flatten / panic" button.
 
         It cancels your ``PENDING`` / ``ARMED`` conditionals FIRST and prepends
-        their conditional-row ids to ``cancelledOrderIds`` (and counts them in
-        ``requestedCount``), so those ids will 404 against any booked-order
-        lookup. It is NOT available under a platform-wide halt — it refuses
-        before cancelling anything, and :meth:`cancel_conditional` is the only
-        cancel that still works then. A 503 can arrive after the conditionals
-        were already cancelled.
+        their conditional-row ids to ``cancelledOrderIds``, so those ids will
+        404 against any booked-order lookup. Then one request to the matching
+        engine cancels all your resting orders at once, in one database
+        transaction: an order placed while it runs may or may not be included,
+        one placed after the response is not.
+
+        ``failedOrders`` lists only orders the engine could not cancel because
+        the request did not complete on their property (an internal fault, or
+        the outcome there is unknown). They stay open, each with the
+        ``errorMessage`` "Trading service is temporarily unavailable. Please
+        try again in a moment."; calling ``cancel_all()`` again is safe (the
+        request is idempotent).
+
+        It is NOT available under a platform-wide halt — it refuses before
+        cancelling anything (:class:`~loaf.exceptions.TradingHaltedError`), and
+        :meth:`cancel_conditional` is the only cancel that still works then. A
+        503 (:class:`~loaf.exceptions.LoafServiceUnavailableError`) means the
+        engine did not process the request or its outcome is unknown; it can
+        arrive after the conditionals were already cancelled, and retrying is
+        safe.
         """
         return self._client.post("/orders/cancel-all")
 
