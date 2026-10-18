@@ -52,8 +52,10 @@ class HistoryResource(Resource):
         Returns ``{trades, total, page, pageSize, nextCursor}``. ``side`` and
         ``fee`` are reported from this user's perspective.
 
-        Trades are final when they match; ``txHash`` is ``""`` until a batch
-        proof covers the trade.
+        Trades are final when they match. ``txHash`` is the trade's content
+        hash, set at the match, not an on-chain transaction; the custody-chain
+        transaction that executed the trade's batch is ``proof["batchTxHash"]``,
+        ``None`` until that batch executes.
         """
         return self._client.get(
             "/history/trades",
