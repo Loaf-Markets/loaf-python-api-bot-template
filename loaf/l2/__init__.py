@@ -13,10 +13,9 @@ from __future__ import annotations
 
 from .pricing import js_round, scale_price, scale_quantity
 from .signer import L2Signer, default_signer
-from .trading import DEFAULT_L2_CHAIN_ID, L2Config, L2KeyState, L2Market, L2Trader, OrderIntent
+from .trading import L2Config, L2KeyState, L2Market, L2Trader, OrderIntent
 
 __all__ = [
-    "DEFAULT_L2_CHAIN_ID",
     "L2Config",
     "L2KeyState",
     "L2Market",

@@ -3,7 +3,8 @@
 The backend refuses an order that is not L2-signed (rule L0). This module signs as the Loaf web app
 signs (loafx-frontend ``apps/trade/src/l2`` placeOrder.ts, orderBody.ts, orderIndexPool.ts):
 
-* the property's L2 market (market index, base and quote asset) comes from its detail,
+* the property's L2 market (market index, base and quote asset, and its custody's L2 chain id)
+  comes from its detail,
   ``GET /trade/{ticker}`` (``property.l2Market``), read again at most every 30 s;
 * the account, its settle epoch and the key in force come from ``GET /l2/keys``, read again after
   ``key_state_max_age_s`` and after a refusal that names the epoch, the key or the signature;
@@ -43,8 +44,6 @@ L2_ORDER_LIFE_MARGIN_MS = 16_777_216
 L2_MAX_SIGNED_LIFE_MS = L2_MAX_ORDER_LIFE_MS - 2 * L2_ORDER_LIFE_MARGIN_MS
 MIN_L2_ORDER_TTL_MS = 60_000
 DEFAULT_L2_ORDER_TTL_MS = 7 * 86_400_000
-#: The canonical ZkLoaf L2 chain id, "loaf" (Loaf-Backend src/config/l2Settle.ts DEFAULT_L2_CHAIN_ID).
-DEFAULT_L2_CHAIN_ID = 1_819_238_758
 #: The highest spot taker fee in the backend's tiers, 70 bps, per million (Loaf-Backend feeTiers.ts).
 DEFAULT_L2_FEE_RATE_CAP = 7_000
 #: Indices one reservation asks for: the web app's block. The engine lets an account hold at most
@@ -63,6 +62,8 @@ MAX_48 = 281_474_976_710_655
 MAX_SAFE_INTEGER = 2**53 - 1
 MAX_ASSET_ID = 62
 MAX_ORDER_INDEX = 1_099_511_627_775
+#: One KoalaBear element (Shared-Types KB_MODULUS): a market's L2 chain id is below it, or the signer refuses it.
+KB_MODULUS = 2_130_706_433
 
 #: The engine's refusals this client acts on, byte for byte (Shared-Types L2_REASONS; engine l2.rs).
 INDEX_USED = "l2 order_index: already used by the account; re-sign with the next index"
@@ -108,17 +109,16 @@ def _ranged(name: str, value: int, lo: int, hi: int) -> int:
 
 @dataclass(frozen=True)
 class L2Config:
-    """What the API does not serve: the L2 chain, the fee consent, the order life and the index
-    block (the web app's build env, config.ts)."""
+    """What the API does not serve: the fee consent, the order life and the index block (the web
+    app's build env, config.ts). The L2 chain id an order signs is its market's
+    (:class:`L2Market`, ``property.l2Market.l2ChainId``)."""
 
-    l2_chain_id: int = DEFAULT_L2_CHAIN_ID
     fee_rate_cap: int = DEFAULT_L2_FEE_RATE_CAP
     buffer_ms: int = L2_BUFFER_MS
     order_ttl_ms: int = DEFAULT_L2_ORDER_TTL_MS
     index_block: int = DEFAULT_ORDER_INDEX_BLOCK
 
     def __post_init__(self) -> None:
-        _ranged("l2_chain_id", self.l2_chain_id, 1, MAX_32)
         _ranged("fee_rate_cap", self.fee_rate_cap, 0, MAX_20)
         # buffer_ms may only raise the engine's BUFFER: a lower value signs expiries the engine refuses.
         _ranged("buffer_ms", self.buffer_ms, L2_BUFFER_MS, L2_MAX_SIGNED_LIFE_MS - MIN_L2_ORDER_TTL_MS)
@@ -127,14 +127,12 @@ class L2Config:
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "L2Config":
-        """``LOAF_L2_CHAIN_ID``, ``LOAF_L2_FEE_RATE_CAP`` (per million: must cover the account's
-        maker and taker rate), ``LOAF_L2_BUFFER_MS``, ``LOAF_L2_ORDER_TTL_MS`` (how long an order
-        rests once past the buffer) and ``LOAF_L2_ORDER_INDEX_BLOCK``; each unset one is the
-        default."""
+        """``LOAF_L2_FEE_RATE_CAP`` (per million: must cover the account's maker and taker rate),
+        ``LOAF_L2_BUFFER_MS``, ``LOAF_L2_ORDER_TTL_MS`` (how long an order rests once past the
+        buffer) and ``LOAF_L2_ORDER_INDEX_BLOCK``; each unset one is the default."""
         env = os.environ if env is None else env
         buffer_ms = _env_int(env, "LOAF_L2_BUFFER_MS", L2_BUFFER_MS, L2_BUFFER_MS, L2_MAX_SIGNED_LIFE_MS - MIN_L2_ORDER_TTL_MS)
         return cls(
-            l2_chain_id=_env_int(env, "LOAF_L2_CHAIN_ID", DEFAULT_L2_CHAIN_ID, 1, MAX_32),
             fee_rate_cap=_env_int(env, "LOAF_L2_FEE_RATE_CAP", DEFAULT_L2_FEE_RATE_CAP, 0, MAX_20),
             buffer_ms=buffer_ms,
             order_ttl_ms=_env_int(
@@ -146,11 +144,13 @@ class L2Config:
 
 @dataclass(frozen=True)
 class L2Market:
-    """A property's book on the engine and its custody (Shared-Types ``L2PropertyMarket``)."""
+    """A property's book on the engine, its custody and the custody's own L2 chain id, which every
+    order on it signs (Shared-Types ``L2PropertyMarket``; the proxy's ``k1ChainId()``)."""
 
     ticker: str
     chain_id: int
     proxy_address: str
+    l2_chain_id: int
     market_index: int
     base_asset_id: int
     quote_asset_id: int
@@ -164,7 +164,7 @@ def parse_l2_market(ticker: str, market: Any) -> Optional[L2Market]:
     where = f"GET /trade/{ticker}: property.l2Market"
     if not isinstance(market, Mapping):
         raise LoafL2Error(f"{where} must be an object")
-    keys = {"chainId", "proxyAddress", "marketIndex", "baseAssetId", "quoteAssetId"}
+    keys = {"chainId", "proxyAddress", "l2ChainId", "marketIndex", "baseAssetId", "quoteAssetId"}
     if set(market) != keys:
         raise LoafL2Error(f"{where} must have exactly the keys {sorted(keys)}; received {sorted(market)}")
 
@@ -181,6 +181,7 @@ def parse_l2_market(ticker: str, market: Any) -> Optional[L2Market]:
         ticker=ticker,
         chain_id=ranged("chainId", 1, MAX_SAFE_INTEGER),
         proxy_address=proxy,
+        l2_chain_id=ranged("l2ChainId", 1, KB_MODULUS - 1),
         market_index=ranged("marketIndex", 0, MAX_12),
         base_asset_id=ranged("baseAssetId", 1, MAX_ASSET_ID),
         quote_asset_id=ranged("quoteAssetId", 1, MAX_ASSET_ID),
@@ -456,7 +457,7 @@ class L2Trader:
         ``Math.round`` (:mod:`loaf.l2.pricing`), so they are scaled from the same floats."""
         assert state.epoch is not None
         return {
-            "l2ChainId": self.config.l2_chain_id,
+            "l2ChainId": market.l2_chain_id,
             "l2MarketIndex": market.market_index,
             "l2BaseAssetId": market.base_asset_id,
             "l2QuoteAssetId": market.quote_asset_id,

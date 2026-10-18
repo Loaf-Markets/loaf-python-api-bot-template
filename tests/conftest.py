@@ -34,9 +34,13 @@ NOW = int(time.time() * 1000)
 EXPIRY = NOW + 86_400_000 + 7 * 86_400_000
 ACCOUNT = 42
 EPOCH = 3
+#: The L2 chain id the test market serves and its orders sign: the one K1's KAT vectors and viem's
+#: signatures use.
+CHAIN_ID = 1_819_238_758
 MARKET = {
     "chainId": 421614,
     "proxyAddress": "0x1111111111111111111111111111111111111111",
+    "l2ChainId": CHAIN_ID,
     "marketIndex": 5,
     "baseAssetId": 7,
     "quoteAssetId": 1,
@@ -59,7 +63,6 @@ _ENV_VARS = (
     "LOAF_API_BASE_URL",
     "LOAF_WS_URL",
     "LOAF_MAX_SLIPPAGE_BPS",
-    "LOAF_L2_CHAIN_ID",
     "LOAF_L2_FEE_RATE_CAP",
     "LOAF_L2_BUFFER_MS",
     "LOAF_L2_ORDER_TTL_MS",

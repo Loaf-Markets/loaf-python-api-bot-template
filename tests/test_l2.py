@@ -18,9 +18,9 @@ from loaf.exceptions import L2SignerError, LoafL2Error
 from loaf.l2.pricing import js_round, scale_price, scale_quantity
 from loaf.l2.signer import HERE, KAT, PLATFORMS, PROVENANCE, L2Signer, vendored_library
 from loaf.l2.trading import (
-    DEFAULT_L2_CHAIN_ID,
     INDEX_REFUSALS,
     INDEX_USED,
+    KB_MODULUS,
     RESERVE_TOO_SOON,
     L2Config,
     OrderIntent,
@@ -29,6 +29,7 @@ from loaf.l2.trading import (
 from conftest import (
     ACCOUNT,
     BASE,
+    CHAIN_ID,
     MARKET,
     NOW,
     ORDER_KEYS,
@@ -239,6 +240,12 @@ def test_key_state_read_again_after_a_key_refusal(exchange, trading_client, cloc
         ({"keys_missing": True}, "no L2 account"),
         ({"market": None}, "no L2 market is listed"),
         ({"market": {**MARKET, "extra": 1}}, "exactly the keys"),
+        # The market's L2 chain id (the proxy's k1ChainId()) is required, and one KoalaBear element.
+        ({"market": {k: v for k, v in MARKET.items() if k != "l2ChainId"}}, "exactly the keys"),
+        ({"market": {**MARKET, "l2ChainId": 0}}, "l2ChainId must be an integer from 1 to 2130706432"),
+        ({"market": {**MARKET, "l2ChainId": KB_MODULUS}}, "l2ChainId must be an integer from 1 to 2130706432"),
+        ({"market": {**MARKET, "l2ChainId": True}}, "l2ChainId must be an integer"),
+        ({"market": {**MARKET, "l2ChainId": str(CHAIN_ID)}}, "l2ChainId must be an integer"),
         ({"market": {**MARKET, "quoteAssetId": 7}}, "must differ"),
     ],
 )
@@ -307,29 +314,45 @@ def test_create_many_signs_one_root_and_posts_each(exchange, trading_client):
 
 def test_config_from_env(exchange, trading_client, monkeypatch):
     cfg = L2Config.from_env({})
-    defaults = (cfg.l2_chain_id, cfg.fee_rate_cap, cfg.order_ttl_ms, cfg.index_block)
-    assert defaults == (1_819_238_758, 7000, 7 * 86_400_000, 64)
-    assert L2Config.from_env({"LOAF_L2_CHAIN_ID": "304", "LOAF_L2_ORDER_INDEX_BLOCK": "4096"}).l2_chain_id == 304
+    defaults = (cfg.fee_rate_cap, cfg.order_ttl_ms, cfg.index_block)
+    assert defaults == (7000, 7 * 86_400_000, 64)
+    assert L2Config.from_env({"LOAF_L2_ORDER_INDEX_BLOCK": "4096"}).index_block == 4096
+    # The L2 chain id is the market's (property.l2Market.l2ChainId): no setting names it.
+    assert L2Config.from_env({"LOAF_L2_CHAIN_ID": "304"}) == cfg
     for env, text in [
         ({"LOAF_L2_BUFFER_MS": "1000"}, "LOAF_L2_BUFFER_MS"),
         ({"LOAF_L2_ORDER_INDEX_BLOCK": "4097"}, "LOAF_L2_ORDER_INDEX_BLOCK"),
         ({"LOAF_L2_ORDER_TTL_MS": "59999"}, "LOAF_L2_ORDER_TTL_MS"),
-        ({"LOAF_L2_CHAIN_ID": "x"}, "LOAF_L2_CHAIN_ID"),
         ({"LOAF_L2_FEE_RATE_CAP": "1048576"}, "LOAF_L2_FEE_RATE_CAP"),
     ]:
         with pytest.raises(LoafL2Error, match=text):
             L2Config.from_env(env)
     with pytest.raises(LoafL2Error, match="order_ttl_ms"):
         L2Config(order_ttl_ms=4_261_412_864)
-    config = L2Config(l2_chain_id=304, fee_rate_cap=5000, order_ttl_ms=60_000)
+    config = L2Config(fee_rate_cap=5000, order_ttl_ms=60_000)
     trading_client(l2_config=config).orders.limit_buy("OPRA", 1, 100)
     (body,) = exchange.bodies("/orders")
     signed = (body["l2ChainId"], body["l2FeeRateCap"], body["l2ExpiryMs"])
-    assert signed == (304, 5000, NOW + 86_400_000 + 60_000)
+    assert signed == (CHAIN_ID, 5000, NOW + 86_400_000 + 60_000)
     assert_signed(body)
     # A client given no l2_config reads the environment when it makes its trader.
-    monkeypatch.setenv("LOAF_L2_CHAIN_ID", "304")
-    assert LoafClient(base_url=BASE, l2_secret_key=SK0, l2_signer=SIGNER).l2.config.l2_chain_id == 304
+    monkeypatch.setenv("LOAF_L2_FEE_RATE_CAP", "5000")
+    assert LoafClient(base_url=BASE, l2_secret_key=SK0, l2_signer=SIGNER).l2.config.fee_rate_cap == 5000
+
+
+def test_each_market_signs_its_own_l2_chain_id(exchange, trading_client):
+    # A competition round's vault is its own proxy, so its own L2 chain id (here the highest one
+    # KoalaBear element allows): an order signs its market's, never another's.
+    round_market = {**MARKET, "proxyAddress": "0x" + "c" * 40, "l2ChainId": KB_MODULUS - 1, "marketIndex": 4094}
+    exchange.details["CPSA"] = detail("CPSA", round_market)
+    client = trading_client()
+    client.orders.limit_buy("OPRA", 1, 100)
+    client.orders.limit_buy("CPSA", 1, 100)
+    opra, cps = exchange.bodies("/orders")
+    assert (opra["l2ChainId"], cps["l2ChainId"]) == (CHAIN_ID, KB_MODULUS - 1)
+    assert (opra["l2MarketIndex"], cps["l2MarketIndex"]) == (MARKET["marketIndex"], 4094)
+    assert_signed(opra)
+    assert_signed(cps)
 
 
 # --------------------------------------------------------------------------- #
@@ -365,12 +388,12 @@ def test_key_typed_data_signs_as_viem():
     from loaf.l2.keys import Custody, change_pub_key_typed_data, l2_key_typed_data
 
     assert Account.from_key(key).address == VIEM["wallet"]
-    custody = Custody(421614, PROXY)
-    assert sign_typed(key, l2_key_typed_data(VIEM["wallet"], custody, DEFAULT_L2_CHAIN_ID, 7, 2)) == VIEM["l2Key"]
+    custody = Custody(421614, PROXY, CHAIN_ID)
+    assert sign_typed(key, l2_key_typed_data(VIEM["wallet"], custody, 7, 2)) == VIEM["l2Key"]
     typed = change_pub_key_typed_data(VIEM["wallet"], custody, 7, PK0, 2, 1_800_000_000)
     assert sign_typed(key, typed) == VIEM["changePubKey"]
     with pytest.raises(LoafL2Error, match="key nonce"):
-        l2_key_typed_data(VIEM["wallet"], custody, DEFAULT_L2_CHAIN_ID, 7, 2**53)
+        l2_key_typed_data(VIEM["wallet"], custody, 7, 2**53)
 
 
 class FakeCustody:
@@ -388,14 +411,15 @@ class FakeCustody:
 
 
 class KeysAPI:
-    def __init__(self, journaled: Optional[str]) -> None:
+    def __init__(self, journaled: Optional[str], market: Optional[Dict[str, Any]] = None) -> None:
         self.journaled = journaled
+        self.market = {**MARKET, "proxyAddress": PROXY} if market is None else market
         self.posted: List[Dict[str, Any]] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path[len("/api"):]
         if path == "/trade/OPRA":
-            return httpx.Response(200, json={"property": {"l2Market": {**MARKET, "proxyAddress": PROXY}}})
+            return httpx.Response(200, json={"property": {"l2Market": self.market}})
         if path == "/l2/keys" and request.method == "GET":
             return httpx.Response(200, json={"accountIndex": 7, "epoch": 1, "journaledKey": self.journaled, "pending": False})
         if path == "/l2/keys" and request.method == "POST":
@@ -415,7 +439,7 @@ def test_rotate_derives_the_web_apps_key_and_registers_it():
 
     api = KeysAPI(journaled="0x" + "cd" * 40)
     client = LoafClient(api_key="k", base_url=BASE, http_client=httpx.Client(transport=httpx.MockTransport(api), base_url=BASE))
-    keys = L2Keys(client, FakeCustody(nonce=2), key, DEFAULT_L2_CHAIN_ID, signer=SIGNER, now_s=lambda: 1_799_999_400.0,
+    keys = L2Keys(client, FakeCustody(nonce=2), key, signer=SIGNER, now_s=lambda: 1_799_999_400.0,
                   sleep=lambda s: None, log=lambda line: None)
     got = keys.rotate("OPRA")
     # The key the web app derives from the same signature (viem's), at the proxy's nonce.
@@ -426,9 +450,25 @@ def test_rotate_derives_the_web_apps_key_and_registers_it():
     typed = change_pub_key_typed_data(VIEM["wallet"], got.custody, 7, got.public_key, 2, 1_800_000_000)
     assert Account.recover_message(encode_typed_data(full_message=typed), signature=body["signature"]) == VIEM["wallet"]
     # derive: the key in force is the one at nonce n - 1 = 2 once the proxy's nonce is 3.
-    keys2 = L2Keys(client, FakeCustody(nonce=3), key, DEFAULT_L2_CHAIN_ID, signer=SIGNER, log=lambda line: None)
+    keys2 = L2Keys(client, FakeCustody(nonce=3), key, signer=SIGNER, log=lambda line: None)
     derived, in_force = keys2.derive("OPRA")
     assert derived.secret_key == got.secret_key and in_force is True
+
+
+def test_a_key_derives_at_its_vaults_served_l2_chain_id():
+    # The key signs its vault's own L2 chain id (property.l2Market.l2ChainId; a round's vault has its
+    # own): served another one, the same wallet derives another key, the one that typed data gives.
+    key = wallet_key()
+    from loaf.evm import keccak, sign_typed
+    from loaf.l2.keys import L2Keys, l2_key_typed_data
+
+    api = KeysAPI(journaled=None, market={**MARKET, "proxyAddress": PROXY, "l2ChainId": 93_780_210})
+    client = LoafClient(api_key="k", base_url=BASE, http_client=httpx.Client(transport=httpx.MockTransport(api), base_url=BASE))
+    derived, _ = L2Keys(client, FakeCustody(nonce=3), key, signer=SIGNER, log=lambda line: None).derive("OPRA")
+    assert derived.custody.l2_chain_id == 93_780_210
+    seed = keccak(hexstr=sign_typed(key, l2_key_typed_data(VIEM["wallet"], derived.custody, 7, 2)))
+    assert derived.secret_key == SIGNER.key_from_seed(seed)
+    assert derived.secret_key != SIGNER.key_from_seed(keccak(hexstr=VIEM["l2Key"]))
 
 
 def test_enable_refuses_a_key_in_force_that_differs_and_a_stale_nonce():
@@ -437,13 +477,13 @@ def test_enable_refuses_a_key_in_force_that_differs_and_a_stale_nonce():
 
     api = KeysAPI(journaled="0x" + "cd" * 40)
     client = LoafClient(api_key="k", base_url=BASE, http_client=httpx.Client(transport=httpx.MockTransport(api), base_url=BASE))
-    keys = L2Keys(client, FakeCustody(nonce=2), key, DEFAULT_L2_CHAIN_ID, signer=SIGNER, log=lambda line: None)
+    keys = L2Keys(client, FakeCustody(nonce=2), key, signer=SIGNER, log=lambda line: None)
     with pytest.raises(LoafL2Error, match="rotate"):
         keys.enable("OPRA")
     with pytest.raises(LoafL2Error, match="serves chain 1"):
-        L2Keys(client, FakeCustody(nonce=2, chain=1), key, DEFAULT_L2_CHAIN_ID, signer=SIGNER).custody("OPRA")
+        L2Keys(client, FakeCustody(nonce=2, chain=1), key, signer=SIGNER).custody("OPRA")
     with pytest.raises(LoafL2Error, match="deposit to open one"):
-        L2Keys(client, FakeCustody(nonce=0, account=2**48 - 1), key, DEFAULT_L2_CHAIN_ID, signer=SIGNER).derive("OPRA")
+        L2Keys(client, FakeCustody(nonce=0, account=2**48 - 1), key, signer=SIGNER).derive("OPRA")
     assert api.posted == []
 
 
@@ -463,7 +503,7 @@ def test_a_custody_ticker_is_matched_whole():
         return api(request)
 
     client = LoafClient(api_key="k", base_url=BASE, http_client=httpx.Client(transport=httpx.MockTransport(handler), base_url=BASE))
-    keys = L2Keys(client, FakeCustody(nonce=2), key, DEFAULT_L2_CHAIN_ID, signer=SIGNER, log=lambda line: None)
+    keys = L2Keys(client, FakeCustody(nonce=2), key, signer=SIGNER, log=lambda line: None)
     with pytest.raises(LoafL2Error, match="ticker must be 1-4"):
         keys.custody("OPRA\n")
     assert paths == []

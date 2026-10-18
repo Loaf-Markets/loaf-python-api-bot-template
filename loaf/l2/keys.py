@@ -37,7 +37,7 @@ from ..constants import ENV_L2_SECRET_KEY
 from ..evm import Account, ChainReader, keccak, sign_typed, to_checksum_address, typed_data
 from ..exceptions import LoafError, LoafL2Error
 from .signer import L2Signer, default_signer
-from .trading import MAX_SAFE_INTEGER, TICKER, L2Config, L2KeyState, parse_key_state, parse_l2_market
+from .trading import MAX_SAFE_INTEGER, TICKER, L2KeyState, parse_key_state, parse_l2_market
 
 # key.ts L2_KEY_DOMAIN, L2_KEY_WARNING, L2_KEY_TYPES and CHANGE_PUB_KEY_TYPES, byte for byte.
 L2_KEY_DOMAIN = {"name": "Loaf L2 Key", "version": "2"}
@@ -95,13 +95,14 @@ def in_force_key_nonce(n: int) -> int:
 
 @dataclass(frozen=True)
 class Custody:
-    """The ZkLoaf proxy and the chain it is on (a property's ``l2Market``)."""
+    """The ZkLoaf proxy, the chain it is on and its own L2 chain id (a property's ``l2Market``)."""
 
     l1_chain_id: int
     proxy: str
+    l2_chain_id: int
 
 
-def l2_key_typed_data(wallet: str, custody: Custody, l2_chain_id: int, account_index: int, key_nonce: int) -> Dict[str, Any]:
+def l2_key_typed_data(wallet: str, custody: Custody, account_index: int, key_nonce: int) -> Dict[str, Any]:
     """The typed data the wallet signs to derive the key (key.ts l2KeyTypedData)."""
     if not isinstance(key_nonce, int) or isinstance(key_nonce, bool) or not 0 <= key_nonce <= MAX_SAFE_INTEGER:
         raise LoafL2Error(KEY_ERRORS["badNonce"])
@@ -112,7 +113,7 @@ def l2_key_typed_data(wallet: str, custody: Custody, l2_chain_id: int, account_i
         {
             "wallet": to_checksum_address(wallet),
             "zkLoaf": to_checksum_address(custody.proxy),
-            "l2ChainId": l2_chain_id,
+            "l2ChainId": custody.l2_chain_id,
             "accountIndex": account_index,
             "apiKeyIndex": API_KEY_INDEX,
             "keyNonce": key_nonce,
@@ -174,7 +175,6 @@ class CustodyReader:
 class TradingKey:
     wallet: str
     custody: Custody
-    l2_chain_id: int
     account_index: int
     key_nonce: int
     secret_key: str
@@ -199,7 +199,6 @@ class L2Keys:
         client: Any,
         reader: Any,
         private_key: str,
-        l2_chain_id: Optional[int] = None,
         signer: Optional[L2Signer] = None,
         now_s: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
@@ -210,7 +209,6 @@ class L2Keys:
         self._reader = reader
         self._private_key = private_key
         self.wallet: str = Account.from_key(private_key).address
-        self.l2_chain_id = L2Config.from_env().l2_chain_id if l2_chain_id is None else l2_chain_id
         self._signer = signer if signer is not None else default_signer()
         self._now_s = now_s
         self._sleep = sleep
@@ -224,7 +222,7 @@ class L2Keys:
         if not isinstance(prop, Mapping):
             raise LoafL2Error(f"GET /trade/{ticker} did not answer a property")
         market = parse_l2_market(ticker, prop.get("l2Market"))
-        return None if market is None else Custody(market.chain_id, to_checksum_address(market.proxy_address))
+        return None if market is None else Custody(market.chain_id, to_checksum_address(market.proxy_address), market.l2_chain_id)
 
     def custody(self, ticker: Optional[str] = None) -> Custody:
         """The vault of ``ticker``'s market; with no ticker, the one vault every listed L2 market
@@ -279,13 +277,12 @@ class L2Keys:
     # -- the key ---------------------------------------------------------------------------
     def derive_at(self, custody: Custody, account_index: int, key_nonce: int) -> TradingKey:
         """The key for this wallet, vault, account and nonce (key.ts deriveSessionKey)."""
-        data = l2_key_typed_data(self.wallet, custody, self.l2_chain_id, account_index, key_nonce)
+        data = l2_key_typed_data(self.wallet, custody, account_index, key_nonce)
         seed = keccak(hexstr=sign_typed(self._private_key, data))
         secret = self._signer.key_from_seed(seed)
         return TradingKey(
             wallet=self.wallet,
             custody=custody,
-            l2_chain_id=self.l2_chain_id,
             account_index=account_index,
             key_nonce=key_nonce,
             secret_key=secret,
@@ -410,7 +407,6 @@ def main(
         private_key = (env.get(args.wallet_key_env) or "").strip()
         if not private_key:
             raise LoafL2Error(f"{args.wallet_key_env} is required: the wallet's private key")
-        l2_chain_id = L2Config.from_env(env).l2_chain_id
         if reader is None:
             rpc_url = (env.get(ENV_L1_RPC_URL) or "").strip()
             if not rpc_url:
@@ -420,7 +416,7 @@ def main(
             from ..client import LoafClient
 
             client = LoafClient()
-        keys = L2Keys(client, reader, private_key, l2_chain_id, **kwargs)
+        keys = L2Keys(client, reader, private_key, **kwargs)
         if args.command == "derive":
             key, in_force = keys.derive(args.ticker)
         else:

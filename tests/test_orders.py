@@ -23,11 +23,12 @@ import pytest
 import loaf
 from loaf import LoafClient, OrderOutcomeUnknownError
 from loaf.l2.signer import KAT
-from loaf.l2.trading import DEFAULT_L2_CHAIN_ID, L2Trader
+from loaf.l2.trading import L2Trader
 
 from conftest import (
     ACCOUNT,
     BASE,
+    CHAIN_ID,
     CONDITIONAL_KEYS,
     EPOCH,
     EXPIRY,
@@ -102,7 +103,7 @@ def test_limit_body_signed_no_bearer(exchange, trading_client):
         "side": "BUY",
         "type": "LIMIT",
         "timeInForce": "GTC",
-        "l2ChainId": DEFAULT_L2_CHAIN_ID,
+        "l2ChainId": CHAIN_ID,
         "l2AccountIndex": ACCOUNT,
         "l2MarketIndex": MARKET["marketIndex"],
         "l2OrderIndex": 1000,

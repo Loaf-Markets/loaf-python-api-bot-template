@@ -82,7 +82,10 @@ export the variables.
 Every order is signed by your account's **L2 trading key** before it is sent;
 the exchange refuses an order that is not. It is the same key the Loaf web app
 derives from your wallet when you enable trading there, so a wallet has one key
-wherever it trades. Your L2 account opens with your first deposit (in the web
+wherever it trades. An order and a key also sign the L2 chain id of the vault
+they are for, which the API serves with each market (`property.l2Market.l2ChainId`,
+the vault's own: a competition round's vault has its own), so there is nothing
+to configure for it. Your L2 account opens with your first deposit (in the web
 app); then derive the key once and register it:
 
 ```bash
