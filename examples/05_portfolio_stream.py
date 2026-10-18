@@ -25,9 +25,14 @@ def main() -> None:
 
     ws = client.websocket()
 
-    ws.on_balances(lambda m: print(f"BALANCE cash={m.cash:,.2f} frozen={m.frozen:,.2f}"))
-    ws.on_position(lambda m: print(f"POSITION {m.ticker} qty={m.quantity} "
-                                   f"total={m.totalQuantity} avg={m.averageEntryPrice}"))
+    def units(row, key):
+        return int(row[key]) / 10 ** row.decimals  # base units as a decimal string
+
+    # The whole L2 book as the engine committed it: replace what you hold.
+    ws.on_balances(lambda m: print("BALANCES " + "  ".join(
+        f"{b.symbol}={units(b, 'available'):,.6f}" for b in m.balances)))
+    # An IPO allocation (an L2 holding's position is read from portfolio.component()).
+    ws.on_position(lambda m: print(f"POSITION {m.position.ticker} qty={m.position.get('quantity')}"))
     # Two order frames: `order_update` carries the full committed order (sent
     # when it is accepted and on every conditional transition; for an order that
     # trades immediately it can follow the fill frames), `order_status` just the
@@ -37,10 +42,10 @@ def main() -> None:
     ws.on_order_status(lambda m: print(f"ORDER #{m.orderId} -> {m.status} "
                                        f"(left {m.get('quantityLeft')})"))
     ws.on_trade(lambda m: print(f"FILL {m.trade.side} {m.trade.quantity} "
-                                f"{m.trade.ticker} @ {m.trade.price} "
-                                f"fee={m.trade.fee} #{m.trade.tradeId}"))
-    ws.on_transfer(lambda m: print(f"TRANSFER {m.transfer.type} {m.transfer.amount} "
-                                   f"-> {m.transfer.status}"))
+                                f"{m.trade.ticker} @ {m.trade.price} fee={m.trade.fee} "
+                                f"#{m.trade.tradeId} proof={(m.trade.get('proof') or {}).get('status')}"))
+    ws.on_transfer(lambda m: print(f"TRANSFER {m.transfer.type} {units(m.transfer, 'amount'):,.6f} "
+                                   f"{m.transfer.symbol} -> {m.transfer.status}"))
     ws.on_offering_order(lambda m: print(f"IPO ORDER #{m.order.ipoOrderId} -> {m.order.status}"))
     ws.on_error(lambda m: print(f"ERROR {m.get('message')}"))
 

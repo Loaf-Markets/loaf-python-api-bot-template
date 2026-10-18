@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import numbers
 from decimal import (
-    ROUND_HALF_UP,
+    ROUND_CEILING,
+    ROUND_FLOOR,
     Context,
     Decimal,
     DivisionByZero,
@@ -128,19 +129,25 @@ def _worst_price(reference_price: Any, side: str, max_slippage_bps: int) -> Deci
     side = _check_side(side)
     bps = validate_slippage_bps(max_slippage_bps)
     factor = 10_000 + bps if side == "BUY" else 10_000 - bps
-    with localcontext(_DECIMAL_CONTEXT):
+    with localcontext(_DECIMAL_CONTEXT) as ctx:
+        # Enough digits that ref x factor / 10,000 is exact, so the rounding below sees the true value.
+        ctx.prec = max(ctx.prec, len(ref.as_tuple().digits) + 6)
         raw = ref * factor / 10_000
         if raw >= _ORDER_PRICE_MAX_DEC:
             return _ORDER_PRICE_MAX_DEC
-        return max(raw.quantize(_PRICE_TICK, rounding=ROUND_HALF_UP), _PRICE_TICK)
+        # Toward the reference (the web app's lib/slippage.ts): a BUY rounds down and a SELL up, so the
+        # signed price never passes the tolerance by part of a cent.
+        rounding = ROUND_FLOOR if side == "BUY" else ROUND_CEILING
+        return max(raw.quantize(_PRICE_TICK, rounding=rounding), _PRICE_TICK)
 
 
 def worst_price(reference_price: float | Decimal, side: str, max_slippage_bps: int) -> float:
     """The worst price the SDK signs off a reference.
 
     ``reference_price x (1 + max_slippage_bps/10,000)`` for a BUY and
-    ``x (1 - max_slippage_bps/10,000)`` for a SELL, rounded half-up to the cent
-    and never below 0.01. It is what :meth:`~loaf.resources.orders.OrdersResource.market_buy`
+    ``x (1 - max_slippage_bps/10,000)`` for a SELL, rounded toward the reference
+    to the cent (a BUY down, a SELL up, so it never passes the tolerance), never
+    below 0.01 and at most 1,000,000,000. It is what :meth:`~loaf.resources.orders.OrdersResource.market_buy`
     / ``market_sell`` sign (off the market reference), what a ``*_MARKET``
     conditional books at (off its trigger), and the lowest price a TP/SL leg
     sells at (off its trigger, as a SELL). Use it to size a MARKET BUY: it

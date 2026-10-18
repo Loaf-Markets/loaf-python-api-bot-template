@@ -19,7 +19,8 @@ DEFAULT_BASE_URL = "https://api.loafmarkets.com/api"
 
 #: Environment variables the client reads when arguments are omitted.
 ENV_API_KEY = "LOAF_API_KEY"
-ENV_AGENT_PRIVATE_KEY = "LOAF_AGENT_PRIVATE_KEY"
+#: The account's L2 trading key (80 lowercase hex), which signs every order.
+ENV_L2_SECRET_KEY = "LOAF_L2_SECRET_KEY"
 ENV_BASE_URL = "LOAF_API_BASE_URL"
 ENV_WS_URL = "LOAF_WS_URL"
 ENV_MAX_SLIPPAGE_BPS = "LOAF_MAX_SLIPPAGE_BPS"
@@ -42,7 +43,7 @@ DEFAULT_MAX_RETRIES = 3
 # Numeric precision
 # --------------------------------------------------------------------------- #
 
-#: Max decimal places accepted for a limit price (cents). Enforced server-side.
+#: Max decimal places accepted for a limit price (cents).
 MAX_PRICE_DECIMALS = 2
 
 #: Max decimal places accepted for a token quantity (0.1 of a token).
@@ -60,10 +61,3 @@ DEFAULT_MAX_SLIPPAGE_BPS = 200
 #: Upper bounds the exchange accepts for a price (dollars) and a quantity (tokens).
 ORDER_PRICE_MAX = 1_000_000_000
 ORDER_QUANTITY_MAX = 1_000_000_000
-
-#: A signed order's nonce carries its signing time; the exchange refuses one more than this far
-#: (milliseconds) from its clock.
-ORDER_NONCE_WINDOW_MS = 86_400_000
-
-#: Every order sends deadline 0 (only good-til-cancelled orders exist).
-DEFAULT_ORDER_DEADLINE = 0

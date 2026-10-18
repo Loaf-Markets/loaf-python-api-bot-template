@@ -1,51 +1,79 @@
-"""Shared fixtures for the offline tests: an in-memory exchange, a signing
-client wired to it, and an independent signature check.
+"""Shared fixtures for the offline tests: an in-memory exchange serving the routes an
+L2 order touches, a client wired to it that signs with K1's KAT key, and a
+signature check rebuilt from the backend's rules.
 
-Only public test keys appear here: never use them for real funds.
+Only the KAT's public test key appears here: never use it for real funds.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
-from eth_account import Account
-from eth_account.messages import encode_typed_data
-from eth_utils.crypto import keccak
 
 from loaf import LoafClient
 from loaf.constants import DEFAULT_TIMEOUT
+from loaf.l2.pricing import scale_price, scale_quantity
+from loaf.l2.signer import KAT, L2Signer
+from loaf.l2.trading import L2Config, L2Trader
 
-# Hardhat account #0: public test key — never use for real funds.
-HARDHAT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-HARDHAT_ADDRESS = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-
-CONTRACT = "0x1111111111111111111111111111111111111111"
-CONTRACT_B = "0x2222222222222222222222222222222222222222"
 BASE = "http://test/api"
 
-# The reference order vector: HARDHAT_KEY signs BUY 1.5 @ 160 over CONTRACT.
-VECTOR_NONCE = "0192a3b4c5d600112233445566778899"
-VECTOR_SIGNATURE = (
-    "0x7bc9e57296d5263219ed48f5fa5f0d04409ccf982345daca98b0bdef5516b6a6"
-    "724a2c4ce21bbd8886b90fcb360298ec0f240907e6a0b78cffc7ade0410066391c"
-)
+_KAT_KEY = json.loads(KAT.read_text())["keys"][0]
+#: K1's KAT key 0 (crates/l2-signer-ffi): a public test key, never use it for real funds.
+SK0 = _KAT_KEY["sk"]
+PK0 = "0x" + _KAT_KEY["pk"]
+
+#: The trader's clock in these tests, read once so every order in a run signs the same expiry.
+NOW = int(time.time() * 1000)
+#: What an order signs at NOW: the engine's one-day buffer, then the default seven-day life.
+EXPIRY = NOW + 86_400_000 + 7 * 86_400_000
+ACCOUNT = 42
+EPOCH = 3
+MARKET = {
+    "chainId": 421614,
+    "proxyAddress": "0x1111111111111111111111111111111111111111",
+    "marketIndex": 5,
+    "baseAssetId": 7,
+    "quoteAssetId": 1,
+}
+
+#: The keys of an order body, in the order the SDK sends them (orderBody.ts buildSignedL2OrderBody).
+ORDER_KEYS = [
+    "ticker", "price", "quantity", "side", "type", "timeInForce",
+    "l2ChainId", "l2AccountIndex", "l2MarketIndex", "l2OrderIndex", "l2Epoch",
+    "l2FeeRateCap", "l2ExpiryMs", "l2BaseAssetId", "l2QuoteAssetId", "l2SigS", "l2SigE",
+]  # fmt: skip
+#: A conditional order's: the same, then its trigger.
+CONDITIONAL_KEYS = ORDER_KEYS + ["triggerPrice"]
+#: An attached TP/SL leg's (orderBody.ts buildSignedL2Leg).
+LEG_KEYS = ["triggerPrice", "price", "l2OrderIndex", "l2ExpiryMs", "l2SigS", "l2SigE"]
 
 _ENV_VARS = (
     "LOAF_API_KEY",
-    "LOAF_AGENT_PRIVATE_KEY",
+    "LOAF_L2_SECRET_KEY",
     "LOAF_API_BASE_URL",
     "LOAF_WS_URL",
     "LOAF_MAX_SLIPPAGE_BPS",
+    "LOAF_L2_CHAIN_ID",
+    "LOAF_L2_FEE_RATE_CAP",
+    "LOAF_L2_BUFFER_MS",
+    "LOAF_L2_ORDER_TTL_MS",
+    "LOAF_L2_ORDER_INDEX_BLOCK",
+    "LOAF_L2_SIGNER_LIB",
+    "LOAF_WALLET_PRIVATE_KEY",
+    "LOAF_L1_RPC_URL",
+    "LOAF_IPO_RPC_URL",
 )
 
 
 @pytest.fixture(autouse=True)
 def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A developer shell's credentials (or max slippage) must not change what a test sees.
+    # A developer shell's credentials, max slippage or L2 settings must not change what a test sees.
     for name in _ENV_VARS:
         monkeypatch.delenv(name, raising=False)
 
@@ -57,85 +85,138 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=lambda seconds: None))
 
 
-def opera_detail(contract: str | None = CONTRACT, market_price: float = 160) -> dict:
-    """A ``GET /trade/OPRA`` body with just the fields order placement reads."""
+class ZeroAux(L2Signer):
+    """The vendored signer with its random bytes fixed, so a signature can be rebuilt and compared."""
+
+    @staticmethod
+    def _aux(aux: bytes | None) -> bytes:
+        return bytes(32) if aux is None else bytes(aux)
+
+
+SIGNER = ZeroAux()
+
+
+def detail(ticker: str = "OPRA", market: Any = MARKET, mark: Any = 160) -> dict:
+    """A ``GET /trade/{ticker}`` body with the fields order placement reads: the
+    property's L2 market and its market reference in ``propertyList``."""
     return {
         "property": {
-            "ticker": "OPRA",
+            "ticker": ticker,
             "tokenName": "Opera",
-            "contractAddress": contract,
             "status": "LIVE",
             "isHalted": False,
+            "l2Market": market,
         },
         "propertyList": [
-            {"ticker": "MUS", "tokenName": "Musgrave", "marketPrice": 50},
-            {"ticker": "OPRA", "tokenName": "Opera", "marketPrice": market_price},
+            {"ticker": "OTHR", "tokenName": "Other", "marketPrice": 9},
+            {"ticker": ticker, "tokenName": "Opera", "marketPrice": mark},
         ],
     }
 
 
 class FakeExchange:
-    """The order routes of the exchange, in memory, for ``httpx.MockTransport``.
+    """The routes an L2 order touches, in memory, for ``httpx.MockTransport``,
+    answering as Loaf-Backend at the K1 head does.
 
-    * ``GET /trade/{ticker}`` pops the next reply queued for it, else serves
-      ``details[ticker]``; an unknown ticker is a 404 ``Property not found``.
-      Replace an entry to change what it serves.
-    * ``POST /orders`` and ``/orders/conditional`` pop the next queued reply
-      (an ``httpx.Response``, or an exception to raise); an empty queue answers
-      200 with a fresh ``orderId``.
+    * ``GET /trade/{ticker}`` serves ``details[ticker]``; an unknown ticker is a
+      404 ``Property not found``. Replace an entry to change what it serves.
+    * ``GET /l2/keys`` serves the account (``account``, ``epoch``, ``journaled``),
+      or a 404 when ``keys_missing``.
+    * ``POST /l2/order-indices`` reserves the next block (``next_first``, then
+      1000 more each time), reserved a second before NOW.
+    * ``POST /orders`` and ``/orders/conditional`` answer 200 with a fresh
+      ``orderId``.
 
+    Any route first pops the next reply queued for its path, if there is one: an
+    ``httpx.Response``, an exception to raise, or a callable taking the request.
     Every request is recorded in :attr:`requests`.
     """
 
-    _ORDER_ROUTES = ("/api/orders", "/api/orders/conditional")
-
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
-        self.details: dict[str, dict] = {"OPRA": opera_detail()}
-        self._queues: dict[str, list[Any]] = {path: [] for path in self._ORDER_ROUTES}
+        self.details: dict[str, dict] = {"OPRA": detail()}
+        self.account = ACCOUNT
+        self.epoch: int | None = EPOCH
+        self.journaled: str | None = PK0
+        self.keys_missing = False
+        self.next_first = 1000
+        self._queues: dict[str, list[Any]] = {}
         self._order_id = 0
+        self._leg_id = 900
 
     def queue(self, path: str, *replies: Any) -> None:
         self._queues.setdefault("/api" + path, []).extend(replies)
 
-    def _pop(self, path: str) -> httpx.Response | None:
-        queue = self._queues.get(path)
+    def _pop(self, request: httpx.Request) -> httpx.Response | None:
+        queue = self._queues.get(request.url.path)
         if not queue:
             return None
         reply = queue.pop(0)
         if isinstance(reply, Exception):
             raise reply
+        if callable(reply):
+            return reply(request)
         return reply
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        path = request.url.path
-        if request.method == "GET" and path.startswith("/api/trade/"):
-            queued = self._pop(path)
-            if queued is not None:
-                return queued
-            detail = self.details.get(path[len("/api/trade/") :])
-            if detail is None:
+        queued = self._pop(request)
+        if queued is not None:
+            return queued
+        method, path = request.method, request.url.path[len("/api") :]
+        if method == "GET" and path.startswith("/trade/"):
+            found = self.details.get(path[len("/trade/") :])
+            if found is None:
                 return httpx.Response(404, json={"error": "Property not found"})
-            return httpx.Response(200, json=detail)
-        if request.method == "POST" and path in self._ORDER_ROUTES:
-            queued = self._pop(path)
-            if queued is not None:
-                return queued
+            return httpx.Response(200, json=found)
+        if method == "GET" and path == "/l2/keys":
+            if self.keys_missing:
+                return httpx.Response(404, json={"error": "l2 account: no L2 account for this user"})
+            return httpx.Response(
+                200,
+                json={
+                    "accountIndex": self.account,
+                    "epoch": self.epoch,
+                    "journaledKey": self.journaled,
+                    "pending": False,
+                    "withdrawalNonce": 0,
+                },
+            )
+        if method == "POST" and path == "/l2/order-indices":
+            first, self.next_first = self.next_first, self.next_first + 1000
+            count = json.loads(request.content)["count"]
+            return httpx.Response(
+                201,
+                json={
+                    "accountIndex": self.account,
+                    "firstIndex": first,
+                    "count": count,
+                    "reservedAtMs": NOW - 1000,
+                },
+            )
+        if method == "POST" and path == "/orders/conditional":
             self._order_id += 1
-            if path.endswith("/conditional"):
-                return httpx.Response(200, json={"success": True, "orderId": self._order_id})
+            return httpx.Response(200, json={"success": True, "orderId": self._order_id})
+        if method == "POST" and path == "/orders":
+            body = json.loads(request.content)
+            self._order_id += 1
+            legs = []
+            for leg in ("tp", "sl"):
+                if leg in body:
+                    self._leg_id += 1
+                    legs.append(self._leg_id)
             return httpx.Response(
                 200,
                 json={
                     "success": True,
                     "orderId": self._order_id,
                     "status": "OPEN",
-                    "quantityLeft": json.loads(request.content)["quantity"],
+                    "quantityLeft": body["quantity"],
                     "duplicate": False,
+                    "attachedLegIds": legs,
                 },
             )
-        return httpx.Response(404, json={"error": "Not found"})
+        return httpx.Response(404, json={"error": f"no route {method} {path}"})
 
     def posts(self, path: str) -> list[bytes]:
         """The raw bodies POSTed to ``path`` (e.g. ``"/orders"``), in order."""
@@ -150,65 +231,105 @@ class FakeExchange:
         return [r for r in self.requests if r.method == "GET" and r.url.path == "/api" + path]
 
 
+class Clock:
+    """A monotonic clock a test moves by hand (the trader's market and key-state ages)."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
 @pytest.fixture
 def exchange() -> FakeExchange:
     return FakeExchange()
 
 
 @pytest.fixture
-def trading_client(exchange: FakeExchange):
-    """``trading_client(api_key=..., agent_key=..., **LoafClient kwargs)`` -> a client
-    that signs with ``agent_key`` and talks to ``exchange``."""
+def clock() -> Clock:
+    return Clock()
+
+
+@pytest.fixture
+def trader_sleeps() -> list:
+    """The pauses the L2 trader took (a reservation refused as too soon is waited out once)."""
+    return []
+
+
+@pytest.fixture
+def trading_client(exchange: FakeExchange, clock: Clock, trader_sleeps: list):
+    """``trading_client(api_key=..., l2_key=..., l2_config=..., **LoafClient kwargs)`` -> a
+    client talking to ``exchange`` whose orders ``l2_key`` signs, with :data:`SIGNER`, the
+    clock reading NOW and ``clock`` as its monotonic clock."""
 
     def make(
-        *, api_key: str | None = "testkey", agent_key: str | None = HARDHAT_KEY, **kwargs: Any
+        *,
+        api_key: str | None = "testkey",
+        l2_key: str | None = SK0,
+        l2_config: L2Config | None = None,
+        **kwargs: Any,
     ) -> LoafClient:
         # The same timeout a LoafClient gives the httpx client it builds itself.
         http = httpx.Client(
             transport=httpx.MockTransport(exchange.handler), base_url=BASE, timeout=DEFAULT_TIMEOUT
         )
-        return LoafClient(
-            api_key=api_key, agent_private_key=agent_key, base_url=BASE, http_client=http, **kwargs
-        )
+        client = LoafClient(api_key=api_key, base_url=BASE, http_client=http, **kwargs)
+        if l2_key is not None:
+            client._l2 = L2Trader(
+                client,
+                l2_key,
+                config=l2_config or L2Config(),
+                signer=SIGNER,
+                clock_ms=lambda: NOW,
+                sleep=trader_sleeps.append,
+                monotonic=clock,
+            )
+        return client
 
     return make
 
 
-def recover(terms: dict, signature: str, contract: str = CONTRACT) -> str:
-    """The address that signed ``terms`` (``{side, price, quantity, nonce}``) over ``contract``.
-
-    Rebuilt straight from the exchange's verification rules with eth-account, not
-    with :mod:`loaf.signing`, so a match proves the two agree: the JSON numbers
-    are scaled like the backend's ``Math.round(price * 1000)`` /
-    ``Math.round(quantity * 10)`` (on-grid values are never at a .5 tie).
-    """
-    price_scaled = round(terms["price"] * 1000)
-    quantity_scaled = round(terms["quantity"] * 10)
-    typed_data = {
-        "types": {
-            "EIP712Domain": [
-                {"name": "name", "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-            ],
-            "Order": [
-                {"name": "nonceHash", "type": "bytes32"},
-                {"name": "propertyToken", "type": "address"},
-                {"name": "tokenAmount", "type": "uint96"},
-                {"name": "paymentAmount", "type": "uint96"},
-                {"name": "deadline", "type": "uint64"},
-                {"name": "isBuying", "type": "bool"},
-            ],
-        },
-        "primaryType": "Order",
-        "domain": {"name": "LoafSettlement", "version": "1", "chainId": 421614},
-        "message": {
-            "nonceHash": keccak(text=terms["nonce"]),
-            "propertyToken": contract.lower(),
-            "tokenAmount": quantity_scaled * 10**17,
-            "paymentAmount": price_scaled * quantity_scaled * 10**6 // 10**4,
-            "deadline": 0,
-            "isBuying": terms["side"] == "BUY",
-        },
+def signed_terms(body: dict) -> dict:
+    """The 12 terms the backend re-derives from an order body (l2OrderFields.ts), as
+    the order signs them: the price and quantity scaled with ``Math.round``."""
+    return {
+        "l2ChainId": body["l2ChainId"],
+        "l2MarketIndex": body["l2MarketIndex"],
+        "l2BaseAssetId": body["l2BaseAssetId"],
+        "l2QuoteAssetId": body["l2QuoteAssetId"],
+        "isAsk": body["side"] == "SELL",
+        "price": scale_price(body["price"]),
+        "l2FeeRateCap": body["l2FeeRateCap"],
+        "l2AccountIndex": body["l2AccountIndex"],
+        "l2OrderIndex": body["l2OrderIndex"],
+        "l2Epoch": body["l2Epoch"],
+        "quantity": scale_quantity(body["quantity"]),
+        "l2ExpiryMs": body["l2ExpiryMs"],
     }
-    return Account.recover_message(encode_typed_data(full_message=typed_data), signature=signature)
+
+
+def leg_terms(body: dict, leg: str) -> dict:
+    """What a TP/SL leg signs: a SELL of the order's quantity at the leg's price, with
+    its own index and expiry and the order's other terms."""
+    return {
+        **signed_terms(body),
+        "isAsk": True,
+        "price": scale_price(body[leg]["price"]),
+        "l2OrderIndex": body[leg]["l2OrderIndex"],
+        "l2ExpiryMs": body[leg]["l2ExpiryMs"],
+    }
+
+
+def signature(terms: dict) -> tuple:
+    """``(s, e)`` of SK0 signing ``terms`` alone, with the fixed random bytes."""
+    sig = SIGNER.sign_order(SK0, terms)
+    return sig["s"], sig["e"]
+
+
+def assert_signed(body: dict) -> None:
+    """``body`` and each of its legs carry SK0's signature of the terms rebuilt from them."""
+    assert (body["l2SigS"], body["l2SigE"]) == signature(signed_terms(body))
+    for leg in ("tp", "sl"):
+        if leg in body:
+            assert (body[leg]["l2SigS"], body[leg]["l2SigE"]) == signature(leg_terms(body, leg))

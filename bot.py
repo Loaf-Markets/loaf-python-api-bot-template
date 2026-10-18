@@ -10,10 +10,13 @@ A runnable starting point that:
   5. runs a simple strategy loop you can replace with your own logic.
 
 Run it:
-    cp .env.example .env          # then set LOAF_API_KEY, and LOAF_AGENT_PRIVATE_KEY
+    cp .env.example .env          # then set LOAF_API_KEY, and LOAF_L2_SECRET_KEY
                                   # to place orders
     pip install -e ".[dotenv]"    # the dotenv extra loads .env; or export the variables yourself
     python bot.py
+
+Placing orders also needs your L2 trading key in LOAF_L2_SECRET_KEY (README,
+"Enable trading"); the template only observes until you add a strategy.
 
 Stop with Ctrl-C.
 """
@@ -43,7 +46,7 @@ except ImportError:
 
 # The property this template watches/trades: a ticker from
 # `loaf.market.properties()`, exactly as listed (uppercase), e.g. "OPRA". Leave it
-# empty to follow the first listed property.
+# empty to follow the first listed property with an L2 market.
 TARGET_TICKER = ""
 
 
@@ -54,16 +57,16 @@ def build_client() -> LoafClient:
         sys.exit(
             "No LOAF_API_KEY set.\n"
             "  1. Create an API key in the Loaf web app (Settings -> API keys).\n"
-            "  2. cp .env.example .env  and put its two values in LOAF_API_KEY\n"
-            "     and LOAF_AGENT_PRIVATE_KEY.\n"
+            "  2. cp .env.example .env  and put it in LOAF_API_KEY; to place orders,\n"
+            "     put your L2 trading key in LOAF_L2_SECRET_KEY (python -m loaf.l2.keys enable).\n"
             "  .env is read only when python-dotenv is installed\n"
-            "  (pip install -e \".[dotenv]\"); otherwise export both variables.\n"
+            "  (pip install -e \".[dotenv]\"); otherwise export the variables.\n"
         )
-    # The agent key is read from $LOAF_AGENT_PRIVATE_KEY, and base_url / ws_url
+    # The L2 trading key is read from $LOAF_L2_SECRET_KEY, and base_url / ws_url
     # from $LOAF_API_BASE_URL / $LOAF_WS_URL, if set.
     try:
         return LoafClient(api_key=api_key)
-    except loaf.LoafConfigError as exc:  # a bad key or LOAF_MAX_SLIPPAGE_BPS, or no eth-account
+    except loaf.LoafConfigError as exc:  # a malformed key, or a bad LOAF_MAX_SLIPPAGE_BPS
         sys.exit(str(exc))
 
 
@@ -79,20 +82,24 @@ def preflight(client: LoafClient) -> None:
     except loaf.LoafAuthError as exc:
         sys.exit(f"Authentication failed — check your API key. ({exc.message})")
 
-    print(f"  Cash: {comp.cash:,.2f} USDC  (frozen {comp.frozen:,.2f})  "
-          f"Portfolio value: {comp.portfolioValue:,.2f}  PnL: {comp.portfolioPnl:,.2f}")
+    # The L2 book: amounts are base units as decimal strings (USDC has 6 decimals).
+    print("  Balances (available / held by open orders):")
+    for row in comp.get("balances") or []:
+        scale = 10 ** row.decimals
+        cash = "  (cash)" if row.isQuote else ""
+        print(f"    {row.symbol:<8} {int(row.available) / scale:,.6f} / {int(row.hold) / scale:,.6f}{cash}")
     positions = comp.get("positions") or []
     if positions:
         print("  Positions:")
         for p in positions:
-            print(f"    {p.ticker}: {p.quantity} @ avg {p.averageEntryPrice} "
-                  f"(mkt {p.marketPrice}, PnL {p.propertyPnl})")
-    if client.agent_address:
+            print(f"    {p.ticker}: avg entry {p.get('averageEntryPrice')} (mkt {p.get('marketPrice')})")
+    if client.l2_public_key:
         bps = client.max_slippage_bps  # $LOAF_MAX_SLIPPAGE_BPS, default 200
-        print(f"  Orders are signed by agent {client.agent_address}")
+        print(f"  Orders are signed by L2 trading key {client.l2_public_key}")
         print(f"  Max slippage: {bps} bps ({bps / 100:g}%) for MARKET orders, stops and TP/SL legs")
     else:
-        print("  No LOAF_AGENT_PRIVATE_KEY: watching only (placing orders needs it).")
+        print("  No LOAF_L2_SECRET_KEY: watching only. Placing orders needs your L2 trading key\n"
+              "  (python -m loaf.l2.keys enable, see the README).")
     print(
         "  Note: while a competition round is ACTIVE, placing orders requires\n"
         "        admission to the round (loaf.competition.queue_position() shows\n"
@@ -110,8 +117,9 @@ def resolve_target(client: LoafClient) -> Any:
         for prop in listing:
             if prop.ticker == TARGET_TICKER:
                 return prop
-        print(f"Ticker {TARGET_TICKER!r} not found; falling back to first listed.")
-    return listing[0]
+        print(f"Ticker {TARGET_TICKER!r} not found; falling back to the first with an L2 market.")
+    tradeable = [prop for prop in listing if prop.get("hasL2Market")]
+    return (tradeable or listing)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -186,7 +194,10 @@ class Strategy:
         print(f"  order #{o.id} {o.side} {o.quantity} {o.ticker} @ {o.price} -> {o.status}")
 
     def on_balances(self, msg) -> None:
-        print(f"  balance update: cash {msg.cash:,.2f}  frozen {msg.frozen:,.2f}")
+        # The whole L2 book as the engine committed it, in base units.
+        cash = next((b for b in msg.balances if b.isQuote), None)
+        if cash is not None:
+            print(f"  balance update: {cash.symbol} available {int(cash.available) / 10 ** cash.decimals:,.6f}")
 
     # -- Decision loop (called on the main thread every few seconds) ------ #
 
@@ -230,9 +241,11 @@ class Strategy:
         # During an ACTIVE competition round, order placement requires admission
         # (loaf.CompetitionEligibilityError otherwise; loaf.TradingHaltedError
         # while this property or the whole platform is halted).
-        # Wrap calls in try/except loaf.LoafAPIError to handle rejections.
-        # On loaf.LoafAuthError from a placement, stop trading and alert: your
-        # agent key was refused (expired or deleted API key).
+        # Wrap calls in try/except loaf.LoafAPIError to handle rejections, and
+        # loaf.LoafL2Error for a setup no order can be signed under.
+        # On loaf.LoafAuthError from a placement, stop trading and alert: the
+        # exchange refused the order's L2 signature or trading key (rotated or
+        # disabled key).
         # On loaf.OrderOutcomeUnknownError the order may be live or already
         # filled. If you still want it, resubmit(e.signed_body) (the same order
         # if it landed, placed now if not); otherwise check history.orders()

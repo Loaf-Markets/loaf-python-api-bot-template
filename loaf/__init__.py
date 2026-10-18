@@ -4,10 +4,10 @@ Quick start::
 
     from loaf import LoafClient
 
-    loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_AGENT_PRIVATE_KEY
-    print(loaf.portfolio.component().cash)
+    loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_L2_SECRET_KEY
+    print(loaf.portfolio.component().balances)
     print(loaf.market.properties())
-    loaf.orders.limit_buy("OPRA", quantity=10, price=167.49)   # signed with your agent key
+    loaf.orders.limit_buy("OPRA", quantity=10, price=167.49)   # signed with your L2 trading key
 
 See the README for the full guide.
 """
@@ -36,6 +36,7 @@ from .enums import (
     OrderType,
     PropertyStatus,
     TimeInForce,
+    TradeProofStatus,
     TransferStatus,
     TransferType,
     WSMessageType,
@@ -43,13 +44,17 @@ from .enums import (
 )
 from .exceptions import (
     CompetitionEligibilityError,
+    KycRequiredError,
+    L2SignerError,
     LoafAPIError,
     LoafAuthError,
+    LoafBusinessRuleError,
     LoafConfigError,
     LoafConflictError,
     LoafConnectionError,
     LoafError,
     LoafForbiddenError,
+    LoafL2Error,
     LoafNotFoundError,
     LoafRateLimitError,
     LoafServerError,
@@ -58,6 +63,7 @@ from .exceptions import (
     OrderOutcomeUnknownError,
     TradingHaltedError,
 )
+from .l2 import L2Config, OrderIntent
 from .money import bps_to_fraction, fraction_to_bps, worst_price
 from .ws import LoafWebSocketClient
 
@@ -67,6 +73,9 @@ __all__ = [
     "LoafClient",
     "LoafWebSocketClient",
     "LoafObject",
+    # L2 signing
+    "L2Config",
+    "OrderIntent",
     # constants
     "DEFAULT_BASE_URL",
     "DEFAULT_MAX_SLIPPAGE_BPS",
@@ -79,6 +88,7 @@ __all__ = [
     "TimeInForce",
     "OrderStatus",
     "ConditionalOrderStatus",
+    "TradeProofStatus",
     "OfferingOrderStatus",
     "PropertyStatus",
     "IpoStatus",
@@ -99,6 +109,8 @@ __all__ = [
     "LoafConfigError",
     "LoafConnectionError",
     "OrderOutcomeUnknownError",
+    "LoafL2Error",
+    "L2SignerError",
     "LoafAPIError",
     "LoafAuthError",
     "LoafForbiddenError",
@@ -107,6 +119,8 @@ __all__ = [
     "LoafValidationError",
     "LoafNotFoundError",
     "LoafConflictError",
+    "LoafBusinessRuleError",
+    "KycRequiredError",
     "LoafRateLimitError",
     "LoafServerError",
     "LoafServiceUnavailableError",
