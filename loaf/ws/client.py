@@ -81,6 +81,15 @@ logger = logging.getLogger("loaf.ws")
 
 Handler = Callable[[Any], None]
 
+def _log_send_failure(future: Any) -> None:
+    """Log a send that failed (the next connect resubscribes every channel anyway)."""
+    if future.cancelled():
+        return
+    exc = future.exception()
+    if exc is not None:
+        logger.warning("Loaf WebSocket send failed: %s", exc)
+
+
 # Internal pseudo-types for lifecycle callbacks (never collide with wire types).
 _ON_CONNECT = "__connect__"
 _ON_TRANSPORT_ERROR = "__transport_error__"
@@ -128,10 +137,15 @@ class LoafWebSocketClient:
         self.ws_url: str = resolved_ws_url
         self._verify = verify if verify is not None else (getattr(client, "_verify", True))
         self.auto_reconnect = auto_reconnect
+        number = isinstance(reconnect_delay, (int, float)) and not isinstance(reconnect_delay, bool)
+        if not number or not 0 < reconnect_delay < float("inf"):
+            raise ValueError(f"reconnect_delay must be a positive number of seconds, got {reconnect_delay!r}")
         self.reconnect_delay = reconnect_delay
 
         self._handlers: dict[str, list[Handler]] = {}
         self._channels: set[str] = set()
+        # subscribe() runs on the caller's thread, a (re)connect reads the set on the loop's.
+        self._channels_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._run_task: asyncio.Task | None = None
@@ -295,13 +309,15 @@ class LoafWebSocketClient:
     def subscribe(self, *channels: str) -> LoafWebSocketClient:
         """Subscribe to one or more raw ``"type:id"`` channel strings."""
         new = {str(c) for c in channels}
-        self._channels |= new
+        with self._channels_lock:
+            self._channels |= new
         self._send_now({"type": "subscribe", "channels": sorted(new)})
         return self
 
     def unsubscribe(self, *channels: str) -> LoafWebSocketClient:
         gone = {str(c) for c in channels}
-        self._channels -= gone
+        with self._channels_lock:
+            self._channels -= gone
         self._send_now({"type": "unsubscribe", "channels": sorted(gone)})
         return self
 
@@ -492,8 +508,10 @@ class LoafWebSocketClient:
     async def _on_open(self, ws: Any) -> None:
         if self.api_key:
             await ws.send(self._frame("auth", token=self.api_key))
-        if self._channels:
-            await ws.send(self._frame("subscribe", channels=sorted(self._channels)))
+        with self._channels_lock:
+            channels = sorted(self._channels)
+        if channels:
+            await ws.send(self._frame("subscribe", channels=channels))
         self._connected_event.set()
         self._emit(_ON_CONNECT, None)
 
@@ -528,10 +546,15 @@ class LoafWebSocketClient:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
-        if running is loop:
-            loop.create_task(coro)
-        else:
-            asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            if running is loop:
+                future: Any = loop.create_task(coro)
+            else:
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:  # the loop closed after the check: the next connect resubscribes
+            coro.close()
+            return
+        future.add_done_callback(_log_send_failure)
 
     @staticmethod
     def _frame(message_type: str, **fields: Any) -> str:

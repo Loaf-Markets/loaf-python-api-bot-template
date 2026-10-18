@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
+from ..exceptions import LoafError
 from .base import Resource
 
 
@@ -91,6 +92,7 @@ class HistoryResource(Resource):
 
     def _iter(self, path: str, key: str, page_size: int) -> Iterator[Any]:
         cursor: str | None = None
+        followed: set[str] = set()
         while True:
             page = self._client.get(path, params={"pageSize": page_size, "cursor": cursor})
             for item in page.get(key, []) or []:
@@ -98,3 +100,6 @@ class HistoryResource(Resource):
             cursor = page.get("nextCursor")
             if not cursor:
                 return
+            if cursor in followed:
+                raise LoafError(f"GET {path} answered a nextCursor it had already given; stopped paging")
+            followed.add(cursor)

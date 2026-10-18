@@ -341,7 +341,15 @@ class LoafClient:
             self._record_rate_limit(response)
 
             if response.is_success:
-                return self._parse_body(response)
+                try:
+                    return self._parse_body(response)
+                except ValueError as exc:  # labelled JSON but not JSON
+                    raise LoafAPIError(
+                        f"The {method} {path} response did not parse as JSON",
+                        status_code=response.status_code,
+                        request_id=response.headers.get("x-request-id"),
+                        body=response.text[:1000],
+                    ) from exc
 
             # Error path — decide whether to retry. Only idempotent (read) requests
             # are retried here. Signed placements go through _send_signed, which
@@ -502,7 +510,7 @@ class LoafClient:
     def _sleep_backoff(self, attempt: int, response: httpx.Response | None = None) -> None:
         if response is not None:
             hinted = self._retry_after_seconds(response)
-            if hinted is not None:
+            if hinted is not None and hinted > 0:
                 time.sleep(min(hinted, 60.0))
                 return
         # Exponential backoff with full jitter, capped at 30s.

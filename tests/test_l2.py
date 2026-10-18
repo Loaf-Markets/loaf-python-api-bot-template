@@ -447,6 +447,30 @@ def test_enable_refuses_a_key_in_force_that_differs_and_a_stale_nonce():
     assert api.posted == []
 
 
+def test_a_custody_ticker_is_matched_whole():
+    # A ^...$ re.match let "OPRA\n" through, into the GET /trade/{ticker} path (PR #3, PY-03).
+    key = wallet_key()
+    from loaf.l2.keys import L2Keys
+
+    api = KeysAPI(journaled=None)
+    paths: List[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/api/trade":
+            listed = [{"ticker": "OPRA\n", "hasL2Market": True}, {"ticker": "OPRA", "hasL2Market": True}]
+            return httpx.Response(200, json={"properties": listed})
+        return api(request)
+
+    client = LoafClient(api_key="k", base_url=BASE, http_client=httpx.Client(transport=httpx.MockTransport(handler), base_url=BASE))
+    keys = L2Keys(client, FakeCustody(nonce=2), key, DEFAULT_L2_CHAIN_ID, signer=SIGNER, log=lambda line: None)
+    with pytest.raises(LoafL2Error, match="ticker must be 1-4"):
+        keys.custody("OPRA\n")
+    assert paths == []
+    assert keys.custody() == keys.custody("OPRA")  # the listed "OPRA\n" is skipped, never read
+    assert paths == ["/api/trade", "/api/trade/OPRA", "/api/trade/OPRA"]
+
+
 def test_custody_reader_encodes_the_proxy_views():
     pytest.importorskip("eth_account")
     from loaf.evm import ChainReader, selector

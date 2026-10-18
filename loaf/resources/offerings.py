@@ -12,7 +12,7 @@ import os
 from typing import Any, Optional
 
 from ..exceptions import _client_validation_error
-from .base import Resource
+from .base import Resource, _check_ticker
 
 ENV_WALLET_KEY = "LOAF_WALLET_PRIVATE_KEY"
 
@@ -34,7 +34,7 @@ class OfferingsResource(Resource):
         (``ipoContractAddress``) and its chain (``ipoChainId``), allocation stats,
         ``recentOrders`` and an ``ipoList`` selector.
         """
-        return self._client.get(f"/offerings/{ticker}", auth=False)
+        return self._client.get(f"/offerings/{_check_ticker(ticker)}", auth=False)
 
     def subscribe(
         self,

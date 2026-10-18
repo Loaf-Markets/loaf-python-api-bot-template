@@ -230,7 +230,7 @@ class L2Keys:
         """The vault of ``ticker``'s market; with no ticker, the one vault every listed L2 market
         names (refused when none is listed or two differ). It must be on the chain the RPC serves."""
         if ticker is not None:
-            if not TICKER.match(ticker):
+            if not TICKER.fullmatch(ticker):
                 raise LoafL2Error(f"ticker must be 1-4 of A-Z 0-9; received {ticker!r}")
             found = {self._custody_of(ticker)} - {None}
             if not found:
@@ -239,7 +239,7 @@ class L2Keys:
             listed = self._client.get("/trade", auth=False)
             items = listed.get("properties") if isinstance(listed, Mapping) else None
             tickers = [p.get("ticker") for p in items or [] if isinstance(p, Mapping) and p.get("hasL2Market") is True]
-            found = {self._custody_of(t) for t in tickers if isinstance(t, str) and TICKER.match(t)} - {None}
+            found = {self._custody_of(t) for t in tickers if isinstance(t, str) and TICKER.fullmatch(t)} - {None}
             if not found:
                 raise LoafL2Error("GET /trade lists no L2 market: this API serves no L2 custody")
             if len(found) > 1:

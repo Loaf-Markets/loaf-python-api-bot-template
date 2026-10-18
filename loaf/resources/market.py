@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from .base import Resource
+from ..exceptions import LoafError
+from .base import Resource, _check_ticker
 
 
 class MarketResource(Resource):
@@ -47,8 +48,9 @@ class MarketResource(Resource):
         ``orderBook`` snapshot (``bids``/``asks`` price levels), ``recentTrades``,
         ``volume24h``, ``dailyReferencePrice``, ``liquidity``,
         ``competitionModeActive`` and market-hours metadata.
-        ``ticker`` is 1-4 uppercase letters or digits, sent exactly as given
-        (``"opra"`` is a 400; pass ``"OPRA"``). Candle history is NOT included
+        ``ticker`` is 1-4 uppercase letters or digits, exactly as listed: any
+        other value (``"opra"`` included) is refused locally with a
+        :class:`~loaf.exceptions.LoafValidationError`. Candle history is NOT included
         — fetch it from the dedicated :meth:`candles` endpoint.
 
         ``property.l2Market`` is the L2 market orders sign (its market index and
@@ -65,7 +67,7 @@ class MarketResource(Resource):
         keep it live with the ``property:{ticker}`` WebSocket channel
         (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_property_status`).
         """
-        return self._client.get(f"/trade/{ticker}", auth=False)
+        return self._client.get(f"/trade/{_check_ticker(ticker)}", auth=False)
 
     # -- Candles (chart history) -------------------------------------------- #
 
@@ -101,7 +103,7 @@ class MarketResource(Resource):
         :class:`~loaf.exceptions.LoafServiceUnavailableError`.
         """
         return self._client.get(
-            f"/trade/{ticker}/candles",
+            f"/trade/{_check_ticker(ticker)}/candles",
             params={"resolution": str(resolution), "to": to, "countBack": count_back},
             auth=False,
         )
@@ -123,18 +125,23 @@ class MarketResource(Resource):
                 yield candle
             if not page.get("hasMore") or page.get("oldestTs") is None:
                 return
+            if to is not None and not page["oldestTs"] < to:
+                raise LoafError(
+                    f"GET /trade/{ticker}/candles answered oldestTs {page['oldestTs']} for to={to}; "
+                    "stopped paging"
+                )
             to = page["oldestTs"]
 
     # -- Info pages -------------------------------------------------------- #
 
     def info_header(self, ticker: str) -> Any:
         """``GET /info/{ticker}/header`` — address, hero image, bed/bath/car, offering valuation."""
-        return self._client.get(f"/info/{ticker}/header", auth=False)
+        return self._client.get(f"/info/{_check_ticker(ticker)}/header", auth=False)
 
     def info_overview(self, ticker: str) -> Any:
         """``GET /info/{ticker}/overview`` — description, media, metrics, amenities."""
-        return self._client.get(f"/info/{ticker}/overview", auth=False)
+        return self._client.get(f"/info/{_check_ticker(ticker)}/overview", auth=False)
 
     def info_documents(self, ticker: str) -> Any:
         """``GET /info/{ticker}/documents`` — public document list (title + URL)."""
-        return self._client.get(f"/info/{ticker}/documents", auth=False)
+        return self._client.get(f"/info/{_check_ticker(ticker)}/documents", auth=False)

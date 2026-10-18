@@ -77,10 +77,10 @@ INDEX_REFUSALS = frozenset({INDEX_USED, INDEX_NOT_RESERVED, INDEX_RANGE_TOO_OLD}
 #: A refusal that says the account's epoch or key moved: the next order reads ``GET /l2/keys`` again.
 KEY_STATE_REFUSAL_PREFIXES = ("l2 epoch:", "l2 key:", "l2 signature:")
 
-TICKER = re.compile(r"^[A-Z0-9]{1,4}$")
-HEX40 = re.compile(r"^0x[0-9a-fA-F]{40}$")
-HEX80 = re.compile(r"^[0-9a-f]{80}$")
-PUBLIC_KEY = re.compile(r"^0x[0-9a-f]{80}$")
+TICKER = re.compile(r"[A-Z0-9]{1,4}")
+HEX40 = re.compile(r"0x[0-9a-fA-F]{40}")
+HEX80 = re.compile(r"[0-9a-f]{80}")
+PUBLIC_KEY = re.compile(r"0x[0-9a-f]{80}")
 
 
 def _whole(v: Any) -> bool:
@@ -175,7 +175,7 @@ def parse_l2_market(ticker: str, market: Any) -> Optional[L2Market]:
         return v
 
     proxy = market["proxyAddress"]
-    if not isinstance(proxy, str) or not HEX40.match(proxy):
+    if not isinstance(proxy, str) or not HEX40.fullmatch(proxy):
         raise LoafL2Error(f"{where}.proxyAddress must be 0x and 40 hex")
     parsed = L2Market(
         ticker=ticker,
@@ -211,7 +211,7 @@ def parse_key_state(raw: Any) -> L2KeyState:
         raise LoafL2Error("GET /l2/keys: accountIndex must be an integer from 0 to 2^48 - 1")
     if epoch is not None and (not _whole(epoch) or epoch < 0 or epoch > MAX_32):
         raise LoafL2Error("GET /l2/keys: epoch must be null or an integer from 0 to 2^32 - 1")
-    if key is not None and (not isinstance(key, str) or not PUBLIC_KEY.match(key)):
+    if key is not None and (not isinstance(key, str) or not PUBLIC_KEY.fullmatch(key)):
         raise LoafL2Error("GET /l2/keys: journaledKey must be null or 0x and 80 lowercase hex")
     if nonce is not None and (not _whole(nonce) or nonce < 0 or nonce > MAX_SAFE_INTEGER):
         raise LoafL2Error("GET /l2/keys: withdrawalNonce must be a non-negative integer")
@@ -333,7 +333,7 @@ class L2Trader:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         try:
-            if not isinstance(secret_key, str) or not HEX80.match(secret_key):
+            if not isinstance(secret_key, str) or not HEX80.fullmatch(secret_key):
                 raise LoafL2Error(f"{ENV_L2_SECRET_KEY} must be 80 lowercase hex (loaf.l2.keys derives it)")
             self._signer = signer if signer is not None else default_signer()
             self.public_key: str = self._signer.public_key(secret_key)
@@ -355,7 +355,7 @@ class L2Trader:
 
     # -- the market ------------------------------------------------------------------------
     def _detail(self, ticker: str) -> Mapping[str, Any]:
-        if not isinstance(ticker, str) or not TICKER.match(ticker):
+        if not isinstance(ticker, str) or not TICKER.fullmatch(ticker):
             raise _client_validation_error(f"ticker must be 1-4 of A-Z 0-9; received {ticker!r}")
         # Read before an order is signed: a 429 raises at once (a late order is stale).
         detail = self._client._request("GET", f"/trade/{ticker}", auth=False, before_order=True)
@@ -373,7 +373,7 @@ class L2Trader:
 
     def market(self, ticker: str) -> L2Market:
         """The property's L2 market, read again at most every 30 s."""
-        if not isinstance(ticker, str) or not TICKER.match(ticker):
+        if not isinstance(ticker, str) or not TICKER.fullmatch(ticker):
             raise _client_validation_error(f"ticker must be 1-4 of A-Z 0-9; received {ticker!r}")
         with self._lock:
             held = self._markets.get(ticker)

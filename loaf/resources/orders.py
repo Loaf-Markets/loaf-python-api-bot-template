@@ -89,7 +89,6 @@ top of the per-IP limit.
 from __future__ import annotations
 
 import numbers
-import re
 import time
 from collections.abc import Sequence
 from decimal import Decimal
@@ -112,9 +111,7 @@ from ..money import (
     validate_quantity,
     validate_slippage_bps,
 )
-from .base import Resource
-
-_TICKER_RE = re.compile(r"[A-Z0-9]{1,4}")
+from .base import Resource, _check_ticker
 
 _LIMIT_CONDITIONALS = (ConditionalOrderType.STOP_LIMIT, ConditionalOrderType.TAKE_LIMIT)
 
@@ -630,7 +627,7 @@ class OrdersResource(Resource):
         It works under a single-property halt and outside trading hours; only a
         platform-wide halt blocks it (:class:`~loaf.exceptions.TradingHaltedError`).
         """
-        return self._client.post("/orders/cancel", json={"orderId": int(order_id)})
+        return self._client.post("/orders/cancel", json={"orderId": _order_id(order_id)})
 
     def cancel_conditional(self, order_id: int) -> Any:
         """``POST /orders/conditional/cancel`` — cancel one PENDING / ARMED conditional.
@@ -649,7 +646,7 @@ class OrdersResource(Resource):
         triggering is level-based, so a row whose mark sat through its trigger
         for the whole halt fires as soon as trading resumes.
         """
-        return self._client.post("/orders/conditional/cancel", json={"orderId": int(order_id)})
+        return self._client.post("/orders/conditional/cancel", json={"orderId": _order_id(order_id)})
 
     def cancel_row(self, order: Mapping[str, Any]) -> Any:
         """Cancel one ``openOrders`` / ``order_update`` row, whichever kind it is.
@@ -737,16 +734,22 @@ class OrdersResource(Resource):
             self._client.l2.after_refusal(error.message, body.get("l2AccountIndex"))
 
 
-def _check_ticker(ticker: Any) -> None:
-    if not isinstance(ticker, str) or not _TICKER_RE.fullmatch(ticker):
-        raise _client_validation_error(
-            "ticker must be 1-4 uppercase letters or digits (a property's ticker, e.g. 'OPRA'), "
-            f"got {ticker!r}"
-        )
-
-
 def _whole(value: Any) -> bool:
     return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+
+def _order_id(value: Any) -> int:
+    """An order id exactly as given: a positive whole number (``7``, ``7.0`` or ``"7"``).
+    ``int()`` would turn ``3.9`` into 3 and ``True`` into 1, and cancel another order."""
+    if isinstance(value, str) and value.isdigit() and value.isascii():
+        value = int(value)
+    elif isinstance(value, float) and value.is_integer():
+        value = int(value)
+    elif isinstance(value, Decimal) and value.is_finite() and value == value.to_integral_value():
+        value = int(value)
+    if not _whole(value) or value < 1:
+        raise _client_validation_error(f"order_id must be a positive whole number, got {value!r}")
+    return int(value)
 
 
 def _is_signed_l2_body(body: Mapping[str, Any]) -> bool:
