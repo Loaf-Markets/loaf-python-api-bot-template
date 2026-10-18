@@ -41,7 +41,8 @@ class ConditionalOrderType(_StrEnum):
 
 
 class TimeInForce(_StrEnum):
-    #: Good-til-cancelled — the only value the exchange accepts; order rows carry it.
+    #: Good-til-cancelled — the only value the exchange accepts; order rows carry it
+    #: (an L2 order rests until its signed expiry).
     GTC = "GTC"
 
 
@@ -61,6 +62,13 @@ class ConditionalOrderStatus(_StrEnum):
     PLACED = "PLACED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class TradeProofStatus(_StrEnum):
+    """A trade's place in the proven batches (``trade.proof.status``)."""
+
+    PENDING = "PENDING"
+    IN_BATCH = "IN_BATCH"
 
 
 class OfferingOrderStatus(_StrEnum):
@@ -139,6 +147,7 @@ class WSMessageType(_StrEnum):
     VOLUME_UPDATE = "volume_update"
     LEADERBOARD_UPDATE = "leaderboard_update"
     PROPERTY_HALT = "property_halt"
+    ROUND_UPDATE = "round_update"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"
     POSITION_UPDATE = "position_update"

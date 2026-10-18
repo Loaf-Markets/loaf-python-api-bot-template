@@ -3,7 +3,8 @@
 This DOES place a real conditional order, triggered far from the market so it
 never fires. Review it before running against a live account.
 
-It needs both keys: LOAF_AGENT_PRIVATE_KEY signs the order, and LOAF_API_KEY
+It needs both keys: LOAF_L2_SECRET_KEY, the account's L2 trading key, signs the
+order, and LOAF_API_KEY reads the account's key state and order indices for it,
 reads it back and cancels it.
 
     python examples/06_stop_and_take.py
@@ -24,13 +25,14 @@ except ImportError:
 
 def main() -> None:
     client = LoafClient()
-    if client.agent_address is None:
-        raise SystemExit("Set LOAF_AGENT_PRIVATE_KEY to place orders (see README §2).")
+    if client.l2_public_key is None:
+        raise SystemExit("Set LOAF_L2_SECRET_KEY to place orders (see README §2).")
     if not client.api_key:
-        raise SystemExit("Set LOAF_API_KEY too, to cancel the order again (see README §2).")
+        raise SystemExit("Set LOAF_API_KEY too: orders need the account's key state, and the cancel (see README §2).")
 
-    # Pick a property you can trade now: LIVE, with a deployed token, and in the
-    # market that is open (competition properties trade only during a round).
+    # Pick a property you can trade now: LIVE, with an L2 market, and in the
+    # market that is open (competition properties trade only during a round;
+    # outside one a property also needs its token contract).
     listing = client.market.properties()
     competition = bool(listing.get("competitionModeActive"))
     tradeable = [
@@ -38,7 +40,8 @@ def main() -> None:
         for p in listing.get("properties") or []
         if p.get("status") == "LIVE"
         and bool(p.get("isCompetition")) == competition
-        and p.get("contractAddress")
+        and p.get("hasL2Market")
+        and (competition or p.get("contractAddress"))
     ]
     if not tradeable:
         raise SystemExit("No tradeable properties right now.")
@@ -51,9 +54,9 @@ def main() -> None:
     # above the market just rests. (A stop SELL would need a holding to sell.)
     trigger = round(mark * 1.50, 2)
     # When it fires it books a LIMIT BUY at the trigger plus the client's max
-    # slippage ($LOAF_MAX_SLIPPAGE_BPS, default 2%). Placing it needs total USDC
-    # of at least that price x quantity plus the taker fee, and that value must
-    # be at least 10 USDC.
+    # slippage ($LOAF_MAX_SLIPPAGE_BPS, default 2%). That price x quantity must be
+    # at least 10 USDL. Your balance is not checked when you arm it: the engine
+    # admits the order when it fires, on the cash available then.
     books_at = loaf.worst_price(trigger, "BUY", client.max_slippage_bps)
     print(f"Arming STOP_MARKET BUY 1 {prop.ticker} @ trigger {trigger} "
           f"(books at up to {books_at}; mark {mark})")
@@ -66,6 +69,10 @@ def main() -> None:
             type="STOP_MARKET",
             trigger_price=trigger,
         )
+    except loaf.LoafConfigError as exc:
+        raise SystemExit(str(exc))
+    except loaf.LoafL2Error as exc:
+        raise SystemExit(f"No order can be signed: {exc}")
     except loaf.CompetitionEligibilityError:
         raise SystemExit(
             "Not admitted to the active competition round — check "
@@ -73,8 +80,8 @@ def main() -> None:
         )
     except loaf.LoafAuthError as exc:
         raise SystemExit(
-            f"Order signature refused: {exc.message}. Is LOAF_AGENT_PRIVATE_KEY "
-            "the agent key of a current API key?"
+            f"Order signature refused: {exc.message}. Is LOAF_L2_SECRET_KEY the "
+            "account's trading key in force (python -m loaf.l2.keys enable)?"
         )
     except loaf.LoafValidationError as exc:
         raise SystemExit(

@@ -63,7 +63,8 @@ class OrderResult(TypedDict, total=False):
     # OrderStatus as of the commit that admitted it; OPEN / PARTIALLY_FILLED mean it is resting.
     status: str
     quantityLeft: float  # tokens not filled (the cancelled remainder on CANCELLED)
-    duplicate: bool  # an order with this nonce already existed (e.g. an SDK re-send)
+    duplicate: bool  # an order with this account and order index already existed (e.g. an SDK re-send)
+    attachedLegIds: list[int]  # the take-profit / stop-loss legs' conditional ids; empty on a duplicate
 
 
 class OrderAck(TypedDict, total=False):
@@ -83,83 +84,139 @@ class OrderHistoryItem(TypedDict, total=False):
     """One row of ``openOrders`` / ``orderHistory`` / ``history.orders()``.
 
     A row is either a booked order or a resting conditional (stop / take), and
-    ``type`` is the discriminator — use
-    :func:`loaf.enums.is_conditional_order`. A conditional carries
-    ``triggerPrice`` and a ``status`` from
+    ``type`` is the discriminator: use :func:`loaf.enums.is_conditional_order`.
+    A conditional carries ``triggerPrice`` and a ``status`` from
     :class:`~loaf.enums.ConditionalOrderStatus`, and has NO ``filledQuantity``
-    and NO ``filledAt``: the keys are absent, not null, so reading either one
-    off a conditional row raises. Narrow before you touch them.
+    and NO ``filledAt``: the keys are absent, not null. Narrow before you touch them.
     """
 
     id: int
     propertyId: int
-    ticker: str  # "" on a conditional for a delisted/uncached property — key on propertyId
+    ticker: str  # "" on a conditional for a delisted/uncached property: key on propertyId
     side: str  # OrderSide
-    type: str  # OrderType, or ConditionalOrderType — THIS is the discriminator
-    timeInForce: str
+    type: str  # OrderType, or ConditionalOrderType: THIS is the discriminator
+    timeInForce: str  # "GTC"
     quantity: float
     # The signed limit; for a MARKET order the worst price it was signed at; on a
     # conditional, the price it books at.
     price: float
     status: str  # OrderStatus, or ConditionalOrderStatus on a conditional
-    filledQuantity: float  # booked orders only — absent on a conditional
+    filledQuantity: float  # booked orders only, absent on a conditional
     # Conditionals only: on a live ARMED row the last deferred attempt, not a failure;
     # always None on booked orders.
     rejectionReason: Optional[str]
-    deadline: int
-    filledAt: Optional[int]  # booked orders only — absent on a conditional
+    expiryMs: int  # the order's signed L2 expiry, unix milliseconds
+    filledAt: Optional[int]  # booked orders only, absent on a conditional
     cancelledAt: Optional[int]
     createdAt: int
     triggerPrice: float  # conditional only; dollars; the mark level that fires the row
     parentOrderId: Optional[int]  # conditional only; the BUY a TP/SL leg arms on
-    placedOrderId: Optional[int]  # conditional only; the booked order id once PLACED — cancel THIS
+    placedOrderId: Optional[int]  # conditional only; the booked order id once PLACED: cancel THIS
     triggeredAt: Optional[int]  # conditional only; unix seconds
+
+
+class TradeProof(TypedDict, total=False):
+    """A trade's place in the proven batches: ``PENDING`` until a batch includes it."""
+
+    status: str  # TradeProofStatus
+    batchNumber: int  # IN_BATCH only
+    blockNumber: int
+    rowIndex: int
+    l2TradeDigest: str
+    batchTxHash: Optional[str]  # the custody-chain transaction that executed the batch; None until then
+    final: bool  # that transaction is final
 
 
 class TradeHistoryItem(TypedDict, total=False):
     tradeId: int
     propertyId: int
     ticker: str
-    txHash: str  # '' until a batch proof covers the trade; trades are final at match
+    txHash: str  # the trade's content hash, not an on-chain transaction
     side: str  # OrderSide, relative to this user
     quantity: float
     price: float
     fee: float  # this user's fee, dollars
     executedAt: int
+    proof: Optional[TradeProof]  # None when the server serves no proofs, or for a competition round's trade
+
+
+class L2AssetBalance(TypedDict, total=False):
+    """One asset of the account's L2 book: amounts in the token's base units, as decimal strings
+    (USDC: 6 decimals, so ``"1500000"`` is 1.5 USDC)."""
+
+    assetId: int
+    symbol: str
+    decimals: int
+    isQuote: bool  # the portfolio's cash
+    total: str
+    hold: str  # held by open orders
+    available: str
 
 
 class Position(TypedDict, total=False):
+    """A held property. An L2 holding's amounts are the ``balances`` row of its ``assetId``; an IPO
+    allocation not yet in the L2 book (``isIpoAllocation``) carries its ``quantity``."""
+
     propertyId: int
-    ticker: str
     tokenName: str  # display name
-    quantity: float  # tradeable (total minus frozen)
-    totalQuantity: float
-    totalTokens: float  # the property's total token supply
-    averageEntryPrice: float
-    marketPrice: float
-    percentChange: float  # plain percent
-    percentOfPortfolio: float
-    propertyPnl: float
-    propertyPnlPercent: float
-    isIpoAllocation: bool
-    imageUrl: str
+    ticker: str
+    totalTokens: int  # the property's token supply
+    averageEntryPrice: Optional[float]
+    marketPrice: float  # the mark when read
     sparkline: list[float]
+    imageUrl: str
+    isIpoAllocation: bool
+    assetId: int  # an L2 holding
+    quantity: float  # an IPO allocation
+
+
+class Transfer(TypedDict, total=False):
+    """One deposit or withdrawal of the account's L2 book."""
+
+    journalSeq: int
+    type: str  # TransferType
+    assetId: int
+    symbol: str
+    decimals: int
+    isQuote: bool
+    amount: str  # token base units, a decimal string
+    status: str  # TransferStatus
+    blockchainTxHash: Optional[str]
+    address: str
+    createdAt: int
+    batch: Optional[dict[str, Any]]  # {batchNumber, rowIndex, final} or {batchNumberAtMost}
+
+
+class OfferingOrder(TypedDict, total=False):
+    ipoOrderId: int
+    ticker: str
+    txHash: str
+    price: float
+    quantity: float
+    status: str  # OfferingOrderStatus
+    rejectionReason: Optional[str]
+    createdAt: int
 
 
 class PortfolioComponent(TypedDict, total=False):
-    cash: float
-    frozen: float
-    portfolioValue: float
-    portfolioPnl: float
-    portfolioPnlPercent: float
-    lifetimeVolume: float  # dollars traded over the account's lifetime
+    """Response to ``GET /portfolio/component``."""
+
+    balances: list[L2AssetBalance]
     positions: list[Position]
+    lifetimeVolume: float  # dollars traded over the account's lifetime
     applicableFees: dict[str, int]  # {takerFeeBps, makerFeeBps}
-    offeringOrders: list[dict[str, Any]]
-    openOrders: list[OrderHistoryItem]  # booked orders + PENDING/ARMED conditionals, merged
+    offeringOrders: list[OfferingOrder]
+    openOrders: list[OrderHistoryItem]  # booked orders and PENDING/ARMED conditionals, merged
     tradeHistory: list[TradeHistoryItem]
-    orderHistory: list[OrderHistoryItem]  # newest rows of both kinds, ANY status
-    transfers: list[dict[str, Any]]
+    orderHistory: list[OrderHistoryItem]  # newest rows of both kinds, any status
+    transfers: list[Transfer]
+
+
+class IpoSubscribeResult(TypedDict, total=False):
+    success: bool
+    subscriptionId: int  # the IPO order id to track
+    allocatedQuantity: float  # may be less than requested if partial
+    errorMessage: str
 
 
 class LeaderboardEntry(TypedDict, total=False):
@@ -260,9 +317,14 @@ __all__ = [
     "OrderAck",
     "CancelAllResult",
     "OrderHistoryItem",
+    "TradeProof",
     "TradeHistoryItem",
+    "L2AssetBalance",
     "Position",
+    "Transfer",
+    "OfferingOrder",
     "PortfolioComponent",
+    "IpoSubscribeResult",
     "LeaderboardEntry",
     "PrizePoolEntry",
     "VolumeMultiplierTier",

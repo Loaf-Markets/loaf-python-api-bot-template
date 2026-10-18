@@ -23,7 +23,8 @@ def main() -> None:
     print(f"{len(properties)} properties listed:\n")
     for prop in properties[:10]:
         print(f"  {prop.ticker:<6} {prop.tokenName:<20} "
-              f"price={prop.marketPrice}  24h vol={prop.volume24h}  status={prop.status}")
+              f"price={prop.marketPrice}  24h vol={prop.volume24h}  status={prop.status}  "
+              f"L2 market={prop.get('hasL2Market')}")
 
     if not properties:
         return
@@ -31,6 +32,7 @@ def main() -> None:
     ticker = properties[0].ticker
     print(f"\n--- detail for {ticker} ---")
     detail = client.market.property(ticker)
+    print(f"  L2 market: {detail.property.get('l2Market')}")
     book = detail.get("orderBook")
     if book:
         best_bid = book.bids[0] if book.get("bids") else None

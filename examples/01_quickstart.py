@@ -17,17 +17,22 @@ except ImportError:
 
 
 def main() -> None:
-    # api_key / agent_private_key / base_url come from $LOAF_API_KEY /
-    # $LOAF_AGENT_PRIVATE_KEY / $LOAF_API_BASE_URL when omitted.
+    # api_key / l2_secret_key / base_url come from $LOAF_API_KEY /
+    # $LOAF_L2_SECRET_KEY / $LOAF_API_BASE_URL when omitted.
     with LoafClient() as client:
         print(f"Talking to {client.base_url}")
 
         # portfolio.component is authenticated, so it doubles as a credentials check.
         comp = client.portfolio.component()
-        print(f"\nCash {comp.cash:,.2f} USDC  |  portfolio {comp.portfolioValue:,.2f}  "
-              f"|  PnL {comp.portfolioPnl:,.2f} ({comp.portfolioPnlPercent:.2f}%)")
+        # The L2 book: amounts are base units as decimal strings (USDC has 6 decimals).
+        print("\nBalances (available / total):")
+        for row in comp.get("balances") or []:
+            scale = 10 ** row.decimals
+            cash = "  (cash)" if row.isQuote else ""
+            print(f"  {row.symbol:<8} {int(row.available) / scale:>16,.6f} / {int(row.total) / scale:,.6f}{cash}")
         print(f"Open positions     : {len(comp.get('positions') or [])}")
-        print(f"Signing agent      : {client.agent_address or 'not set (orders disabled)'}")
+        print(f"Lifetime volume    : {comp.get('lifetimeVolume', 0):,.2f}")
+        print(f"L2 trading key     : {client.l2_public_key or 'not set (orders disabled)'}")
         print(f"Max slippage       : {client.max_slippage_bps} bps (100 bps = 1%)")
         print(f"Listed properties  : {len(client.market.properties().get('properties') or [])}")
 

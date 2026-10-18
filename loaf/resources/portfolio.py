@@ -1,10 +1,9 @@
-"""Portfolio: balances, positions, and PnL.
+"""Portfolio: the account's L2 book, holdings and recent activity.
 
-All currency values are plain dollars and quantities plain tokens. The recent
-activity lists embedded here are capped: ``openOrders`` at 100 (booked orders +
-``PENDING`` / ``ARMED`` conditionals), ``tradeHistory`` and ``orderHistory`` at
-20, ``offeringOrders`` at 50, and ``transfers`` at 50 deposits + 50
-withdrawals. Use :mod:`loaf.resources.history` for deeper, paginated history.
+The recent activity lists embedded here are capped: ``openOrders`` at 100 (booked orders and
+``PENDING`` / ``ARMED`` conditionals), ``tradeHistory`` and ``orderHistory`` at 20, and
+``offeringOrders`` and ``transfers`` at 50. Use :mod:`loaf.resources.history` for deeper,
+paginated history.
 """
 
 from __future__ import annotations
@@ -15,29 +14,21 @@ from .base import Resource
 
 
 class PortfolioResource(Resource):
-    def get(self) -> Any:
-        """``GET /portfolio`` — the portfolio page payload: ``{"component": {...}}``.
-
-        ``component`` is identical to :meth:`component`. Prefer :meth:`component`
-        unless you specifically want the page wrapper.
-        """
-        return self._client.get("/portfolio")
-
     def component(self) -> Any:
-        """``GET /portfolio/component`` — the assembled portfolio.
+        """``GET /portfolio/component``: the assembled portfolio (:class:`~loaf.models.PortfolioComponent`).
 
-        Returns ``cash``, ``frozen``, ``portfolioValue``, ``portfolioPnl``,
-        ``portfolioPnlPercent``, ``lifetimeVolume``, ``positions`` (per-property
-        quantity / avg entry / market price / PnL), ``applicableFees`` (raw
-        bps), and recent ``offeringOrders`` / ``openOrders`` / ``tradeHistory``
-        / ``orderHistory`` / ``transfers``. ``lifetimeVolume`` also streams on
-        the private WS channel as ``lifetime_volume_update``.
+        * ``balances``: the account's L2 book, one row per asset in ascending ``assetId``, with
+          ``symbol``, ``decimals``, ``isQuote`` (the cash) and ``total`` / ``hold`` /
+          ``available`` in the token's base units as decimal strings (USDC: 6 decimals). The
+          engine admits an order on ``available``.
+        * ``positions``: each held property's facts (``ticker``, ``averageEntryPrice``,
+          ``marketPrice``, ``sparkline``); an L2 holding's amounts are the ``balances`` row of its
+          ``assetId``, an IPO allocation not yet in the L2 book carries its ``quantity``.
+        * ``lifetimeVolume``, ``applicableFees`` (raw bps), and recent ``offeringOrders``,
+          ``openOrders`` (booked orders and your ``PENDING`` / ``ARMED`` conditionals), ``tradeHistory``
+          (each fill with its ``proof``), ``orderHistory`` and ``transfers`` (L2 deposits and withdrawals).
 
-        ``openOrders`` interleaves live booked orders with your ``PENDING`` /
-        ``ARMED`` conditionals, newest first, before the list is capped.
-
-        On ``tradeHistory`` rows ``txHash`` is ``""`` until a batch proof covers
-        the trade. Cash, frozen, positions and ``lifetimeVolume`` move when a
-        trade matches.
+        ``balances`` and ``lifetimeVolume`` stream on the private WebSocket channel as
+        ``balances_update`` and ``lifetime_volume_update``.
         """
         return self._client.get("/portfolio/component")

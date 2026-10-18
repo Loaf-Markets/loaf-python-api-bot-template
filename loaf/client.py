@@ -21,9 +21,9 @@ from .constants import (
     DEFAULT_MAX_SLIPPAGE_BPS,
     DEFAULT_PLACEMENT_TIMEOUT,
     DEFAULT_TIMEOUT,
-    ENV_AGENT_PRIVATE_KEY,
     ENV_API_KEY,
     ENV_BASE_URL,
+    ENV_L2_SECRET_KEY,
     ENV_MAX_SLIPPAGE_BPS,
     ENV_WS_URL,
     USER_AGENT,
@@ -38,6 +38,8 @@ from .exceptions import (
 )
 
 if TYPE_CHECKING:
+    from .l2.signer import L2Signer
+    from .l2.trading import L2Config, L2Trader
     from .resources.competition import CompetitionResource
     from .resources.history import HistoryResource
     from .resources.leaderboard import LeaderboardResource
@@ -45,31 +47,35 @@ if TYPE_CHECKING:
     from .resources.offerings import OfferingsResource
     from .resources.orders import OrdersResource
     from .resources.portfolio import PortfolioResource
-    from .signing import OrderSigner
     from .ws.client import LoafWebSocketClient
 
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "DELETE"})
 
-_PRIVATE_KEY_SHAPE = re.compile(r"0[xX][0-9a-fA-F]{64}")
-
-_NO_AGENT_KEY = (
-    "Placing orders needs your agent private key: pass agent_private_key=... or set "
-    f"${ENV_AGENT_PRIVATE_KEY}. You get it together with your API key in the Loaf web app "
-    "(Settings -> API keys)."
-)
+# The account's L2 trading key: 80 lowercase hex (an API token is 64).
+_L2_KEY_SHAPE = re.compile(r"[0-9a-f]{80}")
 
 # Failures before the request left this machine: re-sending them is always safe.
 _NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
-# 503s the exchange sends only when nothing was placed (safe to treat as a definite answer).
+# 503s the exchange sends only when nothing was placed (safe to treat as a definite answer),
+# matched in any case (Loaf-Backend at the K1 head): "Your order was not placed" (ordersService.ts,
+# l2OrderFields.ts, the venue read), "nothing was done" (the account read, l2OrderFields.ts), the
+# eligibility read (auth.ts), and the code of a market-mode switch (competitionVenue.ts).
 _NOT_PLACED_503_TEXTS = (
-    "Your order was not placed",
-    "Trading temporarily unavailable. Please try again shortly.",
+    "your order was not placed",
+    "nothing was done",
+    "trading temporarily unavailable. please try again shortly.",
 )
+_NOT_PLACED_503_CODES = frozenset({"VENUE_SWITCHING"})
 
 
 def _definitely_not_placed(error: LoafAPIError) -> bool:
-    return error.status_code == 503 and any(t in error.message for t in _NOT_PLACED_503_TEXTS)
+    if error.status_code != 503:
+        return False
+    if error.code in _NOT_PLACED_503_CODES:
+        return True
+    message = error.message.lower()
+    return any(t in message for t in _NOT_PLACED_503_TEXTS)
 
 
 # $LOAF_MAX_SLIPPAGE_BPS: a plain whole number from 0 to 9999 (leading zeros allowed).
@@ -107,24 +113,30 @@ class LoafClient:
 
         from loaf import LoafClient
 
-        with LoafClient(api_key="...") as loaf:
-            print(loaf.portfolio.component().cash)
-            print(loaf.market.properties())
+        with LoafClient(api_key="...", l2_secret_key="...") as loaf:
+            print(loaf.portfolio.component().balances)
+            loaf.orders.limit_buy("OPRA", quantity=10, price=167.49)
 
     Args:
         api_key: The API token from the Loaf web app (Settings -> API keys),
-            sent as ``Authorization: Bearer`` on reads, cancels and the
-            WebSocket. It is never sent on order placement. If omitted, read
+            sent as ``Authorization: Bearer`` on reads, cancels, the WebSocket
+            and the account reads an order needs (its key state, its order
+            indices). It is never sent with the order itself. If omitted, read
             from ``$LOAF_API_KEY``. Public endpoints work without one; other
             authenticated calls raise :class:`LoafConfigError`.
         base_url: REST base URL including the ``/api`` suffix. If omitted, read
             from ``$LOAF_API_BASE_URL``, else :data:`~loaf.constants.DEFAULT_BASE_URL`.
-        agent_private_key: The agent private key shown with your API key. It
-            signs every order locally and is never sent. If omitted, read from
-            ``$LOAF_AGENT_PRIVATE_KEY`` (prefer the environment variable: an
-            explicit ``agent_private_key=`` argument can show up in tools that
-            capture call frames). Without it everything works except placing
-            orders.
+        l2_secret_key: The account's L2 trading key, 80 lowercase hex. It signs
+            every order locally and is never sent. If omitted, read from
+            ``$LOAF_L2_SECRET_KEY`` (prefer the environment variable: an
+            explicit ``l2_secret_key=`` argument can show up in tools that
+            capture call frames). ``python -m loaf.l2.keys enable`` derives it
+            from the wallet and registers it. Without it everything works
+            except placing orders.
+        l2_config: L2 signing settings (:class:`~loaf.l2.trading.L2Config`); if
+            omitted, read from the ``LOAF_L2_*`` variables, else the defaults.
+        l2_signer: The native L2 signer (:class:`~loaf.l2.signer.L2Signer`);
+            if omitted, the vendored library for this platform.
         ws_url: Override the WebSocket URL. If omitted it is derived from
             ``base_url`` (``https://host/api`` -> ``wss://host/ws``) or read from
             ``$LOAF_WS_URL``.
@@ -158,7 +170,9 @@ class LoafClient:
         api_key: str | None = None,
         base_url: str | None = None,
         *,
-        agent_private_key: str | None = None,
+        l2_secret_key: str | None = None,
+        l2_config: L2Config | None = None,
+        l2_signer: L2Signer | None = None,
         ws_url: str | None = None,
         max_slippage_bps: int | None = None,
         timeout: float | tuple | httpx.Timeout | None = DEFAULT_TIMEOUT,
@@ -167,39 +181,31 @@ class LoafClient:
         http_client: httpx.Client | None = None,
     ) -> None:
         self.api_key = (api_key or os.environ.get(ENV_API_KEY) or "").strip() or None
-        if self.api_key and _PRIVATE_KEY_SHAPE.fullmatch(self.api_key):
+        if self.api_key and _L2_KEY_SHAPE.fullmatch(self.api_key.lower()):  # in any letter case
             raise LoafConfigError(
-                f"{ENV_API_KEY} looks like a private key (0x + 64 hex). Put the API token in "
-                f"{ENV_API_KEY} and the agent private key in {ENV_AGENT_PRIVATE_KEY}."
+                f"{ENV_API_KEY} looks like an L2 trading key (80 hex). Put the API token in "
+                f"{ENV_API_KEY} and the trading key in {ENV_L2_SECRET_KEY}."
             )
         #: Default max slippage (basis points) for the prices the SDK derives for your orders.
         self.max_slippage_bps: int = _max_slippage_bps(max_slippage_bps)
-        #: Signs placements; None without an agent key. The raw key is not kept.
-        self._signer: OrderSigner | None = None
-        raw_agent = None
+        #: The trading key the L2 signer gets on first use (:attr:`l2`); None without one.
+        self._l2_secret_key: str | None = None
+        raw_l2 = None
         try:
-            raw_agent = (agent_private_key or os.environ.get(ENV_AGENT_PRIVATE_KEY) or "").strip()
-            if raw_agent:
-                # Compared inline, so there is no second copy of the key to scrub.
-                if self.api_key and raw_agent.lower() in (
-                    self.api_key.lower(),
-                    "0x" + self.api_key.lower(),
-                ):
+            raw_l2 = (l2_secret_key or os.environ.get(ENV_L2_SECRET_KEY) or "").strip()
+            if raw_l2:
+                if not _L2_KEY_SHAPE.fullmatch(raw_l2):
                     raise LoafConfigError(
-                        f"{ENV_AGENT_PRIVATE_KEY} is the same value as {ENV_API_KEY}. The API "
-                        "token and the agent private key are two different secrets."
+                        f"{ENV_L2_SECRET_KEY} must be the account's L2 trading key, 80 lowercase "
+                        "hex (python -m loaf.l2.keys enable derives and registers it)."
                     )
-                try:
-                    from .signing import OrderSigner
-                except ImportError as exc:
-                    raise LoafConfigError(
-                        "Order signing needs the 'eth-account' package, new in loaf 0.4.0, and "
-                        f"it could not be imported ({exc}). Re-run: pip install -e ."
-                    ) from exc
-                self._signer = OrderSigner(raw_agent)
+                self._l2_secret_key = raw_l2
         finally:
             # Crash reporters and debuggers record frame locals: leave no key in them.
-            raw_agent = None
+            raw_l2 = l2_secret_key = None
+        self._l2_config = l2_config
+        self._l2_signer = l2_signer
+        self._l2: L2Trader | None = None
 
         self.base_url = (base_url or os.environ.get(ENV_BASE_URL) or DEFAULT_BASE_URL).rstrip("/")
         self._ws_url_override = ws_url or os.environ.get(ENV_WS_URL) or None
@@ -240,9 +246,9 @@ class LoafClient:
 
         #: Public market data: properties, candles, info pages.
         self.market: MarketResource = MarketResource(self)
-        #: Primary market (IPO offerings): list, detail.
+        #: Primary market (IPO offerings): list, detail, subscribe.
         self.offerings: OfferingsResource = OfferingsResource(self)
-        #: Trading: place (signed with your agent key) and cancel orders, stop & take orders.
+        #: Trading: place (signed with your L2 trading key) and cancel orders, stop & take orders.
         self.orders: OrdersResource = OrdersResource(self)
         #: Balances, positions, and PnL.
         self.portfolio: PortfolioResource = PortfolioResource(self)
@@ -335,7 +341,15 @@ class LoafClient:
             self._record_rate_limit(response)
 
             if response.is_success:
-                return self._parse_body(response)
+                try:
+                    return self._parse_body(response)
+                except ValueError as exc:  # labelled JSON but not JSON
+                    raise LoafAPIError(
+                        f"The {method} {path} response did not parse as JSON",
+                        status_code=response.status_code,
+                        request_id=response.headers.get("x-request-id"),
+                        body=response.text[:1000],
+                    ) from exc
 
             # Error path — decide whether to retry. Only idempotent (read) requests
             # are retried here. Signed placements go through _send_signed, which
@@ -358,23 +372,41 @@ class LoafClient:
     # ------------------------------------------------------------------ #
 
     @property
-    def agent_address(self) -> str | None:
-        """Checksummed address of the agent key that signs your orders, or ``None``."""
-        return self._signer.address if self._signer is not None else None
+    def l2_public_key(self) -> str | None:
+        """The public key of the trading key that signs your orders (``0x`` and 80 hex, as
+        ``GET /l2/keys`` names it), or ``None`` without a trading key."""
+        if self._l2 is None and not self._l2_secret_key:
+            return None
+        return self.l2.public_key
 
-    def _require_signer(self) -> OrderSigner:
-        if self._signer is None:
-            raise LoafConfigError(_NO_AGENT_KEY)
-        return self._signer
+    @property
+    def l2(self) -> L2Trader:
+        """The L2 signer of this client's orders (:class:`~loaf.l2.trading.L2Trader`), made on
+        first use from the trading key; :class:`LoafConfigError` without one."""
+        if self._l2 is None:
+            if not self._l2_secret_key:
+                raise LoafConfigError(
+                    "Placing an order needs the account's L2 trading key: pass l2_secret_key=... "
+                    f"or set ${ENV_L2_SECRET_KEY} (python -m loaf.l2.keys enable derives and "
+                    "registers it)."
+                )
+            from .l2.trading import L2Trader
+
+            self._l2 = L2Trader(
+                self, self._l2_secret_key, config=self._l2_config, signer=self._l2_signer
+            )
+            self._l2_secret_key = None  # the trader holds the one copy now
+        return self._l2
 
     def _send_signed(self, path: str, body: dict, *, ambiguous: bool = False) -> Any:
         """POST a signed placement, re-sending the identical bytes on transient failures.
 
         No ``Authorization`` header: the signature authenticates. Network errors
         and 5xx are re-sent up to ``max_retries`` times, after a short jittered
-        pause; the unique nonce makes a repeat a duplicate, never a second
-        order. 4xx (429 included) is final. If any attempt may have landed and
-        no 200 settled it, raises :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
+        pause; the exchange keys an order by its account and order index, so a
+        repeat is a duplicate, never a second order. 4xx (429 included) is
+        final. If any attempt may have landed and no 200 settled it, raises
+        :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
 
         ``ambiguous=True`` (resubmit): an earlier attempt may already have
         landed, so anything but a 200 raises ``OrderOutcomeUnknownError``.
@@ -478,7 +510,7 @@ class LoafClient:
     def _sleep_backoff(self, attempt: int, response: httpx.Response | None = None) -> None:
         if response is not None:
             hinted = self._retry_after_seconds(response)
-            if hinted is not None:
+            if hinted is not None and hinted > 0:
                 time.sleep(min(hinted, 60.0))
                 return
         # Exponential backoff with full jitter, capped at 30s.
@@ -519,7 +551,10 @@ class LoafClient:
     def __repr__(self) -> str:
         # getattr: crash reporters repr a client whose __init__ raised part-way.
         authed = "authenticated" if getattr(self, "api_key", None) else "anonymous"
-        signer = getattr(self, "_signer", None)
-        agent = f" agent={signer.address}" if signer is not None else ""
+        trader = getattr(self, "_l2", None)
+        if trader is not None:
+            l2 = f" l2_key={trader.public_key}"
+        else:
+            l2 = " l2_key=set" if getattr(self, "_l2_secret_key", None) else ""
         base_url = getattr(self, "base_url", None)
-        return f"<LoafClient base_url={base_url!r} {authed}{agent} v{__version__}>"
+        return f"<LoafClient base_url={base_url!r} {authed}{l2} v{__version__}>"

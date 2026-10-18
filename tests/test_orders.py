@@ -1,16 +1,15 @@
-"""Order placement against an in-memory exchange: signed bodies, the contract
-cache, MARKET pricing, TP/SL legs, conditionals, retries, resubmit and the
-contract heal.
+"""Order placement against an in-memory exchange: L2-signed bodies, the market
+read, MARKET pricing, TP/SL legs, conditionals, max slippage, credentials,
+retries, resubmit and the client's construction.
 
-Every signature is checked with ``conftest.recover``, which rebuilds the typed
-data without :mod:`loaf.signing`.
+Every signature is checked with ``conftest.assert_signed``, which rebuilds the
+signed terms from the body by the backend's rules and signs them again.
 """
 
 from __future__ import annotations
 
 import json
 import pathlib
-import re
 import subprocess
 import sys
 import time
@@ -22,25 +21,27 @@ import httpx
 import pytest
 
 import loaf
-import loaf.signing
 from loaf import LoafClient, OrderOutcomeUnknownError
-from loaf.signing import new_order_nonce
+from loaf.l2.signer import KAT
+from loaf.l2.trading import L2Trader
 
 from conftest import (
+    ACCOUNT,
     BASE,
-    CONTRACT,
-    CONTRACT_B,
-    HARDHAT_ADDRESS,
-    HARDHAT_KEY,
-    VECTOR_NONCE,
-    VECTOR_SIGNATURE,
-    opera_detail,
-    recover,
+    CHAIN_ID,
+    CONDITIONAL_KEYS,
+    EPOCH,
+    EXPIRY,
+    LEG_KEYS,
+    MARKET,
+    ORDER_KEYS,
+    PK0,
+    SIGNER,
+    SK0,
+    assert_signed,
+    detail,
+    signed_terms,
 )
-
-# The SDK sends the keys in this fixed order.
-ORDER_KEYS = "ticker price quantity side type timeInForce deadline nonce signature".split()
-CONDITIONAL_KEYS = ORDER_KEYS[:5] + ["triggerPrice"] + ORDER_KEYS[5:]
 
 NOT_CONFIRMED = (
     "Trading service did not confirm the order — it may still be processing. "
@@ -54,14 +55,14 @@ OPEN_ORDER_CAP = (
     "You have reached the limit of 100 open orders on this property. Cancel some open "
     "orders on it before placing a new one."
 )
-STALE_SIGNER = "Signer is not authorized to trade for any account"
-MIXED_SIGNERS = "Every signature in the request must be by the same signer"
+SIGNATURE_REFUSED = "l2 signature: the Schnorr signature does not verify"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-def error_reply(status: int, message: str, **kwargs) -> httpx.Response:
-    return httpx.Response(status, json={"error": message}, **kwargs)
+def error_reply(status: int, message: str, *, code: str | None = None, **kwargs) -> httpx.Response:
+    body = {"error": message} if code is None else {"error": message, "code": code}
+    return httpx.Response(status, json=body, **kwargs)
 
 
 def duplicate_reply(order_id: int = 7) -> httpx.Response:
@@ -74,22 +75,14 @@ def duplicate_reply(order_id: int = 7) -> httpx.Response:
             "status": "OPEN",
             "quantityLeft": 10.0,
             "duplicate": True,
+            "attachedLegIds": [],
         },
     )
 
 
-def leg_terms(body: dict, leg: str) -> dict:
-    """What a TP/SL leg signs: a SELL of the parent's quantity at the leg's price."""
-    return {
-        "side": "SELL",
-        "price": body[leg]["price"],
-        "quantity": body["quantity"],
-        "nonce": body[leg]["nonce"],
-    }
-
-
-def unsigned(body: dict) -> dict:
-    return {k: v for k, v in body.items() if k not in ("nonce", "signature")}
+def plain(body: dict) -> dict:
+    """A body without its L2 fields: what the order says, not who signed it or with which index."""
+    return {k: v for k, v in body.items() if not k.startswith("l2")}
 
 
 # --------------------------------------------------------------------------- #
@@ -102,56 +95,77 @@ def test_limit_body_signed_no_bearer(exchange, trading_client):
     request = exchange.requests[-1]
     body = json.loads(request.content)
     assert list(body) == ORDER_KEYS
-    assert [body[k] for k in ORDER_KEYS[:7]] == ["OPRA", 167.49, 10.0, "BUY", "LIMIT", "GTC", 0]
-    assert re.fullmatch(r"[0-9a-f]{32}", body["nonce"])
+    assert body == {
+        **body,
+        "ticker": "OPRA",
+        "price": 167.49,
+        "quantity": 10.0,
+        "side": "BUY",
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "l2ChainId": CHAIN_ID,
+        "l2AccountIndex": ACCOUNT,
+        "l2MarketIndex": MARKET["marketIndex"],
+        "l2OrderIndex": 1000,
+        "l2Epoch": EPOCH,
+        "l2FeeRateCap": 7000,
+        "l2ExpiryMs": EXPIRY,
+        "l2BaseAssetId": MARKET["baseAssetId"],
+        "l2QuoteAssetId": MARKET["quoteAssetId"],
+    }
     # The signature authenticates a placement: the API key is set but not sent.
     assert "authorization" not in request.headers
     assert request.headers["content-type"] == "application/json"
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
+    assert_signed(body)
     assert (res.orderId, res.status, res.quantityLeft, res.duplicate) == (1, "OPEN", 10.0, False)
-
-
-def test_vector_end_to_end(exchange, trading_client, monkeypatch):
-    monkeypatch.setattr(loaf.signing, "new_order_nonce", lambda now_ms=None: VECTOR_NONCE)
-    trading_client().orders.limit_buy("OPRA", 1.5, 160)
-    (body,) = exchange.bodies("/orders")
-    assert body["nonce"] == VECTOR_NONCE
-    assert body["signature"] == VECTOR_SIGNATURE
+    assert res.attachedLegIds == []
+    # The account and its epoch for this client's key, and one block of the web app's 64 indices.
+    (keys,) = exchange.gets("/l2/keys")
+    assert dict(keys.url.params) == {"apiKeyIndex": "0", "publicKey": PK0}
+    assert exchange.bodies("/l2/order-indices") == [{"count": 64}]
 
 
 # --------------------------------------------------------------------------- #
-# Contract cache
+# The property's L2 market
 # --------------------------------------------------------------------------- #
 
 
-def test_contract_cached_once(exchange, trading_client):
-    client = trading_client()
-    client.orders.limit_buy("OPRA", 10, 167.49)
-    client.orders.limit_buy("OPRA", 10, 167.49)
-    (get,) = exchange.gets("/trade/OPRA")
-    assert "authorization" not in get.headers  # a public read
-    assert len(exchange.posts("/orders")) == 2
-
-
-def test_contract_cached_per_ticker(exchange, trading_client):
-    exchange.details["MUS"] = opera_detail(contract=CONTRACT_B)
+def test_market_read_once_per_ticker(exchange, trading_client):
+    exchange.details["MUS"] = detail("MUS", market={**MARKET, "marketIndex": 6, "baseAssetId": 8})
     client = trading_client()
     for ticker in ("OPRA", "MUS", "OPRA", "MUS"):
         client.orders.limit_buy(ticker, 10, 100)
     assert len(exchange.gets("/trade/OPRA")) == len(exchange.gets("/trade/MUS")) == 1
-    for body, contract in zip(exchange.bodies("/orders"), [CONTRACT, CONTRACT_B] * 2):
-        assert recover(body, body["signature"], contract) == HARDHAT_ADDRESS
+    assert len(exchange.gets("/l2/keys")) == 1
+    bodies = exchange.bodies("/orders")
+    markets = [(b["ticker"], b["l2MarketIndex"], b["l2BaseAssetId"]) for b in bodies]
+    assert markets == [("OPRA", 5, 7), ("MUS", 6, 8)] * 2
+    # One account, one block: the indices run on across the properties.
+    assert [b["l2OrderIndex"] for b in bodies] == [1000, 1001, 1002, 1003]
+    for body in bodies:
+        assert_signed(body)
 
 
-def test_null_contract_local_error(exchange, trading_client):
-    exchange.details["OPRA"] = opera_detail(contract=None)
+def test_market_read_again_after_30_s(exchange, trading_client, clock):
+    client = trading_client()
+    client.orders.limit_buy("OPRA", 1, 100)
+    clock.t += 29
+    client.orders.limit_buy("OPRA", 1, 100)
+    assert len(exchange.gets("/trade/OPRA")) == 1
+    clock.t += 1
+    client.orders.limit_buy("OPRA", 1, 100)
+    assert len(exchange.gets("/trade/OPRA")) == 2
+    assert len(exchange.gets("/l2/keys")) == 1  # the key state keeps for 60 s
+
+
+def test_no_l2_market_never_cached(exchange, trading_client):
+    exchange.details["OPRA"] = detail(market=None)
     client = trading_client()
     for _ in range(2):
-        with pytest.raises(loaf.LoafValidationError, match="no deployed token contract") as info:
+        with pytest.raises(loaf.LoafL2Error, match="no L2 market is listed for OPRA"):
             client.orders.limit_buy("OPRA", 10, 167.49)
-        assert info.value.status_code == 0
     assert exchange.posts("/orders") == []
-    assert len(exchange.gets("/trade/OPRA")) == 2  # a missing contract is never cached
+    assert len(exchange.gets("/trade/OPRA")) == 2  # a missing market is never cached
 
 
 def test_unknown_ticker_404(exchange, trading_client):
@@ -165,30 +179,30 @@ def test_unknown_ticker_404(exchange, trading_client):
 # --------------------------------------------------------------------------- #
 
 
-def test_market_buy_fetches_reference(exchange, trading_client):
+def test_market_buy_reads_the_reference(exchange, trading_client):
     client = trading_client()
     client.orders.market_buy("OPRA", 2)  # reference 160, signs 160 x 1.02
     body = exchange.bodies("/orders")[-1]
     assert (body["type"], body["price"], body["quantity"]) == ("MARKET", 163.2, 2.0)
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
-    assert len(exchange.gets("/trade/OPRA")) == 1
+    assert_signed(body)
+    assert len(exchange.gets("/trade/OPRA")) == 1  # the reference read refreshes the market too
 
     client.orders.market_sell("OPRA", 2)  # 160 x 0.98
     body = exchange.bodies("/orders")[-1]
     assert (body["side"], body["price"]) == ("SELL", 156.8)
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
+    assert_signed(body)
     assert len(exchange.gets("/trade/OPRA")) == 2  # the reference is read for every order
 
 
 def test_market_reference_price_no_reference_get(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("OPRA", 10, 167.49)  # warms the contract cache
+    client.orders.limit_buy("OPRA", 10, 167.49)  # reads the market
     client.orders.market_sell("OPRA", 2, reference_price=100.005, max_slippage_bps=50)
     body = exchange.bodies("/orders")[-1]
-    assert body["price"] == 99.5  # 99.504975, half-up to the cent
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
+    assert body["price"] == 99.51  # 99.504975, up to the cent: never below the tolerance
+    assert_signed(body)
     client.orders.market_buy("OPRA", 2, reference_price=100.005, max_slippage_bps=50)
-    assert exchange.bodies("/orders")[-1]["price"] == 100.51  # 100.505025
+    assert exchange.bodies("/orders")[-1]["price"] == 100.5  # 100.505025, down to the cent
     assert len(exchange.gets("/trade/OPRA")) == 1
 
 
@@ -234,16 +248,16 @@ def test_pricing_refusals(exchange, trading_client, method, args, kwargs, messag
 
 
 @pytest.mark.parametrize(
-    "detail",
+    "served",
     [
-        opera_detail(market_price=0),  # the exchange has no reference yet
-        {**opera_detail(), "propertyList": [{"ticker": "MUS", "tokenName": "Musgrave", "marketPrice": 50}]},
+        detail(mark=0),  # the exchange has no reference yet
+        {**detail(), "propertyList": [{"ticker": "MUS", "tokenName": "Musgrave", "marketPrice": 50}]},
         # Matched on the ticker: an entry whose display name happens to read OPRA is not it.
-        {**opera_detail(), "propertyList": [{"ticker": "MUS", "tokenName": "OPRA", "marketPrice": 50}]},
+        {**detail(), "propertyList": [{"ticker": "MUS", "tokenName": "OPRA", "marketPrice": 50}]},
     ],
 )
-def test_market_without_reference_refused(exchange, trading_client, detail):
-    exchange.details["OPRA"] = detail
+def test_market_without_reference_refused(exchange, trading_client, served):
+    exchange.details["OPRA"] = served
     with pytest.raises(loaf.LoafValidationError, match="No market reference price") as info:
         trading_client().orders.market_buy("OPRA", 1)
     assert info.value.status_code == 0
@@ -257,27 +271,33 @@ def test_market_without_reference_refused(exchange, trading_client, detail):
 
 def test_limit_buy_with_legs(exchange, trading_client):
     client = trading_client()
-    client.orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90)
+    res = client.orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90)
     body = exchange.bodies("/orders")[-1]
     assert list(body) == ORDER_KEYS + ["tp", "sl"]
-    assert list(body["tp"]) == ["triggerPrice", "price", "nonce", "signature"]
-    # The triggers go as given; each leg signs a SELL 2% below its trigger.
+    assert list(body["tp"]) == list(body["sl"]) == LEG_KEYS
+    # The triggers go as given; each leg signs a SELL 2% below its trigger, with the next indices.
     assert (body["tp"]["triggerPrice"], body["tp"]["price"]) == (120.0, 117.6)
     assert (body["sl"]["triggerPrice"], body["sl"]["price"]) == (90.0, 88.2)
-    assert len({body["nonce"], body["tp"]["nonce"], body["sl"]["nonce"]}) == 3
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
-    for leg in ("tp", "sl"):
-        assert recover(leg_terms(body, leg), body[leg]["signature"]) == HARDHAT_ADDRESS
+    indices = (body["l2OrderIndex"], body["tp"]["l2OrderIndex"], body["sl"]["l2OrderIndex"])
+    assert indices == (1000, 1001, 1002)
+    assert body["tp"]["l2ExpiryMs"] == body["sl"]["l2ExpiryMs"] == body["l2ExpiryMs"]
+    assert_signed(body)  # the order and both legs
+    assert res.attachedLegIds == [901, 902]
 
     client.orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90, leg_max_slippage_bps=500)
     body = exchange.bodies("/orders")[-1]
     assert (body["tp"]["price"], body["sl"]["price"]) == (114.0, 85.5)
-    assert recover(leg_terms(body, "sl"), body["sl"]["signature"]) == HARDHAT_ADDRESS
+    assert_signed(body)
 
+    # A lone stop-loss takes the index after its order; the next order follows its legs.
     client.orders.limit_buy("OPRA", 10, 100, sl_price=90)
-    assert list(exchange.bodies("/orders")[-1]) == ORDER_KEYS + ["sl"]
+    body = exchange.bodies("/orders")[-1]
+    assert list(body) == ORDER_KEYS + ["sl"]
+    assert (body["l2OrderIndex"], body["sl"]["l2OrderIndex"]) == (1006, 1007)
     client.orders.limit_buy("OPRA", 10, 100)
-    assert list(exchange.bodies("/orders")[-1]) == ORDER_KEYS  # strict schema: no empty legs
+    body = exchange.bodies("/orders")[-1]
+    assert list(body) == ORDER_KEYS  # strict schema: no empty legs
+    assert body["l2OrderIndex"] == 1008
 
 
 @pytest.mark.parametrize(
@@ -319,9 +339,7 @@ def test_leg_rules_side_and_market_parent(exchange, trading_client):
     orders.market_buy("OPRA", 1, max_slippage_bps=50, tp_price=120, sl_price=90)
     body = exchange.bodies("/orders")[-1]
     assert (body["price"], body["tp"]["price"], body["sl"]["price"]) == (160.8, 117.6, 88.2)
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
-    for leg in ("tp", "sl"):
-        assert recover(leg_terms(body, leg), body[leg]["signature"]) == HARDHAT_ADDRESS
+    assert_signed(body)
 
 
 # --------------------------------------------------------------------------- #
@@ -335,33 +353,34 @@ def test_conditional_market_price_derived(exchange, trading_client):
     assert res.orderId == 1
     body = exchange.bodies("/orders/conditional")[-1]
     assert list(body) == CONDITIONAL_KEYS
-    assert unsigned(body) == {
+    assert plain(body) == {
         "ticker": "OPRA",
         "price": 88.2,  # books at up to 2% below the trigger
         "quantity": 5.0,
         "side": "SELL",
         "type": "STOP_MARKET",
-        "triggerPrice": 90.0,
         "timeInForce": "GTC",
-        "deadline": 0,
+        "triggerPrice": 90.0,
     }
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
+    assert_signed(body)  # the order the trigger books, signed now
     assert exchange.posts("/orders") == []
 
     orders.create_conditional("OPRA", "BUY", 2, type="STOP_MARKET", trigger_price=130)
     body = exchange.bodies("/orders/conditional")[-1]
     assert body["price"] == 132.6  # a BUY books above its trigger
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
+    assert_signed(body)
 
     orders.stop_loss("OPRA", 5, 90)
     stop = exchange.bodies("/orders/conditional")[-1]
-    assert unsigned(stop) == unsigned(exchange.bodies("/orders/conditional")[0])
+    assert plain(stop) == plain(exchange.bodies("/orders/conditional")[0])
 
     orders.take_profit("OPRA", 5, 120, max_slippage_bps=100)
     take = exchange.bodies("/orders/conditional")[-1]
     assert (take["type"], take["side"]) == ("TAKE_MARKET", "SELL")
     assert (take["triggerPrice"], take["price"]) == (120.0, 118.8)  # 1% below the trigger
-    assert recover(take, take["signature"]) == HARDHAT_ADDRESS
+    assert_signed(take)
+    indices = [b["l2OrderIndex"] for b in exchange.bodies("/orders/conditional")]
+    assert indices == [1000, 1001, 1002, 1003]
 
 
 def test_conditional_limit(exchange, trading_client):
@@ -370,7 +389,7 @@ def test_conditional_limit(exchange, trading_client):
     )
     (body,) = exchange.bodies("/orders/conditional")
     assert (body["type"], body["price"], body["triggerPrice"]) == ("TAKE_LIMIT", 70.5, 70.0)
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
+    assert_signed(body)
 
 
 @pytest.mark.parametrize(
@@ -497,19 +516,41 @@ def test_client_max_slippage_read_per_order(exchange, trading_client):
 # --------------------------------------------------------------------------- #
 
 
-def test_no_agent_key(exchange, trading_client):
-    client = trading_client(agent_key=None)
-    assert client.agent_address is None
-    with pytest.raises(loaf.LoafConfigError, match="LOAF_AGENT_PRIVATE_KEY"):
+def test_no_trading_key(exchange, trading_client):
+    client = trading_client(l2_key=None)
+    assert client.l2_public_key is None
+    with pytest.raises(loaf.LoafConfigError, match="LOAF_L2_SECRET_KEY"):
         client.orders.limit_buy("OPRA", 10, 167.49)
+    with pytest.raises(loaf.LoafConfigError, match="LOAF_L2_SECRET_KEY"):
+        client.orders.stop_loss("OPRA", 5, 90)
     assert exchange.requests == []
 
 
-def test_agent_only_client(trading_client):
+def test_trading_key_alone_cannot_place(exchange, trading_client):
+    # The order goes without the API key, but the account's key state and indices need it.
     client = trading_client(api_key=None)
-    assert client.orders.limit_buy("OPRA", 10, 167.49).orderId == 1
+    with pytest.raises(loaf.LoafConfigError, match="no API key is set"):
+        client.orders.limit_buy("OPRA", 10, 167.49)
+    assert [r.url.path for r in exchange.requests] == ["/api/trade/OPRA"]  # the public read only
     with pytest.raises(loaf.LoafConfigError):
-        client.orders.cancel(1)  # cancels still need the API key
+        client.orders.cancel(1)  # cancels need the API key too
+
+
+def test_api_key_on_the_account_reads_only(exchange):
+    # The public construction: the trader is made on first use from l2_secret_key.
+    http = httpx.Client(transport=httpx.MockTransport(exchange.handler), base_url=BASE)
+    client = LoafClient(
+        api_key="testkey", base_url=BASE, http_client=http, l2_secret_key=SK0, l2_signer=SIGNER
+    )
+    client.orders.limit_sell("OPRA", 1, 200)
+    auth = {r.url.path: r.headers.get("authorization") for r in exchange.requests}
+    assert auth == {
+        "/api/trade/OPRA": None,  # a public read
+        "/api/l2/keys": "Bearer testkey",
+        "/api/l2/order-indices": "Bearer testkey",
+        "/api/orders": None,  # the signature authenticates the order
+    }
+    assert_signed(exchange.bodies("/orders")[0])
 
 
 # --------------------------------------------------------------------------- #
@@ -536,17 +577,38 @@ def test_transient_failure_resent_identically(exchange, trading_client, failure)
     assert res.orderId == 7 and res.duplicate is True
 
 
+# The 503s Loaf-Backend sends only when nothing was placed (K1 head): ordersService.ts, the
+# eligibility read (auth.ts), l2OrderFields.ts and the market mode (competitionVenue.ts).
 @pytest.mark.parametrize(
-    "message",
+    "message, code",
     [
-        NOT_PLACED,
-        "Trading is temporarily unavailable for this property. Your order was not placed — "
-        "please try again in a moment.",
-        "Trading temporarily unavailable. Please try again shortly.",
+        (NOT_PLACED, None),
+        (
+            "Trading is temporarily unavailable for this property. Your order was not placed — "
+            "please try again in a moment.",
+            None,
+        ),
+        ("Trading temporarily unavailable. Please try again shortly.", None),
+        ("Trading is temporarily unavailable; your order was not placed, try again in a moment", None),
+        (
+            "l2 signature: the order signature could not be checked; your order was not placed, "
+            "try again",
+            None,
+        ),
+        (
+            "l2 account: the trading account could not be read; nothing was done, try again in a "
+            "moment",
+            None,
+        ),
+        (
+            "The market mode could not be read; your order was not placed, try again in a moment",
+            None,
+        ),
+        ("Market mode is switching; try again in a moment", "VENUE_SWITCHING"),
     ],
 )
-def test_503_not_placed_exhausted(exchange, trading_client, message):
-    exchange.queue("/orders", *(error_reply(503, message) for _ in range(3)))
+def test_503_not_placed_exhausted(exchange, trading_client, message, code):
+    exchange.queue("/orders", *(error_reply(503, message, code=code) for _ in range(3)))
     with pytest.raises(loaf.LoafServiceUnavailableError) as info:
         trading_client(max_retries=2).orders.limit_buy("OPRA", 10, 167.49)
     assert info.value.message == message
@@ -575,7 +637,9 @@ def test_timeouts_exhausted_unknown(exchange, trading_client, failure):
     assert error.attempts == 4
     assert error.signed_body == json.loads(posts[0])
     assert json.dumps(error.signed_body, separators=(",", ":")).encode() == posts[0]
-    assert error.nonce == error.signed_body["nonce"] and error.nonce in str(error)
+    # The exchange holds at most one order per account and index: they name the order.
+    assert (error.l2_account_index, error.l2_order_index) == (ACCOUNT, 1000)
+    assert "order index 1000 of account 42" in str(error)
     assert isinstance(error.last_error, loaf.LoafConnectionError)
     assert error.__cause__ is error.last_error
     # Code that re-places an order on a connection error must not catch this one.
@@ -709,8 +773,9 @@ def test_conditional_timeout_resent_identically(exchange, trading_client):
 
 def test_placement_timeout(exchange, trading_client):
     trading_client().orders.limit_buy("OPRA", 10, 167.49)
-    get, post = exchange.requests
-    assert get.extensions["timeout"]["read"] == 30.0  # reads keep the client's timeout
+    *reads, post = exchange.requests
+    # The market and key-state reads and the index reservation keep the client's timeout.
+    assert [r.extensions["timeout"]["read"] for r in reads] == [30.0, 30.0, 30.0]
     assert post.extensions["timeout"]["read"] == 45.0  # placements wait out the engine
 
     trading_client(timeout=60.0).orders.limit_buy("OPRA", 10, 167.49)
@@ -739,11 +804,14 @@ def test_placement_timeout_ignores_injected_clients_timeout(exchange):
         base_url=BASE,
         timeout=httpx.Timeout(120.0, connect=20.0),
     )
-    client = LoafClient(base_url=BASE, agent_private_key=HARDHAT_KEY, http_client=http)
+    client = LoafClient(
+        api_key="testkey", base_url=BASE, l2_secret_key=SK0, l2_signer=SIGNER, http_client=http
+    )
     client.orders.limit_buy("OPRA", 10, 167.49)
-    get, post = exchange.requests
-    read_timeout = get.extensions["timeout"]
-    assert (read_timeout["connect"], read_timeout["read"]) == (20.0, 120.0)
+    *reads, post = exchange.requests
+    for read in reads:
+        read_timeout = read.extensions["timeout"]
+        assert (read_timeout["connect"], read_timeout["read"]) == (20.0, 120.0)
     placement = post.extensions["timeout"]
     phases = tuple(placement[k] for k in ("connect", "read", "write", "pool"))
     assert phases == (30.0, 45.0, 30.0, 30.0)  # the default 30 s, with only the read raised
@@ -774,30 +842,31 @@ def test_placement_backoff_ignores_rate_limit_headers(exchange, trading_client, 
     assert sleeps == [57.0]
 
 
+@pytest.mark.parametrize("read", ["/trade/OPRA", "/l2/keys"])
 @pytest.mark.parametrize(
     "place",
     [
-        lambda orders: orders.limit_buy("OPRA", 10, 167.49),  # the contract read
+        lambda orders: orders.limit_buy("OPRA", 10, 167.49),
         lambda orders: orders.market_buy("OPRA", 2),  # the reference read
         lambda orders: orders.market_buy("OPRA", 2, reference_price=160),
         lambda orders: orders.stop_loss("OPRA", 5, 90),
     ],
 )
-def test_pre_signing_read_429_not_waited_out(exchange, trading_client, monkeypatch, place):
+def test_pre_signing_read_429_not_waited_out(exchange, trading_client, monkeypatch, place, read):
     sleeps: list = []
     monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=sleeps.append))
     limited = error_reply(429, "Too many requests", headers={"RateLimit-Reset": "58"})
-    exchange.queue("/trade/OPRA", limited)
+    exchange.queue(read, limited)
     # Waiting out the window would place the order a minute late, at a stale price.
     with pytest.raises(loaf.LoafRateLimitError) as info:
         place(trading_client().orders)
     assert info.value.retry_after == 58.0
     assert sleeps == []
-    assert len(exchange.gets("/trade/OPRA")) == 1
+    assert len(exchange.gets(read)) == 1
     assert exchange.posts("/orders") == [] and exchange.posts("/orders/conditional") == []
 
     # A 503 there is retried, after the short jittered pause only (every reply carries the hint).
-    exchange.queue("/trade/OPRA", error_reply(503, "busy", headers={"RateLimit-Reset": "57"}))
+    exchange.queue(read, error_reply(503, "busy", headers={"RateLimit-Reset": "57"}))
     assert place(trading_client().orders).orderId == 1
     assert len(sleeps) == 1 and 0 <= sleeps[0] <= 0.5
 
@@ -816,7 +885,7 @@ def test_resubmit(exchange, trading_client):
         trading_client(max_retries=0).orders.stop_loss("OPRA", 5, 90)
 
     # The body carries its own signature: neither key is needed to re-send it.
-    bare = trading_client(api_key=None, agent_key=None)
+    bare = trading_client(api_key=None, l2_key=None)
     exchange.queue("/orders", duplicate_reply())
     assert bare.orders.resubmit(order.value.signed_body).duplicate is True
     first, again = exchange.posts("/orders")
@@ -827,22 +896,25 @@ def test_resubmit(exchange, trading_client):
 
     sent = len(exchange.requests)
     body = order.value.signed_body
-    day_and_an_hour_ago = time.time_ns() // 1_000_000 - 25 * 3600 * 1000
-    a_day_and_an_hour_ahead = time.time_ns() // 1_000_000 + 25 * 3600 * 1000
+    now_ms = time.time_ns() // 1_000_000
+    hour = 3_600_000
     for bad, message in (
-        ({k: v for k, v in body.items() if k != "signature"}, "needs a signed placement body"),
+        ({k: v for k, v in body.items() if k != "l2SigS"}, "needs a signed placement body"),
+        ({**body, "l2OrderIndex": "1000"}, "needs a signed placement body"),
+        ({**body, "l2AccountIndex": True}, "needs a signed placement body"),
+        ({**body, "l2ExpiryMs": float(body["l2ExpiryMs"])}, "needs a signed placement body"),
         (json.dumps(body), "needs a signed placement body"),
-        ({**body, "nonce": new_order_nonce(day_and_an_hour_ago)}, "more than 24 hours ago"),
-        ({**body, "nonce": new_order_nonce(a_day_and_an_hour_ahead)}, "more than 24 hours ago"),
+        # The exchange refuses an order within a day of its expiry: it could not confirm it either.
+        ({**body, "l2ExpiryMs": now_ms + 23 * hour}, "expires within a day"),
+        ({**body, "l2ExpiryMs": now_ms - hour}, "expires within a day"),
     ):
         with pytest.raises(loaf.LoafValidationError, match=message) as info:
             bare.orders.resubmit(bad)
         assert info.value.status_code == 0
     assert len(exchange.requests) == sent
 
-    # A body signed hours ago (e.g. saved across a restart) still goes out unchanged.
-    twenty_three_hours_ago = time.time_ns() // 1_000_000 - 23 * 3600 * 1000
-    old = {**body, "nonce": new_order_nonce(twenty_three_hours_ago)}
+    # A body signed days ago (e.g. saved across a restart) still goes out unchanged.
+    old = {**body, "l2ExpiryMs": now_ms + 25 * hour}
     bare.orders.resubmit(old)
     assert json.loads(exchange.posts("/orders")[-1]) == old
 
@@ -857,7 +929,7 @@ def test_resubmit(exchange, trading_client):
             loaf.LoafServiceUnavailableError,
         ),
         (lambda: [error_reply(400, OPEN_ORDER_CAP)], loaf.LoafValidationError),
-        (lambda: [error_reply(401, STALE_SIGNER)], loaf.LoafAuthError),
+        (lambda: [error_reply(401, SIGNATURE_REFUSED)], loaf.LoafAuthError),
     ],
 )
 def test_resubmit_failure_stays_unknown(exchange, trading_client, replies, reason):
@@ -874,156 +946,6 @@ def test_resubmit_failure_stays_unknown(exchange, trading_client, replies, reaso
     assert again.value.attempts == len(queued)
     posts = exchange.posts("/orders")
     assert len(posts) == 1 + len(queued) and len(set(posts)) == 1
-
-
-# --------------------------------------------------------------------------- #
-# Contract heal (a competition round redeployed the property's token)
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.parametrize(
-    "path, place",
-    [
-        ("/orders", lambda orders: orders.limit_buy("OPRA", 10, 167.49)),
-        ("/orders/conditional", lambda orders: orders.stop_loss("OPRA", 5, 90)),
-    ],
-)
-def test_contract_heal(exchange, trading_client, path, place):
-    client = trading_client()
-    place(client.orders)  # caches CONTRACT
-    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
-    exchange.queue(path, error_reply(401, STALE_SIGNER))
-    assert place(client.orders).orderId == 2
-    stale, healed = exchange.bodies(path)[1:]
-    assert healed["nonce"] != stale["nonce"]  # re-signed with fresh nonces, not re-sent
-    assert recover(healed, healed["signature"], CONTRACT_B) == HARDHAT_ADDRESS
-    assert len(exchange.gets("/trade/OPRA")) == 2
-
-    place(client.orders)  # the new contract is cached
-    latest = exchange.bodies(path)[-1]
-    assert recover(latest, latest["signature"], CONTRACT_B) == HARDHAT_ADDRESS
-    assert len(exchange.gets("/trade/OPRA")) == 2
-
-
-def test_contract_heal_with_legs(exchange, trading_client):
-    client = trading_client()
-    client.orders.limit_buy("OPRA", 10, 167.49)
-    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
-    exchange.queue("/orders", error_reply(401, MIXED_SIGNERS))
-    client.orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90)
-    healed = exchange.bodies("/orders")[-1]
-    assert len(exchange.posts("/orders")) == 3
-    assert recover(healed, healed["signature"], CONTRACT_B) == HARDHAT_ADDRESS
-    for leg in ("tp", "sl"):
-        signer = recover(leg_terms(healed, leg), healed[leg]["signature"], CONTRACT_B)
-        assert signer == HARDHAT_ADDRESS
-
-
-def test_contract_heal_only_once(exchange, trading_client):
-    client = trading_client()
-    client.orders.limit_buy("OPRA", 10, 167.49)
-    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
-    exchange.queue("/orders", error_reply(401, STALE_SIGNER), error_reply(401, STALE_SIGNER))
-    with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):
-        client.orders.limit_buy("OPRA", 10, 167.49)
-    assert len(exchange.posts("/orders")) == 3
-
-
-def test_no_heal_when_contract_unchanged(exchange, trading_client):
-    client = trading_client()
-    client.orders.limit_buy("OPRA", 10, 167.49)
-    exchange.queue("/orders", error_reply(401, STALE_SIGNER))
-    with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):  # the agent key itself is refused
-        client.orders.limit_buy("OPRA", 10, 167.49)
-    assert len(exchange.posts("/orders")) == 2
-    assert len(exchange.gets("/trade/OPRA")) == 2  # re-read once, found unchanged
-
-
-def test_no_heal_when_contract_differs_only_in_case(exchange, trading_client):
-    mixed_case = "0x" + "aB" * 20
-    exchange.details["OPRA"] = opera_detail(contract=mixed_case)
-    client = trading_client()
-    client.orders.limit_buy("OPRA", 10, 167.49)
-    exchange.details["OPRA"] = opera_detail(contract=mixed_case.lower())  # the same address
-    exchange.queue("/orders", error_reply(401, STALE_SIGNER))
-    with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):
-        client.orders.limit_buy("OPRA", 10, 167.49)
-    assert len(exchange.posts("/orders")) == 2  # nothing to re-sign
-
-
-def test_no_heal_for_other_401s(exchange, trading_client):
-    client = trading_client()
-    client.orders.limit_buy("OPRA", 10, 167.49)
-    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
-    exchange.queue("/orders", error_reply(401, "Invalid signature"))
-    with pytest.raises(loaf.LoafAuthError, match="Invalid signature"):
-        client.orders.limit_buy("OPRA", 10, 167.49)
-    assert len(exchange.posts("/orders")) == 2
-    assert len(exchange.gets("/trade/OPRA")) == 1
-
-
-def test_no_heal_on_freshly_read_contract(exchange, trading_client):
-    client = trading_client()
-    exchange.queue("/orders", error_reply(401, STALE_SIGNER))
-    with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):
-        client.orders.limit_buy("OPRA", 10, 167.49)
-    assert len(exchange.posts("/orders")) == 1
-    assert len(exchange.gets("/trade/OPRA")) == 1
-
-    # A MARKET order's reference read is as fresh, even with the contract already cached.
-    exchange.queue("/orders", error_reply(401, STALE_SIGNER))
-    with pytest.raises(loaf.LoafAuthError, match=STALE_SIGNER):
-        client.orders.market_buy("OPRA", 2)
-    assert len(exchange.posts("/orders")) == 2
-    assert len(exchange.gets("/trade/OPRA")) == 2  # the reference read, no re-read
-
-
-@pytest.mark.parametrize(
-    "path, place, stale",
-    [
-        ("/orders", lambda orders: orders.limit_buy("OPRA", 10, 167.49), STALE_SIGNER),
-        (
-            "/orders",
-            lambda orders: orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90),
-            MIXED_SIGNERS,
-        ),
-        ("/orders/conditional", lambda orders: orders.stop_loss("OPRA", 5, 90), STALE_SIGNER),
-    ],
-)
-@pytest.mark.parametrize(
-    "ambiguous",
-    [
-        lambda: httpx.ReadTimeout("timed out"),
-        lambda: error_reply(503, NOT_CONFIRMED),
-        lambda: error_reply(500, "Internal server error"),
-    ],
-)
-def test_no_heal_after_ambiguous_attempt(exchange, trading_client, path, place, stale, ambiguous):
-    client = trading_client()
-    place(client.orders)  # caches CONTRACT
-    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
-    exchange.queue(path, ambiguous(), error_reply(401, stale))
-    # The first attempt may be live: re-signing now would place a second order.
-    with pytest.raises(OrderOutcomeUnknownError) as info:
-        place(client.orders)
-    assert type(info.value.last_error) is loaf.LoafAuthError
-    assert info.value.last_error.message == stale
-    first, again = exchange.posts(path)[1:]
-    assert again == first  # re-sent unchanged: one nonce
-    assert len(exchange.gets("/trade/OPRA")) == 1  # no heal re-read
-
-
-def test_heal_after_definite_503(exchange, trading_client):
-    # "Your order was not placed" settles the first attempt, so the heal may still run.
-    client = trading_client()
-    client.orders.limit_buy("OPRA", 10, 167.49)
-    exchange.details["OPRA"] = opera_detail(contract=CONTRACT_B)
-    exchange.queue("/orders", error_reply(503, NOT_PLACED), error_reply(401, STALE_SIGNER))
-    assert client.orders.limit_buy("OPRA", 10, 167.49).orderId == 2
-    _, not_placed, stale, healed = exchange.bodies("/orders")
-    assert stale == not_placed and healed["nonce"] != stale["nonce"]
-    assert recover(healed, healed["signature"], CONTRACT_B) == HARDHAT_ADDRESS
-    assert len(exchange.gets("/trade/OPRA")) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -1061,7 +983,7 @@ def test_ticker_and_side_validation(exchange, trading_client, ticker, side):
 
 @pytest.mark.parametrize("ticker", ["A", "MUS", "OPRA", "X1", "1234"])
 def test_ticker_accepted(exchange, trading_client, ticker):
-    exchange.details[ticker] = opera_detail()
+    exchange.details[ticker] = detail(ticker)
     trading_client().orders.limit_buy(ticker, 1, 100)
     (body,) = exchange.bodies("/orders")
     assert body["ticker"] == ticker
@@ -1074,14 +996,14 @@ def test_wire_normalization(exchange, trading_client):
     (content,) = exchange.posts("/orders")
     body = json.loads(content)
     assert (body["price"], body["quantity"]) == (167.49, 2.0)
-    assert b'"price":167.49,' in content and b'"quantity":2.0,' in content
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
+    assert b'"price":167.49,"quantity":2.0,' in content
+    assert_signed(body)
 
     # 2.01 * 1000 == 2009.9999999999998 in floating point: the scaling must stay exact.
     client.orders.limit_buy("OPRA", 10, 2.01)
     body = exchange.bodies("/orders")[-1]
-    assert body["price"] == 2.01
-    assert recover(body, body["signature"]) == HARDHAT_ADDRESS
+    assert body["price"] == 2.01 and signed_terms(body)["price"] == 2010
+    assert_signed(body)
 
 
 # --------------------------------------------------------------------------- #
@@ -1090,30 +1012,30 @@ def test_wire_normalization(exchange, trading_client):
 
 
 def test_client_construction(monkeypatch):
-    monkeypatch.setenv("LOAF_AGENT_PRIVATE_KEY", HARDHAT_KEY)
+    monkeypatch.setenv("LOAF_L2_SECRET_KEY", SK0)
     with LoafClient(base_url=BASE) as client:
-        assert client.agent_address == HARDHAT_ADDRESS
+        assert "l2_key=set" in repr(client)
+        assert client.l2_public_key == PK0  # the trader is made on first use
         text = repr(client)
-        assert HARDHAT_ADDRESS in text and HARDHAT_KEY[2:] not in text
+        assert f"l2_key={PK0}" in text and SK0 not in text
+        assert client._l2_secret_key is None  # the trader holds the one copy
 
-    monkeypatch.setenv("LOAF_AGENT_PRIVATE_KEY", "  ")  # blank counts as unset
+    monkeypatch.setenv("LOAF_L2_SECRET_KEY", "  ")  # blank counts as unset
     with LoafClient(base_url=BASE) as client:
-        assert client.agent_address is None
-        assert "agent=" not in repr(client)
+        assert client.l2_public_key is None
+        assert "l2_key" not in repr(client)
 
-    bad = "0x" + "ab" * 31  # 62 hex: not a key
-    with pytest.raises(loaf.LoafConfigError) as info:
-        LoafClient(agent_private_key=bad)
-    assert bad[2:] not in str(info.value)
+    # 79 hex, upper case, 0x-prefixed, an API token (64 hex): refused, and never echoed.
+    for bad in (SK0[:-1], SK0.upper(), "0x" + SK0, "ab" * 32):
+        with pytest.raises(loaf.LoafConfigError, match="80 lowercase") as info:
+            LoafClient(l2_secret_key=bad)
+        assert bad not in str(info.value)
 
-    swapped_keys = ("0x" + "ab" * 32, " " + HARDHAT_KEY, HARDHAT_KEY + "\n", "0X" + HARDHAT_KEY[2:])
-    for swapped in swapped_keys:
-        with pytest.raises(loaf.LoafConfigError, match="looks like a private key"):
+    # The trading key where the API token goes, in any letter case.
+    for swapped in (SK0, SK0.upper(), " " + SK0 + "\n"):
+        with pytest.raises(loaf.LoafConfigError, match="looks like an L2 trading key") as info:
             LoafClient(api_key=swapped)
-    for api_key in (HARDHAT_KEY[2:], HARDHAT_KEY[2:].upper()):  # whatever the letter case
-        with pytest.raises(loaf.LoafConfigError, match="same value") as info:
-            LoafClient(api_key=api_key, agent_private_key=HARDHAT_KEY)
-        assert HARDHAT_KEY[2:] not in str(info.value)
+        assert SK0 not in str(info.value).lower()
 
 
 def _key_locals(exc: BaseException, secret: str) -> list:
@@ -1124,16 +1046,19 @@ def _key_locals(exc: BaseException, secret: str) -> list:
         frame = tb.tb_frame
         if frame.f_globals.get("__name__", "").startswith("loaf"):
             for name, value in frame.f_locals.items():
-                if isinstance(value, str) and secret in value:
-                    found.append(f"{frame.f_code.co_name}:{name}")
+                for v in value if isinstance(value, (tuple, list)) else (value,):
+                    if (isinstance(v, str) and secret in v) or (
+                        isinstance(v, bytes) and secret.encode() in v
+                    ):
+                        found.append(f"{frame.f_code.co_name}:{name}")
         tb = tb.tb_next
     return found
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")  # httpx 0.28 deprecates verify=<str>
-def test_env_key_not_in_traceback_locals(monkeypatch):
+def test_keys_not_in_traceback_locals(monkeypatch):
     # Crash reporters and debuggers record every traceback frame's locals.
-    monkeypatch.setenv("LOAF_AGENT_PRIVATE_KEY", HARDHAT_KEY)
+    monkeypatch.setenv("LOAF_L2_SECRET_KEY", SK0)
     # Failures after the key was resolved: a CA bundle that does not exist, a bad max_retries.
     kwargs: dict[str, Any]
     for failure, kwargs in (
@@ -1142,25 +1067,36 @@ def test_env_key_not_in_traceback_locals(monkeypatch):
     ):
         with pytest.raises(failure) as info:
             LoafClient(base_url=BASE, **kwargs)
-        assert _key_locals(info.value, HARDHAT_KEY[2:]) == []
+        assert _key_locals(info.value, SK0) == []
+    monkeypatch.delenv("LOAF_L2_SECRET_KEY")
+    with pytest.raises(OSError) as info:  # the key passed in
+        LoafClient(base_url=BASE, l2_secret_key=SK0, verify="/nonexistent/ca.pem")
+    assert _key_locals(info.value, SK0) == []
 
-    with monkeypatch.context() as m:  # installed without eth-account
-        m.setitem(sys.modules, "loaf.signing", None)
-        with pytest.raises(loaf.LoafConfigError, match="eth-account") as info:
-            LoafClient(base_url=BASE)
-    assert _key_locals(info.value, HARDHAT_KEY[2:]) == []
-
-    monkeypatch.setenv("LOAF_API_KEY", HARDHAT_KEY[2:])  # the same secret in both variables
-    with pytest.raises(loaf.LoafConfigError, match="same value") as info:
+    monkeypatch.setenv("LOAF_API_KEY", SK0)  # the trading key in the API token's variable
+    with pytest.raises(loaf.LoafConfigError, match="looks like an L2 trading key") as info:
         LoafClient(base_url=BASE)
-    assert _key_locals(info.value, HARDHAT_KEY[2:]) == []
+    assert _key_locals(info.value, SK0) == []
     monkeypatch.delenv("LOAF_API_KEY")
 
-    near_miss = HARDHAT_KEY[:-1]  # one hex digit short: nearly the key itself
-    monkeypatch.setenv("LOAF_AGENT_PRIVATE_KEY", near_miss)
+    near_miss = SK0[:-1]  # one hex digit short: nearly the key itself
+    monkeypatch.setenv("LOAF_L2_SECRET_KEY", near_miss)
     with pytest.raises(loaf.LoafConfigError) as info:
         LoafClient(base_url=BASE)
-    assert _key_locals(info.value, near_miss[2:]) == []
+    assert _key_locals(info.value, near_miss) == []
+    with pytest.raises(loaf.LoafL2Error) as info:
+        L2Trader(None, near_miss, signer=SIGNER)
+    assert _key_locals(info.value, near_miss) == []
+
+    # The signer's frames, refusing while the key is in hand (an order field it does not know).
+    kat_order = json.loads(KAT.read_text())["orders"][0]
+    order = {k: v for k, v in kat_order.items() if k not in ("m", "kind", "code")}
+    with pytest.raises(loaf.L2SignerError, match="unknown field") as info:
+        SIGNER.sign_order(SK0, {**order, "l2ApiKeyIndex": 0})
+    assert _key_locals(info.value, SK0) == []
+    with pytest.raises(loaf.L2SignerError) as info:
+        SIGNER.sign_batch(SK0, [{**order, "l2ApiKeyIndex": 0}])
+    assert _key_locals(info.value, SK0) == []
 
 
 def test_order_math_ignores_callers_decimal_context(exchange, trading_client):
@@ -1168,32 +1104,31 @@ def test_order_math_ignores_callers_decimal_context(exchange, trading_client):
     with localcontext(Context(prec=6, traps=[Inexact, Rounded, InvalidOperation])):
         client.orders.limit_buy("OPRA", 10, 12345.67)
         client.orders.market_sell("OPRA", 2, reference_price=100.005, max_slippage_bps=50)
-        assert loaf.worst_price(167.49, "BUY", 200) == 170.84
+        assert loaf.worst_price(167.49, "BUY", 200) == 170.83
         with pytest.raises(loaf.LoafValidationError, match="at most 2 decimal places"):
             loaf.money.validate_price(1.234)
     limit, market = exchange.bodies("/orders")
-    assert (limit["price"], market["price"]) == (12345.67, 99.5)
-    assert recover(limit, limit["signature"]) == HARDHAT_ADDRESS
-    assert recover(market, market["signature"]) == HARDHAT_ADDRESS
+    assert (limit["price"], market["price"]) == (12345.67, 99.51)
+    assert_signed(limit)
+    assert_signed(market)
 
 
-def test_client_without_eth_account():
-    # Someone who pulls 0.4 without re-running `pip install -e .` can still read data, and
-    # is told what to install once they configure a key. A fresh interpreter, so that
-    # loaf.signing (and with it eth-account) is imported only when a key needs it.
+def test_reads_and_orders_need_no_eth_account():
+    # eth-account is only the l2keys extra (the wallet flows). A fresh interpreter, so that
+    # nothing imported it before: the client and its trading key never import it.
     code = f"""
 import sys
 sys.modules["eth_account"] = None
 import loaf
-with loaf.LoafClient() as client:
-    assert client.agent_address is None
+with loaf.LoafClient(l2_secret_key={SK0!r}) as client:
+    assert client.l2_public_key == {PK0!r}
+for name in ("loaf.evm", "loaf.ipo", "loaf.l2.keys"):
+    assert name not in sys.modules, name
 try:
-    loaf.LoafClient(agent_private_key={HARDHAT_KEY!r})
-except loaf.LoafConfigError as exc:
-    assert "pip install -e ." in str(exc), exc
-    assert "eth_account" in str(exc), exc  # the real cause, in case it is not eth-account itself
+    import loaf.evm
+except ImportError as exc:
+    assert "loaf-bot[l2keys]" in str(exc), exc
 else:
-    raise AssertionError("no LoafConfigError")
-assert "loaf.signing" not in sys.modules
+    raise AssertionError("no ImportError")
 """
     subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, check=True)

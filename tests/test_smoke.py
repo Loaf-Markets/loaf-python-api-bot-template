@@ -88,9 +88,14 @@ def test_error_mapping():
     )
     assert isinstance(band, loaf.LoafValidationError)
     assert isinstance(
-        error_from_response(409, {"error": "nonce already used by a different order"}),
+        error_from_response(409, {"error": "Conditional order is no longer armed"}),
         loaf.LoafConflictError,
     )
+    # K1 answers an order-index reservation the engine refused with a 422.
+    reserve = error_from_response(422, {"error": "l2 order_index: the account's last reservation is less than 1 s old"})
+    assert type(reserve) is loaf.LoafBusinessRuleError
+    for text in ("KYC verification required", "Wholesale investor verification required"):
+        assert type(error_from_response(403, {"error": text})) is loaf.KycRequiredError
     # A route that does not exist answers with an HTML page; keep just its message.
     missing = error_from_response(
         404,
@@ -104,13 +109,18 @@ def test_error_mapping():
 
 def test_errors_survive_pickle_and_copy():
     # A process pool pickles a worker's exception: signed_body must reach the parent.
-    body = {"nonce": "0192a3b4c5d600112233445566778899", "signature": "0x" + "ab" * 65}
+    body = {
+        "l2AccountIndex": 42, "l2OrderIndex": 1000, "l2ExpiryMs": 1_800_000_000_000,
+        "l2SigS": "ab" * 40, "l2SigE": "cd" * 40,
+    }
     error = loaf.OrderOutcomeUnknownError(
         signed_body=body, attempts=2, last_error=error_from_response(502, {"error": "x"})
     )
+    assert "order index 1000 of account 42" in str(error)
     for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
         assert type(clone) is loaf.OrderOutcomeUnknownError
-        assert (clone.signed_body, clone.attempts, clone.nonce) == (body, 2, body["nonce"])
+        assert (clone.signed_body, clone.attempts) == (body, 2)
+        assert (clone.l2_account_index, clone.l2_order_index) == (42, 1000)
         assert str(clone) == str(error)
         assert type(clone.last_error) is loaf.LoafServerError
         assert (clone.last_error.status_code, clone.last_error.message) == (502, "x")
@@ -360,10 +370,11 @@ def test_ws_channel_helpers():
     ws.subscribe_volume("OPRA")
     ws.subscribe_property_status("OPRA")
     ws.subscribe_leaderboard()
+    ws.subscribe_competition()
     ws.subscribe_portfolio()
     assert ws._channels == {
         "orderbook:OPRA", "trades:OPRA", "chart:OPRA", "markprice:OPRA", "volume:OPRA",
-        "property:OPRA", "leaderboard", "portfolio",
+        "property:OPRA", "leaderboard", "competition", "portfolio",
     }
 
 
@@ -381,17 +392,28 @@ def test_ws_property_halt_dispatch():
 def test_trade_new_dispatches():
     ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
     seen = []
-    # A fill is final when it matches; txHash is "" until a batch proof.
-    ws.on_trade(lambda m: seen.append((m.trade.tradeId, m.trade.txHash, m.trade.fee)))
+    # A fill is final when it matches; its proof is PENDING until a batch includes it.
+    ws.on_trade(lambda m: seen.append((m.trade.tradeId, m.trade.proof.status, m.trade.fee)))
     ws._dispatch(json.dumps({
         "type": "trade_new",
         "trade": {
-            "tradeId": 1, "propertyId": 1, "ticker": "OPRA", "txHash": "", "side": "BUY",
-            "quantity": 1, "price": 100, "executedAt": 0, "fee": 0.1,
+            "tradeId": 1, "propertyId": 1, "ticker": "OPRA", "txHash": "0x" + "ab" * 32, "side": "BUY",
+            "quantity": 1, "price": 100, "executedAt": 0, "fee": 0.1, "proof": {"status": "PENDING"},
         },
         "timestamp": 0,
     }))
-    assert seen == [(1, "", 0.1)]
+    assert seen == [(1, "PENDING", 0.1)]
+
+
+def test_ws_round_update_dispatch():
+    ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
+    seen = []
+    ws.on_round_update(seen.append)
+    ws._dispatch(json.dumps({
+        "type": "round_update", "roundNumber": 2, "status": "PREPARED",
+        "startsAt": 0, "endsAt": 0, "arenaTicker": "ARNA",
+    }))
+    assert seen[0].status == "PREPARED" and seen[0].arenaTicker == "ARNA"
 
 
 def test_rate_limit_headers_recorded():

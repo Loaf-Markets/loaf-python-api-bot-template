@@ -1,0 +1,30 @@
+{
+  "source": "loaf-matching-engine",
+  "commit": "cdcd0feef52b055f326333b6f66b1c0f96d25bbd",
+  "tree": "710f45cb4c9231091bace80d14c72ecf60924e85",
+  "path": "crates/l2-signer-ffi",
+  "build": "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct <commit>) crates/l2-signer-ffi/release.sh <out dir>, from git archive <commit> extracted at /tmp/loaf-matching-engine",
+  "tools": [
+    "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "cargo-zigbuild 0.23.4",
+    "zig 0.16.0",
+    "glibc 2.28",
+    "macOS aarch64:11.0 x86_64:10.12",
+    "windows x86_64-pc-windows-gnu",
+    "checkout /tmp/loaf-matching-engine; paths remapped: source /loaf-matching-engine, CARGO_HOME /cargo, target /target",
+    "macOS install name @rpath/libloaf_l2_signer.dylib, debug stabs stripped in the link",
+    "SOURCE_DATE_EPOCH 1792106585 (the DLL's time stamp)"
+  ],
+  "kat": {
+    "from": "vendor/l2-settle-schema/kat/k1-sign.json",
+    "to": "kat/k1-sign.json"
+  },
+  "files": {
+    "lib/linux-x86_64/libloaf_l2_signer.so": "c95a13179d28fee276978740a31c510f67723ba32778d79e0b925156a247ac54",
+    "lib/linux-aarch64/libloaf_l2_signer.so": "f47ad79c70451fd895798d8a26baae44249b605e87147a054fa91dd403f1856f",
+    "lib/darwin-aarch64/libloaf_l2_signer.dylib": "40c4b0c869013c67142c48cc7b7efc9102813ba886c8fe530638aa16567055bd",
+    "lib/darwin-x86_64/libloaf_l2_signer.dylib": "6cd97d01d0aaf7cabd747f522e51fbb6574e8928b9fe63ccdbb00ae4300196b7",
+    "lib/windows-x86_64/loaf_l2_signer.dll": "b5806ceb6395f26a4187df9660213e5d310c4c8d484d1f9373820bbeea9f872a",
+    "kat/k1-sign.json": "9e3bb38ca080f1046d087fe7b970bd8514a3643628e8d17b481cccb4ee8fed68"
+  }
+}

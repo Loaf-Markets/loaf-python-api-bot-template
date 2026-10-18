@@ -7,14 +7,18 @@ Every error the API can return is mapped to a specific exception so a bot can
     ├── LoafConfigError             misconfiguration (e.g. missing API key)
     ├── LoafConnectionError         network failure / timeout (no HTTP response)
     ├── OrderOutcomeUnknownError    a signed order may be live; the SDK could not confirm it
+    ├── LoafL2Error                 an L2 setup or state no order can be signed under
+    │   └── L2SignerError                 the native signer refused (its own text)
     └── LoafAPIError                the server returned an HTTP error
         ├── LoafAuthError                 401  bad/expired credentials, or an order signature the exchange refused
         ├── LoafForbiddenError            403  generic forbidden
         │   ├── TradingHaltedError        403  "Trading is currently halted" / "Trading halted for this property"
-        │   └── CompetitionEligibilityError 403 code=NOT_COMPETITION_PARTICIPANT
+        │   ├── CompetitionEligibilityError 403 code=NOT_COMPETITION_PARTICIPANT
+        │   └── KycRequiredError          403  retail/wholesale KYC required (IPO subscribe)
         ├── LoafValidationError           400  validation or order-rule refusal (incl. the daily price band)
         ├── LoafNotFoundError             404
         ├── LoafConflictError             409  (e.g. a cancel that lost the race, a prize already claimed)
+        ├── LoafBusinessRuleError         422  an L2 request the engine refused (an index reservation, a withdrawal)
         ├── LoafRateLimitError            429  (carries .retry_after seconds)
         └── LoafServerError               5xx  (503 -> LoafServiceUnavailableError)
             └── LoafServiceUnavailableError 503
@@ -44,7 +48,7 @@ def _rebuild_error(cls: type[LoafError], args: tuple) -> LoafError:
 
 class LoafConfigError(LoafError):
     """The client is misconfigured: no API key for an authed request, a
-    missing or malformed agent private key when placing an order, or an
+    malformed L2 trading key, no trading key when placing an order, or an
     invalid ``LoafClient(max_slippage_bps=)`` / ``$LOAF_MAX_SLIPPAGE_BPS``."""
 
 
@@ -60,9 +64,9 @@ class OrderOutcomeUnknownError(LoafError):
     :meth:`~loaf.resources.orders.OrdersResource.resubmit` on anything but a
     200. The order may be live, and may already have filled, so never place the
     same intent afresh. While you still want it, re-send it with
-    ``orders.resubmit(error.signed_body)``: within 24 hours of signing, and
-    never after a competition round switch. Otherwise look for it in
-    ``history.orders()``.
+    ``orders.resubmit(error.signed_body)`` more than a day before its
+    ``l2ExpiryMs`` (the exchange refuses an order closer to its expiry).
+    Otherwise look for it in ``history.orders()``.
     :meth:`~loaf.resources.orders.OrdersResource.resubmit` documents what each
     answer means.
 
@@ -70,7 +74,8 @@ class OrderOutcomeUnknownError(LoafError):
     order on a connection error must not catch this one.
 
     Attributes:
-        signed_body: The exact body that was sent (nonce and signatures; no secrets).
+        signed_body: The exact body that was sent (its order index and
+            signature; no secrets).
         attempts: How many times it was sent.
         last_error: The last attempt's error (also ``__cause__``).
     """
@@ -82,18 +87,35 @@ class OrderOutcomeUnknownError(LoafError):
         self.attempts = attempts
         self.last_error = last_error
         super().__init__(
-            f"Could not confirm whether order {self.nonce} was placed after {attempts} "
-            f"attempt(s) (last error: {last_error}). It may be live, and may already have "
-            "filled: re-send it unchanged with orders.resubmit(error.signed_body) within 24 "
-            "hours of signing and before any round switch (the same order if it landed; if "
-            "not, it is placed now at the signed price), or look for it in "
-            "history.orders(), which lists every status. openOrders shows only resting orders."
+            f"Could not confirm whether order index {self.l2_order_index} of account "
+            f"{self.l2_account_index} was placed after {attempts} attempt(s) (last error: "
+            f"{last_error}). It may be live, and may already have filled: re-send it unchanged "
+            "with orders.resubmit(error.signed_body) more than a day before its l2ExpiryMs (the "
+            "same order if it landed; if not, it is placed now at the signed price), or look for "
+            "it in history.orders(), which lists every status. openOrders shows only resting "
+            "orders."
         )
 
     @property
-    def nonce(self) -> str:
-        """The order's nonce (``signed_body["nonce"]``)."""
-        return str(self.signed_body.get("nonce", ""))
+    def l2_account_index(self) -> Any:
+        """The order's account (``signed_body["l2AccountIndex"]``)."""
+        return self.signed_body.get("l2AccountIndex")
+
+    @property
+    def l2_order_index(self) -> Any:
+        """The order's index (``signed_body["l2OrderIndex"]``). The exchange holds at most one
+        order per account and index, so this names the order."""
+        return self.signed_body.get("l2OrderIndex")
+
+
+class LoafL2Error(LoafError, ValueError):
+    """An L2 setup or state no order can be signed under (no trading key, a key not in force, no
+    L2 market, an unusable index reservation, a malformed L2 answer) or a wallet flow's refusal;
+    the text names the cause. An order's own bad input is a :class:`LoafValidationError`."""
+
+
+class L2SignerError(LoafL2Error):
+    """The native L2 signer refused; the text names the rule (the engine's own text for a field)."""
 
 
 class LoafAPIError(LoafError):
@@ -143,9 +165,12 @@ class LoafAuthError(LoafAPIError):
     with an ``error`` frame (code ``UNAUTHORIZED``) sent to ``on_error``.
 
     On order placement, which never sends the API key: the exchange refused the
-    order's signature. ``Signer is not authorized to trade for any account``
-    means the agent key is not approved for any account; it expires and is
-    revoked together with its API key. Stop placing and alert.
+    order's L2 signature or the key it names, e.g. ``l2 signature: the Schnorr
+    signature does not verify``, ``l2 key: this trading key has been disabled``
+    or ``l2 account: no trading account has this account index``. The SDK reads
+    the account's key state again before the next order; if the trading key was
+    rotated or disabled, register the new one (``python -m loaf.l2.keys
+    enable``). Stop placing and alert.
     """
 
 
@@ -171,11 +196,21 @@ class CompetitionEligibilityError(LoafForbiddenError):
     """403 ``NOT_COMPETITION_PARTICIPANT`` — not admitted to the active round.
 
     Raised on order placement while a competition round is ACTIVE and your
-    account has not been admitted, and also while the market switches modes,
-    while a round is being prepared, and while it is finalizing. Check your
-    standing with
+    account has not been admitted. Check your standing with
     :meth:`loaf.resources.competition.CompetitionResource.queue_position`.
+
+    The market's other mode refusals carry their own ``code``: a 403
+    :class:`LoafForbiddenError` ``COMPETITION_NOT_STARTED`` before the round
+    starts and ``NOT_TRADEABLE_IN_MODE`` for a property the current mode does
+    not trade, and while the market switches modes a 503
+    :class:`LoafServiceUnavailableError` ``VENUE_SWITCHING`` (nothing was
+    placed; try again in a moment).
     """
+
+
+class KycRequiredError(LoafForbiddenError):
+    """403 — retail or wholesale KYC verification is required for this action
+    (:meth:`~loaf.resources.offerings.OfferingsResource.subscribe`)."""
 
 
 class LoafValidationError(LoafAPIError):
@@ -191,9 +226,15 @@ class LoafNotFoundError(LoafAPIError):
 
 
 class LoafConflictError(LoafAPIError):
-    """409 — conflict (e.g. a cancel that lost the race to a fill, a stop /
-    take nonce already used by a different order, payout details already
-    submitted)."""
+    """409 — conflict (e.g. a cancel that lost the race to a fill, a request
+    paused while a competition round runs (``COMPETITION_IN_PROGRESS``), payout
+    details already submitted)."""
+
+
+class LoafBusinessRuleError(LoafAPIError):
+    """422 — the engine refused an L2 request by its rules: an order-index
+    reservation (``POST /l2/order-indices``, e.g. a second one within 1 s) or a
+    withdrawal. The message is the engine's text."""
 
 
 class LoafRateLimitError(LoafAPIError):
@@ -266,6 +307,8 @@ def error_from_response(
         # The halt rejection carries no machine code — match on the message.
         if "halted" in message.lower():
             return TradingHaltedError(message, **kwargs)
+        if "kyc" in message.lower() or "wholesale" in message.lower():
+            return KycRequiredError(message, **kwargs)
         return LoafForbiddenError(message, **kwargs)
     if status_code == 400:
         return LoafValidationError(message, **kwargs)
@@ -273,6 +316,8 @@ def error_from_response(
         return LoafNotFoundError(message, **kwargs)
     if status_code == 409:
         return LoafConflictError(message, **kwargs)
+    if status_code == 422:
+        return LoafBusinessRuleError(message, **kwargs)
     if status_code == 429:
         return LoafRateLimitError(message, retry_after=retry_after, **kwargs)
     if status_code == 503:

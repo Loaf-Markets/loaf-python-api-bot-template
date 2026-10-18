@@ -21,8 +21,8 @@ Or run it in the background and keep using the REST client::
         ...                               # do other work; handlers fire live
 
 Channels (``"type:key"`` strings — market-data channels key by the property's
-``ticker``, exact case: ``orderbook:opra`` is refused; ``portfolio`` and
-``leaderboard`` have no key):
+``ticker``, exact case: ``orderbook:opra`` is refused; ``portfolio``,
+``leaderboard`` and ``competition`` have no key):
 
 ==================  ========  ===========================================
 Channel             Auth      What you receive
@@ -35,11 +35,16 @@ volume:{ticker}     public    rolling-24h traded volume (replaces ``volume24h``)
 property:{ticker}   public    halt / resume status for one property
 ipo:{ipoId}         public    primary-market allocation progress
 leaderboard         public    competition leaderboard (top entries) on change
+competition         public    a competition round changed state (``round_update``)
 portfolio           PRIVATE   your balances/positions/orders/trades deltas
 ==================  ========  ===========================================
 
-All values are already human units (dollars / tokens); timestamps are unix
-seconds.
+A channel for a ticker the server does not know is refused with an ``error`` frame
+(``UNKNOWN_CHANNEL``).
+
+Prices and quantities are human units (dollars / tokens); ``balances_update``
+rows are base units, as ``portfolio.component().balances`` carries them;
+timestamps are unix seconds.
 
 Handlers run on the client's internal event-loop thread: keep them short. An
 exception raised in a handler is logged and swallowed. Don't place orders from
@@ -75,6 +80,15 @@ except ImportError as exc:  # pragma: no cover
 logger = logging.getLogger("loaf.ws")
 
 Handler = Callable[[Any], None]
+
+def _log_send_failure(future: Any) -> None:
+    """Log a send that failed (the next connect resubscribes every channel anyway)."""
+    if future.cancelled():
+        return
+    exc = future.exception()
+    if exc is not None:
+        logger.warning("Loaf WebSocket send failed: %s", exc)
+
 
 # Internal pseudo-types for lifecycle callbacks (never collide with wire types).
 _ON_CONNECT = "__connect__"
@@ -123,10 +137,15 @@ class LoafWebSocketClient:
         self.ws_url: str = resolved_ws_url
         self._verify = verify if verify is not None else (getattr(client, "_verify", True))
         self.auto_reconnect = auto_reconnect
+        number = isinstance(reconnect_delay, (int, float)) and not isinstance(reconnect_delay, bool)
+        if not number or not 0 < reconnect_delay < float("inf"):
+            raise ValueError(f"reconnect_delay must be a positive number of seconds, got {reconnect_delay!r}")
         self.reconnect_delay = reconnect_delay
 
         self._handlers: dict[str, list[Handler]] = {}
         self._channels: set[str] = set()
+        # subscribe() runs on the caller's thread, a (re)connect reads the set on the loop's.
+        self._channels_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._run_task: asyncio.Task | None = None
@@ -190,22 +209,27 @@ class LoafWebSocketClient:
         entries only, so churn below the served cut does not wake you)."""
         return self.on(WSMessageType.LEADERBOARD_UPDATE, handler)
 
+    def on_round_update(self, handler: Handler | None = None) -> Any:
+        """A competition round changed state (``round_update``: ``{roundNumber, status,
+        startsAt, endsAt, arenaTicker}``, on the ``competition`` channel). ``PREPARED``,
+        ``ENDING`` and ``DRAFT`` can move every per-user read and write to another ledger, so
+        re-read your portfolio on each."""
+        return self.on(WSMessageType.ROUND_UPDATE, handler)
+
     # private portfolio deltas
     def on_balances(self, handler: Handler | None = None) -> Any:
-        """Your committed USDC balance (``balances_update``: ``{cash, frozen}``).
+        """Your L2 book changed (``balances_update``: ``{balances}``, the whole book as the
+        engine committed it, as ``portfolio.component()`` carries it).
 
-        An absolute snapshot: replace, never add. Pushed with every fill, and
-        when a booked BUY is placed or cancelled (its USDC freeze / release).
+        An absolute snapshot: REPLACE the held rows, never add.
         """
         return self.on(WSMessageType.BALANCES_UPDATE, handler)
 
     def on_position(self, handler: Handler | None = None) -> Any:
-        """One of your positions (``position_update``), one frame per touched property.
-
-        An absolute snapshot: replace, never add. Pushed with every fill in that
-        property, and when a booked SELL is placed or cancelled (its token
-        freeze / release).
-        """
+        """An IPO allocation changed (``position_update``: ``{position}``, whole as
+        ``portfolio.component()`` lists it; ``quantity`` 0 removes it). An L2 holding's position
+        is not pushed: read the component again after your own fills, or when a ``balances`` row
+        appears that no position names."""
         return self.on(WSMessageType.POSITION_UPDATE, handler)
 
     def on_order_status(self, handler: Handler | None = None) -> Any:
@@ -242,12 +266,13 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.ORDER_UPDATE, handler)
 
     def on_trade(self, handler: Handler | None = None) -> Any:
-        """Your own fills on the private portfolio channel (``trade_new``).
+        """Your own fills on the private portfolio channel (``trade_new``: ``{trade}``).
 
-        Exactly one frame per fill, final when it matches. ``trade.txHash`` is
-        ``""`` until a batch proof covers the trade. It arrives in the same
-        burst as that fill's ``balances_update``, ``position_update`` and
-        ``order_status``; several fills from one batch arrive back to back.
+        Exactly one frame per fill, final when it matches. ``trade.proof`` is
+        the fill's place in the proven batches: ``PENDING`` until a batch
+        includes it, then ``IN_BATCH`` (the batch, its block, the row, and the
+        custody-chain transaction that executed it once there is one); ``null``
+        when the server serves no proofs or the trade is a competition round's.
         Delivery is at most once (no replay after a reconnect), so reconcile
         with ``history.trades()``.
         """
@@ -284,13 +309,15 @@ class LoafWebSocketClient:
     def subscribe(self, *channels: str) -> LoafWebSocketClient:
         """Subscribe to one or more raw ``"type:id"`` channel strings."""
         new = {str(c) for c in channels}
-        self._channels |= new
+        with self._channels_lock:
+            self._channels |= new
         self._send_now({"type": "subscribe", "channels": sorted(new)})
         return self
 
     def unsubscribe(self, *channels: str) -> LoafWebSocketClient:
         gone = {str(c) for c in channels}
-        self._channels -= gone
+        with self._channels_lock:
+            self._channels -= gone
         self._send_now({"type": "unsubscribe", "channels": sorted(gone)})
         return self
 
@@ -323,8 +350,12 @@ class LoafWebSocketClient:
         return self.subscribe(f"ipo:{int(ipo_id)}")
 
     def subscribe_leaderboard(self) -> LoafWebSocketClient:
-        """Live competition-leaderboard updates (no id — one global channel)."""
+        """Live competition-leaderboard updates (no id: one global channel)."""
         return self.subscribe("leaderboard")
+
+    def subscribe_competition(self) -> LoafWebSocketClient:
+        """Competition round state changes (``round_update``; no id: one global channel)."""
+        return self.subscribe("competition")
 
     def subscribe_portfolio(self) -> LoafWebSocketClient:
         """Subscribe to your PRIVATE portfolio channel.
@@ -477,8 +508,10 @@ class LoafWebSocketClient:
     async def _on_open(self, ws: Any) -> None:
         if self.api_key:
             await ws.send(self._frame("auth", token=self.api_key))
-        if self._channels:
-            await ws.send(self._frame("subscribe", channels=sorted(self._channels)))
+        with self._channels_lock:
+            channels = sorted(self._channels)
+        if channels:
+            await ws.send(self._frame("subscribe", channels=channels))
         self._connected_event.set()
         self._emit(_ON_CONNECT, None)
 
@@ -513,10 +546,15 @@ class LoafWebSocketClient:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
-        if running is loop:
-            loop.create_task(coro)
-        else:
-            asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            if running is loop:
+                future: Any = loop.create_task(coro)
+            else:
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError:  # the loop closed after the check: the next connect resubscribes
+            coro.close()
+            return
+        future.add_done_callback(_log_send_failure)
 
     @staticmethod
     def _frame(message_type: str, **fields: Any) -> str:
