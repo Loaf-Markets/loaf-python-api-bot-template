@@ -8,11 +8,13 @@ import numbers
 import os
 import random
 import re
+import ssl
 import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ._l2 import _SECRET_RE, TradingKey
 from ._object import parse
 from ._version import __version__
 from .constants import (
@@ -21,10 +23,11 @@ from .constants import (
     DEFAULT_MAX_SLIPPAGE_BPS,
     DEFAULT_PLACEMENT_TIMEOUT,
     DEFAULT_TIMEOUT,
-    ENV_AGENT_PRIVATE_KEY,
     ENV_API_KEY,
     ENV_BASE_URL,
+    ENV_SECRET_KEY,
     ENV_MAX_SLIPPAGE_BPS,
+    ENV_WALLET_PRIVATE_KEY,
     ENV_WS_URL,
     USER_AGENT,
 )
@@ -45,31 +48,64 @@ if TYPE_CHECKING:
     from .resources.offerings import OfferingsResource
     from .resources.orders import OrdersResource
     from .resources.portfolio import PortfolioResource
-    from .signing import OrderSigner
     from .ws.client import LoafWebSocketClient
 
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "DELETE"})
 
 _PRIVATE_KEY_SHAPE = re.compile(r"0[xX][0-9a-fA-F]{64}")
+# A space or anything but printable ASCII, which no API key (64 hex) or JWT holds.
+_STRAY = re.compile(r"[^\x21-\x7e]")
 
-_NO_AGENT_KEY = (
-    "Placing orders needs your agent private key: pass agent_private_key=... or set "
-    f"${ENV_AGENT_PRIVATE_KEY}. You get it together with your API key in the Loaf web app "
-    "(Settings -> API keys)."
-)
 
-# Failures before the request left this machine: re-sending them is always safe.
-_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+def _api_key_refusal(api_key: str) -> str | None:
+    """Why ``api_key`` must not be sent as the API key: it holds what looks like a trading or
+    wallet key, which must never leave this machine, or a character no API key has (a second
+    line, say), with which httpx would quote the whole value in its error and the WebSocket
+    send it in every auth frame. ``None`` for any other value."""
+    try:
+        # Searched for, not matched whole: a .env loader can keep quotes, a comment or the pasted
+        # line's own name around the key. An API key is 64 hex, so it holds neither shape.
+        if _SECRET_RE.search(api_key):  # 80 hex in a row are a trading key
+            return (
+                f"{ENV_API_KEY} holds what looks like your trading key (80 hex), which must never "
+                f"leave your machine: it belongs in {ENV_SECRET_KEY} only. {ENV_API_KEY} is "
+                "the API key: 64 hex characters, no prefix."
+            )
+        if _PRIVATE_KEY_SHAPE.search(api_key):
+            return (
+                f"{ENV_API_KEY} holds what looks like a wallet private key (0x + 64 hex), which "
+                f"must never leave your machine. {ENV_API_KEY} is the API key: 64 hex characters, "
+                "no prefix."
+            )
+        if _STRAY.search(api_key.strip()):  # the WebSocket client checks its key unstripped
+            return (
+                f"{ENV_API_KEY} has a line break, space or other stray character inside it. "
+                f"{ENV_API_KEY} is the API key alone: 64 hex characters, no prefix."
+            )
+        return None
+    finally:
+        api_key = ""  # crash reporters record frame locals, and a str pattern raises on bytes
 
-# 503s the exchange sends only when nothing was placed (safe to treat as a definite answer).
+
+# Failures before the request left this machine (a proxy that refused the tunnel included):
+# re-sending them is always safe.
+_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError)
+
+# 503s the exchange sends only when nothing was placed (safe to treat as a definite answer),
+# lowercased: the exchange writes them in both cases.
 _NOT_PLACED_503_TEXTS = (
-    "Your order was not placed",
-    "Trading temporarily unavailable. Please try again shortly.",
+    "your order was not placed",
+    "nothing was done",
+    "trading temporarily unavailable. please try again shortly.",
+    "the l2 balance is temporarily unavailable",
 )
 
 
 def _definitely_not_placed(error: LoafAPIError) -> bool:
-    return error.status_code == 503 and any(t in error.message for t in _NOT_PLACED_503_TEXTS)
+    return error.status_code == 503 and (
+        error.code == "VENUE_SWITCHING"
+        or any(t in error.message.lower() for t in _NOT_PLACED_503_TEXTS)
+    )
 
 
 # $LOAF_MAX_SLIPPAGE_BPS: a plain whole number from 0 to 9999 (leading zeros allowed).
@@ -108,21 +144,24 @@ class LoafClient:
         from loaf import LoafClient
 
         with LoafClient(api_key="...") as loaf:
-            print(loaf.portfolio.component().cash)
+            print(loaf.portfolio.component().balances)
             print(loaf.market.properties())
 
     Args:
-        api_key: The API token from the Loaf web app (Settings -> API keys),
-            sent as ``Authorization: Bearer`` on reads, cancels and the
-            WebSocket. It is never sent on order placement. If omitted, read
-            from ``$LOAF_API_KEY``. Public endpoints work without one; other
-            authenticated calls raise :class:`LoafConfigError`.
+        api_key: The API key from the Loaf web app (API -> Generate API Token),
+            sent as ``Authorization: Bearer`` on reads, cancels, the
+            WebSocket, and the two account requests an order needs
+            (``GET /l2/keys``, ``POST /l2/order-indices``). It is never sent on
+            an order placement. If omitted, read from ``$LOAF_API_KEY``.
+            Public endpoints work without one; other authenticated calls raise
+            :class:`LoafConfigError`.
         base_url: REST base URL including the ``/api`` suffix. If omitted, read
             from ``$LOAF_API_BASE_URL``, else :data:`~loaf.constants.DEFAULT_BASE_URL`.
-        agent_private_key: The agent private key shown with your API key. It
-            signs every order locally and is never sent. If omitted, read from
-            ``$LOAF_AGENT_PRIVATE_KEY`` (prefer the environment variable: an
-            explicit ``agent_private_key=`` argument can show up in tools that
+        secret_key: Your trading key, which signs every order locally and is
+            never sent: the 80 hex characters (no ``0x``) the web app shows
+            under Show trading key (README §2). If omitted, read from
+            ``$LOAF_SECRET_KEY`` (prefer the environment variable: an
+            explicit ``secret_key=`` argument can show up in tools that
             capture call frames). Without it everything works except placing
             orders.
         ws_url: Override the WebSocket URL. If omitted it is derived from
@@ -147,10 +186,17 @@ class LoafClient:
             which cannot place twice; each attempt can wait out the placement
             timeout, so lower this (e.g. ``1``) for a latency-sensitive loop.
             Cancels and other POSTs are never retried.
-        verify: TLS verification, forwarded to httpx. Set ``False`` ONLY for a
-            trusted local dev server using a self-signed certificate — it disables
-            MITM protection, so never use it against a remote host.
-        http_client: Provide your own ``httpx.Client`` (advanced).
+        verify: TLS verification for REST and the WebSocket (only the WebSocket
+            with your own ``http_client``): an ``ssl.SSLContext``, such as
+            ``ssl.create_default_context(cafile=...)``, trusts your own CAs. Set
+            ``False`` ONLY for a trusted local dev server using a self-signed
+            certificate — it disables MITM protection, so never use it against a
+            remote host.
+        http_client: Provide your own ``httpx.Client`` (advanced). Its response
+            hooks must not raise (no ``raise_for_status`` hook): the SDK reads
+            every answer itself, and a hook that raises bypasses its error
+            handling, so the order numbers of a refused order are not reused
+            and what the SDK cached is not refreshed.
     """
 
     def __init__(
@@ -158,48 +204,36 @@ class LoafClient:
         api_key: str | None = None,
         base_url: str | None = None,
         *,
-        agent_private_key: str | None = None,
+        secret_key: str | None = None,
         ws_url: str | None = None,
         max_slippage_bps: int | None = None,
         timeout: float | tuple | httpx.Timeout | None = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
-        verify: bool | str = True,
+        verify: bool | ssl.SSLContext = True,
         http_client: httpx.Client | None = None,
     ) -> None:
-        self.api_key = (api_key or os.environ.get(ENV_API_KEY) or "").strip() or None
-        if self.api_key and _PRIVATE_KEY_SHAPE.fullmatch(self.api_key):
-            raise LoafConfigError(
-                f"{ENV_API_KEY} looks like a private key (0x + 64 hex). Put the API token in "
-                f"{ENV_API_KEY} and the agent private key in {ENV_AGENT_PRIVATE_KEY}."
-            )
-        #: Default max slippage (basis points) for the prices the SDK derives for your orders.
-        self.max_slippage_bps: int = _max_slippage_bps(max_slippage_bps)
-        #: Signs placements; None without an agent key. The raw key is not kept.
-        self._signer: OrderSigner | None = None
-        raw_agent = None
         try:
-            raw_agent = (agent_private_key or os.environ.get(ENV_AGENT_PRIVATE_KEY) or "").strip()
-            if raw_agent:
-                # Compared inline, so there is no second copy of the key to scrub.
-                if self.api_key and raw_agent.lower() in (
-                    self.api_key.lower(),
-                    "0x" + self.api_key.lower(),
-                ):
-                    raise LoafConfigError(
-                        f"{ENV_AGENT_PRIVATE_KEY} is the same value as {ENV_API_KEY}. The API "
-                        "token and the agent private key are two different secrets."
-                    )
-                try:
-                    from .signing import OrderSigner
-                except ImportError as exc:
-                    raise LoafConfigError(
-                        "Order signing needs the 'eth-account' package, new in loaf 0.4.0, and "
-                        f"it could not be imported ({exc}). Re-run: pip install -e ."
-                    ) from exc
-                self._signer = OrderSigner(raw_agent)
+            api_key = (api_key or os.environ.get(ENV_API_KEY) or "").strip()
+            refusal = _api_key_refusal(api_key)
+            if refusal:
+                raise LoafConfigError(refusal)
+            self.api_key = api_key or None
+            if (os.environ.get(ENV_WALLET_PRIVATE_KEY) or "").strip():
+                raise LoafConfigError(
+                    f"{ENV_WALLET_PRIVATE_KEY} is set in this process's environment. The wallet "
+                    "key must never reach your bot: remove it from your environment and from any "
+                    ".env file your bot loads (only python -m loaf.secret_key reads it, for one "
+                    "command; README §2)."
+                )
+            #: Default max slippage (basis points) for the prices the SDK derives for your orders.
+            self.max_slippage_bps: int = _max_slippage_bps(max_slippage_bps)
+            raw = (secret_key or os.environ.get(ENV_SECRET_KEY) or "").strip()
+            #: Signs placements, and keeps the secret to itself; None without a trading key.
+            self._l2_key: TradingKey | None = TradingKey(raw) if raw else None
         finally:
-            # Crash reporters and debuggers record frame locals: leave no key in them.
-            raw_agent = None
+            # Crash reporters and debuggers record frame locals: whatever fails in __init__, no
+            # trading key (nor a wallet or trading key passed as the API key) is left in them.
+            raw = secret_key = api_key = None
 
         self.base_url = (base_url or os.environ.get(ENV_BASE_URL) or DEFAULT_BASE_URL).rstrip("/")
         self._ws_url_override = ws_url or os.environ.get(ENV_WS_URL) or None
@@ -242,9 +276,9 @@ class LoafClient:
         self.market: MarketResource = MarketResource(self)
         #: Primary market (IPO offerings): list, detail.
         self.offerings: OfferingsResource = OfferingsResource(self)
-        #: Trading: place (signed with your agent key) and cancel orders, stop & take orders.
+        #: Trading: place (signed with your trading key) and cancel orders, stop & take orders.
         self.orders: OrdersResource = OrdersResource(self)
-        #: Balances, positions, and PnL.
+        #: Balances, positions, and recent activity.
         self.portfolio: PortfolioResource = PortfolioResource(self)
         #: Paginated order & trade history.
         self.history: HistoryResource = HistoryResource(self)
@@ -297,7 +331,7 @@ class LoafClient:
         auth: bool = True,
         before_order: bool = False,
     ) -> Any:
-        """:meth:`request`, plus ``before_order``: set for the read an order
+        """:meth:`request`, plus ``before_order``: set for the reads an order
         placement makes before signing, so a 429 raises at once and a 503 is
         retried after only a short jittered pause, never the rate-limit hints.
         """
@@ -358,23 +392,21 @@ class LoafClient:
     # ------------------------------------------------------------------ #
 
     @property
-    def agent_address(self) -> str | None:
-        """Checksummed address of the agent key that signs your orders, or ``None``."""
-        return self._signer.address if self._signer is not None else None
-
-    def _require_signer(self) -> OrderSigner:
-        if self._signer is None:
-            raise LoafConfigError(_NO_AGENT_KEY)
-        return self._signer
+    def public_key(self) -> str | None:
+        """The public key of your trading key, ``0x`` + 80 lowercase hex (what ``GET /l2/keys``
+        names ``journaledKey``), or ``None`` when no ``LOAF_SECRET_KEY`` is set."""
+        return self._l2_key.public_key if self._l2_key is not None else None
 
     def _send_signed(self, path: str, body: dict, *, ambiguous: bool = False) -> Any:
         """POST a signed placement, re-sending the identical bytes on transient failures.
 
         No ``Authorization`` header: the signature authenticates. Network errors
         and 5xx are re-sent up to ``max_retries`` times, after a short jittered
-        pause; the unique nonce makes a repeat a duplicate, never a second
-        order. 4xx (429 included) is final. If any attempt may have landed and
-        no 200 settled it, raises :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
+        pause; the exchange admits one order per account and order number, so a
+        repeat is answered as a duplicate, never a second order. 4xx (429
+        included) and a 503 ``VENUE_SWITCHING`` are final. If any attempt may
+        have landed and no 200 settled it, raises
+        :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
 
         ``ambiguous=True`` (resubmit): an earlier attempt may already have
         landed, so anything but a 200 raises ``OrderOutcomeUnknownError``.
@@ -392,6 +424,12 @@ class LoafClient:
                     ambiguous = True
                 error: Exception = LoafConnectionError(f"POST {path} failed: {exc}")
                 error.__cause__ = exc
+            except Exception as exc:
+                # E.g. another thread closed the client, or a response hook of your http_client
+                # raised on a 5xx answer: a body that may have been placed is never lost.
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500:
+                    ambiguous = True
+                error, retryable = exc, False
             else:
                 self._record_rate_limit(response)
                 if response.is_success:
@@ -409,9 +447,11 @@ class LoafClient:
                     ambiguous, retryable = True, False
                 else:
                     error = self._build_error(response)
-                    retryable = response.status_code >= 500
-                    if retryable and not _definitely_not_placed(error):
+                    if response.status_code >= 500 and not _definitely_not_placed(error):
                         ambiguous = True
+                    # VENUE_SWITCHING is an answer, not a lost reply: the body belongs to the
+                    # market mode that is ending.
+                    retryable = response.status_code >= 500 and error.code != "VENUE_SWITCHING"
             if not retryable or attempt >= self.max_retries:
                 break
             # Jitter only: every reply carries RateLimit-Reset, and a signed price goes stale.
@@ -481,8 +521,8 @@ class LoafClient:
             if hinted is not None:
                 time.sleep(min(hinted, 60.0))
                 return
-        # Exponential backoff with full jitter, capped at 30s.
-        delay = min(30.0, (2**attempt) * 0.5)
+        # Exponential backoff with full jitter, capped at 30s; a capped exponent never overflows.
+        delay = min(30.0, 0.5 * 2 ** min(attempt, 6))
         time.sleep(random.uniform(0, delay))
 
     # ------------------------------------------------------------------ #
@@ -494,7 +534,10 @@ class LoafClient:
         client's credentials and host. See that class for usage."""
         from .ws.client import LoafWebSocketClient
 
-        return LoafWebSocketClient(self, **kwargs)
+        try:
+            return LoafWebSocketClient(self, **kwargs)
+        finally:
+            kwargs.clear()  # crash reporters record frame locals: no refused api_key stays here
 
     @property
     def ws_url(self) -> str:
@@ -519,7 +562,7 @@ class LoafClient:
     def __repr__(self) -> str:
         # getattr: crash reporters repr a client whose __init__ raised part-way.
         authed = "authenticated" if getattr(self, "api_key", None) else "anonymous"
-        signer = getattr(self, "_signer", None)
-        agent = f" agent={signer.address}" if signer is not None else ""
+        key = getattr(self, "_l2_key", None)
+        public_key = f" public_key={key.public_key}" if key is not None else ""
         base_url = getattr(self, "base_url", None)
-        return f"<LoafClient base_url={base_url!r} {authed}{agent} v{__version__}>"
+        return f"<LoafClient base_url={base_url!r} {authed}{public_key} v{__version__}>"

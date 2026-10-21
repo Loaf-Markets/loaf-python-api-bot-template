@@ -3,7 +3,9 @@
 ``orders`` and ``trades`` support both offset pagination (``page`` /
 ``page_size``) and opaque keyset pagination (``cursor``). Prefer the cursor:
 take ``nextCursor`` from one response and pass it as ``cursor`` to the next.
-Do not derive "has more" from ``total`` (it is capped at 10000 for orders).
+Pass back only ``nextCursor`` values: a malformed cursor silently returns the
+first page. Do not derive "has more" from ``total`` (it is capped at 10000, for
+trades too). During a competition round these read the round's ledger.
 """
 
 from __future__ import annotations
@@ -31,8 +33,18 @@ class HistoryResource(Resource):
         in ``openOrders`` at once. ``total`` counts both tables and only
         one is capped — another reason not to derive "has more" from it.
 
+        Rows carry ``expiryMs`` (unix ms, the signed expiry): a booked order
+        rests until ``expiryMs`` minus 24 h, and the exchange then cancels it; a
+        stop or take that fires after then FAILS. ``filledQuantity`` is an
+        unrounded float difference (0.2 tokens can read
+        ``0.19999999999999998``): compare it with a tolerance, and rely on
+        ``status`` for "filled".
+
         A MARKET order's ``price`` is the worst price it was signed at, and a
-        resting MARKET remainder shows as ``OPEN`` / ``PARTIALLY_FILLED``.
+        resting MARKET remainder shows as ``OPEN`` / ``PARTIALLY_FILLED``. To
+        find the order an :class:`~loaf.exceptions.OrderOutcomeUnknownError`
+        was about, match side, price, quantity and ``expiryMs ==
+        error.signed_body["l2ExpiryMs"]``.
         """
         return self._client.get(
             "/history/orders",
@@ -49,10 +61,14 @@ class HistoryResource(Resource):
         """``GET /history/trades`` — paginated executed-trade history, newest first.
 
         Returns ``{trades, total, page, pageSize, nextCursor}``. ``side`` and
-        ``fee`` are reported from this user's perspective.
+        ``fee`` (dollars, to 0.001) are reported from this user's perspective.
 
-        Trades are final when they match; ``txHash`` is ``""`` until a batch
-        proof covers the trade.
+        Trades are final when they match. ``txHash`` is the trade's content
+        hash (``0x`` + 64 hex, never ``""``), not an on-chain transaction.
+        ``proof`` is ``None`` (proofs off, or a competition round's trade),
+        ``{"status": "PENDING"}``, or ``{"status": "IN_BATCH", batchNumber,
+        l2BlockNumber, rowIndex, l2TradeDigest, batchTxHash, final}`` once a
+        proven batch includes the trade (:class:`~loaf.models.TradeProofStatus`).
         """
         return self._client.get(
             "/history/trades",
@@ -63,7 +79,9 @@ class HistoryResource(Resource):
         """``GET /history/orders/cancelled`` — all cancel events, newest first (not paginated).
 
         Returns ``{"cancelledOrders": [{orderId, cancelledAt}]}``. Cancelled
-        BOOKED orders only; a cancelled conditional never appears here.
+        BOOKED orders only; a cancelled conditional never appears here. Includes
+        the exchange's own cancels: an expired order, an epoch move, a round
+        start.
         """
         return self._client.get("/history/orders/cancelled")
 

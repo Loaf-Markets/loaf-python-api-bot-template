@@ -1,8 +1,8 @@
 """Primary market (IPO offerings): browse offerings (public).
 
-Subscribing is not available through the API: it is closed until the vault
-launches, and when it opens it needs your account wallet's own signature, which
-an agent key cannot give — do it in the web app.
+Subscribing is not available through the API: each purchase is signed by your
+account wallet (the purchase terms and a payment-token permit), which neither
+the API key nor the trading key can do — subscribe in the web app.
 """
 
 from __future__ import annotations

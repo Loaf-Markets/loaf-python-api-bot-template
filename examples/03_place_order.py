@@ -3,8 +3,8 @@
 This DOES place a real (limit) order, priced far from the market so it rests on
 the book rather than filling. Review it before running against a live account.
 
-It needs both keys: LOAF_AGENT_PRIVATE_KEY signs the order, and LOAF_API_KEY
-cancels it again.
+It needs both keys: LOAF_SECRET_KEY signs the order, and LOAF_API_KEY reads
+your trading account and cancels the order again.
 
     python examples/03_place_order.py
 """
@@ -24,21 +24,20 @@ except ImportError:
 
 def main() -> None:
     client = LoafClient()
-    if client.agent_address is None:
-        raise SystemExit("Set LOAF_AGENT_PRIVATE_KEY to place orders (see README §2).")
+    if client.public_key is None:
+        raise SystemExit("Set LOAF_SECRET_KEY to place orders (see README §2).")
     if not client.api_key:
-        raise SystemExit("Set LOAF_API_KEY too, to cancel the order again (see README §2).")
+        raise SystemExit(
+            "Set LOAF_API_KEY too, to read your trading account and cancel the order "
+            "(see README §2)."
+        )
 
-    # Pick a property you can trade now: LIVE, with a deployed token, and in the
-    # market that is open (competition properties trade only during a round).
-    listing = client.market.properties()
-    competition = bool(listing.get("competitionModeActive"))
+    # Pick a property you can trade now: LIVE, with an L2 market (during a
+    # competition round only the round's market has one).
     tradeable = [
         p
-        for p in listing.get("properties") or []
-        if p.get("status") == "LIVE"
-        and bool(p.get("isCompetition")) == competition
-        and p.get("contractAddress")
+        for p in client.market.properties().get("properties") or []
+        if p.get("status") == "LIVE" and p.get("hasL2Market")
     ]
     if not tradeable:
         raise SystemExit("No tradeable properties right now.")
@@ -53,16 +52,12 @@ def main() -> None:
 
     try:
         result = client.orders.limit_buy(prop.ticker, quantity=1, price=price)
-    except loaf.CompetitionEligibilityError:
-        raise SystemExit(
-            "Not admitted to the active competition round — check "
-            "client.competition.queue_position() for your place in the queue."
-        )
-    except loaf.LoafAuthError as exc:
-        raise SystemExit(
-            f"Order signature refused: {exc.message}. Is LOAF_AGENT_PRIVATE_KEY "
-            "the agent key of a current API key?"
-        )
+    except loaf.VenueSwitchingError:
+        raise SystemExit("The market mode is switching: run this again in a few seconds.")
+    except loaf.VenueError as exc:
+        raise SystemExit(f"{prop.ticker} is not open in the current market mode: {exc.message}")
+    except loaf.LoafConfigError as exc:  # your trading key or account: the message says what to do
+        raise SystemExit(str(exc))
     except loaf.LoafAPIError as exc:  # halted, market closed, order refused, rate limited
         raise SystemExit(f"Refused: {exc}")
     except loaf.OrderOutcomeUnknownError as exc:
@@ -83,8 +78,8 @@ def main() -> None:
     try:
         client.orders.cancel(order_id)
         print("Cancelled.")
-    except loaf.LoafConflictError:
-        print("Order was no longer cancellable (likely already filled/cancelled).")
+    except (loaf.LoafConflictError, loaf.LoafValidationError) as exc:
+        print(f"No longer cancellable: {exc.message}")
 
     client.close()
 

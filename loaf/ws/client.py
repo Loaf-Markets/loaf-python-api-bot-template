@@ -21,8 +21,8 @@ Or run it in the background and keep using the REST client::
         ...                               # do other work; handlers fire live
 
 Channels (``"type:key"`` strings — market-data channels key by the property's
-``ticker``, exact case: ``orderbook:opra`` is refused; ``portfolio`` and
-``leaderboard`` have no key):
+``ticker``, exact case: ``orderbook:opra`` is refused; ``portfolio``,
+``leaderboard`` and ``competition`` have no key):
 
 ==================  ========  ===========================================
 Channel             Auth      What you receive
@@ -33,13 +33,14 @@ chart:{ticker}      public    OHLCV candle updates (note: singular "chart")
 markprice:{ticker}  public    canonical mark price (1s, on change)
 volume:{ticker}     public    rolling-24h traded volume (replaces ``volume24h``)
 property:{ticker}   public    halt / resume status for one property
-ipo:{ipoId}         public    primary-market allocation progress
 leaderboard         public    competition leaderboard (top entries) on change
-portfolio           PRIVATE   your balances/positions/orders/trades deltas
+competition         public    round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT)
+portfolio           PRIVATE   your order transitions, fills and whole L2 balance book
 ==================  ========  ===========================================
 
-All values are already human units (dollars / tokens); timestamps are unix
-seconds.
+Prices and quantities are human units (dollars / tokens); ``balances_update``
+amounts are base-unit decimal strings (see :func:`loaf.from_base_units`);
+timestamps are unix seconds (an order row's ``expiryMs`` is milliseconds).
 
 Handlers run on the client's internal event-loop thread: keep them short. An
 exception raised in a handler is logged and swallowed. Don't place orders from
@@ -54,12 +55,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
+import ssl
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
-from .._object import parse
+import httpx
+
+from .._object import LoafObject, parse
+from ..client import _api_key_refusal
 from ..enums import WSMessageType
+from ..exceptions import LoafConfigError
 
 if TYPE_CHECKING:
     from ..client import LoafClient
@@ -78,7 +85,10 @@ Handler = Callable[[Any], None]
 
 # Internal pseudo-types for lifecycle callbacks (never collide with wire types).
 _ON_CONNECT = "__connect__"
-_ON_TRANSPORT_ERROR = "__transport_error__"
+_ON_DISCONNECT = "__disconnect__"
+
+# The longest wait before a reconnect attempt, in seconds.
+_MAX_RECONNECT_DELAY = 30.0
 
 
 def derive_ws_url(base_url: str) -> str:
@@ -104,6 +114,10 @@ class LoafWebSocketClient:
     with the ``on_*`` decorators/methods, declare subscriptions with the
     ``subscribe_*`` helpers, then call :meth:`run_forever` (blocking) or use the
     instance as a context manager (background thread).
+
+    ``reconnect_delay`` is the longest wait before the first reconnect attempt,
+    in seconds; it doubles after each attempt that does not reach
+    :meth:`on_connect`, up to 30 s, and each wait is drawn at random below it.
     """
 
     def __init__(
@@ -112,16 +126,29 @@ class LoafWebSocketClient:
         *,
         api_key: str | None = None,
         ws_url: str | None = None,
-        verify: bool | str | None = None,
+        verify: bool | ssl.SSLContext | None = None,
         auto_reconnect: bool = True,
-        reconnect_delay: float = 2.0,
+        reconnect_delay: float = 1.0,
     ) -> None:
-        self.api_key = api_key if api_key is not None else (client.api_key if client else None)
+        try:
+            # Sent in every auth frame, so refused as LoafClient refuses its own (which a key
+            # taken from it has passed).
+            refusal = _api_key_refusal(api_key) if api_key else None
+            if refusal:
+                raise LoafConfigError(refusal)
+            self.api_key = api_key if api_key is not None else (client.api_key if client else None)
+        finally:
+            api_key = None  # crash reporters record frame locals: no refused key stays here
         resolved_ws_url = ws_url or (client.ws_url if client is not None else None)
         if not resolved_ws_url:
             raise ValueError("ws_url is required when no LoafClient is provided")
         self.ws_url: str = resolved_ws_url
-        self._verify = verify if verify is not None else (getattr(client, "_verify", True))
+        verify = verify if verify is not None else (client._verify if client else True)
+        # The context httpx builds for REST from the same setting, not websockets' default: the
+        # system store, while REST trusts certifi's CAs. Built now, so a bad CA path raises here.
+        self._ssl = (
+            httpx.create_ssl_context(verify=verify) if self.ws_url.startswith("wss://") else None
+        )
         self.auto_reconnect = auto_reconnect
         self.reconnect_delay = reconnect_delay
 
@@ -131,6 +158,7 @@ class LoafWebSocketClient:
         self._thread: threading.Thread | None = None
         self._run_task: asyncio.Task | None = None
         self._ws: Any = None
+        self._auth_refused = False  # the live connection's auth_result was false
         self._stop_event = threading.Event()
         self._connected_event = threading.Event()
 
@@ -181,32 +209,46 @@ class LoafWebSocketClient:
         """
         return self.on(WSMessageType.PROPERTY_HALT, handler)
 
-    def on_ipo(self, handler: Handler | None = None) -> Any:
-        return self.on(WSMessageType.IPO_ALLOCATION_UPDATE, handler)
-
     def on_leaderboard(self, handler: Handler | None = None) -> Any:
         """The competition leaderboard changed (``leaderboard_update``:
         ``{leaderboard}`` — the same board ``GET /leaderboard`` serves, top
-        entries only, so churn below the served cut does not wake you)."""
+        entries only, so churn below the served cut does not wake you). No frame
+        arrives on subscribe: seed from ``leaderboard.get()``."""
         return self.on(WSMessageType.LEADERBOARD_UPDATE, handler)
+
+    def on_round_update(self, handler: Handler | None = None) -> Any:
+        """A competition round changed status (``round_update``: ``{roundNumber,
+        status, startsAt, endsAt, arenaTicker}``, times in unix seconds,
+        ``arenaTicker`` the round's market).
+
+        ``PREPARED`` and ``ENDING`` switch which ledger serves you, and so does
+        ``DRAFT`` when it aborts a PREPARED round (aborting a PENDING round,
+        which had no frame, switches nothing): only the round's market trades
+        while it is PREPARED or ACTIVE, with a trading key of its own (enable
+        trading on the round's market in the web app, then derive it: README
+        **Competition rounds**). Your real resting orders and stops are
+        cancelled shortly after ``PREPARED``, with no frame. The exchange's
+        servers finish a switch about 20 s after its frame and then close
+        portfolio sockets with 1012 ``venue``: re-seed from REST when
+        :meth:`on_connect` fires after that close, not on this frame (REST
+        reads right after it can still show the previous ledger).
+        Delivery is best-effort: ``competition.info()`` catches you up (after a
+        reconnect, say), but keep a frame over a read made soon after it, which
+        a shared cache can serve stale.
+        """
+        return self.on(WSMessageType.ROUND_UPDATE, handler)
 
     # private portfolio deltas
     def on_balances(self, handler: Handler | None = None) -> Any:
-        """Your committed USDC balance (``balances_update``: ``{cash, frozen}``).
+        """Your whole L2 balance book (``balances_update``: ``{balances}``).
 
-        An absolute snapshot: replace, never add. Pushed with every fill, and
-        when a booked BUY is placed or cancelled (its USDC freeze / release).
+        Rows are ``{assetId, symbol, decimals, isQuote, total, hold,
+        available}``, the amounts decimal strings in the token's base units
+        (:func:`loaf.from_base_units`); the ``isQuote`` rows are your
+        cash. Sent after every engine commit that moves the book: replace yours
+        with it, and treat a missing row as 0.
         """
         return self.on(WSMessageType.BALANCES_UPDATE, handler)
-
-    def on_position(self, handler: Handler | None = None) -> Any:
-        """One of your positions (``position_update``), one frame per touched property.
-
-        An absolute snapshot: replace, never add. Pushed with every fill in that
-        property, and when a booked SELL is placed or cancelled (its token
-        freeze / release).
-        """
-        return self.on(WSMessageType.POSITION_UPDATE, handler)
 
     def on_order_status(self, handler: Handler | None = None) -> Any:
         """A booked order's status/quantity changed (``order_status``).
@@ -216,10 +258,13 @@ class LoafWebSocketClient:
         a fill, and the cancelled quantity on ``CANCELLED``, so filled =
         quantity - quantityLeft always.
 
-        ``CANCELLED`` also arrives for cancels you did not request: your own
-        order crossing your resting one cancels the resting one, a BUY that ran
-        out of frozen budget is cancelled, and a firing stop frees funds by
-        cancelling orders.
+        ``CANCELLED`` also arrives for cancels you did not request: the
+        exchange's sweep 24 h before the order's ``expiryMs``, an epoch move (a
+        trading-key reset or a cancel-all sent on chain), a closed market, a BUY
+        that can no longer fund a fill within its hold (budget exhausted), an
+        aggressing SELL at K1's bound (its remainder does not rest), your own
+        order crossing your resting one (self-trade), and a firing stop freeing
+        funds by cancelling your resting orders.
         """
         return self.on(WSMessageType.ORDER_STATUS, handler)
 
@@ -229,13 +274,15 @@ class LoafWebSocketClient:
         ``order`` is a booked order OR a conditional (stop / take) row — narrow
         with :func:`loaf.is_conditional_order` before reading ``filledQuantity``,
         which a conditional does not carry. Every conditional transition
-        publishes one of these. A firing conditional also cancels your own
-        resting orders on that side of that property to free its funds, so you
-        can receive ``CANCELLED`` frames for orders you never cancelled.
+        publishes one of these, TP/SL legs included (they are conditional rows).
+        A firing conditional also cancels your own resting orders on that side
+        of that property to free its funds, so you can receive ``CANCELLED``
+        frames for orders you never cancelled.
 
         For a booked order it is sent after the exchange commits and carries the
-        committed row. For an order that trades immediately it can arrive AFTER
-        that order's ``order_status`` / ``trade_new`` frames and already show
+        committed row, with ``expiryMs`` (unix ms, the signed expiry). For an
+        order that trades immediately it can arrive AFTER that order's
+        ``order_status`` / ``trade_new`` frames and already show
         ``PARTIALLY_FILLED`` or ``FILLED``, so upsert by id and do not assume
         ``OPEN`` first. A MARKET row's ``price`` is the worst price you signed.
         """
@@ -245,9 +292,11 @@ class LoafWebSocketClient:
         """Your own fills on the private portfolio channel (``trade_new``).
 
         Exactly one frame per fill, final when it matches. ``trade.txHash`` is
-        ``""`` until a batch proof covers the trade. It arrives in the same
-        burst as that fill's ``balances_update``, ``position_update`` and
-        ``order_status``; several fills from one batch arrive back to back.
+        the trade's content hash (``0x`` + 64 hex), not an on-chain transaction;
+        ``trade.proof`` is ``{"status": "PENDING"}``, or ``None`` with proofs
+        off and for a competition round's trade; ``trade.fee`` is dollars to
+        0.001. A fill's burst is ``order_status``, ``trade_new``, then
+        ``balances_update``; several fills from one batch arrive back to back.
         Delivery is at most once (no replay after a reconnect), so reconcile
         with ``history.trades()``.
         """
@@ -258,24 +307,54 @@ class LoafWebSocketClient:
         absolute; recomputed after fills."""
         return self.on(WSMessageType.LIFETIME_VOLUME_UPDATE, handler)
 
-    def on_transfer(self, handler: Handler | None = None) -> Any:
-        return self.on(WSMessageType.TRANSFER_UPDATE, handler)
-
-    def on_offering_order(self, handler: Handler | None = None) -> Any:
-        return self.on(WSMessageType.OFFERING_ORDER_UPDATE, handler)
-
     # lifecycle / control
     def on_error(self, handler: Handler | None = None) -> Any:
-        """Server-sent ``error`` frames (e.g. unauthorized subscription)."""
+        """Server-sent ``error`` frames: ``{message, code}``.
+
+        ``code`` is ``UNKNOWN_CHANNEL`` (no such channel: check the ticker and
+        its case), ``UNAUTHORIZED`` (``portfolio`` without an accepted API
+        key), ``SUBSCRIPTION_LIMIT``, ``TOO_MANY_CHANNELS``,
+        ``INVALID_CHANNELS``, ``RATE_LIMITED`` or ``INVALID_MESSAGE``. A
+        refused subscription or a rate-limited frame is dropped.
+        """
         return self.on(WSMessageType.ERROR, handler)
 
     def on_connect(self, handler: Handler | None = None) -> Any:
-        """Called once each time the socket (re)connects and (re)subscribes."""
+        """Called once each time a connection goes live: the server has
+        answered its auth and subscriptions.
+
+        A refused subscription arrives before it as an :meth:`on_error` frame.
+        While ``portfolio`` is subscribed, a connection whose API key the
+        server does not accept is dropped and retried (see
+        :meth:`on_disconnect`). Nothing is replayed across a reconnect, so flag
+        a re-seed here and do the REST reads from your own thread, as
+        ``bot.py`` does: handlers run on the socket's thread, and a slow read
+        inside one stalls the socket until the server's heartbeat drops it.
+        """
         return self.on(_ON_CONNECT, handler)
 
-    def on_transport_error(self, handler: Handler | None = None) -> Any:
-        """Called with the exception when the connection drops/fails."""
-        return self.on(_ON_TRANSPORT_ERROR, handler)
+    def on_disconnect(self, handler: Handler | None = None) -> Any:
+        """Called each time a connection attempt ends, except when you
+        :meth:`stop` the client, with ``{code, reason}``.
+
+        After a connection closes, ``code`` is the close code received (1006
+        when it dropped without one) and ``reason`` its reason (``""`` if
+        none). After an attempt that made no connection (refused, DNS, TLS, the
+        handshake answered with an HTTP error), ``code`` is ``None`` and
+        ``reason`` the error text. 1012 with reason ``resync`` (pushes were
+        lost) or ``venue`` (the competition venue changed) means re-seed from
+        REST once :meth:`on_connect` fires again. Calls with no
+        :meth:`on_connect` between them mean the feed is down (the client keeps
+        retrying with backoff).
+
+        While ``portfolio`` is subscribed, the client closes a connection whose
+        API key the server does not accept, with ``code`` 1006 and ``reason``
+        ``"the server did not accept the API key"``. The server also answers so
+        when it cannot check the key at that moment, and a later attempt then
+        gets through; if it keeps repeating, the key has expired or been
+        revoked, and REST calls raise :class:`~loaf.exceptions.LoafAuthError`.
+        """
+        return self.on(_ON_DISCONNECT, handler)
 
     # ------------------------------------------------------------------ #
     # Subscriptions
@@ -319,18 +398,24 @@ class LoafWebSocketClient:
         ``property_halt`` frames replace it."""
         return self.subscribe(f"property:{ticker}")
 
-    def subscribe_ipo(self, ipo_id: int) -> LoafWebSocketClient:
-        return self.subscribe(f"ipo:{int(ipo_id)}")
-
     def subscribe_leaderboard(self) -> LoafWebSocketClient:
         """Live competition-leaderboard updates (no id — one global channel)."""
         return self.subscribe("leaderboard")
 
+    def subscribe_competition(self) -> LoafWebSocketClient:
+        """Competition round transitions (no id — one global channel): a
+        ``round_update`` on each of PREPARED, ACTIVE, ENDING, ENDED and DRAFT
+        (none for PENDING). No frame arrives on subscribe: seed from
+        ``competition.info()``."""
+        return self.subscribe("competition")
+
     def subscribe_portfolio(self) -> LoafWebSocketClient:
         """Subscribe to your PRIVATE portfolio channel.
 
-        Requires an ``api_key`` on the client. An anonymous connection is
-        refused with an ``error`` frame (:meth:`on_error`).
+        Requires an ``api_key`` on the client: an anonymous connection is
+        refused with an ``error`` frame (:meth:`on_error`), and one whose API
+        key the server does not accept is dropped and retried
+        (:meth:`on_disconnect`).
         """
         return self.subscribe("portfolio")
 
@@ -398,7 +483,8 @@ class LoafWebSocketClient:
             self._loop = None
 
     def wait_until_connected(self, timeout: float | None = None) -> bool:
-        """Block until the socket has connected once (returns ``True``) or times out."""
+        """Block until a connection is live, the moment :meth:`on_connect` fires
+        (returns ``True``), or until ``timeout`` (returns ``False``)."""
         return self._connected_event.wait(timeout)
 
     def __enter__(self) -> LoafWebSocketClient:
@@ -441,46 +527,63 @@ class LoafWebSocketClient:
             loop.close()
 
     async def _run(self) -> None:
-        connect_kwargs = self._connect_kwargs()
+        connect_kwargs: dict[str, Any] = {} if self._ssl is None else {"ssl": self._ssl}
+        ceiling = min(self.reconnect_delay, _MAX_RECONNECT_DELAY)
         while not self._stop_event.is_set():
+            ws = None
             try:
                 async with websockets.connect(self.ws_url, **connect_kwargs) as ws:
                     self._ws = ws
+                    self._auth_refused = False
                     await self._on_open(ws)
                     async for raw in ws:
                         self._dispatch(raw)
+                # A normal close (1000/1001/1005), read once the context has finished it: the
+                # legacy client (websockets 12) reports close_code only in the CLOSED state.
+                code = ws.close_code if ws.close_code is not None else 1006
+                reason = ws.close_reason or ""
             except asyncio.CancelledError:  # pragma: no cover
                 break
+            except websockets.ConnectionClosed as exc:
+                code = exc.rcvd.code if exc.rcvd is not None else 1006
+                reason = exc.rcvd.reason if exc.rcvd is not None else ""
+                logger.warning("Loaf WebSocket closed: %s %s", code, reason)
             except Exception as exc:  # noqa: BLE001
                 if self._stop_event.is_set():
                     break
-                logger.warning("Loaf WebSocket connection error: %s", exc)
-                self._emit(_ON_TRANSPORT_ERROR, exc)
+                # No connection (refused, DNS, TLS, an HTTP error answering the handshake),
+                # or a failure on a live one. The type stands in for an empty text: websockets
+                # 12 and 13 time a handshake out with a bare TimeoutError.
+                code = None if ws is None else 1006
+                reason = str(exc) or type(exc).__name__
+                logger.warning("Loaf WebSocket connection error: %s", reason)
             finally:
-                self._ws = None
-                self._connected_event.clear()
-            if self._stop_event.is_set() or not self.auto_reconnect:
+                connected = self._connected_event.is_set()
+                # Only this attempt's own state: a stop() that stopped waiting (a close can
+                # outlast its join) lets start() begin the next run before this one ends.
+                if self._ws is ws:
+                    self._ws = None
+                    self._connected_event.clear()
+            if self._stop_event.is_set():
                 break
-            await asyncio.sleep(self.reconnect_delay)
-
-    def _connect_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
-        if self.ws_url.startswith("wss://") and self._verify is False:
-            import ssl
-
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            kwargs["ssl"] = ctx
-        return kwargs
+            self._emit(_ON_DISCONNECT, LoafObject({"code": code, "reason": reason}))
+            if not self.auto_reconnect:
+                break
+            if connected:
+                ceiling = min(self.reconnect_delay, _MAX_RECONNECT_DELAY)
+            await asyncio.sleep(random.uniform(0, ceiling))
+            # Doubled, never computed as a power: 2.0 ** failures overflows after about 1,024
+            # failures (hours offline), and an error here, outside the try, ends this thread.
+            ceiling = min(ceiling * 2, _MAX_RECONNECT_DELAY)
 
     async def _on_open(self, ws: Any) -> None:
         if self.api_key:
             await ws.send(self._frame("auth", token=self.api_key))
         if self._channels:
             await ws.send(self._frame("subscribe", channels=sorted(self._channels)))
-        self._connected_event.set()
-        self._emit(_ON_CONNECT, None)
+        # The server handles a socket's frames in order, so it echoes this one after it has
+        # answered the auth and the subscribe: _dispatch marks the connection live then.
+        await ws.send(self._frame("ping"))
 
     def _dispatch(self, raw: Any) -> None:
         try:
@@ -490,9 +593,33 @@ class LoafWebSocketClient:
             return
         obj = parse(message)
         mtype = message.get("type") if isinstance(message, dict) else None
+        if (
+            mtype == WSMessageType.ECHO
+            and not self._connected_event.is_set()
+            and isinstance(message.get("data"), dict)
+            and message["data"].get("type") == "ping"
+        ):
+            self._connected_event.set()
+            self._emit(_ON_CONNECT, None)
         if mtype is not None:
             self._emit(str(mtype), obj)
         self._emit("*", obj)
+        if mtype == WSMessageType.AUTH_RESULT:
+            self._auth_refused = message.get("success") is False
+        if (
+            self._auth_refused
+            and "portfolio" in self._channels
+            and (
+                mtype == WSMessageType.AUTH_RESULT
+                or (mtype == WSMessageType.ERROR and message.get("code") == "UNAUTHORIZED")
+            )
+        ):
+            # The server answers false for any failure to check the key, a passing one
+            # included, then leaves the socket anonymous and never closes it with a 1012: end
+            # the attempt, so that the private stream is retried with backoff. Portfolio
+            # subscribed after that answer is refused UNAUTHORIZED: end it at that reply, which
+            # comes once the subscribe has gone out (a queued send fails on a closed socket).
+            raise ConnectionError("the server did not accept the API key")
 
     def _emit(self, key: str, payload: Any) -> None:
         for handler in list(self._handlers.get(key, ())):

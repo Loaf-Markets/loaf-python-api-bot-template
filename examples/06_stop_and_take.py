@@ -3,8 +3,8 @@
 This DOES place a real conditional order, triggered far from the market so it
 never fires. Review it before running against a live account.
 
-It needs both keys: LOAF_AGENT_PRIVATE_KEY signs the order, and LOAF_API_KEY
-reads it back and cancels it.
+It needs both keys: LOAF_SECRET_KEY signs the order, and LOAF_API_KEY reads
+your trading account, reads the row back and cancels it.
 
     python examples/06_stop_and_take.py
 """
@@ -24,21 +24,20 @@ except ImportError:
 
 def main() -> None:
     client = LoafClient()
-    if client.agent_address is None:
-        raise SystemExit("Set LOAF_AGENT_PRIVATE_KEY to place orders (see README §2).")
+    if client.public_key is None:
+        raise SystemExit("Set LOAF_SECRET_KEY to place orders (see README §2).")
     if not client.api_key:
-        raise SystemExit("Set LOAF_API_KEY too, to cancel the order again (see README §2).")
+        raise SystemExit(
+            "Set LOAF_API_KEY too, to read your trading account and cancel the order "
+            "(see README §2)."
+        )
 
-    # Pick a property you can trade now: LIVE, with a deployed token, and in the
-    # market that is open (competition properties trade only during a round).
-    listing = client.market.properties()
-    competition = bool(listing.get("competitionModeActive"))
+    # Pick a property you can trade now: LIVE, with an L2 market (during a
+    # competition round only the round's market has one).
     tradeable = [
         p
-        for p in listing.get("properties") or []
-        if p.get("status") == "LIVE"
-        and bool(p.get("isCompetition")) == competition
-        and p.get("contractAddress")
+        for p in client.market.properties().get("properties") or []
+        if p.get("status") == "LIVE" and p.get("hasL2Market")
     ]
     if not tradeable:
         raise SystemExit("No tradeable properties right now.")
@@ -48,15 +47,15 @@ def main() -> None:
     mark = book.bids[0].price if book and book.get("bids") else (prop.marketPrice or 1.0)
 
     # A STOP BUY fires when the mark RISES to the trigger, so a trigger 50%
-    # above the market just rests. (A stop SELL would need a holding to sell.)
+    # above the market just rests. (A stop SELL would need tokens to sell when it
+    # fires.)
     trigger = round(mark * 1.50, 2)
     # When it fires it books a LIMIT BUY at the trigger plus the client's max
-    # slippage ($LOAF_MAX_SLIPPAGE_BPS, default 2%). Placing it needs total USDC
-    # of at least that price x quantity plus the taker fee, and that value must
-    # be at least 10 USDC.
+    # slippage ($LOAF_MAX_SLIPPAGE_BPS, default 2%). That price x quantity must be
+    # at least $10; your cash is checked only when it fires.
     books_at = loaf.worst_price(trigger, "BUY", client.max_slippage_bps)
     print(f"Arming STOP_MARKET BUY 1 {prop.ticker} @ trigger {trigger} "
-          f"(books at up to {books_at}; mark {mark})")
+          f"(books at up to {books_at}; rounded toward the trigger; mark {mark})")
 
     try:
         result = client.orders.create_conditional(
@@ -66,16 +65,12 @@ def main() -> None:
             type="STOP_MARKET",
             trigger_price=trigger,
         )
-    except loaf.CompetitionEligibilityError:
-        raise SystemExit(
-            "Not admitted to the active competition round — check "
-            "client.competition.queue_position() for your place in the queue."
-        )
-    except loaf.LoafAuthError as exc:
-        raise SystemExit(
-            f"Order signature refused: {exc.message}. Is LOAF_AGENT_PRIVATE_KEY "
-            "the agent key of a current API key?"
-        )
+    except loaf.VenueSwitchingError:
+        raise SystemExit("The market mode is switching: run this again in a few seconds.")
+    except loaf.VenueError as exc:
+        raise SystemExit(f"{prop.ticker} is not open in the current market mode: {exc.message}")
+    except loaf.LoafConfigError as exc:  # your trading key or account: the message says what to do
+        raise SystemExit(str(exc))
     except loaf.LoafValidationError as exc:
         raise SystemExit(
             f"Refused: {exc}. If this says 'would trigger immediately', the trigger "
@@ -111,7 +106,7 @@ def main() -> None:
         client.orders.cancel_conditional(order_id)
         print("Cancelled.")
     except loaf.LoafNotFoundError:
-        print("No such conditional order (already cancelled, or a booked-order id).")
+        print("No such conditional order (an unknown id, or a booked-order id).")
     except loaf.LoafValidationError as exc:
         print(f"No longer cancellable: {exc.message}")
 

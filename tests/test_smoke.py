@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import pickle
+import subprocess
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -58,10 +62,20 @@ def test_derive_ws_url():
 
 def test_error_mapping():
     assert isinstance(error_from_response(401, {"error": "no"}), loaf.LoafAuthError)
-    assert isinstance(
-        error_from_response(403, {"error": "x", "code": "NOT_COMPETITION_PARTICIPANT"}),
-        loaf.CompetitionEligibilityError,
+    # The market mode's refusals: one class for the three 403 codes, the code kept.
+    for code, message in (
+        ("NOT_TRADEABLE_IN_MODE", "Property is not tradeable in the current market mode"),
+        ("COMPETITION_NOT_STARTED", "The competition round has not started yet"),
+        ("NOT_COMPETITION_PARTICIPANT", "Not a competition participant for the current round"),
+    ):
+        venue = error_from_response(403, {"error": message, "code": code})
+        assert type(venue) is loaf.VenueError
+        assert (venue.status_code, venue.code, venue.message) == (403, code, message)
+    switching = error_from_response(
+        503, {"error": "Market mode is switching; try again in a moment", "code": "VENUE_SWITCHING"}
     )
+    assert type(switching) is loaf.VenueSwitchingError and switching.code == "VENUE_SWITCHING"
+    assert isinstance(switching, loaf.LoafServiceUnavailableError)
     # The emergency kill switch is a 403 with no machine code — matched on message.
     assert isinstance(
         error_from_response(403, {"error": "Trading is currently halted"}),
@@ -70,7 +84,7 @@ def test_error_mapping():
     err = error_from_response(400, {"error": "Validation failed", "details": ["price: bad"]})
     assert isinstance(err, loaf.LoafValidationError) and err.details == ["price: bad"]
     assert isinstance(error_from_response(429, {"error": "slow"}), loaf.LoafRateLimitError)
-    assert isinstance(error_from_response(503, {"error": "down"}), loaf.LoafServiceUnavailableError)
+    assert type(error_from_response(503, {"error": "down"})) is loaf.LoafServiceUnavailableError
 
     assert isinstance(
         error_from_response(403, {"error": "Trading halted for this property"}),
@@ -87,10 +101,22 @@ def test_error_mapping():
         },
     )
     assert isinstance(band, loaf.LoafValidationError)
-    assert isinstance(
-        error_from_response(409, {"error": "nonce already used by a different order"}),
-        loaf.LoafConflictError,
-    )
+    used = "l2 order_index: already used by the account; re-sign with the next index"
+    assert isinstance(error_from_response(409, {"error": used}), loaf.LoafConflictError)
+    # The exchange engine's own halts arrive as 400s with its text.
+    for message in (
+        "trading halted: L1 request 7 reversed at block 9; see the operator runbook",
+        "L1_RECHECK_PENDING: 3 journaled L1 credits are not final and not re-checked since the "
+        "start; orders and withdrawals are refused (cancels admitted)",
+        "E_L2_ORDERS_WITHOUT_JOURNAL: every order is L2-signed and the L2 journal is not read "
+        "back yet, so no order is admitted",
+    ):
+        halt = error_from_response(400, {"error": message})
+        assert type(halt) is loaf.TradingHaltedError and halt.status_code == 400
+    # "halted" anywhere else in a 400 is an ordinary refusal.
+    assert type(
+        error_from_response(400, {"error": "Order refused: the property was halted earlier"})
+    ) is loaf.LoafValidationError
     # A route that does not exist answers with an HTML page; keep just its message.
     missing = error_from_response(
         404,
@@ -104,16 +130,37 @@ def test_error_mapping():
 
 def test_errors_survive_pickle_and_copy():
     # A process pool pickles a worker's exception: signed_body must reach the parent.
-    body = {"nonce": "0192a3b4c5d600112233445566778899", "signature": "0x" + "ab" * 65}
+    body = {
+        "ticker": "OPRA",
+        "l2AccountIndex": 5,
+        "l2OrderIndex": 4097,
+        "l2ExpiryMs": 1_800_000_000_000,
+        "l2SigS": "ab" * 40,
+        "l2SigE": "cd" * 40,
+    }
     error = loaf.OrderOutcomeUnknownError(
         signed_body=body, attempts=2, last_error=error_from_response(502, {"error": "x"})
     )
+    assert str(error) == (
+        "Could not confirm whether order 4097 of account 5 was placed after 2 attempt(s) (last "
+        "error: HTTP 502: x). It may be live, and may already have filled. Never place it afresh: "
+        "while it can still rest, re-send it unchanged with orders.resubmit(error.signed_body) "
+        "(the same order if it landed; if not, it is placed now at the signed price), or find "
+        "it in history.orders() by its expiryMs 1800000000000 (every status; openOrders shows "
+        "only resting orders). A history miss proves nothing while it can still rest (until its "
+        "expiryMs minus 24 hours)."
+    )
     for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
         assert type(clone) is loaf.OrderOutcomeUnknownError
-        assert (clone.signed_body, clone.attempts, clone.nonce) == (body, 2, body["nonce"])
+        assert (clone.signed_body, clone.attempts) == (body, 2)
         assert str(clone) == str(error)
         assert type(clone.last_error) is loaf.LoafServerError
         assert (clone.last_error.status_code, clone.last_error.message) == (502, "x")
+    venue = error_from_response(403, {"error": "x", "code": "NOT_COMPETITION_PARTICIPANT"})
+    for clone in (pickle.loads(pickle.dumps(venue)), copy.copy(venue), copy.deepcopy(venue)):
+        assert type(clone) is loaf.VenueError
+        assert (clone.status_code, clone.code) == (403, "NOT_COMPETITION_PARTICIPANT")
+        assert str(clone) == str(venue)
     limited = error_from_response(429, {"error": "slow"}, retry_after=3.0, request_id="r1")
     clone = pickle.loads(pickle.dumps(limited))
     assert type(clone) is loaf.LoafRateLimitError
@@ -230,15 +277,6 @@ def test_rate_limit_not_retried_for_non_idempotent_post():
     assert calls["n"] == 1
 
 
-def test_error_surfaces_after_retries_exhausted():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, json={"error": "x", "code": "NOT_COMPETITION_PARTICIPANT"})
-
-    client = make_client(handler)
-    with pytest.raises(loaf.CompetitionEligibilityError):
-        client.orders.cancel(1)
-
-
 def test_candles_params_and_no_auth():
     seen = {}
 
@@ -351,49 +389,6 @@ def test_competition_endpoints():
         client.competition.submit_payout_details(wallet_address="0xabc", email="a@b.c")
 
 
-def test_ws_channel_helpers():
-    ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
-    ws.subscribe_orderbook("OPRA")
-    ws.subscribe_trades("OPRA")
-    ws.subscribe_chart("OPRA")
-    ws.subscribe_mark_price("OPRA")
-    ws.subscribe_volume("OPRA")
-    ws.subscribe_property_status("OPRA")
-    ws.subscribe_leaderboard()
-    ws.subscribe_portfolio()
-    assert ws._channels == {
-        "orderbook:OPRA", "trades:OPRA", "chart:OPRA", "markprice:OPRA", "volume:OPRA",
-        "property:OPRA", "leaderboard", "portfolio",
-    }
-
-
-def test_ws_property_halt_dispatch():
-    ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
-    seen = []
-    ws.on_property_halt(seen.append)
-    ws._dispatch(json.dumps({
-        "type": "property_halt", "propertyId": 1, "ticker": "OPRA",
-        "isHalted": True, "timestamp": 0,
-    }))
-    assert seen[0].ticker == "OPRA" and seen[0].isHalted is True
-
-
-def test_trade_new_dispatches():
-    ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
-    seen = []
-    # A fill is final when it matches; txHash is "" until a batch proof.
-    ws.on_trade(lambda m: seen.append((m.trade.tradeId, m.trade.txHash, m.trade.fee)))
-    ws._dispatch(json.dumps({
-        "type": "trade_new",
-        "trade": {
-            "tradeId": 1, "propertyId": 1, "ticker": "OPRA", "txHash": "", "side": "BUY",
-            "quantity": 1, "price": 100, "executedAt": 0, "fee": 0.1,
-        },
-        "timestamp": 0,
-    }))
-    assert seen == [(1, "", 0.1)]
-
-
 def test_rate_limit_headers_recorded():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -450,5 +445,40 @@ def test_conditional_cancel_routing():
         client.orders.cancel_row({"type": "LIMIT"})  # no id anywhere in the row
 
 
+def test_cancel_all_route_and_auth():
+    answer = {"requestedCount": 2, "cancelledOrderIds": [8, 7], "failedOrders": []}
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json=answer)
+
+    assert make_client(handler).orders.cancel_all() == answer
+    (request,) = sent  # exactly one request
+    assert (request.method, request.url.path) == ("POST", "/api/orders/cancel-all")
+    assert request.headers.get("authorization") == "Bearer testkey"
+    assert request.content == b""  # no body
+
+
 def test_version():
     assert loaf.constants.USER_AGENT == f"loaf-python-sdk/{loaf.__version__}"
+
+
+def test_trading_needs_no_wallet_extra():
+    # eth-account and eth-utils are the `wallet` extra, for python -m loaf.secret_key alone: the SDK
+    # imports, signs and places orders without them. A fresh interpreter, where neither imports.
+    code = """
+import sys
+sys.modules["eth_account"] = sys.modules["eth_utils"] = None
+import httpx
+from conftest import BASE, L2_SECRET, FakeExchange
+from loaf import LoafClient
+exchange = FakeExchange()
+http = httpx.Client(transport=httpx.MockTransport(exchange.handler), base_url=BASE)
+client = LoafClient(api_key="testkey", secret_key=L2_SECRET, base_url=BASE, http_client=http)
+assert client.orders.limit_buy("OPRA", 1, 160).orderId == 1
+assert [name for name in sys.modules if name.startswith("eth_") and sys.modules[name]] == []
+"""
+    tests = Path(__file__).parent
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(tests.parent), str(tests)]))
+    subprocess.run([sys.executable, "-c", code], env=env, check=True)

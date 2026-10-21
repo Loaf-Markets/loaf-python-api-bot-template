@@ -4,10 +4,10 @@ Quick start::
 
     from loaf import LoafClient
 
-    loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_AGENT_PRIVATE_KEY
-    print(loaf.portfolio.component().cash)
+    loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_SECRET_KEY
+    print(loaf.portfolio.component().balances)
     print(loaf.market.properties())
-    loaf.orders.limit_buy("OPRA", quantity=10, price=167.49)   # signed with your agent key
+    loaf.orders.limit_buy("MUS", quantity=10, price=167.49)   # signed with your trading key
 
 See the README for the full guide.
 """
@@ -20,6 +20,8 @@ from .client import LoafClient
 from .constants import (
     DEFAULT_BASE_URL,
     DEFAULT_MAX_SLIPPAGE_BPS,
+    L2_BUFFER_MS,
+    L2_FEE_RATE_CAP,
     MAX_PRICE_DECIMALS,
     MAX_QUANTITY_DECIMALS,
 )
@@ -30,19 +32,15 @@ from .enums import (
     ConditionalOrderStatus,
     ConditionalOrderType,
     IpoStatus,
-    OfferingOrderStatus,
     OrderSide,
     OrderStatus,
     OrderType,
     PropertyStatus,
     TimeInForce,
-    TransferStatus,
-    TransferType,
     WSMessageType,
     is_conditional_order,
 )
 from .exceptions import (
-    CompetitionEligibilityError,
     LoafAPIError,
     LoafAuthError,
     LoafConfigError,
@@ -57,8 +55,10 @@ from .exceptions import (
     LoafValidationError,
     OrderOutcomeUnknownError,
     TradingHaltedError,
+    VenueError,
+    VenueSwitchingError,
 )
-from .money import bps_to_fraction, fraction_to_bps, worst_price
+from .money import bps_to_fraction, fraction_to_bps, from_base_units, worst_price
 from .ws import LoafWebSocketClient
 
 __all__ = [
@@ -70,6 +70,8 @@ __all__ = [
     # constants
     "DEFAULT_BASE_URL",
     "DEFAULT_MAX_SLIPPAGE_BPS",
+    "L2_BUFFER_MS",
+    "L2_FEE_RATE_CAP",
     "MAX_PRICE_DECIMALS",
     "MAX_QUANTITY_DECIMALS",
     # enums
@@ -79,11 +81,8 @@ __all__ = [
     "TimeInForce",
     "OrderStatus",
     "ConditionalOrderStatus",
-    "OfferingOrderStatus",
     "PropertyStatus",
     "IpoStatus",
-    "TransferType",
-    "TransferStatus",
     "CandleResolution",
     "CompetitionRoundStatus",
     "WSMessageType",
@@ -93,6 +92,7 @@ __all__ = [
     # unit helpers
     "bps_to_fraction",
     "fraction_to_bps",
+    "from_base_units",
     "worst_price",
     # exceptions
     "LoafError",
@@ -103,11 +103,12 @@ __all__ = [
     "LoafAuthError",
     "LoafForbiddenError",
     "TradingHaltedError",
-    "CompetitionEligibilityError",
+    "VenueError",
     "LoafValidationError",
     "LoafNotFoundError",
     "LoafConflictError",
     "LoafRateLimitError",
     "LoafServerError",
     "LoafServiceUnavailableError",
+    "VenueSwitchingError",
 ]

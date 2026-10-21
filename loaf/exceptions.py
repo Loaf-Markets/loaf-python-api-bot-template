@@ -4,20 +4,26 @@ Every error the API can return is mapped to a specific exception so a bot can
 ``except`` precisely:
 
     LoafError                       (base — catch this to catch everything)
-    ├── LoafConfigError             misconfiguration (e.g. missing API key)
+    ├── LoafConfigError             misconfiguration (e.g. missing API key or trading key, a trading
+    │                               key not in force, a clock hours ahead)
     ├── LoafConnectionError         network failure / timeout (no HTTP response)
     ├── OrderOutcomeUnknownError    a signed order may be live; the SDK could not confirm it
     └── LoafAPIError                the server returned an HTTP error
-        ├── LoafAuthError                 401  bad/expired credentials, or an order signature the exchange refused
+        ├── LoafAuthError                 401  bad/expired credentials, or an order's signature or key
         ├── LoafForbiddenError            403  generic forbidden
-        │   ├── TradingHaltedError        403  "Trading is currently halted" / "Trading halted for this property"
-        │   └── CompetitionEligibilityError 403 code=NOT_COMPETITION_PARTICIPANT
-        ├── LoafValidationError           400  validation or order-rule refusal (incl. the daily price band)
+        │   ├── TradingHaltedError        403  "…halted…"; 400 "trading halted: …" /
+        │   │                                  "L1_RECHECK_PENDING: …" /
+        │   │                                  "E_L2_ORDERS_WITHOUT_JOURNAL: …"
+        │   └── VenueError                403  code NOT_TRADEABLE_IN_MODE /
+        │                                      COMPETITION_NOT_STARTED /
+        │                                      NOT_COMPETITION_PARTICIPANT (or local, status 0)
+        ├── LoafValidationError           400  validation or order-rule refusal (or local, status 0)
         ├── LoafNotFoundError             404
         ├── LoafConflictError             409  (e.g. a cancel that lost the race, a prize already claimed)
         ├── LoafRateLimitError            429  (carries .retry_after seconds)
         └── LoafServerError               5xx  (503 -> LoafServiceUnavailableError)
             └── LoafServiceUnavailableError 503
+                └── VenueSwitchingError     503  code VENUE_SWITCHING (or local, status 0)
 """
 
 from __future__ import annotations
@@ -27,6 +33,15 @@ import re
 from typing import Any
 
 _PRE_RE = re.compile(r"<pre>(.*?)</pre>", re.IGNORECASE | re.DOTALL)
+
+# 403 codes of the market mode (a competition round's venue) that refuse an order.
+_VENUE_CODES = frozenset({
+    "NOT_TRADEABLE_IN_MODE",
+    "COMPETITION_NOT_STARTED",
+    "NOT_COMPETITION_PARTICIPANT",
+})
+# The exchange engine's own halts, which the API passes through as 400 with the engine's text.
+_ENGINE_HALTS = ("trading halted:", "L1_RECHECK_PENDING:", "E_L2_ORDERS_WITHOUT_JOURNAL:")
 
 
 class LoafError(Exception):
@@ -43,9 +58,25 @@ def _rebuild_error(cls: type[LoafError], args: tuple) -> LoafError:
 
 
 class LoafConfigError(LoafError):
-    """The client is misconfigured: no API key for an authed request, a
-    missing or malformed agent private key when placing an order, or an
-    invalid ``LoafClient(max_slippage_bps=)`` / ``$LOAF_MAX_SLIPPAGE_BPS``."""
+    """The client is misconfigured: no API key for an authed request, a missing
+    or malformed API key or trading key, an invalid
+    ``LoafClient(max_slippage_bps=)`` / ``$LOAF_MAX_SLIPPAGE_BPS``, or
+    ``LOAF_WALLET_PRIVATE_KEY`` set in the bot's environment.
+
+    From an order placement (nothing was placed):
+
+    * your trading key is not the one in force on the property's market (it was
+      reset in the web app, or it belongs to another market's vault): get the
+      key in force again (README §2), restart, and cancel and re-arm every stop
+      and take, because those signed with the old key stay ARMED and FAIL when
+      they fire;
+    * trading is not enabled on your account, or you have no trading account
+      yet: act in the web app (deposit first). On a competition round's market
+      only the round's participants have one, which the round funds;
+    * this machine's clock is hours ahead of the exchange's: synchronize it.
+
+    Act in the web app or fix the setup, then restart.
+    """
 
 
 class LoafConnectionError(LoafError):
@@ -59,10 +90,17 @@ class OrderOutcomeUnknownError(LoafError):
     SDK's own identical re-sends did not settle, and by
     :meth:`~loaf.resources.orders.OrdersResource.resubmit` on anything but a
     200. The order may be live, and may already have filled, so never place the
-    same intent afresh. While you still want it, re-send it with
-    ``orders.resubmit(error.signed_body)``: within 24 hours of signing, and
-    never after a competition round switch. Otherwise look for it in
-    ``history.orders()``.
+    same intent afresh. While you still want it, and while it can still rest
+    (until its ``l2ExpiryMs`` minus :data:`~loaf.constants.L2_BUFFER_MS`),
+    re-send it with ``orders.resubmit(error.signed_body)``. Otherwise look for
+    it in ``history.orders()`` by its ``expiryMs``; a miss is no proof while it
+    can still rest, since an attempt the server still holds can be admitted,
+    and its row recorded, until then.
+
+    After an epoch move (a Reset trading key, or a cancel-all sent on chain)
+    the exchange has cancelled any resting order of the old epoch, and refuses
+    the body. During a competition round the real markets' history is not
+    served and their re-sends are refused: wait for the round to end.
     :meth:`~loaf.resources.orders.OrdersResource.resubmit` documents what each
     answer means.
 
@@ -70,8 +108,13 @@ class OrderOutcomeUnknownError(LoafError):
     order on a connection error must not catch this one.
 
     Attributes:
-        signed_body: The exact body that was sent (nonce and signatures; no secrets).
-        attempts: How many times it was sent.
+        signed_body: The exact body that was sent (its order number, expiry and
+            signatures). It holds no key, but placing it needs none: anyone who
+            has it can place this order until it can no longer rest, so keep it
+            out of logs and alerts (the message leaves the signatures out).
+        attempts: How many times the SDK tried to send it; 0 when
+            :meth:`~loaf.resources.orders.OrdersResource.resubmit` did not try
+            because the order can no longer rest (``last_error`` says so).
         last_error: The last attempt's error (also ``__cause__``).
     """
 
@@ -82,18 +125,16 @@ class OrderOutcomeUnknownError(LoafError):
         self.attempts = attempts
         self.last_error = last_error
         super().__init__(
-            f"Could not confirm whether order {self.nonce} was placed after {attempts} "
-            f"attempt(s) (last error: {last_error}). It may be live, and may already have "
-            "filled: re-send it unchanged with orders.resubmit(error.signed_body) within 24 "
-            "hours of signing and before any round switch (the same order if it landed; if "
-            "not, it is placed now at the signed price), or look for it in "
-            "history.orders(), which lists every status. openOrders shows only resting orders."
+            f"Could not confirm whether order {signed_body.get('l2OrderIndex')} of account "
+            f"{signed_body.get('l2AccountIndex')} was placed after {attempts} attempt(s) (last "
+            f"error: {last_error}). It may be live, and may already have filled. Never place it "
+            "afresh: while it can still rest, re-send it unchanged with "
+            "orders.resubmit(error.signed_body) (the same order if it landed; if not, it is "
+            "placed now at the signed price), or find it in history.orders() by its expiryMs "
+            f"{signed_body.get('l2ExpiryMs')} (every status; openOrders shows only resting "
+            "orders). A history miss proves nothing while it can still rest (until its expiryMs "
+            "minus 24 hours)."
         )
-
-    @property
-    def nonce(self) -> str:
-        """The order's nonce (``signed_body["nonce"]``)."""
-        return str(self.signed_body.get("nonce", ""))
 
 
 class LoafAPIError(LoafError):
@@ -135,17 +176,22 @@ class LoafAPIError(LoafError):
 
 
 class LoafAuthError(LoafAPIError):
-    """401 — credentials or an order signature were refused.
+    """401 — credentials, or an order's signature or key, were refused.
 
-    On reads and cancels: the API key is unknown, expired or deleted
-    (``Invalid credentials``). The WebSocket never raises it: a refused key
-    leaves the socket anonymous, and a ``portfolio`` subscription is refused
-    with an ``error`` frame (code ``UNAUTHORIZED``) sent to ``on_error``.
+    ``Invalid credentials``: the API key is unknown, expired or deleted. Reads
+    and cancels raise it, and so do order placements, which read your trading
+    account and reserve order numbers with the API key: every request it
+    authenticates fails the same way until you create a new key in the web app
+    and restart. The WebSocket never raises it: while ``portfolio`` is
+    subscribed, it drops a connection whose key the server does not accept and
+    retries, reporting each attempt to ``on_disconnect``.
 
-    On order placement, which never sends the API key: the exchange refused the
-    order's signature. ``Signer is not authorized to trade for any account``
-    means the agent key is not approved for any account; it expires and is
-    revoked together with its API key. Stop placing and alert.
+    Otherwise, from an order placement, the exchange refused the order's
+    signature or key — ``l2 signature: …`` (prefixed ``tp: `` / ``sl: `` for a
+    leg), ``l2 key: …``, or ``l2 account: no trading account has this account
+    index``. Nothing was placed. The next order re-reads your trading account
+    and names the cause. After a key change, stops and takes signed before it
+    FAIL when they fire: re-arm them.
     """
 
 
@@ -154,27 +200,46 @@ class LoafForbiddenError(LoafAPIError):
 
 
 class TradingHaltedError(LoafForbiddenError):
-    """403 "Trading is currently halted" (platform-wide) or "Trading halted for
-    this property".
+    """Trading is halted: every new order is refused while it lasts, and nothing
+    was placed.
 
-    Order placement rejects while the halt lasts. A platform-wide halt also
-    blocks :meth:`~loaf.resources.orders.OrdersResource.cancel` and
-    ``cancel_all`` (a single-property halt does not). The one exception is
+    403 ``Trading is currently halted`` (platform-wide) or ``Trading halted for
+    this property``. A platform-wide halt also blocks
+    :meth:`~loaf.resources.orders.OrdersResource.cancel` and ``cancel_all`` (a
+    single-property halt does not). The one exception is
     :meth:`~loaf.resources.orders.OrdersResource.cancel_conditional`, which is
     database-only and stays available — during a platform halt it is your only
-    way to pull a resting stop before the reopen. Otherwise back off and retry
-    later; there is no client-side fix.
+    way to pull a resting stop before the reopen.
+
+    Or 400 from the exchange's engine, whose halts refuse orders but still
+    admit cancels: ``trading halted: …`` (an L1 request was reversed; an
+    operator must act), ``L1_RECHECK_PENDING: …`` or
+    ``E_L2_ORDERS_WITHOUT_JOURNAL: …`` (the engine is re-checking after a
+    restart). Unlike the 403 halts, these do not pause stops and takes: one
+    that fires during them FAILS, with this text as its ``rejectionReason``;
+    re-arm it once the halt is over.
+
+    Back off and retry later; there is no client-side fix.
     """
 
 
-class CompetitionEligibilityError(LoafForbiddenError):
-    """403 ``NOT_COMPETITION_PARTICIPANT`` — not admitted to the active round.
+class VenueError(LoafForbiddenError):
+    """403 — the current market mode does not take this order. Nothing was placed.
 
-    Raised on order placement while a competition round is ACTIVE and your
-    account has not been admitted, and also while the market switches modes,
-    while a round is being prepared, and while it is finalizing. Check your
-    standing with
-    :meth:`loaf.resources.competition.CompetitionResource.queue_position`.
+    ``code`` says why:
+
+    * ``NOT_TRADEABLE_IN_MODE``: during a competition round only the round's
+      market trades (real markets refuse), and a competition market trades only
+      during its round;
+    * ``COMPETITION_NOT_STARTED``: the round is PREPARED; its market opens when
+      it goes ACTIVE;
+    * ``NOT_COMPETITION_PARTICIPANT``: during a round only seat holders trade
+      it (check ``competition.queue_position().participant``). Without a seat
+      you have no trading account on the round's market, so an order there is
+      normally refused before anything is sent, with :class:`LoafConfigError`.
+
+    Also raised locally (``status_code=0``, code ``NOT_TRADEABLE_IN_MODE``) when
+    the property's detail already shows the mismatch, before anything is sent.
     """
 
 
@@ -192,7 +257,7 @@ class LoafNotFoundError(LoafAPIError):
 
 class LoafConflictError(LoafAPIError):
     """409 — conflict (e.g. a cancel that lost the race to a fill, a stop /
-    take nonce already used by a different order, payout details already
+    take whose order number another order holds, payout details already
     submitted)."""
 
 
@@ -219,6 +284,24 @@ class LoafServiceUnavailableError(LoafServerError):
 
     Transient: the client retries reads, and re-sends signed placements (see
     :meth:`~loaf.resources.orders.OrdersResource.create`), before raising it.
+    From a placement it means the order was not placed: a 503 that might have
+    placed it raises :class:`OrderOutcomeUnknownError` instead.
+    """
+
+
+class VenueSwitchingError(LoafServiceUnavailableError):
+    """503 ``VENUE_SWITCHING`` — the market mode is switching (a competition
+    round starting or ending).
+
+    Nothing was placed, and the SDK does not re-send it. Place it again in a few
+    seconds if you still want it; the SDK refreshes what it cached.
+
+    Also raised locally (``status_code=0``, code ``VENUE_SWITCHING``) when the
+    market mode switched while an order was being prepared, or when your trading
+    account does not match your trading key within two minutes of the SDK
+    seeing the mode switch (a market-mode refusal from the exchange, or a read
+    answered in the other mode): the exchange's servers are still switching
+    ledgers.
     """
 
 
@@ -261,13 +344,15 @@ def error_from_response(
     if status_code == 401:
         return LoafAuthError(message, **kwargs)
     if status_code == 403:
-        if code == "NOT_COMPETITION_PARTICIPANT":
-            return CompetitionEligibilityError(message, **kwargs)
+        if code in _VENUE_CODES:
+            return VenueError(message, **kwargs)
         # The halt rejection carries no machine code — match on the message.
         if "halted" in message.lower():
             return TradingHaltedError(message, **kwargs)
         return LoafForbiddenError(message, **kwargs)
     if status_code == 400:
+        if message.startswith(_ENGINE_HALTS):
+            return TradingHaltedError(message, **kwargs)
         return LoafValidationError(message, **kwargs)
     if status_code == 404:
         return LoafNotFoundError(message, **kwargs)
@@ -276,6 +361,8 @@ def error_from_response(
     if status_code == 429:
         return LoafRateLimitError(message, retry_after=retry_after, **kwargs)
     if status_code == 503:
+        if code == "VENUE_SWITCHING":
+            return VenueSwitchingError(message, **kwargs)
         return LoafServiceUnavailableError(message, **kwargs)
     if status_code >= 500:
         return LoafServerError(message, **kwargs)

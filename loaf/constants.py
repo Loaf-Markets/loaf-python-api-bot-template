@@ -1,10 +1,13 @@
 """Protocol constants for the Loaf API.
 
 These capture the wire-level contract every client must honour: numeric
-precision limits, and order limits and defaults.
+precision limits, order limits and defaults, and the timing rules of signed
+orders.
 """
 
 from __future__ import annotations
+
+from decimal import Decimal
 
 from ._version import __version__
 
@@ -19,10 +22,14 @@ DEFAULT_BASE_URL = "https://api.loafmarkets.com/api"
 
 #: Environment variables the client reads when arguments are omitted.
 ENV_API_KEY = "LOAF_API_KEY"
-ENV_AGENT_PRIVATE_KEY = "LOAF_AGENT_PRIVATE_KEY"
+ENV_SECRET_KEY = "LOAF_SECRET_KEY"
 ENV_BASE_URL = "LOAF_API_BASE_URL"
 ENV_WS_URL = "LOAF_WS_URL"
 ENV_MAX_SLIPPAGE_BPS = "LOAF_MAX_SLIPPAGE_BPS"
+
+#: Your account wallet's private key: read only by ``python -m loaf.secret_key``, for one command.
+#: The client refuses to start while it is set.
+ENV_WALLET_PRIVATE_KEY = "LOAF_WALLET_PRIVATE_KEY"
 
 #: User-Agent sent on every request.
 USER_AGENT = f"loaf-python-sdk/{__version__}"
@@ -57,13 +64,43 @@ MAX_QUANTITY_DECIMALS = 1
 #: order's worst price, a *_MARKET conditional's price and a TP/SL leg's sell price). 200 = 2%.
 DEFAULT_MAX_SLIPPAGE_BPS = 200
 
-#: Upper bounds the exchange accepts for a price (dollars) and a quantity (tokens).
-ORDER_PRICE_MAX = 1_000_000_000
-ORDER_QUANTITY_MAX = 1_000_000_000
+#: The highest price (dollars) an order can sign: the largest cent price whose x1000 fits 32 bits.
+ORDER_PRICE_MAX = Decimal("4294967.29")
 
-#: A signed order's nonce carries its signing time; the exchange refuses one more than this far
-#: (milliseconds) from its clock.
-ORDER_NONCE_WINDOW_MS = 86_400_000
+#: The largest quantity (tokens) an order can sign: (2**48 - 1) / 10, whose x10 fits 48 bits.
+ORDER_QUANTITY_MAX = Decimal("28147497671065.5")
 
-#: Every order sends deadline 0 (only good-til-cancelled orders exist).
-DEFAULT_ORDER_DEADLINE = 0
+#: The highest fee rate (per million: 7,000 = 70 bps, the top taker tier) every order signs its
+#: consent to. It also sizes a BUY's hold: price x quantity x (1 + L2_FEE_RATE_CAP / 1,000,000)
+#: of the quote asset, whatever fee the fills are charged.
+L2_FEE_RATE_CAP = 7_000
+
+# --------------------------------------------------------------------------- #
+# Order life (milliseconds)
+# --------------------------------------------------------------------------- #
+
+#: An order stops filling at its signed ``l2ExpiryMs`` minus this (24 hours), and the exchange
+#: refuses one whose expiry is already inside it. The SDK signs now + this + the order's ttl.
+L2_BUFFER_MS = 86_400_000
+
+#: K1's longest order life (about 49.3 days): an order's expiry may lie at most this far past the
+#: reservation of its order number, and at most this less one margin past the exchange's clock.
+L2_MAX_ORDER_LIFE_MS = 4_261_412_864
+
+#: One K1 expiry window (about 4.7 hours): the margin kept for clocks that disagree.
+L2_ORDER_LIFE_MARGIN_MS = 16_777_216
+
+#: How long an order may rest when ``ttl_ms=`` is omitted: 7 days.
+DEFAULT_ORDER_TTL_MS = 604_800_000
+
+#: The shortest ``ttl_ms=`` accepted: one minute.
+MIN_ORDER_TTL_MS = 60_000
+
+#: The longest ``ttl_ms=`` accepted (about 47.9 days): the longest order life, less one margin
+#: for each clock and the buffer.
+MAX_ORDER_TTL_MS = L2_MAX_ORDER_LIFE_MS - 2 * L2_ORDER_LIFE_MARGIN_MS - L2_BUFFER_MS
+
+#: The most order numbers one reservation asks for. Reservations grow from what a process's first
+#: order needs up to this, doubling each time, so a process that stops after a few orders leaves
+#: few of them unused.
+L2_ORDER_INDEX_BLOCK = 64

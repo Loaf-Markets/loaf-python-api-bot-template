@@ -63,14 +63,6 @@ class ConditionalOrderStatus(_StrEnum):
     CANCELLED = "CANCELLED"
 
 
-class OfferingOrderStatus(_StrEnum):
-    """Status of an IPO/offering subscription order."""
-
-    PENDING = "PENDING"
-    ALLOCATED = "ALLOCATED"
-    REJECTED = "REJECTED"
-
-
 class PropertyStatus(_StrEnum):
     PENDING = "PENDING"
     LIVE = "LIVE"
@@ -82,17 +74,6 @@ class IpoStatus(_StrEnum):
     LIVE = "LIVE"
     CLOSED = "CLOSED"
     CANCELLED = "CANCELLED"
-
-
-class TransferType(_StrEnum):
-    DEPOSIT = "DEPOSIT"
-    WITHDRAWAL = "WITHDRAWAL"
-
-
-class TransferStatus(_StrEnum):
-    PENDING = "PENDING"
-    CONFIRMED = "CONFIRMED"
-    REJECTED = "REJECTED"
 
 
 class CandleResolution(_StrEnum):
@@ -108,7 +89,11 @@ class CandleResolution(_StrEnum):
 
 
 class CompetitionRoundStatus(_StrEnum):
-    """Lifecycle of a trading-competition round (leaderboard / competition info)."""
+    """Lifecycle of a trading-competition round (leaderboard / competition info).
+
+    While a round is ``PREPARED`` or ``ACTIVE``, its own ledger serves every
+    user (see :mod:`loaf.resources.competition`).
+    """
 
     DRAFT = "DRAFT"
     PENDING = "PENDING"
@@ -135,19 +120,16 @@ class WSMessageType(_StrEnum):
     TRADES_BATCH = "trades_batch"
     CANDLE_UPDATE = "candle_update"
     MARK_PRICE = "mark_price"
-    IPO_ALLOCATION_UPDATE = "ipo_allocation_update"
     VOLUME_UPDATE = "volume_update"
     LEADERBOARD_UPDATE = "leaderboard_update"
     PROPERTY_HALT = "property_halt"
+    ROUND_UPDATE = "round_update"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"
-    POSITION_UPDATE = "position_update"
     ORDER_STATUS = "order_status"
     ORDER_UPDATE = "order_update"
     TRADE_NEW = "trade_new"
     LIFETIME_VOLUME_UPDATE = "lifetime_volume_update"
-    TRANSFER_UPDATE = "transfer_update"
-    OFFERING_ORDER_UPDATE = "offering_order_update"
 
 
 #: The four ``type`` values that mark an order row as a conditional (stop / take).

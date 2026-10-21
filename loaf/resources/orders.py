@@ -4,41 +4,71 @@ Placing an order is a single ``POST /orders``; the common case is a one-liner::
 
     loaf.orders.limit_buy("OPRA", quantity=10, price=167.49)
 
-**Signing.** Every placement is signed on your machine with your agent key
-(``agent_private_key=`` / ``$LOAF_AGENT_PRIVATE_KEY``) and authenticated by that
-signature alone: the API key is not sent. Cancels still use the API key. The
-first order on a property reads its token contract once (a public request); if
-a competition round has since redeployed it, the SDK notices the refusal,
-re-reads the contract and re-signs once.
+**Signing.** Every placement is signed on your machine with your trading key
+(``secret_key=`` / ``$LOAF_SECRET_KEY``) and authenticated by that
+signature alone: the API key is not sent with it. The API key is still needed,
+for cancels and for the account reads below.
+
+**What the SDK reads for you.** An order signs the property's L2 market
+(``property.l2Market`` of ``GET /trade/{ticker}``), your trading account's
+index and epoch (``GET /l2/keys``), and an order number reserved to your
+account (``POST /l2/order-indices``), reserved in blocks that grow from what
+your first order needs to 64. All of it is cached in memory and refreshed when
+a refusal shows it stale. The order numbers of an order that was definitely not
+placed are reused by later orders; a restart leaves the unused rest of a block
+unused.
+
+**Order life.** Every order expires. ``ttl_ms=`` sets how long it may rest
+(default 7 days, from one minute to about 47.9 days): the SDK signs the expiry
+``l2ExpiryMs`` = now + 24 hours + ``ttl_ms`` (``expiryMs`` on order rows), and
+the exchange stops filling the order 24 hours before it and cancels it at its
+next batch (a ``CANCELLED`` you did not request). TP/SL legs share their
+parent's life. An ARMED stop, take or leg is not cancelled when its life ends:
+it keeps its open-order slot until you cancel it or it fires, and FAILS if it
+fires later, so cancel and re-arm it before then. After an epoch
+move — a Reset trading key in the web app, a cancel-all sent on chain, or any
+placement refused ``l2 epoch: …`` — the exchange has cancelled your resting
+orders, but the stops, takes and TP/SL legs signed before it stay ARMED and
+FAIL when they fire: cancel and re-arm them, a TP/SL leg as a separate
+:meth:`OrdersResource.stop_loss` / :meth:`OrdersResource.take_profit` (not OCO).
 
 **The response.** A 200 from :meth:`OrdersResource.create` is sent after the
 exchange commits the order, and carries ``status`` (``OPEN`` /
-``PARTIALLY_FILLED`` / ``FILLED`` / ``CANCELLED``), ``quantityLeft`` and
-``duplicate``. ``FILLED`` means filled. ``CANCELLED`` on a new BUY means it
-filled partly and could not pay for more within what it froze. Later fills and
-cancels arrive on the private ``portfolio`` WebSocket channel.
+``PARTIALLY_FILLED`` / ``FILLED`` / ``CANCELLED``), ``quantityLeft``,
+``duplicate`` and ``attachedLegIds``. ``FILLED`` means filled. ``CANCELLED`` on
+a new order means it stopped early: a BUY whose hold could not pay for its next
+fill, or a SELL stopped at K1's bound. Later fills and cancels arrive on the
+private ``portfolio`` WebSocket channel.
 
 **MARKET orders** take no price. The SDK signs a worst price: the market
 reference moved against you by the max slippage (``max_slippage_bps=``, default
-``client.max_slippage_bps``). The engine matches it like a LIMIT at that price,
-and an unfilled remainder **rests** on the book until it fills or you cancel
-it. A BUY freezes worst price x quantity plus the taker fee.
+``client.max_slippage_bps``), rounded toward the reference to the cent. The
+engine matches it like a LIMIT at that price, and an unfilled remainder
+**rests** on the book until it fills, expires or you cancel it. A BUY holds
+worst price x quantity x (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` /
+1,000,000) of your cash.
 
 Order placement can be rejected with a 403 when:
 
-* a trading-competition round is ACTIVE and your account is not admitted, or a
-  round is switching (:class:`~loaf.exceptions.CompetitionEligibilityError` —
-  check ``loaf.competition.queue_position()``); outside a round trading is
-  unrestricted,
+* the current market mode does not take it
+  (:class:`~loaf.exceptions.VenueError`, by ``code``): during a competition
+  round only the round's market trades (``NOT_TRADEABLE_IN_MODE``), it opens
+  when the round goes ACTIVE (``COMPETITION_NOT_STARTED``), and only seat
+  holders trade it (``NOT_COMPETITION_PARTICIPANT`` — check
+  ``loaf.competition.queue_position().participant``; without a seat you have no
+  trading account on its market, so an order there normally raises
+  :class:`~loaf.exceptions.LoafConfigError` before anything is sent); while the
+  mode is switching the answer is a 503
+  :class:`~loaf.exceptions.VenueSwitchingError` instead,
 * trading is halted platform-wide or for the property
   (:class:`~loaf.exceptions.TradingHaltedError`), or
 * the market is closed (:class:`~loaf.exceptions.LoafForbiddenError`,
-  ``Trading is currently closed``).
+  ``Trading is currently closed``; real markets only).
 
 Server-side checks reject an order the SDK cannot pre-validate for you (all 400,
 :class:`~loaf.exceptions.LoafValidationError`):
 
-* **Minimum order value** — price x quantity must be at least 10 USD, measured
+* **Minimum order value** — price x quantity must be at least $10, measured
   at the price you **sign** (a MARKET order's worst price). A SELL closing your
   ENTIRE available position in a property is exempt, so a dust position can
   always be flattened.
@@ -50,6 +80,9 @@ Server-side checks reject an order the SDK cannot pre-validate for you (all 400,
   and the band width.
 * **Balance and open-order caps** — not enough available balance, or too many
   open orders (resting stops count too).
+* **Fee-rate cap** — ``l2 fee: the signed fee-rate cap is below the account's
+  fee rate``: your account's fee rate is above
+  :data:`~loaf.constants.L2_FEE_RATE_CAP`, which every order signs.
 
 A **conditional** (stop / take) order goes to ``POST /orders/conditional``
 instead. It rests server-side until the mark price reaches your trigger,
@@ -67,26 +100,60 @@ things it adds to the list above:
   through the trigger in the order's direction. The SDK cannot see the mark, so
   it cannot pre-check this.
 
-Conditional rows freeze nothing at placement but do occupy an open-order slot,
-counted together with booked orders.
+Conditional rows hold nothing at placement, and your cash and holding are
+checked only when they fire, but they do occupy an open-order slot, counted
+together with booked orders. The exchange checks a row's price grid, order
+number and its range only when the row fires, so those mistakes — and an order
+number made stale by an exchange reset — FAIL the row then: watch
+``on_order_update`` for ``status: "FAILED"`` (``order_status`` frames carry
+booked orders only). Each stop or take holds its order number until it fires,
+and one cancelled or expired unfired keeps counting against your account's
+allowance (below) for about 49.5 days: move a trailing stop on meaningful
+moves, never on every tick.
 
 **Retries.** Placements are re-sent unchanged on timeouts and 5xx; a repeat is
-answered as a duplicate, never placed twice. If that does not settle it the SDK
-raises :class:`~loaf.exceptions.OrderOutcomeUnknownError`: see
-:meth:`OrdersResource.resubmit`.
+answered as a duplicate, never placed twice. Two rules cover the rest:
 
-Placements and cancels are also per-account rate limited (429 on abuse), on
-top of the per-IP limit.
+* any error other than :class:`~loaf.exceptions.OrderOutcomeUnknownError`
+  means the order was not placed: place it again if you still want it;
+* on :class:`~loaf.exceptions.OrderOutcomeUnknownError`,
+  ``resubmit(error.signed_body)`` while it can still rest, or find it in
+  ``history.orders()`` by its ``expiryMs``, where a miss proves nothing while
+  it can still rest. Never place a fresh order for the same intent while one
+  may be live.
+
+**Order-number allowance.** A reservation refused ``l2 order_index: the account
+would hold more than … reserved indices no order uses`` means the account has
+used up its allowance of reserved-but-unused order numbers: no order can be
+placed on it, the web app included, until old reservations age out (up to about
+49.5 days). It takes frequent restarts (each can leave up to 64 unused), many
+stops that never fire, or many processes on one account.
+
+Placements and cancels are also rate limited per account (429), on top of the
+per-IP limit.
 """
 
 from __future__ import annotations
 
-import re
+import copy
+import numbers
 import time
-from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from datetime import datetime, timezone
+from decimal import Decimal, localcontext
+from functools import partial
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
-from ..constants import DEFAULT_ORDER_DEADLINE, ORDER_NONCE_WINDOW_MS
+from .. import k1
+from .._l2 import _TICKER_RE, AccountState, L2State, Market, TradingKey, _is_int, market_of
+from ..constants import (
+    DEFAULT_ORDER_TTL_MS,
+    ENV_API_KEY,
+    ENV_SECRET_KEY,
+    L2_BUFFER_MS,
+    L2_FEE_RATE_CAP,
+    MAX_ORDER_TTL_MS,
+    MIN_ORDER_TTL_MS,
+)
 from ..enums import (
     CONDITIONAL_ORDER_TYPES,
     ConditionalOrderStatus,
@@ -96,8 +163,15 @@ from ..enums import (
     TimeInForce,
     is_conditional_order,
 )
-from ..exceptions import LoafAuthError, _client_validation_error
+from ..exceptions import (
+    LoafAPIError,
+    LoafConfigError,
+    LoafError,
+    OrderOutcomeUnknownError,
+    _client_validation_error,
+)
 from ..money import (
+    _DECIMAL_CONTEXT,
     _check_side,
     _worst_price,
     validate_price,
@@ -108,26 +182,18 @@ from .base import Resource
 
 if TYPE_CHECKING:
     from ..client import LoafClient
-    from ..signing import OrderSigner
-
-_TICKER_RE = re.compile(r"[A-Z0-9]{1,4}")
-_NONCE_RE = re.compile(r"[0-9a-f]{32}")
-
-# The signer 401s a stale token contract produces: it recovers a stranger's address.
-_STALE_CONTRACT_401S = frozenset({
-    "Signer is not authorized to trade for any account",
-    "Every signature in the request must be by the same signer",
-})
 
 _LIMIT_CONDITIONALS = (ConditionalOrderType.STOP_LIMIT, ConditionalOrderType.TAKE_LIMIT)
+
+_SIGNED_BODY_STRS = ("l2SigS", "l2SigE")
+_SIGNED_BODY_INTS = ("l2OrderIndex", "l2AccountIndex", "l2ExpiryMs")
 
 
 class OrdersResource(Resource):
     def __init__(self, client: LoafClient) -> None:
         super().__init__(client)
-        #: ticker -> the property's token contract, as served. Filled lazily; healed on a
-        #: signer 401 (competition rounds redeploy the contracts).
-        self._contracts: dict[str, str] = {}
+        #: The markets, account and order numbers your orders sign, refreshed on refusals.
+        self._l2 = L2State(client)
 
     def create(
         self,
@@ -142,8 +208,14 @@ class OrdersResource(Resource):
         tp_price: float | None = None,
         sl_price: float | None = None,
         leg_max_slippage_bps: int | None = None,
+        ttl_ms: int | None = None,
     ) -> Any:
-        """``POST /orders`` — place a trading order, signed with your agent key.
+        """``POST /orders`` — place a trading order, signed with your trading key.
+
+        Every :class:`~loaf.exceptions.LoafAPIError` and
+        :class:`~loaf.exceptions.LoafConnectionError` it raises means the order
+        was not placed: anything that might have landed raises
+        :class:`~loaf.exceptions.OrderOutcomeUnknownError` instead.
 
         Args:
             ticker: the property's ``ticker``, exactly as listed (1-4
@@ -151,10 +223,11 @@ class OrdersResource(Resource):
                 :meth:`loaf.resources.market.MarketResource.properties` (not
                 every listed row is tradeable; see its docstring).
             side: ``BUY`` or ``SELL`` (:class:`~loaf.enums.OrderSide`).
-            quantity: tokens, at most 1 decimal place, up to 1,000,000,000.
+            quantity: tokens, at most 1 decimal place, up to
+                28,147,497,671,065.5.
             type: ``LIMIT`` (default) or ``MARKET`` (:class:`~loaf.enums.OrderType`).
             price: ``LIMIT`` only: dollars, at most 2 decimals, up to
-                1,000,000,000. Refused for ``MARKET``, which signs a worst price
+                4,294,967.29. Refused for ``MARKET``, which signs a worst price
                 derived from ``reference_price`` instead.
             reference_price: ``MARKET`` only: the price your max slippage is
                 measured from. Default: the exchange's market reference (book
@@ -162,7 +235,8 @@ class OrdersResource(Resource):
                 read with one extra public request that is served from a shared
                 cache, so it can trail the live market by tens of seconds. Pass
                 the ``markprice:{ticker}`` WebSocket value for a fresher
-                reference (it also saves the request).
+                reference (it also saves the request once the SDK has read the
+                property's market).
             max_slippage_bps: ``MARKET`` only: the most the price may move
                 against you, in basis points (default: the client's
                 ``max_slippage_bps``, 2% unless configured). The SDK signs
@@ -179,27 +253,55 @@ class OrdersResource(Resource):
                 this order's ``max_slippage_bps``). Each leg books a LIMIT SELL
                 at ``trigger x (1 - leg_max_slippage_bps/10,000)``, so after a
                 gap past that price it rests instead of selling.
+            ttl_ms: how long the order may rest, in whole milliseconds, from
+                60,000 (one minute) to 4,141,458,432 (about 47.9 days); default
+                604,800,000 (7 days). The exchange then stops filling it and
+                cancels it; its TP/SL legs share its life. A bot's quotes
+                should die with the bot: give them a short one.
 
         Returns:
-            ``{success, orderId, status, quantityLeft, duplicate}`` — the order
-            as of the commit that admitted it (:class:`~loaf.models.OrderResult`).
+            ``{success, orderId, status, quantityLeft, duplicate,
+            attachedLegIds}`` (:class:`~loaf.models.OrderResult`): a new order
+            as of the commit that admitted it, a duplicate as it is now (it may
+            have filled or been cancelled since); ``attachedLegIds`` are the
+            legs' conditional ids, take-profit first (``[]`` without legs).
+            When ``duplicate`` is true (an identical re-send of an order that
+            had landed), the legs are not compared, and any legs of the first
+            admission exist although ``attachedLegIds`` is ``[]``: find them in
+            ``portfolio.component().openOrders``, never attach them again (a
+            second stop means a second sell).
 
         Raises:
+            LoafConfigError: no trading key or API key; your trading key is not
+                the one in force; no trading account; trading not enabled; this
+                machine's clock hours ahead. Act in the web app or fix the
+                setup, then restart.
+            LoafAuthError: ``Invalid credentials``: your API key expired or was
+                revoked (cancels fail too): create a new one in the web app and
+                restart. Otherwise the exchange refused the order's signature or
+                key; the next order re-reads your account.
+            VenueError: the current market mode does not take this order.
+            VenueSwitchingError: the market mode is switching (the exchange's
+                answer, or the SDK's own while the switch settles): place it
+                again in a few seconds if you still want it.
+            TradingHaltedError: trading is halted.
+            LoafValidationError: refused locally (``status_code`` 0) or by the
+                exchange (400), including its ``l2 …`` texts.
             OrderOutcomeUnknownError: the order may or may not be live (or
                 already filled); :meth:`resubmit` it while you still want it, or
                 look for it in ``history.orders()``, never place it afresh.
 
         Notes:
-            * BUY freezes USDC; SELL freezes the property token.
+            * A resting BUY holds price x quantity x (1 +
+              :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of your
+              cash; a SELL holds the property's tokens.
             * ``tp_price`` / ``sl_price`` attach protective legs to a **BUY**
               (spot has no short to protect, so a SELL parent is refused). They
               are the only way to get an OCO pair: when one fires the other is
               cancelled automatically, with no window where both are live. Order is
               ``sl_price < price < tp_price`` on a LIMIT parent.
-            * The legs' ids are NOT in the response — only the parent's
-              ``orderId``. They arrive on the ``portfolio`` channel as
-              ``order_update`` rows and show up in ``openOrders`` as ``PENDING``
-              conditionals.
+            * The legs arrive on the ``portfolio`` channel as ``order_update``
+              rows and show up in ``openOrders`` as ``PENDING`` conditionals.
             * Legs arm only on a FULL fill of the parent. A parent that ends
               CANCELLED after a partial fill FAILS its legs, and one with no
               fill cancels them, so **cancelling a resting MARKET remainder
@@ -209,9 +311,8 @@ class OrdersResource(Resource):
               price for order`` when it has none).
             * A leg's own price is first checked (deviation, band, minimum
               value) when it fires; a failure FAILS the leg.
-            * A duplicate re-send ignores changed legs.
         """
-        signer = self._client._require_signer()
+        key = self._credentials()
         _check_ticker(ticker)
         side = _check_side(side)
         otype = str(type)
@@ -255,8 +356,8 @@ class OrdersResource(Resource):
                     raise _client_validation_error("tp_price must be above the order price")
             leg_bps = self._tolerance(leg_max_slippage_bps, "leg_max_slippage_bps")
             legs = [
-                (key, trigger_d, _worst_price(trigger_d, OrderSide.SELL, leg_bps))
-                for key, trigger_d in (("tp", tp_d), ("sl", sl_d))
+                (leg, trigger_d, _worst_price(trigger_d, OrderSide.SELL, leg_bps))
+                for leg, trigger_d in (("tp", tp_d), ("sl", sl_d))
                 if trigger_d is not None
             ]
         elif leg_max_slippage_bps is not None:
@@ -264,36 +365,17 @@ class OrdersResource(Resource):
                 "leg_max_slippage_bps only applies when tp_price or sl_price is set"
             )
 
-        fetched = False  # whether this call has already read the property (and its contract)
+        order_price: Decimal | Callable[[Any], Decimal]
         if limit_d is not None:
-            price_d = limit_d
+            order_price = limit_d
         else:
             bps = self._tolerance(max_slippage_bps)
-            if reference_price is None:
-                reference_price = _reference_from(self._fetch_property(ticker), ticker)
-                fetched = True
-            price_d = _worst_price(reference_price, side, bps)
-
-        def build(contract: str) -> dict:
-            body = {
-                "ticker": ticker,
-                "price": float(price_d),
-                "quantity": float(qty_d),
-                "side": side,
-                "type": otype,
-                "timeInForce": TimeInForce.GTC.value,
-                "deadline": DEFAULT_ORDER_DEADLINE,
-                **_signed(signer, contract, side, price_d, qty_d),
-            }
-            for key, trigger_d, leg_price_d in legs:
-                body[key] = {
-                    "triggerPrice": float(trigger_d),
-                    "price": float(leg_price_d),
-                    **_signed(signer, contract, OrderSide.SELL.value, leg_price_d, qty_d),
-                }
-            return body
-
-        return self._place("/orders", ticker, build, fetched=fetched)
+            if reference_price is None:  # the exchange's, read with the order's market
+                order_price = partial(_worst_price, side=side, max_slippage_bps=bps)
+            else:
+                order_price = _worst_price(reference_price, side, bps)
+        ttl = _ttl(ttl_ms)
+        return self._place(key, ticker, side, otype, qty_d, order_price, ttl, legs=legs)
 
     # -- Convenience wrappers --------------------------------------------- #
 
@@ -306,6 +388,7 @@ class OrdersResource(Resource):
         tp_price: float | None = None,
         sl_price: float | None = None,
         leg_max_slippage_bps: int | None = None,
+        ttl_ms: int | None = None,
     ) -> Any:
         """Place a LIMIT BUY, optionally with take-profit / stop-loss legs (see :meth:`create`)."""
         return self.create(
@@ -317,11 +400,16 @@ class OrdersResource(Resource):
             tp_price=tp_price,
             sl_price=sl_price,
             leg_max_slippage_bps=leg_max_slippage_bps,
+            ttl_ms=ttl_ms,
         )
 
-    def limit_sell(self, ticker: str, quantity: float, price: float) -> Any:
+    def limit_sell(
+        self, ticker: str, quantity: float, price: float, *, ttl_ms: int | None = None
+    ) -> Any:
         """Place a LIMIT SELL (see :meth:`create`)."""
-        return self.create(ticker, OrderSide.SELL, quantity, type=OrderType.LIMIT, price=price)
+        return self.create(
+            ticker, OrderSide.SELL, quantity, type=OrderType.LIMIT, price=price, ttl_ms=ttl_ms
+        )
 
     def market_buy(
         self,
@@ -333,6 +421,7 @@ class OrdersResource(Resource):
         tp_price: float | None = None,
         sl_price: float | None = None,
         leg_max_slippage_bps: int | None = None,
+        ttl_ms: int | None = None,
     ) -> Any:
         """Place a MARKET BUY that pays at most
         ``reference_price x (1 + max_slippage_bps/10,000)``.
@@ -351,6 +440,7 @@ class OrdersResource(Resource):
             tp_price=tp_price,
             sl_price=sl_price,
             leg_max_slippage_bps=leg_max_slippage_bps,
+            ttl_ms=ttl_ms,
         )
 
     def market_sell(
@@ -360,6 +450,7 @@ class OrdersResource(Resource):
         *,
         reference_price: float | None = None,
         max_slippage_bps: int | None = None,
+        ttl_ms: int | None = None,
     ) -> Any:
         """Place a MARKET SELL that sells at no less than
         ``reference_price x (1 - max_slippage_bps/10,000)``.
@@ -375,6 +466,7 @@ class OrdersResource(Resource):
             type=OrderType.MARKET,
             reference_price=reference_price,
             max_slippage_bps=max_slippage_bps,
+            ttl_ms=ttl_ms,
         )
 
     # -- Conditional orders (stop / take) ---------------------------------- #
@@ -389,8 +481,9 @@ class OrdersResource(Resource):
         trigger_price: float,
         price: float | None = None,
         max_slippage_bps: int | None = None,
+        ttl_ms: int | None = None,
     ) -> Any:
-        """``POST /orders/conditional`` — place a stop / take order, signed with your agent key.
+        """``POST /orders/conditional`` — place a stop / take order, signed with your trading key.
 
         The row rests server-side as ``ARMED`` and books an ordinary limit
         order the moment the mark price sits at or through ``trigger_price``.
@@ -423,6 +516,11 @@ class OrdersResource(Resource):
                 ``trigger_price x (1 ± max_slippage_bps/10,000)`` (+ for a BUY,
                 - for a SELL; default: the client's ``max_slippage_bps``) as the
                 price the row books at, fixed for its life.
+            ttl_ms: the life of the order the row books, as in :meth:`create`
+                (default 7 days): a row that fires after it FAILS, and one that
+                has not fired by then stays ``ARMED``, in its open-order slot,
+                until it fires or you cancel it. So cancel and re-arm a stop
+                before then.
 
         Returns:
             ``{success, orderId}`` (:class:`~loaf.models.OrderAck`).
@@ -431,6 +529,8 @@ class OrdersResource(Resource):
             OrderOutcomeUnknownError: the row may or may not be armed (or
                 already fired); :meth:`resubmit` it while you still want it, or
                 look for it in ``history.orders()``, never place it afresh.
+            LoafError: the others :meth:`create` raises, with the same meaning:
+                the row was not placed.
 
         Notes:
             * **A 200 means the row is ARMED — not that it will ever book.** A
@@ -440,9 +540,9 @@ class OrdersResource(Resource):
             * A ``*_MARKET`` type is a *protected limit*, not a market order:
               its price is fixed at placement, so after a gap past it the
               booked order rests instead of executing.
-            * The minimum order value (10 USDC) and a BUY's cash check are
-              measured at the signed price. A SELL of your whole holding is
-              exempt from the minimum.
+            * The minimum order value ($10) is measured at the signed price; a
+              SELL of your whole holding is exempt. Your cash and holding are
+              checked only when the row fires.
             * A re-send of the same signed order answers with the same
               ``orderId`` whatever the row's status, but the checks run again
               first.
@@ -450,7 +550,7 @@ class OrdersResource(Resource):
               once ``PLACED`` use :meth:`cancel` with the row's ``placedOrderId``
               (:meth:`cancel_row` picks for you).
         """
-        signer = self._client._require_signer()
+        key = self._credentials()
         _check_ticker(ticker)
         side = _check_side(side)
         otype = str(type)
@@ -475,21 +575,8 @@ class OrdersResource(Resource):
                     "(1 ± max_slippage_bps/10,000) as the price it books at"
                 )
             price_d = _worst_price(trigger_d, side, self._tolerance(max_slippage_bps))
-
-        def build(contract: str) -> dict:
-            return {
-                "ticker": ticker,
-                "price": float(price_d),
-                "quantity": float(qty_d),
-                "side": side,
-                "type": otype,
-                "triggerPrice": float(trigger_d),
-                "timeInForce": TimeInForce.GTC.value,
-                "deadline": DEFAULT_ORDER_DEADLINE,
-                **_signed(signer, contract, side, price_d, qty_d),
-            }
-
-        return self._place("/orders/conditional", ticker, build)
+        ttl = _ttl(ttl_ms)
+        return self._place(key, ticker, side, otype, qty_d, price_d, ttl, trigger_d=trigger_d)
 
     def stop_loss(
         self,
@@ -498,6 +585,7 @@ class OrdersResource(Resource):
         trigger_price: float,
         *,
         max_slippage_bps: int | None = None,
+        ttl_ms: int | None = None,
     ) -> Any:
         """Arm a protective SELL that fires when the mark FALLS to ``trigger_price``.
 
@@ -506,11 +594,13 @@ class OrdersResource(Resource):
         client's ``max_slippage_bps``, 2% unless configured), so after a gap
         past that price it rests instead of selling.
 
-        ``quantity`` is fixed for the life of the row and the SDK never reads
-        your position, so if the holding later shrinks below it the row turns
-        ``FAILED`` within seconds — long before the mark reaches your trigger,
-        leaving you unprotected. Watch for that ``FAILED`` row and re-arm at the
-        new size. For a take-profit / stop-loss pair that cancels itself (OCO),
+        ``quantity`` is fixed for the life of the row, and your holding is not
+        checked until it fires: a stop that fires short of tokens cancels your
+        resting SELLs on this property and tries once more, and if the holding
+        is still below ``quantity`` the row turns ``FAILED`` and sells nothing.
+        Nothing warns you earlier, so when you sell part of the position,
+        cancel the stop (:meth:`cancel_conditional`) and re-arm it at the new
+        size. For a take-profit / stop-loss pair that cancels itself (OCO),
         attach ``tp_price`` / ``sl_price`` to the BUY (:meth:`create`).
         """
         return self.create_conditional(
@@ -520,6 +610,7 @@ class OrdersResource(Resource):
             type=ConditionalOrderType.STOP_MARKET,
             trigger_price=trigger_price,
             max_slippage_bps=max_slippage_bps,
+            ttl_ms=ttl_ms,
         )
 
     def take_profit(
@@ -529,6 +620,7 @@ class OrdersResource(Resource):
         trigger_price: float,
         *,
         max_slippage_bps: int | None = None,
+        ttl_ms: int | None = None,
     ) -> Any:
         """Arm a SELL that fires when the mark RISES to ``trigger_price``.
 
@@ -550,6 +642,7 @@ class OrdersResource(Resource):
             type=ConditionalOrderType.TAKE_MARKET,
             trigger_price=trigger_price,
             max_slippage_bps=max_slippage_bps,
+            ttl_ms=ttl_ms,
         )
 
     # -- Re-send ------------------------------------------------------------ #
@@ -558,15 +651,16 @@ class OrdersResource(Resource):
         """Re-send a signed placement exactly as it was (e.g. the ``signed_body``
         of an :class:`~loaf.exceptions.OrderOutcomeUnknownError`).
 
-        If the first attempt landed, the answer is that same order (on
-        ``/orders`` with ``duplicate: True``); if not, it is placed now, at the
-        price and quantity signed then, so resubmit only while you still want
-        it. It cannot be placed twice, unless a competition round switch (a
-        round being prepared or ending) has happened since it was signed. A
-        switch deletes every order, and with them the record that makes a
-        re-send a duplicate, so a body signed before a switch would simply be
-        placed again. Never resubmit one; compare your positions and cash to
-        see whether it landed.
+        If the first attempt landed, the answer is that same order as it is
+        now (on ``/orders`` with ``duplicate: True``). A stop or take is
+        answered with just the ``orderId`` of its row, whatever its status: a
+        re-send never re-arms one that was cancelled (as a competition round
+        does on the real markets), fired or FAILED. So read that row's
+        ``status`` in ``history.orders()`` before relying on it, and arm a new
+        one if it is ``CANCELLED`` or ``FAILED``. If the first attempt did not
+        land, the order is placed now, at the price and quantity signed then,
+        so resubmit only while you still want it. It cannot be placed twice:
+        the exchange admits one order per account and order number.
 
         Anything but a 200 raises :class:`~loaf.exceptions.OrderOutcomeUnknownError`
         again, with the reason in ``last_error``: whatever this re-send ran
@@ -577,28 +671,47 @@ class OrdersResource(Resource):
         re-sending, so look for the order in ``history.orders()`` (every
         status) then; an order that filled is not in ``openOrders``.
 
-        Needs neither the agent key nor the API key. Refused locally when the
-        order was signed more than 24 hours ago, which the exchange no longer
-        accepts.
+        After an epoch move (a Reset trading key, or a cancel-all sent on chain)
+        the exchange refuses it (``l2 epoch: …``) and has cancelled any resting
+        order of the old epoch. While a competition round is PREPARED or ACTIVE,
+        a real market's body is refused (``NOT_TRADEABLE_IN_MODE``, so
+        ``OrderOutcomeUnknownError`` again) and its history is not served: keep
+        the body and resubmit it after the round ends, while it can still rest.
+
+        Needs neither the trading key nor the API key. Once the order can no
+        longer rest (its ``l2ExpiryMs`` minus 24 hours has passed) nothing is
+        sent, since the exchange refuses it then: the
+        ``OrderOutcomeUnknownError`` has ``attempts`` 0 and the reason in
+        ``last_error``. Stop resubmitting it: find it in ``history.orders()`` by
+        its ``expiryMs``, and cancel any stop, take or TP/SL leg of it that is
+        still ``ARMED``.
         """
-        nonce = signed_body.get("nonce") if isinstance(signed_body, Mapping) else None
-        if (
-            not isinstance(nonce, str)
-            or not _NONCE_RE.fullmatch(nonce)
-            or not isinstance(signed_body.get("signature"), str)
+        body = signed_body if isinstance(signed_body, Mapping) else {}
+        if not (
+            all(isinstance(body.get(field), str) for field in _SIGNED_BODY_STRS)
+            and all(_is_int(body.get(field)) for field in _SIGNED_BODY_INTS)
         ):
             raise _client_validation_error(
-                "resubmit needs a signed placement body (with its nonce and signature), "
+                "resubmit needs a signed placement body (its l2 fields and signature), "
                 "e.g. OrderOutcomeUnknownError.signed_body"
             )
-        if abs(time.time() * 1000 - int(nonce[:12], 16)) > ORDER_NONCE_WINDOW_MS:
-            raise _client_validation_error(
-                "This order was signed more than 24 hours ago, so the exchange would refuse it and "
-                "could no longer confirm a duplicate. Look for it in history.orders() instead "
-                "(openOrders shows only resting orders, not one that already filled)."
+        expiry_ms = body["l2ExpiryMs"]
+        rests_until_ms = expiry_ms - L2_BUFFER_MS
+        if time.time_ns() // 1_000_000 >= rests_until_ms:
+            until = datetime.fromtimestamp(rests_until_ms // 1000, tz=timezone.utc)
+            refusal = _client_validation_error(
+                f"This order could rest only until {until.isoformat()} (its l2ExpiryMs minus 24 "
+                "hours): the exchange refuses it now. If it landed, any part of it still resting "
+                "is cancelled, but a stop or take, or a TP/SL leg, stays ARMED, holding an "
+                "open-order slot, until it fires and FAILS: find it in history.orders() "
+                f"(expiryMs {expiry_ms}) and cancel it."
             )
-        path = "/orders/conditional" if "triggerPrice" in signed_body else "/orders"
-        return self._client._send_signed(path, dict(signed_body), ambiguous=True)
+            # Nothing is sent, but the first attempt may have landed, and filled: still unknown.
+            raise OrderOutcomeUnknownError(
+                signed_body=copy.deepcopy(dict(body)), attempts=0, last_error=refusal
+            ) from refusal
+        path = "/orders/conditional" if "triggerPrice" in body else "/orders"
+        return self._client._send_signed(path, dict(body), ambiguous=True)
 
     # -- Cancel ------------------------------------------------------------ #
 
@@ -675,7 +788,6 @@ class OrdersResource(Resource):
 
         Returns ``{requestedCount, cancelledOrderIds, failedOrders}``, where
         ``requestedCount`` is ``len(cancelledOrderIds) + len(failedOrders)``.
-        Your "flatten / panic" button.
 
         It cancels your ``PENDING`` / ``ARMED`` conditionals FIRST and prepends
         their conditional-row ids to ``cancelledOrderIds``, so those ids will
@@ -703,6 +815,21 @@ class OrdersResource(Resource):
 
     # -- Signing & sending ------------------------------------------------- #
 
+    def _credentials(self) -> TradingKey:
+        """The trading key that signs, once both keys a placement needs are set."""
+        key = self._client._l2_key
+        if key is None:
+            raise LoafConfigError(
+                f"Placing orders needs your trading key: set ${ENV_SECRET_KEY} (the web app's "
+                "Show trading key gives it; see the README) or pass secret_key=..."
+            )
+        if not self._client.api_key:
+            raise LoafConfigError(
+                "Placing orders needs your API key too: the SDK reads your trading account and "
+                f"reserves order numbers with it. Pass api_key=... or set ${ENV_API_KEY}."
+            )
+        return key
+
     def _tolerance(self, max_slippage_bps: int | None, field: str = "max_slippage_bps") -> int:
         """This order's max slippage, else the client's (re-checked: it is a public attribute)."""
         if max_slippage_bps is None:
@@ -711,35 +838,97 @@ class OrdersResource(Resource):
             )
         return validate_slippage_bps(max_slippage_bps, field)
 
-    def _fetch_property(self, ticker: str) -> Any:
-        # market.property(), minus waiting out a 429 (a late order is stale); a 404 propagates.
-        detail = self._client._request("GET", f"/trade/{ticker}", auth=False, before_order=True)
-        self._contracts[ticker] = _contract_from(detail, ticker)
-        return detail
-
     def _place(
-        self, path: str, ticker: str, build: Callable[[str], dict], *, fetched: bool = False
+        self,
+        key: TradingKey,
+        ticker: str,
+        side: str,
+        otype: str,
+        qty_d: Decimal,
+        price: Decimal | Callable[[Any], Decimal],
+        ttl: int,
+        trigger_d: Decimal | None = None,
+        legs: Sequence[tuple[str, Decimal, Decimal]] = (),
     ) -> Any:
-        """Sign with the property's contract and send. ``fetched``: the caller read the
-        property during this call, so its cached contract is fresh."""
-        if ticker not in self._contracts:
-            self._fetch_property(ticker)
-            fetched = True
-        contract = self._contracts[ticker]
+        """Read what the order signs, take its order numbers, sign it and send it.
+
+        ``price`` is the order's price, or (a MARKET order without
+        ``reference_price``) the function that derives it from the exchange's
+        reference; ``trigger_d`` makes it a conditional; ``legs`` are its TP/SL
+        legs as ``("tp" | "sl", trigger, price)``.
+        """
+        l2 = self._l2
+        span = 1 + len(legs)
+        account = block = None
+        first = 0
         try:
-            return self._client._send_signed(path, build(contract))
-        except LoafAuthError as exc:
-            # A cached contract a competition round has since replaced: re-read it and, if it
-            # changed, re-sign with fresh nonces once. Safe only because no earlier attempt of
-            # this body can have landed: after an ambiguous attempt _send_signed raises
-            # OrderOutcomeUnknownError instead (even for a 401), which must never be caught here.
-            if fetched or exc.message not in _STALE_CONTRACT_401S:
-                raise
-            self._fetch_property(ticker)
-            current = self._contracts[ticker]
-            if current.lower() == contract.lower():
-                raise
-            return self._client._send_signed(path, build(current))
+            market = l2.market(ticker)
+            account = None if market is None else l2.cached_account(market)
+            if market is None or account is None or not isinstance(price, Decimal):
+                # The account is read only right after a detail read of the order's ticker whose
+                # venue check passed; a MARKET order reads the detail for its reference anyway.
+                detail = self._client._request(
+                    "GET", f"/trade/{ticker}", auth=False, before_order=True
+                )
+                l2.note_mode(detail)  # before the venue check: a refused read shows the mode too
+                market = market_of(detail, ticker)
+                l2.remember(ticker, market)
+                account = l2.account(market, key.public_key, ticker)
+                if not isinstance(price, Decimal):
+                    price = price(_reference_from(detail, ticker))
+            first, block, expiry_ms = l2.take(market, account, span, ttl)
+
+            body: dict[str, Any] = {
+                "ticker": ticker,
+                "price": float(price),
+                "quantity": float(qty_d),
+                "side": side,
+                "type": otype,
+            }
+            if trigger_d is not None:  # a conditional: the order it books when the mark gets there
+                body["triggerPrice"] = float(trigger_d)
+            body.update({
+                "timeInForce": TimeInForce.GTC.value,
+                "l2ChainId": market.l2_chain_id,
+                "l2AccountIndex": account.account_index,
+                "l2MarketIndex": market.market_index,
+                "l2OrderIndex": first,
+                "l2Epoch": account.epoch,
+                "l2FeeRateCap": L2_FEE_RATE_CAP,
+                "l2ExpiryMs": expiry_ms,
+                "l2BaseAssetId": market.base_asset_id,
+                "l2QuoteAssetId": market.quote_asset_id,
+                **_signed(key, market, account, first, expiry_ms, side, price, qty_d),
+            })
+            # Each leg is a SELL of the parent's quantity at its own price, with the parent's
+            # expiry and the next order number: tp, then sl.
+            for index, (leg, trigger, leg_price) in enumerate(legs, first + 1):
+                body[leg] = {
+                    "triggerPrice": float(trigger),
+                    "price": float(leg_price),
+                    "l2OrderIndex": index,
+                    "l2ExpiryMs": expiry_ms,
+                    **_signed(
+                        key, market, account, index, expiry_ms, OrderSide.SELL, leg_price, qty_d
+                    ),
+                }
+            path = "/orders/conditional" if trigger_d is not None else "/orders"
+            return self._client._send_signed(path, body)
+        except OrderOutcomeUnknownError as exc:
+            # It may be live, so its order numbers are never given back: only a resubmit of this
+            # very body (a duplicate at worst) may ever carry them.
+            if isinstance(exc.last_error, LoafAPIError):
+                l2.after_refusal(ticker, account, block, exc.last_error)
+            raise
+        except LoafError as exc:
+            # Definite: nothing this call sent can be live (it signed at most one body, and every
+            # attempt carrying it was refused or never arrived), so a later order may sign the
+            # same numbers (L2State.give_back). Never re-signed here: one call, one signed body.
+            if isinstance(exc, LoafAPIError):
+                l2.after_refusal(ticker, account, block, exc)
+            if block is not None:
+                l2.give_back(block, first, span)
+            raise
 
 
 def _check_ticker(ticker: Any) -> None:
@@ -750,15 +939,17 @@ def _check_ticker(ticker: Any) -> None:
         )
 
 
-def _contract_from(detail: Any, ticker: str) -> str:
-    prop = detail.get("property") if isinstance(detail, dict) else None
-    address = prop.get("contractAddress") if isinstance(prop, dict) else None
-    if not address:
+def _ttl(ttl_ms: Any) -> int:
+    """``ttl_ms=`` checked, or the default life when omitted."""
+    if ttl_ms is None:
+        return DEFAULT_ORDER_TTL_MS
+    whole = isinstance(ttl_ms, numbers.Integral) and not isinstance(ttl_ms, bool)
+    if not whole or not MIN_ORDER_TTL_MS <= int(ttl_ms) <= MAX_ORDER_TTL_MS:
         raise _client_validation_error(
-            f"Trading unavailable: {ticker!r} has no deployed token contract yet, "
-            "so an order for it cannot be signed"
+            f"ttl_ms must be a whole number of milliseconds from {MIN_ORDER_TTL_MS:,} (one "
+            f"minute) to {MAX_ORDER_TTL_MS:,} (about 47.9 days) (got {ttl_ms!r})"
         )
-    return str(address)
+    return int(ttl_ms)
 
 
 def _reference_from(detail: Any, ticker: str) -> Any:
@@ -775,13 +966,36 @@ def _reference_from(detail: Any, ticker: str) -> Any:
 
 
 def _signed(
-    signer: OrderSigner, contract: str, side: str, price: Decimal, quantity: Decimal
+    key: TradingKey,
+    market: Market,
+    account: AccountState,
+    index: int,
+    expiry_ms: int,
+    side: str,
+    price: Decimal,
+    quantity: Decimal,
 ) -> dict[str, str]:
-    """A fresh nonce and the signature over it: every signed order and leg gets its own."""
-    from .. import signing  # lazy: eth-account is importable once a signer exists
-
-    nonce = signing.new_order_nonce()
-    signature = signer.sign_order(
-        contract_address=contract, side=side, price=price, quantity=quantity, nonce=nonce
-    )
-    return {"nonce": nonce, "signature": signature}
+    """``l2SigS`` / ``l2SigE`` over one order's 12 signed terms: an order, a leg or a
+    conditional (the order it books)."""
+    with localcontext(_DECIMAL_CONTEXT):
+        price_scaled, quantity_scaled = int(price * 1000), int(quantity * 10)  # exact on the grid
+    try:
+        message = k1.order_message(
+            l2_chain_id=market.l2_chain_id,
+            l2_market_index=market.market_index,
+            l2_base_asset_id=market.base_asset_id,
+            l2_quote_asset_id=market.quote_asset_id,
+            is_ask=side == OrderSide.SELL,
+            price=price_scaled,
+            l2_fee_rate_cap=L2_FEE_RATE_CAP,
+            l2_account_index=account.account_index,
+            l2_order_index=index,
+            l2_epoch=account.epoch,
+            quantity=quantity_scaled,
+            l2_expiry_ms=expiry_ms,
+        )
+    except k1.K1Error as exc:
+        # The engine's own text, e.g. K1's bound on price x quantity; nothing was sent.
+        raise _client_validation_error(str(exc)) from None
+    s, e = key.sign(message)
+    return {"l2SigS": s, "l2SigE": e}

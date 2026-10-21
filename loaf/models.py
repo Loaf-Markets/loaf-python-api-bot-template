@@ -7,7 +7,9 @@ attribute access (``order.price``). New/extra fields the backend adds are
 preserved at runtime even though they are not listed here.
 
 Every monetary field is in plain dollars and every quantity in plain tokens
-unless explicitly noted (see :mod:`loaf.money`). Timestamps are unix seconds.
+(see :mod:`loaf.money`), except ``balances`` and a transfer's ``amount``:
+decimal strings in the token's base units (:func:`loaf.from_base_units`).
+Timestamps are unix seconds, except ``expiryMs`` (unix milliseconds).
 """
 
 from __future__ import annotations
@@ -44,11 +46,24 @@ class CandleHistory(TypedDict, total=False):
     hasMore: bool  # at least one older candle exists before oldestTs
 
 
+class L2Market(TypedDict):
+    """``property.l2Market`` of ``GET /trade/{ticker}``: the L2 market every order
+    on the property signs (the SDK reads it for you)."""
+
+    chainId: int  # the chain the proxy is on, not what an order signs
+    proxyAddress: str  # the ZkLoaf proxy, or a competition round's vault
+    l2ChainId: int
+    marketIndex: int
+    baseAssetId: int  # the property token's balances row
+    quoteAssetId: int  # the cash balances row
+
+
 class TradeTick(TypedDict, total=False):
-    """A public trade (from a property detail page or the ``trades`` WS channel)."""
+    """A public trade: the detail's ``recentTrades`` (newest first) or a ``trades_batch`` frame."""
 
     tradeId: int
     propertyId: int
+    txHash: str  # the trade's content hash (0x + 64 hex), not an on-chain transaction
     aggressorSide: str  # OrderSide of the taker
     price: float
     quantity: float
@@ -60,10 +75,12 @@ class OrderResult(TypedDict, total=False):
 
     success: bool
     orderId: int
-    # OrderStatus as of the commit that admitted it; OPEN / PARTIALLY_FILLED mean it is resting.
+    # OrderStatus as of the commit that admitted it, or for a duplicate as it is now (it may have
+    # filled or been cancelled since); OPEN / PARTIALLY_FILLED mean it is resting.
     status: str
     quantityLeft: float  # tokens not filled (the cancelled remainder on CANCELLED)
-    duplicate: bool  # an order with this nonce already existed (e.g. an SDK re-send)
+    duplicate: bool  # an order with this account and order number already existed
+    attachedLegIds: list[int]  # the legs' conditional ids, tp first; [] if none or a duplicate
 
 
 class OrderAck(TypedDict, total=False):
@@ -106,7 +123,7 @@ class OrderHistoryItem(TypedDict, total=False):
     # Conditionals only: on a live ARMED row the last deferred attempt, not a failure;
     # always None on booked orders.
     rejectionReason: Optional[str]
-    deadline: int
+    expiryMs: int  # unix ms, the signed expiry
     filledAt: Optional[int]  # booked orders only — absent on a conditional
     cancelledAt: Optional[int]
     createdAt: int
@@ -116,42 +133,62 @@ class OrderHistoryItem(TypedDict, total=False):
     triggeredAt: Optional[int]  # conditional only; unix seconds
 
 
+class TradeProofStatus(TypedDict, total=False):
+    """A trade's ``proof``: ``{"status": "PENDING"}`` until a proven batch includes
+    the trade, then ``IN_BATCH`` with the other fields."""
+
+    status: str  # "PENDING" or "IN_BATCH"
+    batchNumber: int
+    l2BlockNumber: int
+    rowIndex: int
+    l2TradeDigest: str  # 64 hex, no 0x
+    batchTxHash: Optional[str]  # the transaction that executed the batch; None until then
+    final: bool
+
+
 class TradeHistoryItem(TypedDict, total=False):
     tradeId: int
     propertyId: int
     ticker: str
-    txHash: str  # '' until a batch proof covers the trade; trades are final at match
+    txHash: str  # the trade's content hash (0x + 64 hex), not an on-chain transaction
     side: str  # OrderSide, relative to this user
     quantity: float
     price: float
-    fee: float  # this user's fee, dollars
+    fee: float  # this user's fee, dollars, to 0.001
     executedAt: int
+    proof: Optional[TradeProofStatus]  # None with proofs off, and for a competition round's trade
+
+
+class L2AssetBalance(TypedDict):
+    """One row of ``balances``: amounts are decimal strings in the token's base units."""
+
+    assetId: int
+    symbol: str
+    decimals: int
+    isQuote: bool  # a market's quote asset: cash
+    total: str
+    hold: str  # held for your resting orders
+    available: str  # total minus hold: what a new order can use
 
 
 class Position(TypedDict, total=False):
+    """A held property: facts only. An L2 holding's amounts are its ``balances`` row."""
+
     propertyId: int
     ticker: str
     tokenName: str  # display name
-    quantity: float  # tradeable (total minus frozen)
-    totalQuantity: float
     totalTokens: float  # the property's total token supply
-    averageEntryPrice: float
+    averageEntryPrice: Optional[float]  # None when the cost is unknown
     marketPrice: float
-    percentChange: float  # plain percent
-    percentOfPortfolio: float
-    propertyPnl: float
-    propertyPnlPercent: float
     isIpoAllocation: bool
+    assetId: int  # L2 holding only: its balances row
+    quantity: float  # IPO allocation only, tokens
     imageUrl: str
     sparkline: list[float]
 
 
 class PortfolioComponent(TypedDict, total=False):
-    cash: float
-    frozen: float
-    portfolioValue: float
-    portfolioPnl: float
-    portfolioPnlPercent: float
+    balances: list[L2AssetBalance]  # the whole L2 book; a missing row is 0
     lifetimeVolume: float  # dollars traded over the account's lifetime
     positions: list[Position]
     applicableFees: dict[str, int]  # {takerFeeBps, makerFeeBps}
@@ -159,7 +196,7 @@ class PortfolioComponent(TypedDict, total=False):
     openOrders: list[OrderHistoryItem]  # booked orders + PENDING/ARMED conditionals, merged
     tradeHistory: list[TradeHistoryItem]
     orderHistory: list[OrderHistoryItem]  # newest rows of both kinds, ANY status
-    transfers: list[dict[str, Any]]
+    transfers: list[dict[str, Any]]  # newest first, keyed by journalSeq; `amount` in base units
 
 
 class LeaderboardEntry(TypedDict, total=False):
@@ -210,14 +247,16 @@ class CompetitionRound(TypedDict, total=False):
     roundNumber: int
     name: str
     rules: str
-    startsAt: Optional[int]  # unix seconds; None until the round starts
-    endsAt: Optional[int]
-    startingBalanceUsdl: float  # whole USDC seeded per participant
+    startsAt: Optional[int]  # unix seconds; the schedule, re-stamped when the round goes ACTIVE
+    endsAt: Optional[int]  # likewise, re-stamped when it leaves ACTIVE
+    startingBalanceUsdl: float  # whole play cUSD seeded on the round's vault (+ referral bonus)
     participantBatchSize: int  # how many the queue admits into the round
     status: str  # CompetitionRoundStatus
-    newAssetProperty: Optional[dict[str, Any]]  # the round's headline property
+    newAssetProperty: Optional[dict[str, Any]]  # the round's market (a GET /trade row)
     prizePool: list[PrizePoolEntry]
     volumeMultiplierTiers: list[VolumeMultiplierTier]
+    volumeExponent: float  # e in points = a * volume^e + b * pnl
+    pnlMultiplier: float  # b
     bottomCullPercent: float  # 0-100, lowest-ranked share dropped at round end
     # Top 10 paid places only (a podium, not the full paid list); None until the
     # round is ENDING/ENDED, and while a finished round's results are pending.
@@ -248,6 +287,7 @@ class QueuePosition(TypedDict, total=False):
     leaderboardPosition: Optional[int]  # your rank on the served board
     referralCount: int
     estimatedRoundEntry: Optional[int]  # round that position is on track to enter
+    participant: bool  # a round is PREPARED/ACTIVE and you hold a seat in it
 
 
 __all__ = [
@@ -255,12 +295,15 @@ __all__ = [
     "OrderBook",
     "Candle",
     "CandleHistory",
+    "L2Market",
     "TradeTick",
     "OrderResult",
     "OrderAck",
     "CancelAllResult",
     "OrderHistoryItem",
+    "TradeProofStatus",
     "TradeHistoryItem",
+    "L2AssetBalance",
     "Position",
     "PortfolioComponent",
     "LeaderboardEntry",
