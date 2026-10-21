@@ -497,9 +497,9 @@ def test_a_refused_subscription_reaches_on_error_before_on_connect():
 
 
 def test_a_refused_api_key_is_retried_while_portfolio_is_subscribed(ceilings: list[float]):
-    # The server also refuses a valid key it cannot check at that moment, and never checks that
-    # socket again: the client drops the connection, once handlers have had the refusal, and
-    # retries with backoff until the key is accepted.
+    # A refused auth, even a transient one, leaves the socket anonymous: the client drops the
+    # connection, once handlers have had the refusal, and retries with backoff until the key is
+    # accepted.
     server = _Server(refusals=3).start()
     log = _Log()
     ws = _client(server.port, log, api_key="key")

@@ -23,7 +23,7 @@ def _bot(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
 
 
 def test_seed_keeps_frames_newer_than_its_read(monkeypatch: pytest.MonkeyPatch):
-    # GET /trade/MUS as a shared cache can still serve it after a reconnect: halted, bid 100.
+    # GET /trade/MUS as a stale read can still show it after a reconnect: halted, bid 100.
     stale = LoafObject({
         "property": {"isHalted": True},
         "orderBook": {"bids": [{"price": 100}], "asks": [{"price": 101}]},

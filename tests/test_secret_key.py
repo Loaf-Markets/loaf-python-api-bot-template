@@ -47,8 +47,7 @@ WALLET = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 PROXY = "0xedf6877B00000000000000000000000000000001"
 # secp256k1's group order: every private key is below it.
 SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFF_FFFFFFFFFFFFFFFE_BAAEDCE6AF48A03B_BFD25E8CD0364141
-# The web app's typed data signed by viem 2.48.11, the version the web app runs, and the keys
-# loaf.k1 derives from those signatures.
+# The web app's typed data signed by viem, and the keys loaf.k1 derives from those signatures.
 VECTORS = [
     Vector(
         chain_id=421614,

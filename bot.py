@@ -167,7 +167,7 @@ class Strategy:
         # and each time the feed goes live again (nothing is replayed).
         self.needs_seed = True
         # Which of them a frame has set since the feed went live: that read leaves those
-        # alone, since a shared cache can serve it older than the frame.
+        # alone, since the read can be older than the frame.
         self.from_feed: set[str] = set()
 
     # -- WebSocket handlers (called on the WS thread) --------------------- #
@@ -211,7 +211,7 @@ class Strategy:
     def on_round(self, msg) -> None:
         # Only report it: after a frame that switches the ledger (PREPARED, ENDING,
         # or DRAFT after PREPARED) the server closes the portfolio socket with 1012
-        # "venue" about 20 s later, and on_connect then re-seeds; a REST read on the
+        # "venue" shortly after, and on_connect then re-seeds; a REST read on the
         # frame itself can still see the previous ledger.
         print(f"  *** competition round {msg.roundNumber} {msg.status} "
               f"(its market: {msg.arenaTicker})")

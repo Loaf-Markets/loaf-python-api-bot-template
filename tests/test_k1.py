@@ -1,9 +1,9 @@
 """K1 signing, offline: K1's known answers, the order checks the web app's signer
 makes, and the curve's own vectors.
 
-``k1-sign.json`` is k1-sign's ``kat/sign.json`` byte for byte, the file the
-matching engine and the web app run too: a match here means a signature made by
-this SDK verifies there. Its withdraw and batch vectors are out of scope.
+``k1-sign.json`` holds K1's known answers for keys, signatures and orders, the
+vectors the matching engine and the web app run too: a match here means a
+signature made by this SDK verifies there.
 """
 
 from __future__ import annotations
@@ -24,14 +24,14 @@ from loaf.k1 import K1Error, key_from_seed, order_message, public_key, sign, ver
 KAT_FILE = Path(__file__).with_name("k1-sign.json")
 KAT = json.loads(KAT_FILE.read_text())
 
-# The group order n (k1-sign curve::N).
+# The group order n.
 N = 0x7FFFFFFD80000007_7FFFFFF100000016_7FFFFFE6CFB80639_E8885C39D724A09C_E80FD996948BFFE1
-# An order's wire keys in message order (k1-sign tests/kat.rs ORDER_KEYS).
+# An order's wire keys in message order.
 ORDER_KEYS = (
     "l2ChainId", "l2MarketIndex", "l2BaseAssetId", "l2QuoteAssetId", "isAsk", "price",
     "l2FeeRateCap", "l2AccountIndex", "l2OrderIndex", "l2Epoch", "quantity", "l2ExpiryMs",
 )
-# The field each message refusal code names, as the engine names it (me_rules::msg_refusal).
+# The field each message refusal code names, as the engine names it.
 REFUSED_FIELD = {
     "E_MSG_CHAIN_ID": "l2_chain_id",
     "E_MSG_MARKET": "l2_market_index",
@@ -44,8 +44,8 @@ REFUSED_FIELD = {
     "E_MSG_BASE_AMOUNT": "quantity",
     "E_MSG_EXPIRY": "l2_expiry_ms",
 }
-# The engine's widths of an order's fields, in its parse order (SignedOrder::parse), and the chain
-# id's, below the KoalaBear modulus, which comes last.
+# The engine's widths of an order's fields, in its parse order, and the chain id's, below the
+# KoalaBear modulus, which comes last.
 WIDTHS = [
     ("l2_account_index", 0, 2**48 - 1),
     ("l2_market_index", 0, 4095),
@@ -87,9 +87,9 @@ def refused(code: str, call: Any, *args: Any, **kwargs: Any) -> K1Error:
 # --------------------------------------------------------------------------- #
 
 
-def test_kat_file_is_k1s():
+def test_kat_file_is_unchanged():
     digest = hashlib.sha256(KAT_FILE.read_bytes()).hexdigest()
-    assert digest == "9e3bb38ca080f1046d087fe7b970bd8514a3643628e8d17b481cccb4ee8fed68"
+    assert digest == "1a7a716158a8aa893268c9b121a37c858a6af51b18dd3a4582c71bdf007c570e"
 
 
 @pytest.mark.parametrize("v", KAT["keys"], ids=lambda v: v["seed"][:8])
@@ -138,7 +138,7 @@ def test_kat_orders_outside_the_engines_widths_are_refused_by_name():
 
 @pytest.mark.parametrize("v", ORDER_REFUSALS, ids=lambda v: v["code"])
 def test_kat_message_refusals(v):
-    if v["code"] == "E_UNKNOWN_KEY":  # a key the wire does not have (serde's deny_unknown_fields)
+    if v["code"] == "E_UNKNOWN_KEY":  # a key the wire does not have
         with pytest.raises(TypeError, match="l2_api_key_index"):
             order_message(**fields(v))
     else:
@@ -156,7 +156,7 @@ def test_kat_message_refusals_cover_every_order_field():
 
 
 def test_kat_order_signs_as_the_web_app_signs_it():
-    # loafx-frontend signer.test.ts L2-SG-04: the wasm signer's bytes for KAT order 0, key 0, aux 0.
+    # The web app's signer gives these bytes for KAT order 0, key 0, aux 0.
     m = order_message(**ORDER0)
     s, e = sign(SK0, m, bytes(32))
     assert s.hex() + e.hex() == (
@@ -285,9 +285,9 @@ def test_fresh_keys_sign_and_verify():
 # The curve and the challenge's permutation
 # --------------------------------------------------------------------------- #
 
-# Pornin's reference vectors (github.com/pornin/ecgfp5 python/ecGFp5.py, as K1 pins them in k1-sig
-# tests/curve_kat.rs) as 40-byte encodings: P1, P2 = E P1, P3 = P1 + P2, P4 = 2 P1, P5 = 2 P2,
-# P6 = 2 P1 + P2 and P7 = P1 + 2 P2; then encodings of no point.
+# Pornin's reference vectors (github.com/pornin/ecgfp5 python/ecGFp5.py) as 40-byte encodings:
+# P1, P2 = E P1, P3 = P1 + P2, P4 = 2 P1, P5 = 2 P2, P6 = 2 P1 + P2 and P7 = P1 + 2 P2; then
+# encodings of no point.
 POINTS = [
     "599deb76146104ae660d2722c8d670d700a6e2bfa4af71d1d30bba141eed309e17f8d0f7b7061498",
     "b80dce0616c1ae98729d0cec0f34f7ec961f3ad01e35b1365bd6f6f481ed69d02fce8f992f63004d",
@@ -349,7 +349,7 @@ def test_doublings_and_multiplications_agree():
 
 
 def test_poseidon2_goldilocks_upstream_known_answer():
-    # p3-goldilocks 0.8.0's test_default_goldilocks_poseidon2_width_16, which k1-sign pins.
+    # p3-goldilocks 0.8.0's test_default_goldilocks_poseidon2_width_16, which K1 pins.
     state = [
         0x4D3F967FAB9D4979, 0x57E1FBA55677697E, 0x57429A86E75A3774, 0x31D379F3A592B5EB,
         0x497232E1B648E3F1, 0x325A7DB57173C39E, 0xA802252D78BEE916, 0x8920F55E154ADEF8,

@@ -52,9 +52,9 @@ The bot uses **two secrets**:
 Both come from the Loaf web app's **API** page (log in → **API**).
 
 1. **The API key**: select **Generate API Token**. It is shown **once**, so
-   copy it right away. It lasts at most 180 days; once it expires, or you
-   revoke it, every request it authenticates gets `401 Invalid credentials`. A
-   bot cannot read its own key's expiry, so note the date when you create it.
+   copy it right away. It has an expiry; once it expires, or you revoke it,
+   every request it authenticates gets `401 Invalid credentials`. A bot cannot
+   read its own key's expiry, so note the date when you create it.
 2. **The trading key** needs trading enabled: deposit (your first deposit opens
    your trading account), then select **Enable trading** in the order panel on
    a property's Trade page and wait until it is active. Then, under **Trading
@@ -108,9 +108,8 @@ set): what `GET /l2/keys` names `journaledKey` while the key is in force.
 
 `python -m loaf.secret_key` derives the same keys from your wallet's private
 key. You need it for a competition round's market, whose key the web app does
-not show. It needs an account whose wallet private key you hold: a wallet
-login, or a dedicated bot account (email-login accounts cannot export one
-today). It reads your trading account with `LOAF_API_KEY` (and
+not show. It needs an account whose wallet private key you hold, such as a
+wallet login or a dedicated bot account. It reads your trading account with `LOAF_API_KEY` (and
 `LOAF_API_BASE_URL`), so set those first, and run it from your bot's directory
 (it loads the `.env` found from the working directory up), on a trusted
 machine, once trading is enabled on the market:
@@ -319,16 +318,15 @@ stop means a second sell).
 - The exchange matches a MARKET order against resting orders at their prices,
   never worse than the price you signed, and **anything left rests on the
   book** until it fills, expires or you cancel it.
-- The reference read is one extra public request, served from a shared cache,
-  so it can trail the live market by tens of seconds and may not yet show a
-  trade you just made. For price-sensitive orders pass the
+- The reference read is one extra public request; it can lag the live market
+  and may not yet show a trade you just made. For price-sensitive orders pass the
   `markprice:{ticker}` value you stream as `reference_price` (once the SDK has
   read the property's market, that also saves the request).
 - If the exchange has no market price yet, the SDK refuses the order locally
   rather than sign it off zero.
 - A BUY holds **worst price × quantity × (1 + `L2_FEE_RATE_CAP` / 1,000,000)**
-  of your cash: `L2_FEE_RATE_CAP` is the fee-rate cap every order signs (70 bps,
-  the top taker tier), whatever fee its fills are charged. Size it with the same
+  of your cash: `L2_FEE_RATE_CAP` is the fee-rate cap every order signs (70 bps),
+  whatever fee its fills are charged. Size it with the same
   reference and max slippage you sign with:
 
 ```python
@@ -372,13 +370,7 @@ If trading is halted — platform-wide or for that property — order placement
 raises `TradingHaltedError` (403). A platform-wide halt blocks cancels too,
 except `orders.cancel_conditional()`, which is database-only and stays
 available (see **Stop & take orders** below). `TradingHaltedError` also covers
-the exchange's own halts, a 400 whose text starts `trading halted:`,
-`L1_RECHECK_PENDING:` or `E_L2_ORDERS_WITHOUT_JOURNAL:`: wait them out; cancels
-still work. Unlike a platform-wide or property halt, these do not pause stops
-and takes: a stop, take or TP/SL leg whose trigger is reached during one is
-refused and FAILS, with the halt's text as its `rejectionReason`. Re-arm what
-failed once the halt is over (a TP/SL leg as a separate `stop_loss` /
-`take_profit`, see **Stop & take orders**).
+the exchange engine's own halts (a 400): wait them out; cancels still work.
 
 To see a halt coming instead of discovering it on a rejected order, subscribe to
 the property's status channel:
@@ -401,8 +393,8 @@ not resume a property that is individually halted; the frame accounts for that.
 Every order expires. `ttl_ms=` on any placement sets how long it may rest, from
 one minute (`60_000`) to about 47.9 days; it is 7 days when omitted. The SDK
 signs the expiry `l2ExpiryMs` = now + 24 hours + `ttl_ms` (`expiryMs` on order
-rows): the exchange stops filling the order 24 hours before it and cancels it at
-its next batch, a `CANCELLED` you did not request. TP/SL legs share their
+rows): the exchange stops filling the order 24 hours before it and cancels it, a
+`CANCELLED` you did not request. TP/SL legs share their
 parent's life. An ARMED stop, take or leg is not cancelled when its life ends:
 one that fires later FAILS, so cancel and re-arm stops before then (see
 **Stop & take orders**). A bot's quotes should die with it, so give them a short
@@ -459,9 +451,8 @@ longest `ttl_ms`, weeks for the default and shorter.
   can be placed on the account, web app included, for up to about 49.5 days.
   The SDK reuses the numbers of an order that was refused, but each time the bot
   stops, the rest of the numbers it last reserved stay unused: up to 64, fewer
-  after only a few orders. So keep a bot running rather than restarting it often
-  (a busy bot restarted every half hour can reach the cap within weeks), and
-  restart it after a crash with a growing delay. Many stops that never fire, or
+  after only a few orders. So keep a bot running rather than restarting it
+  often, and restart it after a crash with a growing delay. Many stops that never fire, or
   many processes on one account, add up too.
 - The client keeps the trading key only inside its signer and never logs it.
   Prefer `$LOAF_SECRET_KEY` over `secret_key=`: an explicit argument can
@@ -610,7 +601,7 @@ To trade the round's market:
    (`COMPETITION_NOT_STARTED` until then).
 
 Watch the rounds live on the public `competition` channel. After each switch
-the server closes portfolio sockets with 1012 `venue`, about 20 s after the
+the server closes portfolio sockets with 1012 `venue`, shortly after the
 frame: re-seed from REST when `on_connect` fires after that close, not on the
 frame itself (a read right after the frame can still show the previous
 ledger). Right around a switch a placement can raise `VenueSwitchingError`: try
@@ -673,8 +664,8 @@ ws.run_forever()                # blocking; or `with loaf.websocket() as ws:` fo
 
 Handlers run on the client's event-loop thread, so keep them short. An
 exception raised in a handler is logged and swallowed. Don't place orders from
-a handler: a placement can block the feed for minutes while the exchange
-struggles (long enough for the server to drop the connection), and an
+a handler: a placement can block the feed for minutes while the exchange is
+slow to answer (long enough for the server to drop the connection), and an
 `OrderOutcomeUnknownError` raised there is only logged. Record the event and
 act from your own loop, as `bot.py` does.
 
@@ -682,7 +673,7 @@ Channels:
 
 | Channel | Auth | Handler | Payload |
 | --- | --- | --- | --- |
-| `orderbook:{ticker}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (at most every 500 ms); no initial frame — seed from `market.property(ticker).orderBook` |
+| `orderbook:{ticker}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (throttled); no initial frame — seed from `market.property(ticker).orderBook` |
 | `trades:{ticker}` | public | `on_trades` | rolling recent-trades batch |
 | `chart:{ticker}` | public | `on_candle` | OHLCV candle updates |
 | `markprice:{ticker}` | public | `on_mark_price` | canonical mark price (1s, on change) |
@@ -705,8 +696,8 @@ your API key authenticated as, so an anonymous connection is refused with an
 - Each fill arrives **once**, final when it matches: `order_status`, then
   `trade_new`, then `balances_update`. There is no position frame: your
   holdings are balances rows. `trade.txHash` is the trade's content hash, not an
-  on-chain transaction; `trade.proof` is `{"status": "PENDING"}`, or `None` with
-  proofs off and for a competition round's trade.
+  on-chain transaction; `trade.proof` is `{"status": "PENDING"}`, or `None` (always
+  for a competition round's trade).
 - `order_update` carries the whole committed order, with its `expiryMs`. For an
   order that trades immediately it can arrive after the fill frames and already
   show FILLED. Stop and take orders (TP/SL legs included) ride the same frame,
@@ -714,7 +705,7 @@ your API key authenticated as, so an anonymous connection is refused with an
   `filledQuantity`.
 - `order_status` `CANCELLED` carries the cancelled remainder in
   `quantityLeft`. It also arrives for orders you never cancelled: the
-  exchange's expiry sweep (24 h before `expiryMs`), an epoch move (a Reset
+  order's expiry (24 h before `expiryMs`), an epoch move (a Reset
   trading key, or a cancel-all sent on chain), a closed market, a BUY that can
   no longer fund a fill within its hold, your own order crossing a resting one
   of yours (the resting one is cancelled), and a firing stop freeing funds by
@@ -727,9 +718,9 @@ your API key authenticated as, so an anonymous connection is refused with an
 **Reconnects.** `on_connect` fires once the server has answered the auth and
 the subscriptions. Nothing is replayed across a reconnect, so flag a re-seed in
 `on_connect` and do the REST reads from your own thread: handlers run on the
-socket's thread, and a slow read there stalls it. A public read is served from
-a shared cache and can be older than a frame received since `on_connect`, so
-keep the frame's value over the read's. `bot.py` does both. `on_disconnect`
+socket's thread, and a slow read there stalls it. A public read can be older
+than a frame received since `on_connect`, so keep the frame's value over the
+read's. `bot.py` does both. `on_disconnect`
 gets `{code, reason}` after every ended attempt: 1012 with reason `resync`
 (pushes were lost) or `venue` (a competition round switched the ledger) means
 re-seed once `on_connect` fires again; `code` `None` means no connection was

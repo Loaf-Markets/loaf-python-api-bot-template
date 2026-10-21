@@ -37,8 +37,8 @@ USER_AGENT = f"loaf-python-sdk/{__version__}"
 #: Default per-request timeout (seconds).
 DEFAULT_TIMEOUT = 30.0
 
-#: Placements wait at least this long (seconds): the exchange may try its matching engine twice
-#: before it answers, and a timeout is re-sent anyway.
+#: Placements wait at least this long (seconds): the exchange can take a while to confirm an
+#: order, and a timeout is re-sent anyway.
 DEFAULT_PLACEMENT_TIMEOUT = 45.0
 
 #: Default number of automatic retries for transient failures: reads (429/503/network) and
@@ -70,7 +70,7 @@ ORDER_PRICE_MAX = Decimal("4294967.29")
 #: The largest quantity (tokens) an order can sign: (2**48 - 1) / 10, whose x10 fits 48 bits.
 ORDER_QUANTITY_MAX = Decimal("28147497671065.5")
 
-#: The highest fee rate (per million: 7,000 = 70 bps, the top taker tier) every order signs its
+#: The highest fee rate (per million: 7,000 = 70 bps) every order signs its
 #: consent to. It also sizes a BUY's hold: price x quantity x (1 + L2_FEE_RATE_CAP / 1,000,000)
 #: of the quote asset, whatever fee the fills are charged.
 L2_FEE_RATE_CAP = 7_000

@@ -156,7 +156,7 @@ class TradeHistoryItem(TypedDict, total=False):
     price: float
     fee: float  # this user's fee, dollars, to 0.001
     executedAt: int
-    proof: Optional[TradeProofStatus]  # None with proofs off, and for a competition round's trade
+    proof: Optional[TradeProofStatus]  # may be None; always None for a competition round's trade
 
 
 class L2AssetBalance(TypedDict):

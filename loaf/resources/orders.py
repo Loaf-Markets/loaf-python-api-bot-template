@@ -21,8 +21,8 @@ unused.
 **Order life.** Every order expires. ``ttl_ms=`` sets how long it may rest
 (default 7 days, from one minute to about 47.9 days): the SDK signs the expiry
 ``l2ExpiryMs`` = now + 24 hours + ``ttl_ms`` (``expiryMs`` on order rows), and
-the exchange stops filling the order 24 hours before it and cancels it at its
-next batch (a ``CANCELLED`` you did not request). TP/SL legs share their
+the exchange stops filling the order 24 hours before it and cancels it (a
+``CANCELLED`` you did not request). TP/SL legs share their
 parent's life. An ARMED stop, take or leg is not cancelled when its life ends:
 it keeps its open-order slot until you cancel it or it fires, and FAILS if it
 fires later, so cancel and re-arm it before then. After an epoch
@@ -104,7 +104,7 @@ Conditional rows hold nothing at placement, and your cash and holding are
 checked only when they fire, but they do occupy an open-order slot, counted
 together with booked orders. The exchange checks a row's price grid, order
 number and its range only when the row fires, so those mistakes — and an order
-number made stale by an exchange reset — FAIL the row then: watch
+number made stale if the exchange resets order numbers — FAIL the row then: watch
 ``on_order_update`` for ``status: "FAILED"`` (``order_status`` frames carry
 booked orders only). Each stop or take holds its order number until it fires,
 and one cancelled or expired unfired keeps counting against your account's
@@ -232,8 +232,8 @@ class OrdersResource(Resource):
             reference_price: ``MARKET`` only: the price your max slippage is
                 measured from. Default: the exchange's market reference (book
                 mid, else last trade, else last candle close, else IPO price),
-                read with one extra public request that is served from a shared
-                cache, so it can trail the live market by tens of seconds. Pass
+                read with one extra public request, which can lag the live
+                market. Pass
                 the ``markprice:{ticker}`` WebSocket value for a fresher
                 reference (it also saves the request once the SDK has read the
                 property's market).
@@ -724,8 +724,8 @@ class OrdersResource(Resource):
         * :class:`~loaf.exceptions.LoafConflictError` (409) if the engine no
           longer holds the order; the message can name its status
           (``Order can no longer be cancelled — it is FILLED.``);
-        * :class:`~loaf.exceptions.LoafValidationError` (400) for a terminal
-          status the database already knows;
+        * :class:`~loaf.exceptions.LoafValidationError` (400) for an order
+          already known to be in a terminal status;
         * :class:`~loaf.exceptions.LoafForbiddenError` (403
           ``Not authorized to cancel this order``) for someone else's order;
         * :class:`~loaf.exceptions.LoafServiceUnavailableError` (503) when the
@@ -792,12 +792,12 @@ class OrdersResource(Resource):
         It cancels your ``PENDING`` / ``ARMED`` conditionals FIRST and prepends
         their conditional-row ids to ``cancelledOrderIds``, so those ids will
         404 against any booked-order lookup. Then one request to the matching
-        engine cancels all your resting orders at once, in one database
-        transaction: an order placed while it runs may or may not be included,
-        one placed after the response is not.
+        engine cancels all your resting orders at once, atomically: an order
+        placed while it runs may or may not be included, one placed after the
+        response is not.
 
         ``failedOrders`` lists only orders the engine could not cancel because
-        the request did not complete on their property (an internal fault, or
+        the request did not complete on their property (it failed there, or
         the outcome there is unknown). They stay open, each with the
         ``errorMessage`` "Trading service is temporarily unavailable. Please
         try again in a moment."; calling ``cancel_all()`` again is safe (the

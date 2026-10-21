@@ -59,8 +59,7 @@ _MAX_SAFE_INT = 2**53 - 1
 _KB_MODULUS = 2_130_706_433  # an L2 chain id is a KoalaBear element, below this prime
 
 # How long after the SDK last saw the market mode switch an account that contradicts the trading
-# key is taken for the exchange still switching ledgers (seconds): each of its servers switches
-# within about 20 s, and the edge can serve a property detail up to about a minute old.
+# key is taken for the switch still settling (seconds).
 _VENUE_SETTLE_S = 120.0
 
 _SWITCHED = (
@@ -381,7 +380,7 @@ class L2State:
                     )
             except LoafConfigError as exc:
                 # Around a round transition consecutive reads can land on different ledgers (the
-                # detail behind the venue check is edge-cached), so a contradiction then is no
+                # detail behind the venue check can be stale), so a contradiction then is no
                 # configuration mistake.
                 if time.monotonic() - self._switch_seen_at < _VENUE_SETTLE_S:
                     raise VenueSwitchingError(
@@ -490,7 +489,7 @@ class L2State:
             try:
                 answer = self._client._request("POST", "/l2/order-indices", json={"count": count})
             except LoafAPIError as exc:
-                if _RESERVED_TOO_SOON not in exc.message:  # one reservation per account a second
+                if _RESERVED_TOO_SOON not in exc.message:  # too soon after the last reservation
                     raise
                 time.sleep(1.0)
                 answer = self._client._request("POST", "/l2/order-indices", json={"count": count})

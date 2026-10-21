@@ -65,7 +65,7 @@ class HistoryResource(Resource):
 
         Trades are final when they match. ``txHash`` is the trade's content
         hash (``0x`` + 64 hex, never ``""``), not an on-chain transaction.
-        ``proof`` is ``None`` (proofs off, or a competition round's trade),
+        ``proof`` is ``None`` (always for a competition round's trade),
         ``{"status": "PENDING"}``, or ``{"status": "IN_BATCH", batchNumber,
         l2BlockNumber, rowIndex, l2TradeDigest, batchTxHash, final}`` once a
         proven batch includes the trade (:class:`~loaf.models.TradeProofStatus`).

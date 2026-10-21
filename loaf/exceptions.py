@@ -11,9 +11,7 @@ Every error the API can return is mapped to a specific exception so a bot can
     └── LoafAPIError                the server returned an HTTP error
         ├── LoafAuthError                 401  bad/expired credentials, or an order's signature or key
         ├── LoafForbiddenError            403  generic forbidden
-        │   ├── TradingHaltedError        403  "…halted…"; 400 "trading halted: …" /
-        │   │                                  "L1_RECHECK_PENDING: …" /
-        │   │                                  "E_L2_ORDERS_WITHOUT_JOURNAL: …"
+        │   ├── TradingHaltedError        403  "…halted…", or 400 from the exchange's engine
         │   └── VenueError                403  code NOT_TRADEABLE_IN_MODE /
         │                                      COMPETITION_NOT_STARTED /
         │                                      NOT_COMPETITION_PARTICIPANT (or local, status 0)
@@ -211,13 +209,8 @@ class TradingHaltedError(LoafForbiddenError):
     database-only and stays available — during a platform halt it is your only
     way to pull a resting stop before the reopen.
 
-    Or 400 from the exchange's engine, whose halts refuse orders but still
-    admit cancels: ``trading halted: …`` (an L1 request was reversed; an
-    operator must act), ``L1_RECHECK_PENDING: …`` or
-    ``E_L2_ORDERS_WITHOUT_JOURNAL: …`` (the engine is re-checking after a
-    restart). Unlike the 403 halts, these do not pause stops and takes: one
-    that fires during them FAILS, with this text as its ``rejectionReason``;
-    re-arm it once the halt is over.
+    Or 400 from the exchange's engine, whose own halts refuse orders but still
+    admit cancels.
 
     Back off and retry later; there is no client-side fix.
     """
@@ -300,8 +293,7 @@ class VenueSwitchingError(LoafServiceUnavailableError):
     market mode switched while an order was being prepared, or when your trading
     account does not match your trading key within two minutes of the SDK
     seeing the mode switch (a market-mode refusal from the exchange, or a read
-    answered in the other mode): the exchange's servers are still switching
-    ledgers.
+    answered in the other mode): the switch is still settling.
     """
 
 

@@ -33,8 +33,8 @@ EPOCH = 2
 # A property's l2Market as the exchange serves it.
 MARKET = {
     "chainId": 421614,
-    "proxyAddress": "0x5f81DB97a8CaC02Dcd3D04985cD6c5bC1A2dbC96",
-    "l2ChainId": 909694930,
+    "proxyAddress": "0x" + "11" * 20,
+    "l2ChainId": 4242,
     "marketIndex": 2050,
     "baseAssetId": 6,
     "quoteAssetId": 3,

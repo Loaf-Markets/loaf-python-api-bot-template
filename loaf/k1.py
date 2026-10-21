@@ -1,8 +1,8 @@
 """K1 signing: the keys, order messages and Schnorr signatures of Loaf's L2.
 
-A pure-Python port of K1's ``k1-sign`` crate (``crates/k1-sign`` in the matching
-engine), the one implementation the engine verifies with and the web app signs
-with. It reproduces K1's known answers byte for byte (``tests/k1-sign.json``).
+A pure-Python port of K1's reference signer, the one implementation the engine
+verifies with and the web app signs with. It reproduces K1's known answers byte
+for byte (``tests/k1-sign.json``).
 
 * :func:`key_from_seed` and :func:`public_key`: a 40-byte secret key from a
   32-byte seed, and its 40-byte public key, the point ``sk G`` of ECgFp5
@@ -35,8 +35,8 @@ from .exceptions import LoafError
 
 
 class K1Error(LoafError):
-    """A refusal: ``code`` names the rule (k1-sign's name, or the engine's for an
-    order field) and the message is the engine's or the web app signer's text."""
+    """A refusal: ``code`` names the rule (K1's name, or the engine's for an order
+    field) and the message is the engine's or the web app signer's text."""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -86,8 +86,8 @@ def order_message(
     """
     if not isinstance(is_ask, bool):
         raise TypeError(f"is_ask must be a bool, not {type(is_ask).__name__}")
-    # The engine's widths in its parse order (SignedOrder::parse), then K1's bounds on the order's
-    # largest fill, then the chain id, which the message carries below the KoalaBear modulus.
+    # The engine's widths in its parse order, then K1's bounds on the order's largest fill, then
+    # the chain id, which the message carries below the KoalaBear modulus.
     _width("l2_account_index", l2_account_index, 0, _MAX_48)
     _width("l2_market_index", l2_market_index, 0, 4095)
     _width("l2_order_index", l2_order_index, 1, 2**40 - 1)
@@ -130,7 +130,7 @@ def sign(sk: bytes, message: bytes, aux: bytes) -> tuple[bytes, bytes]:
     little-endian each (the body's ``l2SigS`` and ``l2SigE`` are their hex).
 
     ``aux`` is 32 fresh random bytes per signature (``os.urandom(32)``); fixed
-    bytes only reproduce a known answer. The nonce is k1-sign's:
+    bytes only reproduce a known answer. The nonce is K1's:
     ``k = int_le(TH("loaf/k1/nonce", t || pk || message)) mod n`` with
     ``t = sk XOR TH("loaf/k1/aux", aux)``. Then ``R = k G``, ``e`` is the
     Poseidon2 challenge of R and the message mod n, and ``s = k - e sk mod n``.
@@ -156,9 +156,9 @@ def sign(sk: bytes, message: bytes, aux: bytes) -> tuple[bytes, bytes]:
 
 def verify(pk: bytes, message: bytes, s: bytes, e: bytes) -> None:
     """Check ``(s, e)`` over a 32-byte message under a 40-byte public key, as the
-    engine checks an order (k1-sign ``verify_bytes``), or raise :class:`K1Error`
-    with k1-sign's code, in its order: ``SigLength``, ``SigNoncanonical``,
-    ``Noncanonical``, ``PubKeyZero``, ``PubKeyDecode``, ``RIdentity``, ``Sig``."""
+    engine checks an order, or raise :class:`K1Error` with K1's code, checked in
+    this order: ``SigLength``, ``SigNoncanonical``, ``Noncanonical``,
+    ``PubKeyZero``, ``PubKeyDecode``, ``RIdentity``, ``Sig``."""
     if len(s) != 40 or len(e) != 40:
         raise K1Error("SigLength", _NOT_VERIFIED)
     s_int, e_int = int.from_bytes(s, "little"), int.from_bytes(e, "little")
@@ -182,8 +182,8 @@ def verify(pk: bytes, message: bytes, s: bytes, e: bytes) -> None:
         raise K1Error("Sig", _NOT_VERIFIED)
 
 
-# The engine's texts for a refused signature (me_rules::sig_refusal). The engine has none for a bad
-# message, since it hashes its own.
+# The engine's texts for a refused signature. The engine has none for a bad message, since it
+# hashes its own.
 _NOT_VERIFIED = "l2 signature: the Schnorr signature does not verify"
 _BIG_SCALAR = "l2 signature: a signature scalar is not below the ECgFp5 group order"
 _NO_KEY = "l2 signature: the api key has no usable public key"
@@ -215,9 +215,9 @@ def _order_message(
     base_amount: int,
     expiry: int,
 ) -> bytes:
-    """The order message of fields in range, unchecked (k1-sign ``order_digest``
-    then ``message_bytes``): the KoalaBear sponge digest m of the order's 16
-    elements, sent as P_i = m[2i] + 2^31 m[2i+1], each 8 bytes little-endian."""
+    """The order message of fields in range, unchecked: the KoalaBear sponge
+    digest m of the order's 16 elements, sent as P_i = m[2i] + 2^31 m[2i+1],
+    each 8 bytes little-endian."""
     word = 149 + (is_ask << 16) + (base_asset << 17) + (quote_asset << 23)  # 149: a settle order
     elements = (
         chain_id, word, market, price & _M24, price >> 24, fee_cap,
@@ -385,7 +385,7 @@ def _sqrt(a: _Fp5) -> _Fp5 | None:
     """A square root of a != 0, or None. With r = (p^5 - 1) / (p - 1),
     y = a^((r + 1) / 2) has y^2 = a N(a), so y / sqrt(N(a)) is a root; and
     (r + 1) / 2 = 1 + p (1 + p) (1 + p^2) / 2 makes y = a phi(u) phi^3(u) with
-    u = a^((p + 1) / 2) and phi the Frobenius (k1-sign's ``Fp5::sqrt``)."""
+    u = a^((p + 1) / 2) and phi the Frobenius."""
     s = _sqrt_fp(_norm(a)[0])
     if s is None:
         return None

@@ -44,8 +44,8 @@ timestamps are unix seconds (an order row's ``expiryMs`` is milliseconds).
 
 Handlers run on the client's internal event-loop thread: keep them short. An
 exception raised in a handler is logged and swallowed. Don't place orders from
-a handler: a placement can block the feed for minutes while the exchange
-struggles (long enough for the server to drop the connection), and an
+a handler: a placement can block the feed for minutes while the exchange is
+slow to answer (long enough for the server to drop the connection), and an
 :class:`~loaf.exceptions.OrderOutcomeUnknownError` raised there is only logged.
 Record the event and act from your own loop, as ``bot.py`` does.
 """
@@ -227,14 +227,13 @@ class LoafWebSocketClient:
         while it is PREPARED or ACTIVE, with a trading key of its own (enable
         trading on the round's market in the web app, then derive it: README
         **Competition rounds**). Your real resting orders and stops are
-        cancelled shortly after ``PREPARED``, with no frame. The exchange's
-        servers finish a switch about 20 s after its frame and then close
-        portfolio sockets with 1012 ``venue``: re-seed from REST when
+        cancelled shortly after ``PREPARED``, with no frame. Shortly after
+        this frame the server closes portfolio sockets with 1012 ``venue``: re-seed from REST when
         :meth:`on_connect` fires after that close, not on this frame (REST
         reads right after it can still show the previous ledger).
         Delivery is best-effort: ``competition.info()`` catches you up (after a
         reconnect, say), but keep a frame over a read made soon after it, which
-        a shared cache can serve stale.
+        can be stale.
         """
         return self.on(WSMessageType.ROUND_UPDATE, handler)
 
@@ -614,8 +613,7 @@ class LoafWebSocketClient:
                 or (mtype == WSMessageType.ERROR and message.get("code") == "UNAUTHORIZED")
             )
         ):
-            # The server answers false for any failure to check the key, a passing one
-            # included, then leaves the socket anonymous and never closes it with a 1012: end
+            # A refused auth, even a transient one, leaves the socket anonymous and open: end
             # the attempt, so that the private stream is retried with backoff. Portfolio
             # subscribed after that answer is refused UNAUTHORIZED: end it at that reply, which
             # comes once the subscribe has gone out (a queued send fails on a closed socket).

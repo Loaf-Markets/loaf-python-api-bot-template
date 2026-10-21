@@ -105,11 +105,9 @@ def test_error_mapping():
     assert isinstance(error_from_response(409, {"error": used}), loaf.LoafConflictError)
     # The exchange engine's own halts arrive as 400s with its text.
     for message in (
-        "trading halted: L1 request 7 reversed at block 9; see the operator runbook",
-        "L1_RECHECK_PENDING: 3 journaled L1 credits are not final and not re-checked since the "
-        "start; orders and withdrawals are refused (cancels admitted)",
-        "E_L2_ORDERS_WITHOUT_JOURNAL: every order is L2-signed and the L2 journal is not read "
-        "back yet, so no order is admitted",
+        "trading halted: …",
+        "L1_RECHECK_PENDING: …",
+        "E_L2_ORDERS_WITHOUT_JOURNAL: …",
     ):
         halt = error_from_response(400, {"error": message})
         assert type(halt) is loaf.TradingHaltedError and halt.status_code == 400

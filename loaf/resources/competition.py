@@ -47,8 +47,8 @@ class CompetitionResource(Resource):
             rounds = loaf.competition.info().rounds or []
             current = next((r for r in rounds if r.status in ("PREPARED", "ACTIVE")), None)
 
-        A round starts and ends by an operator's action, which re-stamps its
-        ``startsAt`` / ``endsAt`` (until then they hold the schedule, if any).
+        A round's actual start and end re-stamp its ``startsAt`` / ``endsAt``
+        (until then they hold the schedule, if any).
 
         A ``prizePool`` entry is ``{place, amount}`` or, for a BAND,
         ``{place, toPlace, amount}`` — ``toPlace`` is inclusive and ``amount``

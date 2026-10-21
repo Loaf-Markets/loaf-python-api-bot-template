@@ -65,7 +65,7 @@ CONDITIONAL_KEYS = ORDER_KEYS[:5] + ["triggerPrice"] + ORDER_KEYS[5:]
 LEG_KEYS = "triggerPrice price l2OrderIndex l2ExpiryMs l2SigS l2SigE".split()
 # What every order on OPRA signs besides its own terms: MARKET and the account in KEYS.
 CONTEXT = {
-    "l2ChainId": 909694930,
+    "l2ChainId": 4242,
     "l2AccountIndex": 5,
     "l2MarketIndex": 2050,
     "l2Epoch": 2,
@@ -385,7 +385,7 @@ def test_server_without_the_l2_exchange(exchange, trading_client):
         ({**MARKET, "quoteAssetId": 0}, "quoteAssetId"),
         ({**MARKET, "quoteAssetId": 63}, "quoteAssetId"),
         ({**MARKET, "quoteAssetId": 6}, "quoteAssetId"),  # the base asset's id
-        ("0x5f81DB97a8CaC02Dcd3D04985cD6c5bC1A2dbC96", "l2Market"),
+        (MARKET["proxyAddress"], "l2Market"),
     ],
 )
 def test_unusable_l2_market(exchange, trading_client, l2_market, field):
@@ -2032,7 +2032,7 @@ def test_a_number_given_back_serves_only_expiries_its_block_admits(
 
 # --------------------------------------------------------------------------- #
 # The market-mode window: an account read that contradicts the trading key right
-# after the SDK saw the market mode switch is the exchange still switching ledgers
+# after the SDK saw the market mode switch is the switch still settling
 # --------------------------------------------------------------------------- #
 
 
@@ -2048,7 +2048,7 @@ def _refused_locally(exchange: FakeExchange, orders: Any) -> None:
     exchange.details["OPRA"] = property_detail(mode=True)  # a round started
     with pytest.raises(loaf.VenueError):
         orders.market_buy("OPRA", 1)  # a MARKET order reads the property every time
-    exchange.details["OPRA"] = property_detail()  # an edge-cached detail: still the old mode
+    exchange.details["OPRA"] = property_detail()  # a stale detail: still the old mode
 
 
 def _switching(exchange: FakeExchange, orders: Any) -> None:
@@ -2094,7 +2094,7 @@ def _reserved_with_no_account_on_the_retry(exchange: FakeExchange, orders: Any) 
         (_reserved_on_the_other_ledger, 1_000.0),
         (_reserved_with_no_account, 1_000.0),
         (_reserved_with_no_account_on_the_retry, 1_000.0),
-        # The edge-cached read at 1_119 shows the other mode again: the window counts from it.
+        # The stale read at 1_119 shows the other mode again: the window counts from it.
         (_refused_locally, 1_119.0),
     ],
 )
@@ -2178,8 +2178,8 @@ def test_a_switch_seen_in_a_property_read_opens_the_window(exchange, trading_cli
         l2_clock.monotonic = lambda at=1_000.0 + 30 * tick: at
         with pytest.raises(loaf.VenueError):
             orders.limit_buy("MUS", 10, 167.49)
-    # The round ends: a fresh read shows the real mode, while a server still on the round's
-    # ledger, which holds no account of yours, answers the account read.
+    # The round ends: a fresh read shows the real mode, while the round's ledger, which holds
+    # no account of yours, still answers the account read.
     exchange.details["MUS"] = property_detail("MUS")
     exchange.keys = None
     l2_clock.monotonic = lambda: 1_120.0
@@ -2222,8 +2222,8 @@ def test_a_switch_seen_during_an_account_read_counts_for_it(exchange, seen):
     exchange.queue("/orders", error_reply(400, STALE_EPOCH))
     with pytest.raises(loaf.LoafValidationError):
         orders.limit_buy("OPRA", 10, 167.49)  # the account is read again next time
-    # A server already on the round's ledger answers that read, while the detail, edge-cached,
-    # still shows the real mode.
+    # The round's ledger already answers that read, while the detail, still stale, shows the
+    # real mode.
     exchange.keys = None
     raised: list[Exception] = []
 
