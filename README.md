@@ -770,19 +770,19 @@ except loaf.LoafAPIError as e:
 ```
 
 `LoafConnectionError` means no HTTP response arrived (network error or
-timeout); from an order placement it means the order never reached the
-exchange, because anything that might have landed raises
-`OrderOutcomeUnknownError` instead. `LoafConfigError` means a missing or
-invalid key (placing orders needs `LOAF_SECRET_KEY` and `LOAF_API_KEY`),
-`LOAF_WALLET_PRIVATE_KEY` left in the bot's environment, or an invalid
-client-wide max slippage (`LOAF_MAX_SLIPPAGE_BPS` /
-`LoafClient(max_slippage_bps=)`). From a placement it means a setup to fix
-before retrying: your trading key is not the one in force, trading is not
-enabled, you have no trading account yet (on a competition round's market: no
-seat, or the round has not funded your account yet), or this machine's clock is
-hours ahead; the message says what to do. A bad per-order `max_slippage_bps=` /
-`leg_max_slippage_bps=` / `ttl_ms=` is a local `LoafValidationError`
-(status_code 0).
+timeout), or one arrived whose compressed body could not be decompressed; from
+an order placement it means the order never reached the exchange, because
+anything that might have landed raises `OrderOutcomeUnknownError` instead.
+`LoafConfigError` means a missing or invalid key (placing orders needs
+`LOAF_SECRET_KEY` and `LOAF_API_KEY`), `LOAF_WALLET_PRIVATE_KEY` left in the
+bot's environment, or an invalid client-wide max slippage
+(`LOAF_MAX_SLIPPAGE_BPS` / `LoafClient(max_slippage_bps=)`). From a placement
+it means a setup to fix before retrying: your trading key is not the one in
+force, trading is not enabled, you have no trading account yet (on a
+competition round's market: no seat, or the round has not funded your account
+yet), or this machine's clock is hours ahead; the message says what to do. A
+bad per-order `max_slippage_bps=` / `leg_max_slippage_bps=` / `ttl_ms=` is a
+local `LoafValidationError` (status_code 0).
 
 ## Rate limits & retries
 

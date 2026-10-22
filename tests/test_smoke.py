@@ -301,23 +301,32 @@ def test_candles_params_and_no_auth():
 @pytest.mark.parametrize(
     "call, path",
     [
-        (lambda c: c.market.property("OPRA"), "/api/trade/OPRA"),
-        (lambda c: c.market.info_header("OPRA"), "/api/info/OPRA/header"),
-        (lambda c: c.market.info_overview("OPRA"), "/api/info/OPRA/overview"),
-        (lambda c: c.market.info_documents("OPRA"), "/api/info/OPRA/documents"),
-        (lambda c: c.offerings.get("OPRA"), "/api/offerings/OPRA"),
+        (lambda c, t: c.market.property(t), "/api/trade/OPRA"),
+        (lambda c, t: c.market.candles(t, "1h"), "/api/trade/OPRA/candles"),
+        (lambda c, t: list(c.market.iter_candles(t, "1h")), "/api/trade/OPRA/candles"),
+        (lambda c, t: c.market.info_header(t), "/api/info/OPRA/header"),
+        (lambda c, t: c.market.info_overview(t), "/api/info/OPRA/overview"),
+        (lambda c, t: c.market.info_documents(t), "/api/info/OPRA/documents"),
+        (lambda c, t: c.offerings.get(t), "/api/offerings/OPRA"),
     ],
 )
-def test_property_routes_take_the_ticker(call, path):
-    seen = {}
+def test_property_routes_take_only_a_ticker(call, path):
+    sent = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["auth"] = request.headers.get("authorization")
+        sent.append((request.url.path, request.headers.get("authorization")))
         return httpx.Response(200, json={})
 
-    call(make_client(handler))
-    assert seen == {"path": path, "auth": None}  # sent as given, and public
+    client = make_client(handler)
+    call(client, "OPRA")
+    assert sent == [(path, None)]  # sent as given, and public
+    # Refused as orders refuse it, before anything is sent: "" or "OPRA#" would fetch another
+    # route, and a control character would raise an httpx error, not a LoafError.
+    for ticker in ("opra", "", "OPRA#", "../trade", "OPRA\n", None):
+        with pytest.raises(loaf.LoafValidationError) as info:
+            call(client, ticker)
+        assert info.value.status_code == 0
+    assert len(sent) == 1
 
 
 def test_candles_busy_503_retried_then_raises():
@@ -351,6 +360,34 @@ def test_iter_candles_pages_backwards():
     client = make_client(handler)
     times = [c.time for c in client.market.iter_candles("OPRA", "1m")]
     assert times == [160, 100, 40]  # newest -> oldest across pages
+
+
+@pytest.mark.parametrize(
+    "key, iterate",
+    [
+        ("orders", lambda c: c.history.iter_orders(page_size=2)),
+        ("trades", lambda c: c.history.iter_trades(page_size=2)),
+    ],
+    ids=["orders", "trades"],
+)
+def test_iter_history_follows_the_cursor(key, iterate):
+    pages = {
+        # First call: no cursor; then each page's nextCursor, until a page has none.
+        None: {key: [{"id": 3}, {"id": 2}], "nextCursor": "MTAwOjI"},
+        "MTAwOjI": {key: [{"id": 1}], "nextCursor": None},
+    }
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, dict(request.url.params)))
+        assert len(sent) <= len(pages), "paged past the last page"
+        return httpx.Response(200, json=pages[request.url.params.get("cursor")])
+
+    assert [row.id for row in iterate(make_client(handler))] == [3, 2, 1]
+    assert sent == [
+        (f"/api/history/{key}", {"pageSize": "2"}),
+        (f"/api/history/{key}", {"pageSize": "2", "cursor": "MTAwOjI"}),
+    ]
 
 
 def test_competition_endpoints():
@@ -456,6 +493,73 @@ def test_cancel_all_route_and_auth():
     assert (request.method, request.url.path) == ("POST", "/api/orders/cancel-all")
     assert request.headers.get("authorization") == "Bearer testkey"
     assert request.content == b""  # no body
+
+
+@pytest.mark.parametrize("order_id", [3.9, True, "7", 0, -1, None])
+@pytest.mark.parametrize(
+    "cancel",
+    [
+        lambda orders, order_id: orders.cancel(order_id),
+        lambda orders, order_id: orders.cancel_conditional(order_id),
+        lambda orders, order_id: orders.cancel_row({"id": order_id, "type": "LIMIT"}),
+    ],
+    ids=["cancel", "cancel_conditional", "cancel_row"],
+)
+def test_cancel_refuses_what_is_not_an_order_id(cancel, order_id):
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"success": True})
+
+    orders = make_client(handler).orders
+    # Never rounded or read from text: 3.9 or True would name another order.
+    with pytest.raises(loaf.LoafValidationError) as info:
+        cancel(orders, order_id)
+    assert info.value.status_code == 0
+    assert sent == []
+
+
+def test_a_signed_body_passed_as_an_order_id_stays_out_of_the_refusal():
+    orders = make_client(lambda request: httpx.Response(200)).orders
+    signed_body = {"l2OrderIndex": 4097, "l2SigS": "ab" * 40, "l2SigE": "cd" * 40}
+    for cancel in (orders.cancel, orders.cancel_conditional):
+        with pytest.raises(loaf.LoafValidationError) as info:
+            cancel(signed_body)  # type: ignore[arg-type]
+        # Anyone holding its signatures can place the order: the refusal only names its type.
+        assert str(info.value).endswith("(got dict)")
+
+
+@pytest.mark.parametrize(
+    "call", [lambda c: c.market.properties(), lambda c: c.orders.cancel(1)], ids=["GET", "POST"]
+)
+def test_a_2xx_that_is_not_json_is_a_server_error(call):
+    body = '{"properties": ['
+    client = make_client(
+        lambda request: httpx.Response(
+            200,
+            content=body.encode(),
+            headers={"content-type": "application/json", "x-request-id": "r1"},
+        )
+    )
+    with pytest.raises(loaf.LoafServerError) as info:
+        call(client)
+    assert (info.value.status_code, info.value.request_id, info.value.body) == (200, "r1", body)
+
+
+def test_an_undecodable_body_is_a_connection_error():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(
+            200, stream=httpx.ByteStream(b"this is not gzip"), headers={"content-encoding": "gzip"}
+        )
+
+    with pytest.raises(loaf.LoafConnectionError) as info:
+        make_client(handler, max_retries=1).market.properties()
+    assert isinstance(info.value.__cause__, httpx.DecodingError)
+    assert len(sent) == 2  # a read is sent again
 
 
 def test_version():

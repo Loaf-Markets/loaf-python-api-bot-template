@@ -6,7 +6,7 @@ Every error the API can return is mapped to a specific exception so a bot can
     LoafError                       (base — catch this to catch everything)
     ├── LoafConfigError             misconfiguration (e.g. missing API key or trading key, a trading
     │                               key not in force, a clock hours ahead)
-    ├── LoafConnectionError         network failure / timeout (no HTTP response)
+    ├── LoafConnectionError         network failure / timeout / a body that failed to decompress
     ├── OrderOutcomeUnknownError    a signed order may be live; the SDK could not confirm it
     └── LoafAPIError                the server returned an HTTP error
         ├── LoafAuthError                 401  bad/expired credentials, or an order's signature or key
@@ -58,8 +58,9 @@ def _rebuild_error(cls: type[LoafError], args: tuple) -> LoafError:
 class LoafConfigError(LoafError):
     """The client is misconfigured: no API key for an authed request, a missing
     or malformed API key or trading key, an invalid
-    ``LoafClient(max_slippage_bps=)`` / ``$LOAF_MAX_SLIPPAGE_BPS``, or
-    ``LOAF_WALLET_PRIVATE_KEY`` set in the bot's environment.
+    ``LoafClient(max_slippage_bps=)`` / ``$LOAF_MAX_SLIPPAGE_BPS`` or
+    ``websocket(reconnect_delay=)``, or ``LOAF_WALLET_PRIVATE_KEY`` set in the
+    bot's environment.
 
     From an order placement (nothing was placed):
 
@@ -78,7 +79,8 @@ class LoafConfigError(LoafError):
 
 
 class LoafConnectionError(LoafError):
-    """The request never received an HTTP response (network error / timeout)."""
+    """The request never received an HTTP response (network error / timeout), or
+    received one whose compressed body could not be decompressed."""
 
 
 class OrderOutcomeUnknownError(LoafError):
@@ -268,7 +270,11 @@ class LoafRateLimitError(LoafAPIError):
 
 
 class LoafServerError(LoafAPIError):
-    """5xx — the server failed to process the request."""
+    """5xx — the server failed to process the request.
+
+    Also raised with a 2xx ``status_code`` for an answer the SDK cannot use,
+    e.g. a body labelled JSON that is not JSON.
+    """
 
 
 class LoafServiceUnavailableError(LoafServerError):

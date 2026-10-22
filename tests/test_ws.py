@@ -1,5 +1,5 @@
-"""Offline unit tests for the WebSocket client: the API keys it refuses, channel helpers and
-frame dispatch.
+"""Offline unit tests for the WebSocket client: the API keys and reconnect delays it refuses,
+channel helpers and frame dispatch.
 
 Frames are fed straight to the dispatcher; the connection lifecycle against a
 real server is covered by test_ws_lifecycle.py.
@@ -7,6 +7,7 @@ real server is covered by test_ws_lifecycle.py.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from decimal import Decimal
 from typing import Any
@@ -72,6 +73,22 @@ def test_a_key_passed_as_bytes_is_left_in_no_frame():
         assert secret_locals(info.value, "ab" * 32) == []
 
 
+@pytest.mark.parametrize(
+    "delay", [0, -1.0, float("nan"), float("-inf"), Decimal("1"), "1", None, True]
+)
+def test_reconnect_delay_must_be_a_positive_number(delay: Any):
+    # On the loop thread, 0 or less (and NaN before Python 3.13) would reconnect without a
+    # pause, and a str, None or NaN from 3.13 would end the thread.
+    message = f"reconnect_delay must be a positive number of seconds, got {delay!r}"
+    for make in (
+        lambda: LoafWebSocketClient(ws_url="ws://test/ws", reconnect_delay=delay),
+        lambda: LoafClient().websocket(reconnect_delay=delay),
+    ):
+        with pytest.raises(LoafConfigError) as info:
+            make()
+        assert str(info.value) == message
+
+
 def test_channel_helpers():
     ws = _client()
     ws.subscribe_orderbook("OPRA")
@@ -87,6 +104,28 @@ def test_channel_helpers():
         "orderbook:OPRA", "trades:OPRA", "chart:OPRA", "markprice:OPRA", "volume:OPRA",
         "property:OPRA", "leaderboard", "competition", "portfolio",
     }
+
+
+def test_a_subscribe_as_the_loop_closes_is_left_to_the_next_connection(
+    recwarn: pytest.WarningsRecorder
+):
+    # The bot's thread can read the live connection just before the run ends and closes its
+    # loop: the send is dropped, with no error and no "never awaited" warning, and the channel
+    # set still changes, for the next connection to subscribe.
+    loop = asyncio.new_event_loop()
+
+    class Connection:
+        def send(self, frame: str) -> Any:
+            loop.close()  # the run ends between the reads and the send
+            return asyncio.sleep(0)
+
+    ws = _client()
+    ws.subscribe_orderbook("OPRA")
+    ws._loop, ws._ws = loop, Connection()
+    ws.subscribe_trades("OPRA")
+    ws.unsubscribe("orderbook:OPRA")
+    assert ws._channels == {"trades:OPRA"}
+    assert [str(w.message) for w in recwarn] == []
 
 
 def test_property_halt_dispatch():

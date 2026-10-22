@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import numbers
 import random
 import ssl
 import threading
@@ -150,6 +151,11 @@ class LoafWebSocketClient:
             httpx.create_ssl_context(verify=verify) if self.ws_url.startswith("wss://") else None
         )
         self.auto_reconnect = auto_reconnect
+        real = isinstance(reconnect_delay, numbers.Real) and not isinstance(reconnect_delay, bool)
+        if not real or not reconnect_delay > 0:  # NaN is not > 0
+            raise LoafConfigError(
+                f"reconnect_delay must be a positive number of seconds, got {reconnect_delay!r}"
+            )
         self.reconnect_delay = reconnect_delay
 
         self._handlers: dict[str, list[Handler]] = {}
@@ -570,7 +576,9 @@ class LoafWebSocketClient:
                 break
             if connected:
                 ceiling = min(self.reconnect_delay, _MAX_RECONNECT_DELAY)
-            await asyncio.sleep(random.uniform(0, ceiling))
+            # float(): a numpy float32 delay stays float32 through the draw, and from Python 3.10
+            # macOS's selector (kqueue) refuses it as a timeout, outside the try: this thread ends.
+            await asyncio.sleep(random.uniform(0, float(ceiling)))
             # Doubled, never computed as a power: 2.0 ** failures overflows after about 1,024
             # failures (hours offline), and an error here, outside the try, ends this thread.
             ceiling = min(ceiling * 2, _MAX_RECONNECT_DELAY)
@@ -641,7 +649,10 @@ class LoafWebSocketClient:
         if running is loop:
             loop.create_task(coro)
         else:
-            asyncio.run_coroutine_threadsafe(coro, loop)
+            try:
+                asyncio.run_coroutine_threadsafe(coro, loop)
+            except RuntimeError:  # the run closed its loop after the reads above
+                coro.close()  # unsent, without a "never awaited" warning
 
     @staticmethod
     def _frame(message_type: str, **fields: Any) -> str:
@@ -650,5 +661,9 @@ class LoafWebSocketClient:
         return json.dumps(payload)
 
     def __repr__(self) -> str:
-        state = "connected" if self._connected_event.is_set() else "idle"
-        return f"<LoafWebSocketClient {self.ws_url!r} {state} channels={len(self._channels)}>"
+        # getattr: crash reporters repr a client whose __init__ raised part-way.
+        ws_url = getattr(self, "ws_url", None)
+        connected = getattr(self, "_connected_event", None)
+        state = "connected" if connected is not None and connected.is_set() else "idle"
+        channels = len(getattr(self, "_channels", ()))
+        return f"<LoafWebSocketClient {ws_url!r} {state} channels={channels}>"

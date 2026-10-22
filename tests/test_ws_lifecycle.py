@@ -15,6 +15,7 @@ import json
 import socket
 import ssl
 import threading
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -356,6 +357,20 @@ def test_eleven_hundred_failed_connects_leave_the_thread_alive(ceilings: list[fl
         ws.stop()
     assert all(code is None for code, _ in log.events)
     assert max(ceilings) == 30.0
+
+
+def test_each_wait_is_drawn_below_a_float_ceiling(ceilings: list[float]):
+    # Whatever the delay's type: a numpy float32 stays float32 through the draw, and from Python
+    # 3.10 macOS's selector (kqueue) refuses it as a timeout, which ends the loop thread.
+    log = _Log()
+    ws = _client(_closed_port(), log, reconnect_delay=Fraction(1, 2))
+    ws.start()
+    try:
+        log.wait_for(lambda events: len(events) >= 3)
+    finally:
+        ws.stop()
+    assert ceilings[:3] == [0.5, 1.0, 2.0]
+    assert {type(ceiling) for ceiling in ceilings} == {float}
 
 
 class _TimesOut:

@@ -144,7 +144,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from .. import k1
-from .._l2 import _TICKER_RE, AccountState, L2State, Market, TradingKey, _is_int, market_of
+from .._l2 import AccountState, L2State, Market, TradingKey, _is_int, market_of
 from ..constants import (
     DEFAULT_ORDER_TTL_MS,
     ENV_API_KEY,
@@ -178,7 +178,7 @@ from ..money import (
     validate_quantity,
     validate_slippage_bps,
 )
-from .base import Resource
+from .base import Resource, _check_ticker
 
 if TYPE_CHECKING:
     from ..client import LoafClient
@@ -725,7 +725,8 @@ class OrdersResource(Resource):
           longer holds the order; the message can name its status
           (``Order can no longer be cancelled — it is FILLED.``);
         * :class:`~loaf.exceptions.LoafValidationError` (400) for an order
-          already known to be in a terminal status;
+          already known to be in a terminal status, or (``status_code`` 0,
+          nothing sent) for an ``order_id`` that is not a whole number from 1;
         * :class:`~loaf.exceptions.LoafForbiddenError` (403
           ``Not authorized to cancel this order``) for someone else's order;
         * :class:`~loaf.exceptions.LoafServiceUnavailableError` (503) when the
@@ -734,7 +735,7 @@ class OrdersResource(Resource):
         It works under a single-property halt and outside trading hours; only a
         platform-wide halt blocks it (:class:`~loaf.exceptions.TradingHaltedError`).
         """
-        return self._client.post("/orders/cancel", json={"orderId": int(order_id)})
+        return self._client.post("/orders/cancel", json={"orderId": _order_id(order_id)})
 
     def cancel_conditional(self, order_id: int) -> Any:
         """``POST /orders/conditional/cancel`` — cancel one PENDING / ARMED conditional.
@@ -745,7 +746,10 @@ class OrdersResource(Resource):
         like any unknown one. A terminal row raises
         :class:`~loaf.exceptions.LoafValidationError` (400), NOT the
         :class:`~loaf.exceptions.LoafConflictError` (409) :meth:`cancel` raises
-        for the same race — an idempotent cancel must catch both.
+        for the same race — an idempotent cancel must catch both. A
+        ``status_code`` 0 :class:`~loaf.exceptions.LoafValidationError` does not
+        mean a terminal row: the ``order_id`` is not a whole number from 1, so
+        nothing was sent and the order may still be live.
 
         This route is database-only, so unlike :meth:`cancel` and
         :meth:`cancel_all` it still works under a platform-wide halt. That makes
@@ -753,7 +757,9 @@ class OrdersResource(Resource):
         triggering is level-based, so a row whose mark sat through its trigger
         for the whole halt fires as soon as trading resumes.
         """
-        return self._client.post("/orders/conditional/cancel", json={"orderId": int(order_id)})
+        return self._client.post(
+            "/orders/conditional/cancel", json={"orderId": _order_id(order_id)}
+        )
 
     def cancel_row(self, order: Mapping[str, Any]) -> Any:
         """Cancel one ``openOrders`` / ``order_update`` row, whichever kind it is.
@@ -931,14 +937,6 @@ class OrdersResource(Resource):
             raise
 
 
-def _check_ticker(ticker: Any) -> None:
-    if not isinstance(ticker, str) or not _TICKER_RE.fullmatch(ticker):
-        raise _client_validation_error(
-            "ticker must be 1-4 uppercase letters or digits (a property's ticker, e.g. 'OPRA'), "
-            f"got {ticker!r}"
-        )
-
-
 def _ttl(ttl_ms: Any) -> int:
     """``ttl_ms=`` checked, or the default life when omitted."""
     if ttl_ms is None:
@@ -950,6 +948,19 @@ def _ttl(ttl_ms: Any) -> int:
             f"minute) to {MAX_ORDER_TTL_MS:,} (about 47.9 days) (got {ttl_ms!r})"
         )
     return int(ttl_ms)
+
+
+def _order_id(order_id: Any) -> int:
+    """``order_id`` checked: refused unless a whole number from 1, never rounded or read from
+    text (3.9 or ``True`` would name another order)."""
+    whole = isinstance(order_id, numbers.Integral) and not isinstance(order_id, bool)
+    if not whole or int(order_id) < 1:
+        # A mapping shows only its type: a signed body passed by mistake must stay out of logs.
+        shown = type(order_id).__name__ if isinstance(order_id, Mapping) else repr(order_id)
+        raise _client_validation_error(
+            f"order_id must be an order's id, a whole number from 1 (got {shown})"
+        )
+    return int(order_id)
 
 
 def _reference_from(detail: Any, ticker: str) -> Any:

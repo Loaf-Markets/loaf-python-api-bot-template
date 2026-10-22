@@ -627,12 +627,12 @@ def test_no_derived_key_is_in_force(helper, capsys, monkeypatch, candidates):
     assert candidates == [0, 1, 2, 3]
 
 
-def test_unexpected_failure_is_one_line(helper, capsys):
-    helper.queue(
-        "/trade",
-        httpx.Response(200, content=b"{", headers={"Content-Type": "application/json"}),
-    )
-    assert refused(capsys).startswith("Deriving your trading key failed (JSONDecodeError: ")
+def test_unexpected_failure_is_one_line(helper, capsys, monkeypatch):
+    def fail(wallet: str, **fields: Any) -> dict[str, Any]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("loaf.secret_key.l2_key_typed_data", fail)
+    assert refused(capsys) == "Deriving your trading key failed (RuntimeError: boom).\n"
 
 
 def test_interrupted(helper, capsys, monkeypatch):

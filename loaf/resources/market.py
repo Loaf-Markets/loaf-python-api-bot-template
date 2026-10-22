@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
-from .base import Resource
+from .base import Resource, _check_ticker
 
 
 class MarketResource(Resource):
@@ -49,9 +49,9 @@ class MarketResource(Resource):
         ``volume24h``, ``dailyReferencePrice``, ``liquidity``,
         ``competitionModeActive`` and market-hours metadata (real markets only:
         a competition round keeps no trading hours). ``ticker`` is 1-4 uppercase
-        letters or digits, sent exactly as given (``"opra"`` is a 400; pass
-        ``"OPRA"``). Candle history is NOT included — fetch it from the
-        dedicated :meth:`candles` endpoint.
+        letters or digits (``"OPRA"``, not ``"opra"``); every REST call that
+        takes one refuses anything else before sending. Candle history is NOT
+        included — fetch it from the dedicated :meth:`candles` endpoint.
 
         ``property.l2Market`` is ``{chainId, proxyAddress, l2ChainId,
         marketIndex, baseAssetId, quoteAssetId}``, the market every order on the
@@ -74,6 +74,7 @@ class MarketResource(Resource):
         keep it live with the ``property:{ticker}`` WebSocket channel
         (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_property_status`).
         """
+        _check_ticker(ticker)
         return self._client.get(f"/trade/{ticker}", auth=False)
 
     # -- Candles (chart history) -------------------------------------------- #
@@ -109,6 +110,7 @@ class MarketResource(Resource):
         ``Retry-After``) up to ``max_retries``, then raises
         :class:`~loaf.exceptions.LoafServiceUnavailableError`.
         """
+        _check_ticker(ticker)
         return self._client.get(
             f"/trade/{ticker}/candles",
             params={"resolution": str(resolution), "to": to, "countBack": count_back},
@@ -138,12 +140,15 @@ class MarketResource(Resource):
 
     def info_header(self, ticker: str) -> Any:
         """``GET /info/{ticker}/header`` — address, hero image, bed/bath/car, offering valuation."""
+        _check_ticker(ticker)
         return self._client.get(f"/info/{ticker}/header", auth=False)
 
     def info_overview(self, ticker: str) -> Any:
         """``GET /info/{ticker}/overview`` — description, media, metrics, amenities."""
+        _check_ticker(ticker)
         return self._client.get(f"/info/{ticker}/overview", auth=False)
 
     def info_documents(self, ticker: str) -> Any:
         """``GET /info/{ticker}/documents`` — public document list (title + URL)."""
+        _check_ticker(ticker)
         return self._client.get(f"/info/{ticker}/documents", auth=False)

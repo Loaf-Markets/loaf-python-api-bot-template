@@ -133,7 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except LoafError as exc:
         message = str(exc)
-    except Exception as exc:  # e.g. an unreadable .env, or an answer that is not JSON
+    except Exception as exc:  # e.g. an unreadable .env
         message = f"Deriving your trading key failed ({type(exc).__name__}: {exc})."
     except KeyboardInterrupt:
         message = "Interrupted."

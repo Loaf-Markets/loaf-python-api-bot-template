@@ -359,7 +359,7 @@ class LoafClient:
                     json=clean_json,
                     headers=headers,
                 )
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
+            except httpx.RequestError as exc:
                 if idempotent and attempt < self.max_retries:
                     self._sleep_backoff(attempt)
                     attempt += 1
@@ -369,7 +369,15 @@ class LoafClient:
             self._record_rate_limit(response)
 
             if response.is_success:
-                return self._parse_body(response)
+                try:
+                    return self._parse_body(response)
+                except ValueError as exc:  # labelled JSON but not JSON
+                    raise LoafServerError(
+                        f"{method} {path} answered a body that is not JSON",
+                        status_code=response.status_code,
+                        request_id=response.headers.get("x-request-id"),
+                        body=response.text,
+                    ) from exc
 
             # Error path — decide whether to retry. Only idempotent (read) requests
             # are retried here. Signed placements go through _send_signed, which

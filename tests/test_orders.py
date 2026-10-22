@@ -2486,6 +2486,14 @@ def test_half_built_objects_still_repr():
     client, key = selves(refused.value)
     assert repr(client) == f"<LoafClient base_url=None anonymous v{loaf.__version__}>"
     assert repr(key) == "TradingKey(public_key=None)"
+    with pytest.raises(loaf.LoafConfigError) as refused:
+        loaf.LoafWebSocketClient(ws_url="ws://test/ws", api_key="0x" + "ab" * 32)
+    (ws,) = selves(refused.value)
+    assert repr(ws) == "<LoafWebSocketClient None idle channels=0>"
+    with pytest.raises(loaf.LoafConfigError) as refused:
+        loaf.LoafWebSocketClient(ws_url="ws://test/ws", reconnect_delay=0)
+    (ws,) = selves(refused.value)
+    assert repr(ws) == "<LoafWebSocketClient 'ws://test/ws' idle channels=0>"
 
 
 def test_signing_failure_leaves_no_trace(exchange, trading_client, monkeypatch):

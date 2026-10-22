@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Resource
+from .base import Resource, _check_ticker
 
 
 class OfferingsResource(Resource):
@@ -28,4 +28,5 @@ class OfferingsResource(Resource):
         Includes pricing, ``feeBps`` (raw basis points), allocation stats,
         ``recentOrders`` and an ``ipoList`` selector.
         """
+        _check_ticker(ticker)
         return self._client.get(f"/offerings/{ticker}", auth=False)
