@@ -723,10 +723,12 @@ than a frame received since `on_connect`, so keep the frame's value over the
 read's. `bot.py` does both. `on_disconnect`
 gets `{code, reason}` after every ended attempt: 1012 with reason `resync`
 (pushes were lost) or `venue` (a competition round switched the ledger) means
-re-seed once `on_connect` fires again; `code` `None` means no connection was
-made (`reason` says why); several without an `on_connect` between them mean the
-feed is down. The client keeps retrying, waiting a random time below a ceiling
-that doubles up to 30 s. With `portfolio` subscribed, a connection whose API
+re-seed once `on_connect` fires again; 4001 with reason `revoked` or `expired`
+means the API key was revoked or has expired and will not authenticate again:
+create a new one; `code` `None` means no connection was made (`reason` says
+why); several without an `on_connect` between them mean the feed is down. The
+client keeps retrying, waiting a random time below a ceiling that doubles up to
+30 s. With `portfolio` subscribed, a connection whose API
 key the server does not accept is dropped and retried, with the reason
 `the server did not accept the API key`. The server also answers so when it
 cannot check the key at that moment, and a later attempt then gets through; if

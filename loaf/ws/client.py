@@ -348,7 +348,9 @@ class LoafWebSocketClient:
         handshake answered with an HTTP error), ``code`` is ``None`` and
         ``reason`` the error text. 1012 with reason ``resync`` (pushes were
         lost) or ``venue`` (the competition venue changed) means re-seed from
-        REST once :meth:`on_connect` fires again. Calls with no
+        REST once :meth:`on_connect` fires again. 4001 with reason ``revoked``
+        or ``expired`` means the API key was revoked or has expired and will
+        not authenticate again: create a new one. Calls with no
         :meth:`on_connect` between them mean the feed is down (the client keeps
         retrying with backoff).
 
