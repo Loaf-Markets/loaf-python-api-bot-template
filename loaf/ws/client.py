@@ -28,14 +28,14 @@ Channels (``"type:key"`` strings — market-data channels key by the property's
 Channel             Auth      What you receive
 ==================  ========  ===========================================
 orderbook:{ticker}  public    full bid/ask book snapshots, on change (no initial frame)
-trades:{ticker}     public    rolling recent-trades batches
+trades:{ticker}     public    every trade, at most one frame per 100 ms (the recent ones on subscribe)
 chart:{ticker}      public    OHLCV candle updates (note: singular "chart")
 markprice:{ticker}  public    canonical mark price (1s, on change)
 volume:{ticker}     public    rolling-24h traded volume (replaces ``volume24h``)
 property:{ticker}   public    halt / resume status for one property
 leaderboard         public    competition leaderboard (top entries) on change
 competition         public    round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT)
-portfolio           PRIVATE   your order transitions, fills and whole L2 balance book
+portfolio           PRIVATE   your order transitions, fills, queue places and whole L2 balance book
 ==================  ========  ===========================================
 
 Prices and quantities are human units (dollars / tokens); ``balances_update``
@@ -190,7 +190,17 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.ORDERBOOK_UPDATE, handler)
 
     def on_trades(self, handler: Handler | None = None) -> Any:
-        """Public recent-trades batches for a property (``trades_batch``)."""
+        """A property's public trades (``trades_batch``: ``{propertyId, trades}``,
+        each a :class:`~loaf.models.TradeTick`).
+
+        Every trade is pushed, in at most one frame per property every 100 ms:
+        each frame holds every trade printed since the previous one, newest
+        first. Right after the subscription (so on every connection, before
+        :meth:`on_connect`), one frame brings the property's recent trades, if
+        any, up to 20, once; after a reconnect it repeats trades you already
+        hold, so dedupe by ``tradeId``. For the trades missed while the feed
+        was down, see :meth:`loaf.resources.market.MarketResource.trades`.
+        """
         return self.on(WSMessageType.TRADES_BATCH, handler)
 
     def on_candle(self, handler: Handler | None = None) -> Any:
@@ -296,16 +306,46 @@ class LoafWebSocketClient:
     def on_trade(self, handler: Handler | None = None) -> Any:
         """Your own fills on the private portfolio channel (``trade_new``).
 
-        Exactly one frame per fill, final when it matches. ``trade.txHash`` is
-        the trade's content hash (``0x`` + 64 hex), not an on-chain transaction;
+        Exactly one frame per fill, final when it matches. ``trade.orderId`` is
+        your order the fill belongs to, and ``trade.role`` is ``"MAKER"`` (that
+        order rested) or ``"TAKER"`` (it aggressed). ``trade.txHash`` is the
+        trade's content hash (``0x`` + 64 hex), not an on-chain transaction;
         ``trade.proof`` is ``{"status": "PENDING"}``, or ``None`` with proofs
         off and for a competition round's trade; ``trade.fee`` is dollars to
-        0.001. A fill's burst is ``order_status``, ``trade_new``, then
-        ``balances_update``; several fills from one batch arrive back to back.
-        Delivery is at most once (no replay after a reconnect), so reconcile
-        with ``history.trades()``.
+        0.001. Each engine update's burst carries its ``order_status`` frames,
+        then its ``trade_new`` frames, then ``balances_update``; an update with
+        more than 200 statuses or trades comes as several such bursts,
+        ``balances_update`` in the last only. Match a fill to its order by
+        ``trade.orderId``, not by frame order. Delivery is at most once (no
+        replay after a reconnect), so reconcile with ``history.trades()``.
         """
         return self.on(WSMessageType.TRADE_NEW, handler)
+
+    def on_order_queue(self, handler: Handler | None = None) -> Any:
+        """Your resting orders' places in one property's book (``order_queue``:
+        ``{propertyId, orders}``).
+
+        ``orders`` lists your orders resting there, bids best first, then asks
+        best first, each ``{orderId, side, price, quantity, quantityAhead,
+        ordersAhead}`` (:class:`~loaf.models.OrderQueueEntry`): ``quantity`` is
+        its unfilled remainder, ``ordersAhead`` how many orders at its price
+        are ahead of it (time priority) and ``quantityAhead`` their unfilled
+        tokens. The frame is absolute for ``propertyId``: replace what you hold
+        for it, and an empty list means none of your orders rests there now.
+        Each time a connection newly subscribes ``portfolio`` with your API
+        key, as the client does on every connection (subscribing again while
+        subscribed sends nothing), one arrives for each property where you
+        have resting orders (before or after :meth:`on_connect` on a new
+        connection), then another whenever your entries there change. A
+        property where none rests sends nothing, and no REST read serves queue
+        places, so drop every list you hold in :meth:`on_disconnect` and,
+        after you :meth:`unsubscribe` ``portfolio``, at the
+        ``subscription_confirmed`` that answers it (frames sent before it can
+        still arrive; :meth:`on` ``"subscription_confirmed"`` gets it), not in
+        :meth:`on_connect`. It can arrive before the order's
+        :meth:`on_order_update`.
+        """
+        return self.on(WSMessageType.ORDER_QUEUE, handler)
 
     def on_lifetime_volume(self, handler: Handler | None = None) -> Any:
         """Your lifetime traded volume changed (``lifetime_volume_update``):
@@ -328,13 +368,17 @@ class LoafWebSocketClient:
         """Called once each time a connection goes live: the server has
         answered its auth and subscriptions.
 
-        A refused subscription arrives before it as an :meth:`on_error` frame.
+        A refused subscription arrives before it as an :meth:`on_error` frame,
+        and a ``trades`` subscription's recent trades too (:meth:`on_trades`).
         While ``portfolio`` is subscribed, a connection whose API key the
         server does not accept is dropped and retried (see
         :meth:`on_disconnect`). Nothing is replayed across a reconnect, so flag
         a re-seed here and do the REST reads from your own thread, as
         ``bot.py`` does: handlers run on the socket's thread, and a slow read
         inside one stalls the socket until the server's heartbeat drops it.
+        The private reads (``portfolio.component()`` and the ``history`` reads)
+        first wait, up to 2 s, until every change pushed before them is
+        readable.
         """
         return self.on(_ON_CONNECT, handler)
 
@@ -346,13 +390,27 @@ class LoafWebSocketClient:
         when it dropped without one) and ``reason`` its reason (``""`` if
         none). After an attempt that made no connection (refused, DNS, TLS, the
         handshake answered with an HTTP error), ``code`` is ``None`` and
-        ``reason`` the error text. 1012 with reason ``resync`` (pushes were
-        lost) or ``venue`` (the competition venue changed) means re-seed from
-        REST once :meth:`on_connect` fires again. 4001 with reason ``revoked``
-        or ``expired`` means the API key was revoked or has expired and will
-        not authenticate again: create a new one. Calls with no
-        :meth:`on_connect` between them mean the feed is down (the client keeps
-        retrying with backoff).
+        ``reason`` the error text. 1012 with reason ``resync`` (pushes may have
+        been lost; see below) or ``venue`` (the competition venue changed)
+        means re-seed from REST once :meth:`on_connect` fires again. 4001 with
+        reason ``revoked`` or ``expired`` means the API key was revoked or has
+        expired and will not authenticate again: create a new one. Calls with
+        no :meth:`on_connect` between them mean the feed is down (the client
+        keeps retrying with backoff). Drop every :meth:`on_order_queue` list
+        you hold here (and, after you :meth:`unsubscribe` ``portfolio``, at
+        the ``subscription_confirmed`` that answers it), not in
+        :meth:`on_connect`: the next connection sends them again, possibly
+        before :meth:`on_connect`.
+
+        The server sends ``resync`` after a loss on its side: its message bus
+        reconnected, it was overloaded and shed pushes, or the matching engine
+        dropped some or restarted without a clean shutdown (a clean restart
+        closes nothing). It closes every connection holding ``portfolio`` and,
+        about 2 s after the last bus reconnect or engine-side loss, every one
+        holding the ``trades`` channel of a property that traded since or whose
+        recent trades the server had missed: each at most once every 30 s, and
+        a connection holding both only once. An API-key connection can also
+        get ``resync`` so that its key is checked again.
 
         While ``portfolio`` is subscribed, the client closes a connection whose
         API key the server does not accept, with ``code`` 1006 and ``reason``

@@ -34,10 +34,16 @@ def main() -> None:
         ask = msg.asks[0] if msg.get("asks") else None
         print(f"BOOK  bid={bid.price if bid else '-':<10} ask={ask.price if ask else '-'}")
 
+    last_trade_id = 0
+
     @ws.on_trades
     def on_trades(msg):
-        for t in (msg.get("trades") or [])[:1]:  # newest
-            print(f"TRADE {t.aggressorSide} {t.quantity} @ {t.price}")
+        nonlocal last_trade_id
+        # Newest first; each (re)subscription brings the recent trades again: skip those printed.
+        for t in reversed(msg.get("trades") or []):
+            if t.tradeId > last_trade_id:
+                last_trade_id = t.tradeId
+                print(f"TRADE {t.aggressorSide} {t.quantity} @ {t.price}")
 
     @ws.on_mark_price
     def on_mark(msg):

@@ -59,7 +59,8 @@ class L2Market(TypedDict):
 
 
 class TradeTick(TypedDict, total=False):
-    """A public trade: the detail's ``recentTrades`` (newest first) or a ``trades_batch`` frame."""
+    """A public trade: the detail's ``recentTrades`` or a ``trades_batch`` frame (newest first),
+    or a ``market.trades`` row (oldest first)."""
 
     tradeId: int
     propertyId: int
@@ -133,6 +134,18 @@ class OrderHistoryItem(TypedDict, total=False):
     triggeredAt: Optional[int]  # conditional only; unix seconds
 
 
+class OrderQueueEntry(TypedDict):
+    """One of your resting orders in an ``order_queue`` frame and its place in its price
+    level's queue (time priority)."""
+
+    orderId: int
+    side: str  # OrderSide
+    price: float  # dollars
+    quantity: float  # tokens: its unfilled quantity in the book
+    quantityAhead: float  # tokens: the unfilled quantity of the level's orders ahead of it
+    ordersAhead: int  # how many of the level's orders are ahead of it
+
+
 class TradeProofStatus(TypedDict, total=False):
     """A trade's ``proof``: ``{"status": "PENDING"}`` until a proven batch includes
     the trade, then ``IN_BATCH`` with the other fields."""
@@ -148,10 +161,12 @@ class TradeProofStatus(TypedDict, total=False):
 
 class TradeHistoryItem(TypedDict, total=False):
     tradeId: int
+    orderId: int  # this user's order the fill belongs to
     propertyId: int
     ticker: str
     txHash: str  # the trade's content hash (0x + 64 hex), not an on-chain transaction
     side: str  # OrderSide, relative to this user
+    role: str  # "MAKER" | "TAKER": the resting order is the MAKER, the aggressor's the TAKER
     quantity: float
     price: float
     fee: float  # this user's fee, dollars, to 0.001
@@ -301,6 +316,7 @@ __all__ = [
     "OrderAck",
     "CancelAllResult",
     "OrderHistoryItem",
+    "OrderQueueEntry",
     "TradeProofStatus",
     "TradeHistoryItem",
     "L2AssetBalance",

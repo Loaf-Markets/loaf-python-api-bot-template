@@ -1,8 +1,9 @@
 """Offline lifecycle tests for the WebSocket client against a real local server.
 
 ``_Server`` answers like the exchange's: it greets, answers ``auth``, confirms
-subscriptions (refusing ``portfolio`` without an accepted auth) and echoes any
-other frame, then runs the connection's scripted action. Backoff waits come from
+subscriptions (refusing ``portfolio`` without an accepted auth, and following a
+new ``trades:`` one with its recent trades) and echoes any other frame, then
+runs the connection's scripted action. Backoff waits come from
 a stand-in for ``loaf.ws.client.random`` that returns 0, so nothing really
 sleeps. Also guards the bug where stop() raised "Event loop is closed" after a
 successful connection.
@@ -39,6 +40,10 @@ async def _close_venue(ws: Any) -> None:
     await ws.close(1012, "venue")
 
 
+async def _close_resync(ws: Any) -> None:
+    await ws.close(1012, "resync")
+
+
 async def _go_away(ws: Any) -> None:
     await ws.close(1001, "going away")
 
@@ -50,12 +55,20 @@ async def _drop(ws: Any) -> None:
 class _Server:
     """A local Loaf-like WS server. ``actions`` run one per connection, in order,
     after the echo of the connection's first ping; later connections just idle.
-    It refuses the first ``refusals`` auth frames (``auth_result`` false)."""
+    It refuses the first ``refusals`` auth frames (``auth_result`` false), and
+    answers a new ``trades:`` subscription with ``recent_trades`` (when any)."""
 
-    def __init__(self, *actions: Action, refusals: int = 0, port: int = 0) -> None:
+    def __init__(
+        self,
+        *actions: Action,
+        refusals: int = 0,
+        port: int = 0,
+        recent_trades: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.actions = list(actions)
         self.refusals = refusals
         self.port = port
+        self.recent_trades = recent_trades or []
         self.received: list[list[dict[str, Any]]] = []  # the client's frames, per connection
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -114,6 +127,11 @@ class _Server:
                     if added:
                         channels += added
                         await self._send(ws, type="subscription_confirmed", channels=channels)
+                    for channel in added:
+                        if channel.startswith("trades:") and self.recent_trades:
+                            await self._send(
+                                ws, type="trades_batch", propertyId=1, trades=self.recent_trades
+                            )
                 else:
                     await self._send(ws, type="echo", data=frame)
                     if action is not None:
@@ -243,6 +261,24 @@ def test_a_1012_close_reconnects_and_resubscribes(ceilings: list[float]):
                   for frames in server.received]
     assert subscribes == [[["portfolio"]], [["portfolio"]]]
     assert ceilings == [1.0]
+
+
+def test_a_trades_subscription_brings_its_recent_trades_before_on_connect():
+    # The server follows a new trades subscription with the recent trades, newest first, before
+    # it reads the ping: they reach on_trades ahead of on_connect, again on every connection.
+    recent = [{"tradeId": 9, "price": 101.0}, {"tradeId": 7, "price": 100.5}]
+    server = _Server(_close_resync, recent_trades=recent).start()
+    log = _Log()
+    ws = _client(server.port, log)
+    ws.on_trades(lambda m: log.add([t.tradeId for t in m.trades]))
+    ws.subscribe_trades("OPRA")
+    ws.start()
+    try:
+        log.wait_for(lambda events: events.count("on_connect") == 2)
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events == [[9, 7], "on_connect", (1012, "resync"), [9, 7], "on_connect"]
 
 
 def test_subscribe_and_unsubscribe_from_another_thread_while_connected():

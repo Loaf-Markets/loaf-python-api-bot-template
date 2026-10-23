@@ -143,12 +143,26 @@ def test_trade_new_dispatch():
     # A fill is final when it matches: its txHash is the trade's content hash from the start.
     tx_hash = "0x" + "3f" * 32
     ws._dispatch(_frame(type="trade_new", trade={
-        "tradeId": 1, "propertyId": 1, "ticker": "OPRA", "txHash": tx_hash, "side": "BUY",
-        "quantity": 1, "price": 100, "executedAt": 0, "fee": 0.173, "proof": {"status": "PENDING"},
+        "tradeId": 1, "orderId": 991, "propertyId": 1, "ticker": "OPRA", "txHash": tx_hash,
+        "side": "BUY", "role": "TAKER", "quantity": 1, "price": 100, "executedAt": 0,
+        "fee": 0.173, "proof": {"status": "PENDING"},
     }))
     trade = seen[0].trade
     assert (trade.tradeId, trade.txHash, trade.fee) == (1, tx_hash, 0.173)
+    assert (trade.orderId, trade.role) == (991, "TAKER")  # the user's own order, which aggressed
     assert trade.proof == {"status": "PENDING"}
+
+
+def test_order_queue_dispatch():
+    ws = _client()
+    seen = []
+    ws.on_order_queue(seen.append)
+    entry = {"orderId": 991, "side": "BUY", "price": 159.5, "quantity": 4,
+             "quantityAhead": 12.5, "ordersAhead": 3}
+    ws._dispatch(_frame(type="order_queue", propertyId=1, orders=[entry]))
+    ws._dispatch(_frame(type="order_queue", propertyId=1, orders=[]))  # none rests there now
+    assert [(m.propertyId, m.orders) for m in seen] == [(1, [entry]), (1, [])]
+    assert (seen[0].orders[0].quantityAhead, seen[0].orders[0].ordersAhead) == (12.5, 3)
 
 
 def test_round_update_reaches_on_round_update():

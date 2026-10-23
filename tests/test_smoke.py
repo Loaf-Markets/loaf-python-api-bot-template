@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 import loaf
-from loaf import LoafClient
+from loaf import LoafClient, models
 from loaf._object import LoafObject, parse
 from loaf.exceptions import error_from_response
 from loaf.money import bps_to_fraction, fraction_to_bps
@@ -175,6 +175,20 @@ def test_is_conditional_order():
     assert loaf.is_conditional_order({}) is False
 
 
+def test_models_list_every_shape():
+    # __all__ names every TypedDict the module defines.
+    shapes = {
+        name for name, value in vars(models).items()
+        if isinstance(value, type) and issubclass(value, dict)
+        and value.__module__ == models.__name__
+    }
+    assert set(models.__all__) == shapes
+    assert models.OrderQueueEntry.__required_keys__ == {
+        "orderId", "side", "price", "quantity", "quantityAhead", "ordersAhead"
+    }
+    assert {"orderId", "role"} <= models.TradeHistoryItem.__optional_keys__
+
+
 # --------------------------------------------------------------------------- #
 # Client behaviour
 # --------------------------------------------------------------------------- #
@@ -298,12 +312,32 @@ def test_candles_params_and_no_auth():
     assert seen["params"] == {"resolution": "1d", "to": "1700000000"}
 
 
+def test_trades_params_and_no_auth():
+    sent = []
+    tape = [{"tradeId": 41, "price": 160.5}, {"tradeId": 44, "price": 161}]  # oldest first
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(
+            (request.url.path, dict(request.url.params), request.headers.get("authorization"))
+        )
+        return httpx.Response(200, json={"trades": tape})
+
+    client = make_client(handler)
+    assert [t.tradeId for t in client.market.trades("OPRA").trades] == [41, 44]
+    client.market.trades("OPRA", after_trade_id=44, limit=1000)  # the next page
+    assert sent == [
+        ("/api/trade/OPRA/trades", {"afterTradeId": "0", "limit": "100"}, None),  # the defaults
+        ("/api/trade/OPRA/trades", {"afterTradeId": "44", "limit": "1000"}, None),
+    ]
+
+
 @pytest.mark.parametrize(
     "call, path",
     [
         (lambda c, t: c.market.property(t), "/api/trade/OPRA"),
         (lambda c, t: c.market.candles(t, "1h"), "/api/trade/OPRA/candles"),
         (lambda c, t: list(c.market.iter_candles(t, "1h")), "/api/trade/OPRA/candles"),
+        (lambda c, t: c.market.trades(t), "/api/trade/OPRA/trades"),
         (lambda c, t: c.market.info_header(t), "/api/info/OPRA/header"),
         (lambda c, t: c.market.info_overview(t), "/api/info/OPRA/overview"),
         (lambda c, t: c.market.info_documents(t), "/api/info/OPRA/documents"),

@@ -1,4 +1,4 @@
-"""Public market data: properties, candles, info pages.
+"""Public market data: properties, candles, trades, info pages.
 
 None of these require authentication — they work with an anonymous client.
 All currency values are plain dollars and quantities plain tokens (see
@@ -135,6 +135,33 @@ class MarketResource(Resource):
             if not page.get("hasMore") or page.get("oldestTs") is None:
                 return
             to = page["oldestTs"]
+
+    # -- Trades (the tape's backfill) -------------------------------------- #
+
+    def trades(self, ticker: str, *, after_trade_id: int = 0, limit: int = 100) -> Any:
+        """``GET /trade/{ticker}/trades`` — the property's trades after
+        ``after_trade_id``, oldest first: what the ``trades:{ticker}`` channel
+        pushed, to fill a gap in it.
+
+        Returns ``{"trades": [...]}``: at most ``limit`` (1-1000) trades whose
+        ``tradeId`` is above ``after_trade_id`` (0: from the first), each
+        ``{tradeId, propertyId, txHash, aggressorSide, price, quantity,
+        timestamp}`` as the channel pushes it. While a page comes back full,
+        pass its last ``tradeId`` as ``after_trade_id`` for the next; stop at
+        an empty or short page, or one whose last ``tradeId`` is not above the
+        ``after_trade_id`` you sent.
+
+        Rows trail the live push by up to 2 s, so after a reconnect read from
+        the newest ``tradeId`` you hold 2 s or more after
+        :meth:`~loaf.ws.client.LoafWebSocketClient.on_connect` fires, and merge
+        them with the frames by ``tradeId``.
+        """
+        _check_ticker(ticker)
+        return self._client.get(
+            f"/trade/{ticker}/trades",
+            params={"afterTradeId": after_trade_id, "limit": limit},
+            auth=False,
+        )
 
     # -- Info pages -------------------------------------------------------- #
 

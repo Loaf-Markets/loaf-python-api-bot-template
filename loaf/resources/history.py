@@ -60,8 +60,10 @@ class HistoryResource(Resource):
     ) -> Any:
         """``GET /history/trades`` — paginated executed-trade history, newest first.
 
-        Returns ``{trades, total, page, pageSize, nextCursor}``. ``side`` and
-        ``fee`` (dollars, to 0.001) are reported from this user's perspective.
+        Returns ``{trades, total, page, pageSize, nextCursor}``. ``side``,
+        ``fee`` (dollars, to 0.001), ``orderId`` (your order the fill belongs
+        to) and ``role`` (``"MAKER"`` or ``"TAKER"``) are reported from this
+        user's perspective.
 
         Trades are final when they match. ``txHash`` is the trade's content
         hash (``0x`` + 64 hex, never ``""``), not an on-chain transaction.

@@ -129,6 +129,7 @@ class WSMessageType(_StrEnum):
     ORDER_STATUS = "order_status"
     ORDER_UPDATE = "order_update"
     TRADE_NEW = "trade_new"
+    ORDER_QUEUE = "order_queue"
     LIFETIME_VOLUME_UPDATE = "lifetime_volume_update"
 
 

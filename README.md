@@ -196,7 +196,7 @@ Create one `LoafClient` and reach everything through grouped resources:
 
 | Resource | What it covers |
 | --- | --- |
-| `loaf.market` | properties, property detail, candle history, info pages (all public) |
+| `loaf.market` | properties, property detail, candle history, trade backfill, info pages (all public) |
 | `loaf.offerings` | IPO offerings: list, detail |
 | `loaf.orders` | place (signed) / cancel / cancel-all orders, stop & take (conditional) orders |
 | `loaf.portfolio` | balances, positions, recent activity |
@@ -219,6 +219,7 @@ market.properties()                   GET    /trade
 market.property(ticker)               GET    /trade/{ticker}
 market.candles(ticker, resolution)    GET    /trade/{ticker}/candles
 market.iter_candles(ticker, res)      (auto-paginate candle history)
+market.trades(ticker)                 GET    /trade/{ticker}/trades
 market.info_header(ticker)            GET    /info/{ticker}/header
 market.info_overview(ticker)          GET    /info/{ticker}/overview
 market.info_documents(ticker)         GET    /info/{ticker}/documents
@@ -674,14 +675,14 @@ Channels:
 | Channel | Auth | Handler | Payload |
 | --- | --- | --- | --- |
 | `orderbook:{ticker}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (throttled); no initial frame — seed from `market.property(ticker).orderBook` |
-| `trades:{ticker}` | public | `on_trades` | rolling recent-trades batch |
+| `trades:{ticker}` | public | `on_trades` | every trade, in at most one frame every 100 ms holding every trade since the previous one, newest first; right after subscribing, the recent trades (up to 20) once, before `on_connect` — dedupe by `tradeId` |
 | `chart:{ticker}` | public | `on_candle` | OHLCV candle updates |
 | `markprice:{ticker}` | public | `on_mark_price` | canonical mark price (1s, on change) |
 | `volume:{ticker}` | public | `on_volume` | rolling-24h traded volume (replaces `volume24h`) |
 | `property:{ticker}` | public | `on_property_halt` | halt / resume status for that property |
 | `leaderboard` | public | `on_leaderboard` | competition leaderboard (top entries), on change |
 | `competition` | public | `on_round_update` | round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT); no initial frame — seed from `competition.info()` |
-| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_lifetime_volume` | your account deltas |
+| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_order_queue`, `on_lifetime_volume` | your account deltas, and your resting orders' places in their books |
 
 The private channel carries no id: the server resolves it from the account
 your API key authenticated as, so an anonymous connection is refused with an
@@ -693,11 +694,15 @@ your API key authenticated as, so an anonymous connection is refused with an
   symbol, decimals, isQuote, total, hold, available}`, the amounts in base
   units (`loaf.from_base_units`); the `isQuote` rows are your cash, and a
   property's row is its `property.l2Market.baseAssetId`.
-- Each fill arrives **once**, final when it matches: `order_status`, then
-  `trade_new`, then `balances_update`. There is no position frame: your
-  holdings are balances rows. `trade.txHash` is the trade's content hash, not an
-  on-chain transaction; `trade.proof` is `{"status": "PENDING"}`, or `None` (always
-  for a competition round's trade).
+- Each fill arrives **once**, final when it matches. Each engine update's burst
+  carries its `order_status` frames, then its `trade_new` frames, then
+  `balances_update`; an update with more than 200 statuses or trades comes as
+  several such bursts, `balances_update` in the last only. So match a fill to
+  its order by `trade.orderId`, not by frame order; `trade.role` is
+  `MAKER` (that order rested) or `TAKER` (it aggressed). There is no position
+  frame: your holdings are balances rows. `trade.txHash` is the trade's content
+  hash, not an on-chain transaction; `trade.proof` is `{"status": "PENDING"}`, or
+  `None` (always for a competition round's trade).
 - `order_update` carries the whole committed order, with its `expiryMs`. For an
   order that trades immediately it can arrive after the fill frames and already
   show FILLED. Stop and take orders (TP/SL legs included) ride the same frame,
@@ -710,6 +715,21 @@ your API key authenticated as, so an anonymous connection is refused with an
   no longer fund a fill within its hold, your own order crossing a resting one
   of yours (the resting one is cancelled), and a firing stop freeing funds by
   cancelling your resting orders on its side.
+- `order_queue` places your resting orders in one property's book:
+  `{propertyId, orders}`, bids best first, then asks, each `{orderId, side,
+  price, quantity, quantityAhead, ordersAhead}` (`ordersAhead`: how many orders
+  at its price are ahead of it in time priority; `quantityAhead`: their
+  unfilled tokens). It replaces what you hold for that property, and an empty
+  list means none of yours rests there. Each time a connection newly
+  subscribes `portfolio` with your API key, as the client does on every
+  connection (subscribing again while subscribed sends nothing), one arrives
+  for each property where you have resting orders (before or after
+  `on_connect` on a new connection), then one on every change; a property
+  where none rests sends nothing, and no REST read serves queue places, so
+  drop every list you hold in `on_disconnect` and, after you unsubscribe
+  `portfolio`, at the `subscription_confirmed` that answers it (frames sent
+  before it can still arrive; `ws.on("subscription_confirmed", handler)` gets
+  it), not in `on_connect`. It can arrive before the order's `order_update`.
 - Delivery is at most once, so after a reconnect reconcile from
   `loaf.portfolio.component()` / `loaf.history.trades()`. To value positions
   live, combine your balances with the `markprice` channel (the server does not
@@ -720,10 +740,15 @@ the subscriptions. Nothing is replayed across a reconnect, so flag a re-seed in
 `on_connect` and do the REST reads from your own thread: handlers run on the
 socket's thread, and a slow read there stalls it. A public read can be older
 than a frame received since `on_connect`, so keep the frame's value over the
-read's. `bot.py` does both. `on_disconnect`
-gets `{code, reason}` after every ended attempt: 1012 with reason `resync`
-(pushes were lost) or `venue` (a competition round switched the ledger) means
-re-seed once `on_connect` fires again; 4001 with reason `revoked` or `expired`
+read's. `bot.py` does both. The private reads (`portfolio.component()` and the
+`history` reads) first wait, up to 2 s, until every change pushed before them
+is readable. The `order_queue` lists have no REST read: drop them in
+`on_disconnect` (and, after you unsubscribe `portfolio`, at the
+`subscription_confirmed` that answers it), and the next subscription (the
+client makes one on every connection while you stay subscribed) sends them
+again. `on_disconnect` gets `{code, reason}` after every ended attempt: 1012 with reason `resync`
+(pushes may have been lost, below) or `venue` (a competition round switched the
+ledger) means re-seed once `on_connect` fires again; 4001 with reason `revoked` or `expired`
 means the API key was revoked or has expired and will not authenticate again:
 create a new one; `code` `None` means no connection was made (`reason` says
 why); several without an `on_connect` between them mean the feed is down. The
@@ -733,6 +758,34 @@ key the server does not accept is dropped and retried, with the reason
 `the server did not accept the API key`. The server also answers so when it
 cannot check the key at that moment, and a later attempt then gets through; if
 it keeps repeating, the key has expired or been revoked.
+
+The server sends `resync` after a loss on its side: its message bus
+reconnected, it was overloaded and shed pushes, or the matching engine dropped
+some or restarted without a clean shutdown (a clean restart closes nothing). It
+closes every connection holding `portfolio` and, about 2 s after the last bus
+reconnect or engine-side loss, every one holding the `trades` channel of a
+property that traded since or whose recent trades the server had missed: each
+at most once every 30 s, and a connection holding both only once. An API-key
+connection can also get `resync` so that its key is checked again.
+
+**The tape across a reconnect.** A `trades` subscription brings only the
+recent trades, up to 20. For the trades missed while the feed was down, page
+`market.trades()` forward from the newest `tradeId` you hold, from your own
+thread. Its rows come oldest first and trail the live push by up to 2 s, so
+read it 2 s or more after `on_connect` and merge it with the frames by
+`tradeId`:
+
+```python
+after = newest_trade_id   # the newest tradeId you hold
+while True:
+    page = loaf.market.trades("MUS", after_trade_id=after, limit=1000).trades   # oldest first
+    if not page or page[-1].tradeId <= after:
+        break             # nothing past `after`
+    merge(page)           # by tradeId: the frames since on_connect may hold some of them
+    if len(page) < 1000:
+        break             # caught up
+    after = page[-1].tradeId
+```
 
 ---
 
