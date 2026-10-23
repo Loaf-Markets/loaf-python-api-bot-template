@@ -385,7 +385,7 @@ not resume a property that is individually halted; the frame accounts for that.
 - If the SDK still cannot tell whether an order was placed, it raises
   `OrderOutcomeUnknownError`. The order may be live, or may already have
   filled. Don't answer it with a brand-new order:
-  - **Still want it?** `loaf.orders.resubmit(e.signed_body)` more than a day
+  - **Still want it?** `loaf.orders.resubmit(e.signed_body)` more than 72 hours
     before its `l2ExpiryMs` (about a week, with the default order life): the
     answer is that same order if it landed; if not, it is placed now, at the
     price and quantity you signed then.
@@ -400,10 +400,10 @@ not resume a property that is individually halted; the frame accounts for that.
     go to `history.orders()` then.
   - **Across a round switch** do neither: compare positions and cash instead
     (see **Round switches** below).
-- Each order's expiry is signed from your machine's clock: a day's buffer plus
-  the order's life (`LOAF_L2_ORDER_TTL_MS`, 7 days by default). The exchange
-  refuses an order within a day of its expiry, so a clock running behind by
-  more than the order's life signs orders it refuses.
+- Each order's expiry is signed from your machine's clock: the engine's 72-hour
+  buffer plus the order's life (`LOAF_L2_ORDER_TTL_MS`, 7 days by default). The
+  exchange refuses an order within 72 hours of its expiry, so a clock running
+  behind by more than the order's life signs orders it refuses.
 - The client keeps the trading key only inside its signer and never logs it,
   and the SDK's own frames drop it once read. Prefer `$LOAF_L2_SECRET_KEY` over
   `l2_secret_key=`: the environment variable never appears in a call frame,

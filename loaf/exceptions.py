@@ -64,7 +64,7 @@ class OrderOutcomeUnknownError(LoafError):
     :meth:`~loaf.resources.orders.OrdersResource.resubmit` on anything but a
     200. The order may be live, and may already have filled, so never place the
     same intent afresh. While you still want it, re-send it with
-    ``orders.resubmit(error.signed_body)`` more than a day before its
+    ``orders.resubmit(error.signed_body)`` more than 72 hours before its
     ``l2ExpiryMs`` (the exchange refuses an order closer to its expiry).
     Otherwise look for it in ``history.orders()``.
     :meth:`~loaf.resources.orders.OrdersResource.resubmit` documents what each
@@ -90,7 +90,7 @@ class OrderOutcomeUnknownError(LoafError):
             f"Could not confirm whether order index {self.l2_order_index} of account "
             f"{self.l2_account_index} was placed after {attempts} attempt(s) (last error: "
             f"{last_error}). It may be live, and may already have filled: re-send it unchanged "
-            "with orders.resubmit(error.signed_body) more than a day before its l2ExpiryMs (the "
+            "with orders.resubmit(error.signed_body) more than 72 hours before its l2ExpiryMs (the "
             "same order if it landed; if not, it is placed now at the signed price), or look for "
             "it in history.orders(), which lists every status. openOrders shows only resting "
             "orders."

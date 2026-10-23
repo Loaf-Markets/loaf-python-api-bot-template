@@ -333,7 +333,8 @@ def test_config_from_env(exchange, trading_client, monkeypatch):
     trading_client(l2_config=config).orders.limit_buy("OPRA", 1, 100)
     (body,) = exchange.bodies("/orders")
     signed = (body["l2ChainId"], body["l2FeeRateCap"], body["l2ExpiryMs"])
-    assert signed == (CHAIN_ID, 5000, NOW + 86_400_000 + 60_000)
+    # The expiry is now + BUFFER (l2-settle-schema 0.27.0's L2_BUFFER_MS, 72 h) + the order's TTL.
+    assert signed == (CHAIN_ID, 5000, NOW + 259_200_000 + 60_000)
     assert_signed(body)
     # A client given no l2_config reads the environment when it makes its trader.
     monkeypatch.setenv("LOAF_L2_FEE_RATE_CAP", "5000")

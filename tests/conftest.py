@@ -31,7 +31,7 @@ PK0 = "0x" + _KAT_KEY["pk"]
 #: The trader's clock in these tests, read once so every order in a run signs the same expiry.
 NOW = int(time.time() * 1000)
 #: What an order signs at NOW: the engine's one-day buffer, then the default seven-day life.
-EXPIRY = NOW + 86_400_000 + 7 * 86_400_000
+EXPIRY = NOW + 259_200_000 + 7 * 86_400_000
 ACCOUNT = 42
 EPOCH = 3
 #: The L2 chain id the test market serves and its orders sign: the one K1's KAT vectors and viem's

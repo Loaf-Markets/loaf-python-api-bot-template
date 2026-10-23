@@ -588,9 +588,9 @@ class OrdersResource(Resource):
         status) then; an order that filled is not in ``openOrders``.
 
         Needs neither the trading key nor the API key. Refused locally once the
-        order is within a day of its ``l2ExpiryMs``: the exchange refuses an
-        order that close to its expiry, so it could neither place it nor
-        confirm a duplicate.
+        order is within the engine's BUFFER (72 hours) of its ``l2ExpiryMs``:
+        the exchange refuses an order that close to its expiry, so it could
+        neither place it nor confirm a duplicate.
         """
         if not isinstance(signed_body, Mapping) or not _is_signed_l2_body(signed_body):
             raise _client_validation_error(
@@ -599,8 +599,9 @@ class OrdersResource(Resource):
             )
         if time.time() * 1000 > signed_body["l2ExpiryMs"] - L2_BUFFER_MS:
             raise _client_validation_error(
-                "This order expires within a day, so the exchange would refuse it and could no "
-                "longer confirm a duplicate. Look for it in history.orders() instead "
+                "This order expires within 72 hours (the engine's BUFFER), so the exchange would "
+                "refuse it and could no longer confirm a duplicate. Look for it in "
+                "history.orders() instead "
                 "(openOrders shows only resting orders, not one that already filled)."
             )
         path = "/orders/conditional" if "triggerPrice" in signed_body else "/orders"

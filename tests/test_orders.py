@@ -904,9 +904,9 @@ def test_resubmit(exchange, trading_client):
         ({**body, "l2AccountIndex": True}, "needs a signed placement body"),
         ({**body, "l2ExpiryMs": float(body["l2ExpiryMs"])}, "needs a signed placement body"),
         (json.dumps(body), "needs a signed placement body"),
-        # The exchange refuses an order within a day of its expiry: it could not confirm it either.
-        ({**body, "l2ExpiryMs": now_ms + 23 * hour}, "expires within a day"),
-        ({**body, "l2ExpiryMs": now_ms - hour}, "expires within a day"),
+        # The exchange refuses an order within BUFFER (72 h) of its expiry: it could not confirm it either.
+        ({**body, "l2ExpiryMs": now_ms + 71 * hour}, "expires within 72 hours"),
+        ({**body, "l2ExpiryMs": now_ms - hour}, "expires within 72 hours"),
     ):
         with pytest.raises(loaf.LoafValidationError, match=message) as info:
             bare.orders.resubmit(bad)
@@ -914,7 +914,7 @@ def test_resubmit(exchange, trading_client):
     assert len(exchange.requests) == sent
 
     # A body signed days ago (e.g. saved across a restart) still goes out unchanged.
-    old = {**body, "l2ExpiryMs": now_ms + 25 * hour}
+    old = {**body, "l2ExpiryMs": now_ms + 73 * hour}
     bare.orders.resubmit(old)
     assert json.loads(exchange.posts("/orders")[-1]) == old
 

@@ -36,7 +36,8 @@ from .pricing import scale_price, scale_quantity
 from .signer import MAX_BATCH_ORDERS, L2Signer, batch_fields, default_signer, signed_fields
 
 # Shared-Types src/l2-constants.ts: the values the engine and the backend use.
-L2_BUFFER_MS = 86_400_000
+# BUFFER is 72 h since l2-settle-schema 0.27.0 (Shared-Types 2.0.73), 24 h before.
+L2_BUFFER_MS = 259_200_000
 L2_MAX_ORDER_LIFE_MS = 4_261_412_864
 L2_ORDER_LIFE_MARGIN_MS = 16_777_216
 #: The longest expiry less now an order signs: K1's longest order life less two windows, the
