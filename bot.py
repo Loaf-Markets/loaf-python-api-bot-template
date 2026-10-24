@@ -117,10 +117,6 @@ def preflight(client: LoafClient) -> None:
         print(f"  Max slippage: {bps} bps ({bps / 100:g}%) for MARKET orders, stops and TP/SL legs")
     else:
         print("  No LOAF_SECRET_KEY: watching only (placing orders needs it).")
-    print(
-        "  Note: during a competition round only the round's market trades, with a\n"
-        "        trading key of its own (README: Competition rounds)."
-    )
 
 
 def resolve_target(client: LoafClient) -> Any:
@@ -135,7 +131,7 @@ def resolve_target(client: LoafClient) -> Any:
             if prop.ticker == TARGET_TICKER:
                 return prop
         print(f"Ticker {TARGET_TICKER!r} not found; falling back to the first tradeable one.")
-    # Tradeable: LIVE with an L2 market (halts, trading hours and round seats still apply).
+    # Tradeable: LIVE with an L2 market (halts and trading hours still apply).
     return next(
         (p for p in listing if p.get("status") == "LIVE" and p.get("hasL2Market")), listing[0]
     )
@@ -209,12 +205,8 @@ class Strategy:
             print(f"  feed closed: {msg.code} {msg.reason}; reconnecting")
 
     def on_round(self, msg) -> None:
-        # Only report it: after a frame that switches the ledger (PREPARED, ENDING,
-        # or DRAFT after PREPARED) the server closes the portfolio socket with 1012
-        # "venue" shortly after, and on_connect then re-seeds; a REST read on the
-        # frame itself can still see the previous ledger.
-        print(f"  *** competition round {msg.roundNumber} {msg.status} "
-              f"(its market: {msg.arenaTicker})")
+        # Only report it: a round changes nothing about trading.
+        print(f"  *** competition round {msg.roundNumber} {msg.status}")
 
     def on_halt(self, msg) -> None:
         # `isHalted` is the effective state (this property's own flag OR a
@@ -324,9 +316,7 @@ class Strategy:
         #   self.client.orders.cancel_all()
         #
         # Wrap calls in try/except. Every loaf.LoafAPIError from a placement
-        # means it was not placed: loaf.VenueError (the current market mode
-        # does not take it), loaf.VenueSwitchingError (the mode is switching:
-        # try again next tick), loaf.TradingHaltedError (halted), and the rest.
+        # means it was not placed: loaf.TradingHaltedError (halted), and the rest.
         # On loaf.LoafConfigError from a placement, stop and alert: e.g. your
         # trading key is no longer in force (set the new one, README §2,
         # restart, and re-arm your stops).

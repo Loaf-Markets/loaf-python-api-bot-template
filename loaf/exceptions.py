@@ -11,17 +11,13 @@ Every error the API can return is mapped to a specific exception so a bot can
     └── LoafAPIError                the server returned an HTTP error
         ├── LoafAuthError                 401  bad/expired credentials, or an order's signature or key
         ├── LoafForbiddenError            403  generic forbidden
-        │   ├── TradingHaltedError        403  "…halted…", or 400 from the exchange's engine
-        │   └── VenueError                403  code NOT_TRADEABLE_IN_MODE /
-        │                                      COMPETITION_NOT_STARTED /
-        │                                      NOT_COMPETITION_PARTICIPANT (or local, status 0)
+        │   └── TradingHaltedError        403  "…halted…", or 400 from the exchange's engine
         ├── LoafValidationError           400  validation or order-rule refusal (or local, status 0)
         ├── LoafNotFoundError             404
         ├── LoafConflictError             409  (e.g. a cancel that lost the race, a prize already claimed)
         ├── LoafRateLimitError            429  (carries .retry_after seconds)
         └── LoafServerError               5xx  (503 -> LoafServiceUnavailableError)
             └── LoafServiceUnavailableError 503
-                └── VenueSwitchingError     503  code VENUE_SWITCHING (or local, status 0)
 """
 
 from __future__ import annotations
@@ -32,12 +28,6 @@ from typing import Any
 
 _PRE_RE = re.compile(r"<pre>(.*?)</pre>", re.IGNORECASE | re.DOTALL)
 
-# 403 codes of the market mode (a competition round's venue) that refuse an order.
-_VENUE_CODES = frozenset({
-    "NOT_TRADEABLE_IN_MODE",
-    "COMPETITION_NOT_STARTED",
-    "NOT_COMPETITION_PARTICIPANT",
-})
 # The exchange engine's own halts, which the API passes through as 400 with the engine's text.
 _ENGINE_HALTS = ("trading halted:", "L1_RECHECK_PENDING:", "E_L2_ORDERS_WITHOUT_JOURNAL:")
 
@@ -65,13 +55,12 @@ class LoafConfigError(LoafError):
     From an order placement (nothing was placed):
 
     * your trading key is not the one in force on the property's market (it was
-      reset in the web app, or it belongs to another market's vault): get the
-      key in force again (README §2), restart, and cancel and re-arm every stop
-      and take, because those signed with the old key stay ARMED and FAIL when
-      they fire;
+      reset in the web app, or it belongs to another vault): get the key in
+      force again (README §2), restart, and cancel and re-arm every stop and
+      take, because those signed with the old key stay ARMED and FAIL when they
+      fire;
     * trading is not enabled on your account, or you have no trading account
-      yet: act in the web app (deposit first). On a competition round's market
-      only the round's participants have one, which the round funds;
+      yet: act in the web app (deposit first);
     * this machine's clock is hours ahead of the exchange's: synchronize it.
 
     Act in the web app or fix the setup, then restart.
@@ -99,10 +88,8 @@ class OrderOutcomeUnknownError(LoafError):
 
     After an epoch move (a Reset trading key, or a cancel-all sent on chain)
     the exchange has cancelled any resting order of the old epoch, and refuses
-    the body. During a competition round the real markets' history is not
-    served and their re-sends are refused: wait for the round to end.
-    :meth:`~loaf.resources.orders.OrdersResource.resubmit` documents what each
-    answer means.
+    the body. :meth:`~loaf.resources.orders.OrdersResource.resubmit` documents
+    what each answer means.
 
     Deliberately NOT a :class:`LoafConnectionError`: code that re-places an
     order on a connection error must not catch this one.
@@ -143,7 +130,7 @@ class LoafAPIError(LoafError):
     Attributes:
         status_code: HTTP status code.
         message: Human-readable error message (the API's ``error`` field).
-        code: Machine-readable code when present (e.g. ``NOT_COMPETITION_PARTICIPANT``).
+        code: Machine-readable code when present.
         details: List of field-level messages on a 400 validation error.
         request_id: The ``X-Request-Id`` for support correlation, if any.
         body: The raw parsed response body.
@@ -218,26 +205,6 @@ class TradingHaltedError(LoafForbiddenError):
     """
 
 
-class VenueError(LoafForbiddenError):
-    """403 — the current market mode does not take this order. Nothing was placed.
-
-    ``code`` says why:
-
-    * ``NOT_TRADEABLE_IN_MODE``: during a competition round only the round's
-      market trades (real markets refuse), and a competition market trades only
-      during its round;
-    * ``COMPETITION_NOT_STARTED``: the round is PREPARED; its market opens when
-      it goes ACTIVE;
-    * ``NOT_COMPETITION_PARTICIPANT``: during a round only seat holders trade
-      it (check ``competition.queue_position().participant``). Without a seat
-      you have no trading account on the round's market, so an order there is
-      normally refused before anything is sent, with :class:`LoafConfigError`.
-
-    Also raised locally (``status_code=0``, code ``NOT_TRADEABLE_IN_MODE``) when
-    the property's detail already shows the mismatch, before anything is sent.
-    """
-
-
 class LoafValidationError(LoafAPIError):
     """400 — request validation failed. See :attr:`details` for field errors.
 
@@ -288,21 +255,6 @@ class LoafServiceUnavailableError(LoafServerError):
     """
 
 
-class VenueSwitchingError(LoafServiceUnavailableError):
-    """503 ``VENUE_SWITCHING`` — the market mode is switching (a competition
-    round starting or ending).
-
-    Nothing was placed, and the SDK does not re-send it. Place it again in a few
-    seconds if you still want it; the SDK refreshes what it cached.
-
-    Also raised locally (``status_code=0``, code ``VENUE_SWITCHING``) when the
-    market mode switched while an order was being prepared, or when your trading
-    account does not match your trading key within two minutes of the SDK
-    seeing the mode switch (a market-mode refusal from the exchange, or a read
-    answered in the other mode): the switch is still settling.
-    """
-
-
 def _client_validation_error(message: str, details: list[str] | None = None) -> LoafValidationError:
     """Build a validation error for input rejected locally (no HTTP round-trip)."""
     return LoafValidationError(message, status_code=0, details=details)
@@ -342,8 +294,6 @@ def error_from_response(
     if status_code == 401:
         return LoafAuthError(message, **kwargs)
     if status_code == 403:
-        if code in _VENUE_CODES:
-            return VenueError(message, **kwargs)
         # The halt rejection carries no machine code — match on the message.
         if "halted" in message.lower():
             return TradingHaltedError(message, **kwargs)
@@ -359,8 +309,6 @@ def error_from_response(
     if status_code == 429:
         return LoafRateLimitError(message, retry_after=retry_after, **kwargs)
     if status_code == 503:
-        if code == "VENUE_SWITCHING":
-            return VenueSwitchingError(message, **kwargs)
         return LoafServiceUnavailableError(message, **kwargs)
     if status_code >= 500:
         return LoafServerError(message, **kwargs)

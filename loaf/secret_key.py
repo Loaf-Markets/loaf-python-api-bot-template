@@ -2,11 +2,10 @@
 derived on this machine from your account wallet's private key, as the Loaf web
 app derives it.
 
-The web app's Show trading key gives the real markets' key without it; a
-competition round's market has a key of its own, which only this derives. Run
-it on a trusted machine, once trading is enabled on the market, with the
-``wallet`` extra installed (``pip install -e ".[wallet]"``). Give it the wallet
-key for this one command only (README §2)::
+The web app's Show trading key gives the same key without it. Run it on a
+trusted machine, once trading is enabled on the market, with the ``wallet``
+extra installed (``pip install -e ".[wallet]"``). Give it the wallet key for
+this one command only (README §2)::
 
     read -rs W && LOAF_WALLET_PRIVATE_KEY="$W" python -m loaf.secret_key; unset W
 
@@ -23,11 +22,9 @@ stdout stays empty. Exit status: 0 printed, 1 refused, 2 a usage error.
   ``.env`` found from the working directory up (run it from your bot's
   directory to use your bot's), and refuses one that holds the wallet key.
   ``$LOAF_SECRET_KEY`` is ignored.
-* A trading key serves one vault: ``--ticker``'s market's, else the one vault
-  the live L2 markets share. A competition round's market has its own, and a
-  Reset trading key in the web app replaces it: run this again for each (after
-  a reset, once the new key is active), and restart your bot with the new key.
-  During a round only the round's market's key can be derived.
+* A trading key serves one vault: ``--ticker``'s market's, else the first live
+  L2 market's. A Reset trading key in the web app replaces it: run this again
+  once the new key is active, and restart your bot with the new key.
 * The web app derives one key per key change your wallet made on the vault. The
   one in force is found by comparing each candidate with your account's key in
   ``GET /l2/keys``, so no chain RPC is needed.
@@ -122,8 +119,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--ticker",
         type=_ticker,
-        help="a property on the vault to derive the key for, e.g. MUS, or a competition round's "
-        "market (default: the one vault the live L2 markets share)",
+        help="a property on the vault to derive the key for, e.g. MUS (default: the first live "
+        "L2 market's)",
     )
     ticker = parser.parse_args(argv).ticker
     # Whatever stops it, stderr gets one line and never a traceback, which would carry the frames
@@ -142,7 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _print_trading_key(ticker: str | None) -> None:
-    """Print the key in force on ``ticker``'s vault (or the live markets' one vault).
+    """Print the key in force on ``ticker``'s vault (or the first live L2 market's).
 
     Raises:
         LoafError: why it cannot be derived or read (stderr gets its text).
@@ -271,10 +268,8 @@ def _load_dotenv(wallet_key: str | None) -> None:
 
 def _vault(client: LoafClient, ticker: str | None) -> tuple[str, Market]:
     """The market whose vault the key is for, and the ticker that names it: ``ticker``'s,
-    else the first live L2 market's, once every live L2 market is on that vault."""
+    else the first live L2 market's."""
     if ticker is not None:
-        # The venue check refuses a real market during a competition round, when its vault's
-        # account cannot be read.
         return ticker, market_of(client.get(f"/trade/{ticker}", auth=False), ticker)
     listing = client.get("/trade", auth=False)
     rows = listing.get("properties") if isinstance(listing, Mapping) else None
@@ -287,21 +282,16 @@ def _vault(client: LoafClient, ticker: str | None) -> tuple[str, Market]:
             "GET /trade lists no hasL2Market: this server does not run the exchange this SDK "
             f"trades on (check {ENV_BASE_URL})."
         )
-    tickers = [
+    tickers: list[str] = [
         row["ticker"] for row in rows if row.get("status") == "LIVE" and row["hasL2Market"] is True
     ]
-    markets = [market_of(client.get(f"/trade/{t}", auth=False), t) for t in tickers]
-    if not markets:
+    if not tickers:
         raise LoafConfigError(
             "No live market has an L2 market right now, so there is no vault to derive a key for "
             "(pass --ticker to name one)."
         )
-    if len({(m.chain_id, m.proxy_address.lower(), m.l2_chain_id) for m in markets}) > 1:
-        raise LoafConfigError(
-            "The live L2 markets name more than one vault: pass --ticker (one of: "
-            f"{', '.join(tickers)})."
-        )
-    return tickers[0], markets[0]
+    ticker = tickers[0]
+    return ticker, market_of(client.get(f"/trade/{ticker}", auth=False), ticker)
 
 
 class _Parser(argparse.ArgumentParser):

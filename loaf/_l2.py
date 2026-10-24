@@ -29,8 +29,6 @@ from .exceptions import (
     LoafError,
     LoafNotFoundError,
     LoafServerError,
-    VenueError,
-    VenueSwitchingError,
     _client_validation_error,
 )
 
@@ -39,7 +37,7 @@ if TYPE_CHECKING:
 
     from .client import LoafClient
 
-#: ``GET /l2/keys``'s 404 text while you have no trading account on the ledger it reads.
+#: ``GET /l2/keys``'s 404 text while you have no trading account.
 NO_ACCOUNT = "l2 account: no L2 account for this user"
 
 _SECRET_RE = re.compile(r"[0-9a-fA-F]{80}")
@@ -58,14 +56,6 @@ _MAX_ORDER_INDEX = 2**40 - 1
 _MAX_SAFE_INT = 2**53 - 1
 _KB_MODULUS = 2_130_706_433  # an L2 chain id is a KoalaBear element, below this prime
 
-# How long after the SDK last saw the market mode switch an account that contradicts the trading
-# key is taken for the switch still settling (seconds).
-_VENUE_SETTLE_S = 120.0
-
-_SWITCHED = (
-    "The market mode switched while this order was being prepared: nothing was placed; try again "
-    "in a few seconds."
-)
 _RESERVED_TOO_SOON = "l2 order_index: the account's last reservation is less than 1 s old"
 
 # Refusals that show a cached market or account stale (matched in prefixed leg forms too).
@@ -152,14 +142,9 @@ class Market(NamedTuple):
     base_asset_id: int
     quote_asset_id: int
 
-    @property
-    def vault(self) -> tuple[str, int]:
-        """``(proxy address lowercased, L2 chain id)``: the ledger the market settles on."""
-        return (self.proxy_address.lower(), self.l2_chain_id)
-
 
 class AccountState(NamedTuple):
-    """Your trading account on one vault: what every order on it signs."""
+    """Your trading account: what every order signs."""
 
     account_index: int
     epoch: int
@@ -185,32 +170,14 @@ def market_of(detail: Any, ticker: str) -> Market:
     """The market an order on ``ticker`` signs, from its ``GET /trade/{ticker}`` answer.
 
     Raises:
-        VenueError: the property does not trade in the current market mode (local,
-            code ``NOT_TRADEABLE_IN_MODE``).
         LoafConfigError: the server does not run the exchange this SDK trades on.
-        LoafValidationError: the property, a real one, has no L2 market right now (local).
+        LoafValidationError: the property has no L2 market right now (local).
         LoafServerError: the answer has no property, or an unusable ``l2Market``.
     """
     prop = detail.get("property") if isinstance(detail, Mapping) else None
     if not isinstance(prop, Mapping):
         raise LoafServerError(
             f"GET /trade/{ticker} answered no property", status_code=200, body=detail
-        )
-    # Your account and order numbers are read from the current market mode's ledger: read for a
-    # property that mode does not trade, they would name another vault's account. During a round
-    # only the round's own market has an l2Market: another competition property's is null.
-    mode = bool(detail.get("competitionModeActive"))
-    outside_its_round = mode and "l2Market" in prop and prop["l2Market"] is None
-    if bool(prop.get("isCompetition")) != mode or outside_its_round:
-        raise VenueError(
-            f"{ticker} is not tradeable in the current market mode: "
-            + (
-                "a competition round is on, and only its market trades"
-                if mode
-                else "it is a competition market, which trades only during its round"
-            ),
-            status_code=0,
-            code="NOT_TRADEABLE_IN_MODE",
         )
     if "l2Market" not in prop:
         raise LoafConfigError(
@@ -266,15 +233,14 @@ def parse_keys(answer: Any) -> tuple[int, int | None, str | None]:
 
 
 def read_account(client: LoafClient, ticker: str) -> tuple[int, int, str]:
-    """``GET /l2/keys`` — your trading account on the current market mode's ledger:
-    ``(account_index, epoch, journaled_key)``, once a trading key is in force on it.
+    """``GET /l2/keys`` — your trading account: ``(account_index, epoch,
+    journaled_key)``, once a trading key is in force on it.
 
     ``ticker`` names the market in the refusals.
 
     Raises:
-        LoafConfigError: you have no trading account there yet (on a competition
-            round's market: no seat, or the round has not funded it yet), or no
-            trading key is in force on it.
+        LoafConfigError: you have no trading account yet, or no trading key is in
+            force on it.
     """
     try:
         # No publicKey: the caller compares journaledKey with its own key itself.
@@ -283,10 +249,8 @@ def read_account(client: LoafClient, ticker: str) -> tuple[int, int, str]:
         if exc.message != NO_ACCOUNT:
             raise
         raise LoafConfigError(
-            f"You have no trading account on {ticker}'s market yet: on a real market, deposit in "
-            "the Loaf web app first; a competition round's market has accounts only for the "
-            "round's participants, which the round funds (check "
-            "loaf.competition.queue_position().participant; with a seat, wait for the funding)."
+            f"You have no trading account on {ticker}'s market yet: deposit in the Loaf web app "
+            "first."
         ) from exc
     account_index, epoch, journaled = parse_keys(answer)
     if epoch is None or journaled is None or journaled == _DISABLED_KEY:
@@ -294,22 +258,19 @@ def read_account(client: LoafClient, ticker: str) -> tuple[int, int, str]:
             f"Trading is not enabled on your account on {ticker}'s market (no trading key is in "
             f"force): open {ticker} on the Loaf web app's Trade page, enable trading there and "
             "wait for it to take effect, then set LOAF_SECRET_KEY to the key in force: the web "
-            "app's Show trading key (README §2), or on a competition round's market "
-            f"python -m loaf.secret_key --ticker {ticker} (README, Competition rounds)."
+            "app's Show trading key (README §2)."
         )
     return account_index, epoch, journaled
 
 
 class L2State:
     """What an orders resource keeps between placements: each ticker's market, your
-    account as read on one vault (a trading key is in force on one vault only), and
-    the block of order indices being handed out. In memory only, and refreshed only
-    when a refusal shows it stale.
+    account and the block of order indices being handed out. In memory only, and
+    refreshed only when a refusal shows it stale.
 
     One lock guards the account and the block, and is held across the account read
     and a reservation, so concurrent placements wait for and share the one in flight.
-    Signing and sending happen outside it, and so does noting a market-mode switch,
-    which an account read in flight must see.
+    Signing and sending happen outside it.
     """
 
     def __init__(self, client: LoafClient) -> None:
@@ -317,12 +278,9 @@ class L2State:
         self._lock = threading.Lock()
         # Each access is one atomic dict operation; losing a race costs one detail read.
         self._markets: dict[str, Market] = {}
-        self._vault: tuple[str, int] | None = None  # the vault _account was read on
         self._account: AccountState | None = None
         self._block: _Block | None = None
         self._last_count = 0
-        self._mode: bool | None = None  # competitionModeActive of the last property read
-        self._switch_seen_at = float("-inf")  # time.monotonic() the mode was last seen switching
 
     def market(self, ticker: str) -> Market | None:
         """``ticker``'s market as last read, if any."""
@@ -332,88 +290,39 @@ class L2State:
         """Keep ``ticker``'s market as just read."""
         self._markets[ticker] = market
 
-    def note_mode(self, detail: Any) -> None:
-        """Note the market mode a placement's ``GET /trade/{ticker}`` answer shows: one
-        other than the last read's is a switch, which opens the window of :meth:`account`."""
-        if not isinstance(detail, Mapping):
-            return
-        mode = bool(detail.get("competitionModeActive"))
-        # Not under the lock, which an account read in flight holds: it must count this switch.
-        # Reads racing here can at worst note one switch twice.
-        previous, self._mode = self._mode, mode
-        if previous is not None and mode != previous:
-            self._switch_seen_at = time.monotonic()
+    def account(self, public_key: str, ticker: str) -> AccountState:
+        """Your account: the one kept, else read with ``GET /l2/keys``.
 
-    def cached_account(self, market: Market) -> AccountState | None:
-        """The account read on ``market``'s vault, if one is kept (no I/O)."""
-        with self._lock:
-            return self._account if self._vault == market.vault else None
-
-    def account(self, market: Market, public_key: str, ticker: str) -> AccountState:
-        """Your account on ``market``'s vault: the one kept, else read with ``GET /l2/keys``.
-
-        Call it only right after a detail read of ``ticker`` whose venue check passed.
         Nothing is kept on a failure, so the next placement reads again.
 
         Raises:
             LoafConfigError: no trading account, trading not enabled, or ``public_key``
                 is not the trading key in force.
-            VenueSwitchingError: one of those within two minutes of the SDK seeing the
-                market mode switch (local, code ``VENUE_SWITCHING``).
         """
         with self._lock:
-            if self._vault == market.vault and self._account is not None:
-                return self._account
-            try:
+            if self._account is None:
                 account_index, epoch, journaled = read_account(self._client, ticker)
-                # The web app derives a distinct key per vault, so a match also proves the answer
-                # is this vault's account.
                 if journaled != public_key:
                     raise LoafConfigError(
                         f"LOAF_SECRET_KEY is not the trading key in force on {ticker}'s "
                         "market: it was reset in the web app, or this key belongs to another "
-                        "market's vault (a competition round's market has its own). Set "
-                        "LOAF_SECRET_KEY to the key in force (the web app's Show trading key; on "
-                        f"a round's market, python -m loaf.secret_key --ticker {ticker}) and "
-                        "restart; then cancel and re-arm your stops and takes, which stay "
-                        "ARMED but FAIL when they fire once the key changed."
+                        "vault. Set LOAF_SECRET_KEY to the key in force (the web app's Show "
+                        "trading key) and restart; then cancel and re-arm your stops and takes, "
+                        "which stay ARMED but FAIL when they fire once the key changed."
                     )
-            except LoafConfigError as exc:
-                # Around a round transition consecutive reads can land on different ledgers (the
-                # detail behind the venue check can be stale), so a contradiction then is no
-                # configuration mistake.
-                if time.monotonic() - self._switch_seen_at < _VENUE_SETTLE_S:
-                    raise VenueSwitchingError(
-                        "The market mode is switching (a competition round is starting or "
-                        f"ending), so your trading account on {ticker}'s market cannot be read "
-                        "reliably yet: nothing was placed; try again in a few seconds.",
-                        status_code=0,
-                        code="VENUE_SWITCHING",
-                    ) from exc
-                raise
-            if self._vault != market.vault:
-                self._vault, self._block = market.vault, None  # a block never serves another vault
-            self._account = AccountState(account_index, epoch)
+                self._account = AccountState(account_index, epoch)
             return self._account
 
-    def take(
-        self, market: Market, account: AccountState, span: int, ttl_ms: int
-    ) -> tuple[int, _Block, int]:
+    def take(self, account: AccountState, span: int, ttl_ms: int) -> tuple[int, _Block, int]:
         """``span`` consecutive order indices for an order (and its legs) that may rest
         ``ttl_ms``, reserving more when needed: ``(first, block, expiry_ms)``, where
         ``expiry_ms`` is its signed ``l2ExpiryMs``, from the placement's one clock reading.
 
         Raises:
-            VenueSwitchingError: ``market`` is not the vault the account was read on,
-                or the reservation was answered from another ledger (local, code
-                ``VENUE_SWITCHING``).
             LoafConfigError: even a fresh reservation cannot take that expiry: this
                 machine's clock is hours ahead.
         """
         with self._lock:
-            if self._vault != market.vault:
-                # Another thread read an account on another vault since this placement read its own.
-                raise VenueSwitchingError(_SWITCHED, status_code=0, code="VENUE_SWITCHING")
             # Read here, so waiting for the lock or a reservation never shortens the order's life.
             expiry_ms = time.time_ns() // 1_000_000 + L2_BUFFER_MS + ttl_ms
             block = self._block
@@ -462,17 +371,9 @@ class L2State:
         # Texts count on refusals only: the 503s for an unreadable account or an unchecked
         # signature carry the l2 prefixes too, and show nothing stale.
         message = error.message if error.status_code < 500 else ""
-        # The market mode's refusals, the exchange's or the SDK's own, at any status.
-        venue = isinstance(error, (VenueError, VenueSwitchingError))
-        context = venue or any(text in message for text in _CONTEXT_TEXTS)
+        context = any(text in message for text in _CONTEXT_TEXTS)
         if context:
             self._markets.pop(ticker, None)
-        # The exchange's market-mode refusals show a switch, noted before the lock as note_mode
-        # does. The SDK's own (status 0) do not: a local one repeats for as long as a mode lasts
-        # (note_mode sees the switch itself), so a real configuration error surfaces once the
-        # window has passed.
-        if venue and error.status_code:
-            self._switch_seen_at = time.monotonic()
         with self._lock:
             if context and self._account == account:  # by value: a fresh, different read survives
                 self._account = None
@@ -486,26 +387,20 @@ class L2State:
         # count grows from the first order's span, doubling up to L2_ORDER_INDEX_BLOCK.
         count = min(L2_ORDER_INDEX_BLOCK, max(span, 2 * self._last_count))
         try:
-            try:
-                answer = self._client._request("POST", "/l2/order-indices", json={"count": count})
-            except LoafAPIError as exc:
-                if _RESERVED_TOO_SOON not in exc.message:  # too soon after the last reservation
-                    raise
-                time.sleep(1.0)
-                answer = self._client._request("POST", "/l2/order-indices", json={"count": count})
-        except LoafNotFoundError as exc:
-            if exc.message != NO_ACCOUNT:
+            answer = self._client._request("POST", "/l2/order-indices", json={"count": count})
+        except LoafAPIError as exc:
+            if _RESERVED_TOO_SOON not in exc.message:  # too soon after the last reservation
                 raise
-            raise self._switched() from exc  # a ledger that holds no account of yours answered
+            time.sleep(1.0)
+            answer = self._client._request("POST", "/l2/order-indices", json={"count": count})
         values = answer if isinstance(answer, Mapping) else {}
         index = values.get("accountIndex")
         first = values.get("firstIndex")
         got = values.get("count")
         reserved_at = values.get("reservedAtMs")
-        if _is_int(index) and index != account.account_index:
-            raise self._switched()  # another account: another ledger answered
         if (
             _is_int(index)
+            and index == account.account_index
             and _whole(first, 1, _MAX_ORDER_INDEX)
             and _whole(got, 1, _MAX_ORDER_INDEX)
             and first + got - 1 <= _MAX_ORDER_INDEX
@@ -517,19 +412,14 @@ class L2State:
             self._block = _Block(first, first + got, latest)
             self._last_count = got
             return self._block
+        if _is_int(index) and index != account.account_index:
+            self._account = self._block = None  # another account's range: both are stale
         shown = dict(answer) if isinstance(answer, Mapping) else answer
         raise LoafServerError(
             f"POST /l2/order-indices answered a range no order can be signed in: {shown!r}",
             status_code=201,
             body=answer,
         )
-
-    def _switched(self) -> VenueSwitchingError:
-        """A reservation answered from another ledger than the account was read on:
-        the market mode switched in between (under the lock)."""
-        self._account = None  # read it again
-        self._switch_seen_at = time.monotonic()
-        return VenueSwitchingError(_SWITCHED, status_code=0, code="VENUE_SWITCHING")
 
 
 def _is_int(value: object) -> TypeGuard[int]:

@@ -235,21 +235,11 @@ class LoafWebSocketClient:
     def on_round_update(self, handler: Handler | None = None) -> Any:
         """A competition round changed status (``round_update``: ``{roundNumber,
         status, startsAt, endsAt, arenaTicker}``, times in unix seconds,
-        ``arenaTicker`` the round's market).
+        ``arenaTicker`` the round's headline asset, if any).
 
-        ``PREPARED`` and ``ENDING`` switch which ledger serves you, and so does
-        ``DRAFT`` when it aborts a PREPARED round (aborting a PENDING round,
-        which had no frame, switches nothing): only the round's market trades
-        while it is PREPARED or ACTIVE, with a trading key of its own (enable
-        trading on the round's market in the web app, then derive it: README
-        **Competition rounds**). Your real resting orders and stops are
-        cancelled shortly after ``PREPARED``, with no frame. Shortly after
-        this frame the server closes portfolio sockets with 1012 ``venue``: re-seed from REST when
-        :meth:`on_connect` fires after that close, not on this frame (REST
-        reads right after it can still show the previous ledger).
-        Delivery is best-effort: ``competition.info()`` catches you up (after a
-        reconnect, say), but keep a frame over a read made soon after it, which
-        can be stale.
+        A round changes nothing about trading. Delivery is best-effort:
+        ``competition.info()`` catches you up (after a reconnect, say), but keep
+        a frame over a read made soon after it, which can be stale.
         """
         return self.on(WSMessageType.ROUND_UPDATE, handler)
 
@@ -311,13 +301,13 @@ class LoafWebSocketClient:
         order rested) or ``"TAKER"`` (it aggressed). ``trade.txHash`` is the
         trade's content hash (``0x`` + 64 hex), not an on-chain transaction;
         ``trade.proof`` is ``{"status": "PENDING"}``, or ``None`` with proofs
-        off and for a competition round's trade; ``trade.fee`` is dollars to
-        0.001. Each engine update's burst carries its ``order_status`` frames,
-        then its ``trade_new`` frames, then ``balances_update``; an update with
-        more than 200 statuses or trades comes as several such bursts,
-        ``balances_update`` in the last only. Match a fill to its order by
-        ``trade.orderId``, not by frame order. Delivery is at most once (no
-        replay after a reconnect), so reconcile with ``history.trades()``.
+        off; ``trade.fee`` is dollars to 0.001. Each engine update's burst
+        carries its ``order_status`` frames, then its ``trade_new`` frames,
+        then ``balances_update``; an update with more than 200 statuses or
+        trades comes as several such bursts, ``balances_update`` in the last
+        only. Match a fill to its order by ``trade.orderId``, not by frame
+        order. Delivery is at most once (no replay after a reconnect), so
+        reconcile with ``history.trades()``.
         """
         return self.on(WSMessageType.TRADE_NEW, handler)
 
@@ -391,16 +381,15 @@ class LoafWebSocketClient:
         none). After an attempt that made no connection (refused, DNS, TLS, the
         handshake answered with an HTTP error), ``code`` is ``None`` and
         ``reason`` the error text. 1012 with reason ``resync`` (pushes may have
-        been lost; see below) or ``venue`` (the competition venue changed)
-        means re-seed from REST once :meth:`on_connect` fires again. 4001 with
-        reason ``revoked`` or ``expired`` means the API key was revoked or has
-        expired and will not authenticate again: create a new one. Calls with
-        no :meth:`on_connect` between them mean the feed is down (the client
-        keeps retrying with backoff). Drop every :meth:`on_order_queue` list
-        you hold here (and, after you :meth:`unsubscribe` ``portfolio``, at
-        the ``subscription_confirmed`` that answers it), not in
-        :meth:`on_connect`: the next connection sends them again, possibly
-        before :meth:`on_connect`.
+        been lost; see below) means re-seed from REST once :meth:`on_connect`
+        fires again. 4001 with reason ``revoked`` or ``expired`` means the API
+        key was revoked or has expired and will not authenticate again: create
+        a new one. Calls with no :meth:`on_connect` between them mean the feed
+        is down (the client keeps retrying with backoff). Drop every
+        :meth:`on_order_queue` list you hold here (and, after you
+        :meth:`unsubscribe` ``portfolio``, at the ``subscription_confirmed``
+        that answers it), not in :meth:`on_connect`: the next connection sends
+        them again, possibly before :meth:`on_connect`.
 
         The server sends ``resync`` after a loss on its side: its message bus
         reconnected, it was overloaded and shed pushes, or the matching engine
@@ -469,9 +458,8 @@ class LoafWebSocketClient:
 
     def subscribe_competition(self) -> LoafWebSocketClient:
         """Competition round transitions (no id — one global channel): a
-        ``round_update`` on each of PREPARED, ACTIVE, ENDING, ENDED and DRAFT
-        (none for PENDING). No frame arrives on subscribe: seed from
-        ``competition.info()``."""
+        ``round_update`` on each of PREPARED, ACTIVE, ENDING, ENDED and DRAFT.
+        No frame arrives on subscribe: seed from ``competition.info()``."""
         return self.subscribe("competition")
 
     def subscribe_portfolio(self) -> LoafWebSocketClient:

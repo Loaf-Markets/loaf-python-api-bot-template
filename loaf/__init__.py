@@ -55,8 +55,6 @@ from .exceptions import (
     LoafValidationError,
     OrderOutcomeUnknownError,
     TradingHaltedError,
-    VenueError,
-    VenueSwitchingError,
 )
 from .money import bps_to_fraction, fraction_to_bps, from_base_units, worst_price
 from .ws import LoafWebSocketClient
@@ -103,12 +101,10 @@ __all__ = [
     "LoafAuthError",
     "LoafForbiddenError",
     "TradingHaltedError",
-    "VenueError",
     "LoafValidationError",
     "LoafNotFoundError",
     "LoafConflictError",
     "LoafRateLimitError",
     "LoafServerError",
     "LoafServiceUnavailableError",
-    "VenueSwitchingError",
 ]

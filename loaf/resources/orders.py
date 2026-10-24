@@ -50,20 +50,10 @@ worst price x quantity x (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` /
 
 Order placement can be rejected with a 403 when:
 
-* the current market mode does not take it
-  (:class:`~loaf.exceptions.VenueError`, by ``code``): during a competition
-  round only the round's market trades (``NOT_TRADEABLE_IN_MODE``), it opens
-  when the round goes ACTIVE (``COMPETITION_NOT_STARTED``), and only seat
-  holders trade it (``NOT_COMPETITION_PARTICIPANT`` — check
-  ``loaf.competition.queue_position().participant``; without a seat you have no
-  trading account on its market, so an order there normally raises
-  :class:`~loaf.exceptions.LoafConfigError` before anything is sent); while the
-  mode is switching the answer is a 503
-  :class:`~loaf.exceptions.VenueSwitchingError` instead,
 * trading is halted platform-wide or for the property
   (:class:`~loaf.exceptions.TradingHaltedError`), or
 * the market is closed (:class:`~loaf.exceptions.LoafForbiddenError`,
-  ``Trading is currently closed``; real markets only).
+  ``Trading is currently closed``).
 
 Server-side checks reject an order the SDK cannot pre-validate for you (all 400,
 :class:`~loaf.exceptions.LoafValidationError`):
@@ -280,10 +270,6 @@ class OrdersResource(Resource):
                 revoked (cancels fail too): create a new one in the web app and
                 restart. Otherwise the exchange refused the order's signature or
                 key; the next order re-reads your account.
-            VenueError: the current market mode does not take this order.
-            VenueSwitchingError: the market mode is switching (the exchange's
-                answer, or the SDK's own while the switch settles): place it
-                again in a few seconds if you still want it.
             TradingHaltedError: trading is halted.
             LoafValidationError: refused locally (``status_code`` 0) or by the
                 exchange (400), including its ``l2 …`` texts.
@@ -654,13 +640,13 @@ class OrdersResource(Resource):
         If the first attempt landed, the answer is that same order as it is
         now (on ``/orders`` with ``duplicate: True``). A stop or take is
         answered with just the ``orderId`` of its row, whatever its status: a
-        re-send never re-arms one that was cancelled (as a competition round
-        does on the real markets), fired or FAILED. So read that row's
-        ``status`` in ``history.orders()`` before relying on it, and arm a new
-        one if it is ``CANCELLED`` or ``FAILED``. If the first attempt did not
-        land, the order is placed now, at the price and quantity signed then,
-        so resubmit only while you still want it. It cannot be placed twice:
-        the exchange admits one order per account and order number.
+        re-send never re-arms one that was cancelled, fired or FAILED. So read
+        that row's ``status`` in ``history.orders()`` before relying on it, and
+        arm a new one if it is ``CANCELLED`` or ``FAILED``. If the first
+        attempt did not land, the order is placed now, at the price and
+        quantity signed then, so resubmit only while you still want it. It
+        cannot be placed twice: the exchange admits one order per account and
+        order number.
 
         Anything but a 200 raises :class:`~loaf.exceptions.OrderOutcomeUnknownError`
         again, with the reason in ``last_error``: whatever this re-send ran
@@ -673,10 +659,7 @@ class OrdersResource(Resource):
 
         After an epoch move (a Reset trading key, or a cancel-all sent on chain)
         the exchange refuses it (``l2 epoch: …``) and has cancelled any resting
-        order of the old epoch. While a competition round is PREPARED or ACTIVE,
-        a real market's body is refused (``NOT_TRADEABLE_IN_MODE``, so
-        ``OrderOutcomeUnknownError`` again) and its history is not served: keep
-        the body and resubmit it after the round ends, while it can still rest.
+        order of the old epoch.
 
         Needs neither the trading key nor the API key. Once the order can no
         longer rest (its ``l2ExpiryMs`` minus 24 hours has passed) nothing is
@@ -869,20 +852,17 @@ class OrdersResource(Resource):
         first = 0
         try:
             market = l2.market(ticker)
-            account = None if market is None else l2.cached_account(market)
-            if market is None or account is None or not isinstance(price, Decimal):
-                # The account is read only right after a detail read of the order's ticker whose
-                # venue check passed; a MARKET order reads the detail for its reference anyway.
+            if market is None or not isinstance(price, Decimal):
+                # A MARKET order reads the detail for its reference anyway.
                 detail = self._client._request(
                     "GET", f"/trade/{ticker}", auth=False, before_order=True
                 )
-                l2.note_mode(detail)  # before the venue check: a refused read shows the mode too
                 market = market_of(detail, ticker)
                 l2.remember(ticker, market)
-                account = l2.account(market, key.public_key, ticker)
                 if not isinstance(price, Decimal):
                     price = price(_reference_from(detail, ticker))
-            first, block, expiry_ms = l2.take(market, account, span, ttl)
+            account = l2.account(key.public_key, ticker)
+            first, block, expiry_ms = l2.take(account, span, ttl)
 
             body: dict[str, Any] = {
                 "ticker": ticker,

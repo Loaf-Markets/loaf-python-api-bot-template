@@ -36,10 +36,6 @@ async def _push_book(ws: Any) -> None:
     }))
 
 
-async def _close_venue(ws: Any) -> None:
-    await ws.close(1012, "venue")
-
-
 async def _close_resync(ws: Any) -> None:
     await ws.close(1012, "resync")
 
@@ -246,7 +242,7 @@ def test_a_handler_that_raises_leaves_the_connection_up(caplog: pytest.LogCaptur
 
 
 def test_a_1012_close_reconnects_and_resubscribes(ceilings: list[float]):
-    server = _Server(_close_venue).start()
+    server = _Server(_close_resync).start()
     log = _Log()
     ws = _client(server.port, log, api_key="key")
     ws.subscribe_portfolio()
@@ -256,7 +252,7 @@ def test_a_1012_close_reconnects_and_resubscribes(ceilings: list[float]):
     finally:
         ws.stop()
         server.stop()
-    assert log.events == ["on_connect", (1012, "venue"), "on_connect"]
+    assert log.events == ["on_connect", (1012, "resync"), "on_connect"]
     subscribes = [[f["channels"] for f in frames if f["type"] == "subscribe"]
                   for frames in server.received]
     assert subscribes == [[["portfolio"]], [["portfolio"]]]
@@ -288,7 +284,7 @@ def test_subscribe_and_unsubscribe_from_another_thread_while_connected():
         async def close() -> None:
             while not any(f["type"] == "unsubscribe" for f in server.received[0]):
                 await asyncio.sleep(0.01)
-            await ws.close(1012, "venue")
+            await ws.close(1012, "resync")
 
         asyncio.ensure_future(close())  # meanwhile _handle goes on reading the client's frames
 
@@ -305,7 +301,7 @@ def test_subscribe_and_unsubscribe_from_another_thread_while_connected():
     finally:
         ws.stop()
         server.stop()
-    assert log.events == ["on_connect", (1012, "venue"), "on_connect"]
+    assert log.events == ["on_connect", (1012, "resync"), "on_connect"]
     assert [[(f["type"], f.get("channels")) for f in frames] for frames in server.received] == [
         [("subscribe", ["orderbook:OPRA"]), ("ping", None), ("subscribe", ["trades:OPRA"]),
          ("unsubscribe", ["orderbook:OPRA"])],
@@ -350,7 +346,7 @@ def test_backoff_doubles_to_30_s_and_resets_once_connected(
     server = None
     try:
         log.wait_for(lambda events: len(events) >= 8)
-        server = _Server(_close_venue, port=port).start()
+        server = _Server(_close_resync, port=port).start()
         log.wait_for(lambda events: events.count("on_connect") == 2)
     finally:
         ws.stop()
@@ -359,7 +355,7 @@ def test_backoff_doubles_to_30_s_and_resets_once_connected(
     failures = log.events.index("on_connect")
     assert failures >= 8
     assert all(code is None and reason for code, reason in log.events[:failures])
-    assert log.events[failures:] == ["on_connect", (1012, "venue"), "on_connect"]
+    assert log.events[failures:] == ["on_connect", (1012, "resync"), "on_connect"]
     assert ceilings[:failures] == below_cap + [30.0] * (failures - len(below_cap))
     assert ceilings[failures:] == [min(delay, 30.0)]
 
@@ -473,7 +469,7 @@ def test_the_websocket_trusts_what_rest_trusts(monkeypatch: pytest.MonkeyPatch, 
 def test_stop_fires_no_on_disconnect():
     # stop() sets the stop event, then cancels the connection's task, so a close can land in
     # between: it must not reach on_disconnect. The handler sets only the event, so it does.
-    server = _Server(_close_venue).start()
+    server = _Server(_close_resync).start()
     log = _Log()
     ws = _client(server.port, log)
     ws.on_connect(lambda _: ws._stop_event.set())
@@ -509,7 +505,7 @@ def test_a_run_ending_late_leaves_the_next_runs_connection_alone():
     # stop() stops waiting after 5 s while a close can take longer, so start() can begin the next
     # run before the old one ends. The handler stands in for that next run, live by the time the
     # old connection closes: the old run must leave its connection and live flag alone.
-    server = _Server(_close_venue).start()
+    server = _Server(_close_resync).start()
     log = _Log()
     ws = _client(server.port, log, auto_reconnect=False)
     newer = object()
@@ -523,7 +519,7 @@ def test_a_run_ending_late_leaves_the_next_runs_connection_alone():
     finally:
         ws.stop()
         server.stop()
-    assert log.events == ["on_connect", (1012, "venue")]
+    assert log.events == ["on_connect", (1012, "resync")]
 
 
 def test_stop_without_start_is_safe():

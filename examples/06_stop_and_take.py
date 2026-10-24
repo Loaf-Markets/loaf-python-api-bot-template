@@ -32,8 +32,7 @@ def main() -> None:
             "(see README §2)."
         )
 
-    # Pick a property you can trade now: LIVE, with an L2 market (during a
-    # competition round only the round's market has one).
+    # Pick a property you can trade now: LIVE, with an L2 market.
     tradeable = [
         p
         for p in client.market.properties().get("properties") or []
@@ -65,10 +64,6 @@ def main() -> None:
             type="STOP_MARKET",
             trigger_price=trigger,
         )
-    except loaf.VenueSwitchingError:
-        raise SystemExit("The market mode is switching: run this again in a few seconds.")
-    except loaf.VenueError as exc:
-        raise SystemExit(f"{prop.ticker} is not open in the current market mode: {exc.message}")
     except loaf.LoafConfigError as exc:  # your trading key or account: the message says what to do
         raise SystemExit(str(exc))
     except loaf.LoafValidationError as exc:

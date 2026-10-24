@@ -61,10 +61,8 @@ Both come from the Loaf web app's **API** page (log in → **API**).
    key** below your tokens, select **Show trading key**: your wallet signs
    once, and the page shows the key if it is the one in force (right after
    enabling or a reset, try again in a moment). Your account has one trading
-   key for the real markets, shared by the web app and all your bots: it is
-   the same at every showing until you reset it, and the page does not save
-   it. While a competition round runs the page cannot show it: get it outside
-   a round.
+   key, shared by the web app and all your bots: it is the same at every
+   showing until you reset it, and the page does not save it.
 
 ```bash
 cp .env.example .env
@@ -82,12 +80,12 @@ The SDK reads environment variables; `bot.py`, the examples and
 
 ### Your trading key
 
-- **What it can do.** Trade the account's balance on one vault, the ledger a
-  market settles on (the real markets share one; each competition round has its
-  own). Whoever holds it can trade that balance away, against orders of their
-  own: keep it, and the `.env` that holds it beside your API key, as secret as
-  your wallet key. It cannot move your wallet's funds: a withdrawal it signs
-  pays only the account's own wallet, and needs the API key too.
+- **What it can do.** Trade the account's balance on its vault, the ledger the
+  markets settle on. Whoever holds it can trade that balance away, against
+  orders of their own: keep it, and the `.env` that holds it beside your API
+  key, as secret as your wallet key. It cannot move your wallet's funds: a
+  withdrawal it signs pays only the account's own wallet, and needs the API
+  key too.
   **Reset trading key** in the web app (in Account Settings) revokes it, for the
   web app and every bot alike.
 - **When it changes.** After a Reset trading key, get the new key once it is
@@ -96,9 +94,7 @@ The SDK reads environment variables; `bot.py`, the examples and
   refused with `l2 epoch: …` (`LoafValidationError`); after that its orders
   raise `LoafConfigError` (the key is not in force). Also cancel and re-arm
   every stop, take and TP/SL leg (see **Stop & take orders**): those signed with
-  the old key stay ARMED but FAIL when they fire. Each competition round's
-  market has a key of its own (see **Competition rounds**; one client per
-  trading key).
+  the old key stay ARMED but FAIL when they fire.
 
 Without `LOAF_SECRET_KEY` everything works except placing orders.
 `loaf.public_key` is your trading key's public key (`None` when no key is
@@ -106,13 +102,12 @@ set): what `GET /l2/keys` names `journaledKey` while the key is in force.
 
 ### Deriving a trading key on your machine
 
-`python -m loaf.secret_key` derives the same keys from your wallet's private
-key. You need it for a competition round's market, whose key the web app does
-not show. It needs an account whose wallet private key you hold, such as a
-wallet login or a dedicated bot account. It reads your trading account with `LOAF_API_KEY` (and
-`LOAF_API_BASE_URL`), so set those first, and run it from your bot's directory
-(it loads the `.env` found from the working directory up), on a trusted
-machine, once trading is enabled on the market:
+`python -m loaf.secret_key` derives the same key from your wallet's private
+key, without the web app. It needs an account whose wallet private key you
+hold, such as a wallet login or a dedicated bot account. It reads your trading
+account with `LOAF_API_KEY` (and `LOAF_API_BASE_URL`), so set those first, and
+run it from your bot's directory (it loads the `.env` found from the working
+directory up), on a trusted machine, once trading is enabled on the market:
 
 ```bash
 pip install -e ".[wallet]"
@@ -123,9 +118,8 @@ read -rs W && LOAF_WALLET_PRIVATE_KEY="$W" python -m loaf.secret_key; unset W
 press Enter. The wallet key goes to that one command only: a plain shell
 variable is not exported, so nothing started later in the shell inherits it,
 even if the command fails or `unset` is skipped. The helper prints one line,
-`LOAF_SECRET_KEY=<80 hex>`: paste it into your `.env`. During a competition
-round it derives only the round's market's key (see **Competition rounds**);
-after a Reset trading key it prints the old key until the new one is active.
+`LOAF_SECRET_KEY=<80 hex>`: paste it into your `.env`. After a Reset trading
+key it prints the old key until the new one is active.
 
 Never put the wallet key in `.env` (the helper refuses one that holds it) or in
 the bot's environment (`LoafClient()` refuses to start while
@@ -272,7 +266,7 @@ Placing an order is a single call:
 
 ```python
 # Orders are addressed by ticker. Pick a tradeable one from loaf.market.properties():
-# status "LIVE" and hasL2Market (halts, trading hours and round seats still apply).
+# status "LIVE" and hasL2Market (halts and trading hours still apply).
 
 # LIMIT order (price in dollars, <=2 dp; quantity in tokens, <=1 dp):
 res = loaf.orders.limit_buy("MUS", quantity=10, price=167.49)
@@ -353,18 +347,7 @@ rejections rather than trying to avoid them:
 | `LoafValidationError` (400) | **Balance and open-order caps** — `Insufficient available balance for this order`, or too many open orders (resting stops count too). |
 | `LoafValidationError` (400) | **Fee-rate cap** — `l2 fee: the signed fee-rate cap is below the account's fee rate`: your account's fee rate is above the cap every order signs. |
 
-**Market modes.** While a trading-competition round is PREPARED or ACTIVE,
-only the round's market trades (see **Competition rounds**). An order the
-current market mode does not take raises `VenueError`, whose `code` says why:
-`NOT_TRADEABLE_IN_MODE` (a real market during a round, or a competition market
-outside its round), `COMPETITION_NOT_STARTED` (the round's market before the
-round goes ACTIVE) or `NOT_COMPETITION_PARTICIPANT` (only seat holders trade
-it: check `loaf.competition.queue_position().participant`). Without a seat you
-have no trading account on the round's market, so an order there normally
-raises `LoafConfigError` before anything is sent. While the mode is
-switching, a placement raises `VenueSwitchingError` instead: nothing was
-placed, so place it again in a few seconds if you still want it. Real markets
-keep trading hours: outside them placement raises `LoafForbiddenError`
+Markets keep trading hours: outside them placement raises `LoafForbiddenError`
 (`Trading is currently closed`); cancels still work.
 
 If trading is halted — platform-wide or for that property — order placement
@@ -435,16 +418,14 @@ longest `ttl_ms`, weeks for the default and shorter.
     `loaf.orders.resubmit(e.signed_body)`: the answer is that same order if it
     landed; if not, it is placed now, at the price and quantity you signed
     then. A stop or take that landed is answered with its row in whatever
-    status it has now (a re-send never re-arms one that was cancelled, as a
-    competition round does on the real markets, fired or FAILED): read that
-    row's `status` in `loaf.history.orders()` before relying on it, and arm a
-    new one if it is `CANCELLED` or `FAILED`. Anyone who holds `e.signed_body`
-    can place it the same way, with no key, so keep it out of logs and alerts.
-    Otherwise find it in `loaf.history.orders()` by its `expiryMs`
-    (`e.signed_body["l2ExpiryMs"]`): a miss proves nothing while it can still
-    rest (until `expiryMs` minus 24 hours, its `ttl_ms` after signing). During
-    a competition round a real market's history is not served and its
-    resubmit is refused: wait for the round to end.
+    status it has now (a re-send never re-arms one that was cancelled, fired
+    or FAILED): read that row's `status` in `loaf.history.orders()` before
+    relying on it, and arm a new one if it is `CANCELLED` or `FAILED`. Anyone
+    who holds `e.signed_body` can place it the same way, with no key, so keep
+    it out of logs and alerts. Otherwise find it in `loaf.history.orders()` by
+    its `expiryMs` (`e.signed_body["l2ExpiryMs"]`): a miss proves nothing while
+    it can still rest (until `expiryMs` minus 24 hours, its `ttl_ms` after
+    signing).
 - **The order-number allowance.** Every order signs an order number reserved to
   your account, and the exchange caps how many an account holds reserved but
   unused. Past the cap every reservation is refused (`l2 order_index: the
@@ -571,9 +552,6 @@ is your only lever if you don't want stops firing into the reopen.
 conditional does not carry. `loaf.history.active_orders()` and
 `loaf.history.cancelled_orders()` are booked-orders-only and never show them.
 
-A competition round cancels your real stops and takes too: see **Competition
-rounds**.
-
 Derive triggers with `round(mark * 0.95, 2)`: an unrounded float product carries
 17 decimals and the SDK rejects it locally before the request goes out.
 
@@ -581,40 +559,21 @@ Derive triggers with `round(mark * 0.95, 2)`: an unrounded float product carries
 
 ## Competition rounds
 
-While a trading-competition round is PREPARED or ACTIVE, the exchange serves
-everyone from the round's own ledger: only the round's market trades, on its
-own vault, and only for seat holders (`loaf.competition.queue_position().participant`).
-Real markets refuse orders (`VenueError`); your real resting orders and stops
-are cancelled shortly after the round is prepared, with no WebSocket frame;
-your real balances are untouched and come back when the round ends. Meanwhile
-`history` and `resubmit` serve the round's ledger.
-
-To trade the round's market:
-
-1. Once you are admitted and the round is PREPARED, wait for the round to fund
-   your account.
-2. Open the round's market in the web app and **Enable trading** on it.
-3. Derive its trading key with the command of §2, adding `--ticker` and the
-   round's market: the `arenaTicker` of its `round_update` frame, or the
-   round's `newAssetProperty.ticker` in `loaf.competition.info()`.
-4. Trade it with a second client, `LoafClient(secret_key=...)`: one client
-   per trading key. Orders open when the round goes ACTIVE
-   (`COMPETITION_NOT_STARTED` until then).
-
-Watch the rounds live on the public `competition` channel. After each switch
-the server closes portfolio sockets with 1012 `venue`, shortly after the
-frame: re-seed from REST when `on_connect` fires after that close, not on the
-frame itself (a read right after the frame can still show the previous
-ledger). Right around a switch a placement can raise `VenueSwitchingError`: try
-again in a few seconds. The SDK itself refreshes what it cached only when a
-refusal shows the switch.
+A round is normal trading scored over a window: it changes nothing about
+trading, your orders or your balances. Once the admission queue admits you,
+your trading (your bots' included) from the round's start, or your admission if
+later, until its end scores on the leaderboard by its volume and its PnL
+(deposits and withdrawals in the window are not PnL). Everyone else trades as
+usual. `loaf.competition.queue_position()` gives your place in the queue, or
+your `leaderboardPosition` and `leaderboardPoints` on the board being served,
+and the public `competition` channel announces each round transition:
 
 ```python
 ws.subscribe_competition()
 
 @ws.on_round_update
 def on_round(msg):
-    print(msg.roundNumber, msg.status, msg.arenaTicker)   # re-seed on the next on_connect
+    print(msg.roundNumber, msg.status)
 ```
 
 ---
@@ -702,7 +661,7 @@ your API key authenticated as, so an anonymous connection is refused with an
   `MAKER` (that order rested) or `TAKER` (it aggressed). There is no position
   frame: your holdings are balances rows. `trade.txHash` is the trade's content
   hash, not an on-chain transaction; `trade.proof` is `{"status": "PENDING"}`, or
-  `None` (always for a competition round's trade).
+  `None` with proofs off.
 - `order_update` carries the whole committed order, with its `expiryMs`. For an
   order that trades immediately it can arrive after the fill frames and already
   show FILLED. Stop and take orders (TP/SL legs included) ride the same frame,
@@ -746,12 +705,12 @@ is readable. The `order_queue` lists have no REST read: drop them in
 `on_disconnect` (and, after you unsubscribe `portfolio`, at the
 `subscription_confirmed` that answers it), and the next subscription (the
 client makes one on every connection while you stay subscribed) sends them
-again. `on_disconnect` gets `{code, reason}` after every ended attempt: 1012 with reason `resync`
-(pushes may have been lost, below) or `venue` (a competition round switched the
-ledger) means re-seed once `on_connect` fires again; 4001 with reason `revoked` or `expired`
-means the API key was revoked or has expired and will not authenticate again:
-create a new one; `code` `None` means no connection was made (`reason` says
-why); several without an `on_connect` between them mean the feed is down. The
+again. `on_disconnect` gets `{code, reason}` after every ended attempt: 1012
+with reason `resync` (pushes may have been lost, below) means re-seed once
+`on_connect` fires again; 4001 with reason `revoked` or `expired` means the API
+key was revoked or has expired and will not authenticate again: create a new
+one; `code` `None` means no connection was made (`reason` says why); several
+without an `on_connect` between them mean the feed is down. The
 client keeps retrying, waiting a random time below a ceiling that doubles up to
 30 s. With `portfolio` subscribed, a connection whose API
 key the server does not accept is dropped and retried, with the reason
@@ -803,10 +762,6 @@ try:
     client.orders.limit_buy("MUS", quantity=1, price=167.49)
 except loaf.OrderOutcomeUnknownError as e:
     ...   # may be live or filled: resubmit(e.signed_body) if still wanted, else check history.orders()
-except loaf.VenueSwitchingError:
-    ...   # the market mode is switching (a round starting or ending): try again in a few seconds
-except loaf.VenueError as e:
-    ...   # the current market mode does not take this order: e.code says why
 except loaf.TradingHaltedError:
     ...   # halted — back off and retry later
 except loaf.LoafConfigError:
@@ -833,9 +788,8 @@ anything that might have landed raises `OrderOutcomeUnknownError` instead.
 bot's environment, or an invalid client-wide max slippage
 (`LOAF_MAX_SLIPPAGE_BPS` / `LoafClient(max_slippage_bps=)`). From a placement
 it means a setup to fix before retrying: your trading key is not the one in
-force, trading is not enabled, you have no trading account yet (on a
-competition round's market: no seat, or the round has not funded your account
-yet), or this machine's clock is hours ahead; the message says what to do. A
+force, trading is not enabled, you have no trading account yet, or this
+machine's clock is hours ahead; the message says what to do. A
 bad per-order `max_slippage_bps=` / `leg_max_slippage_bps=` / `ttl_ms=` is a
 local `LoafValidationError` (status_code 0).
 
@@ -852,10 +806,9 @@ raise a 429 at once instead, since a late order is stale. Order placements are
 re-sent unchanged on network errors and server errors after a short jittered
 pause, not the rate-limit headers (see **Signing & retries**), but never on a
 429 — a rate-limited order raises `LoafRateLimitError` so you can decide
-whether to re-issue it at a fresh price — nor on a `VenueSwitchingError`. (A
-rate-limited `resubmit` raises `OrderOutcomeUnknownError` instead, since the
-first attempt may be live.) Cancels are never retried. Tune with
-`LoafClient(max_retries=...)`.
+whether to re-issue it at a fresh price. (A rate-limited `resubmit` raises
+`OrderOutcomeUnknownError` instead, since the first attempt may be live.)
+Cancels are never retried. Tune with `LoafClient(max_retries=...)`.
 
 ---
 

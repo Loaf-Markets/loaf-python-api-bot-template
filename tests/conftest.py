@@ -79,12 +79,10 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     # The client's retries back off with real sleeps (honouring Retry-After); skip them. Only the
     # SDK modules' `time` is replaced, so time.sleep elsewhere stays real.
     monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=lambda seconds: None))
-    # One clock for loaf._l2 (an order's expiry, the order-number pool, the market-mode window)
-    # and resubmit's guard: tests freeze or advance it by replacing time_ns / monotonic.
+    # One clock for loaf._l2 (an order's expiry, the order-number pool) and resubmit's guard:
+    # tests freeze or advance it by replacing time_ns.
     slept: list[float] = []
-    clock = SimpleNamespace(
-        sleep=slept.append, slept=slept, time_ns=time.time_ns, monotonic=time.monotonic
-    )
+    clock = SimpleNamespace(sleep=slept.append, slept=slept, time_ns=time.time_ns)
     monkeypatch.setattr("loaf._l2.time", clock)
     monkeypatch.setattr("loaf.resources.orders.time", clock)
     return clock
@@ -92,38 +90,31 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 @pytest.fixture
 def l2_clock(_no_sleep: SimpleNamespace) -> SimpleNamespace:
-    """The SDK's order clock: ``time_ns`` and ``monotonic`` to replace, and ``slept``, the
-    seconds each sleep asked for (every sleep returns at once)."""
+    """The SDK's order clock: ``time_ns`` to replace, and ``slept``, the seconds each sleep
+    asked for (every sleep returns at once)."""
     return _no_sleep
 
 
 def property_detail(
-    ticker: str = "OPRA",
-    *,
-    l2_market: Any = MARKET,
-    market_price: float = 160,
-    competition: bool = False,
-    mode: bool = False,
+    ticker: str = "OPRA", *, l2_market: Any = MARKET, market_price: float = 160
 ) -> dict:
     """A ``GET /trade/{ticker}`` body with the fields order placement reads.
 
-    ``competition`` is the property's ``isCompetition``, ``mode`` the answer's
-    ``competitionModeActive``; ``l2_market=...`` leaves ``l2Market`` out, as a
-    server that predates the L2 exchange does.
+    ``l2_market=...`` leaves ``l2Market`` out, as a server that predates the L2
+    exchange does.
     """
     prop: dict[str, Any] = {
         "ticker": ticker,
         "tokenName": _NAMES.get(ticker, ticker),
         "status": "LIVE",
         "isHalted": False,
-        "isCompetition": competition,
     }
     if l2_market is not ...:
         prop["l2Market"] = l2_market
     listed = [{"ticker": ticker, "tokenName": prop["tokenName"], "marketPrice": market_price}]
     if ticker != "MUS":  # another property ahead of it: the reference is found by its ticker
         listed.insert(0, {"ticker": "MUS", "tokenName": "Musgrave", "marketPrice": 50})
-    return {"property": prop, "propertyList": listed, "competitionModeActive": mode}
+    return {"property": prop, "propertyList": listed}
 
 
 class FakeExchange:
@@ -220,14 +211,11 @@ class FakeExchange:
         rows = []
         for ticker, detail in self.details.items():
             prop = detail["property"]
-            row = {
-                "ticker": ticker, "status": prop["status"], "isCompetition": prop["isCompetition"]
-            }
+            row = {"ticker": ticker, "status": prop["status"]}
             if "l2Market" in prop:  # a server that predates the L2 exchange lists no hasL2Market
                 row["hasL2Market"] = prop["l2Market"] is not None
             rows.append(row)
-        mode = any(detail.get("competitionModeActive") for detail in self.details.values())
-        return {"properties": rows, "competitionModeActive": mode}
+        return {"properties": rows}
 
     def posts(self, path: str) -> list[bytes]:
         """The raw bodies POSTed to ``path`` (e.g. ``"/orders"``), in order."""

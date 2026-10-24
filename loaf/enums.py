@@ -89,11 +89,7 @@ class CandleResolution(_StrEnum):
 
 
 class CompetitionRoundStatus(_StrEnum):
-    """Lifecycle of a trading-competition round (leaderboard / competition info).
-
-    While a round is ``PREPARED`` or ``ACTIVE``, its own ledger serves every
-    user (see :mod:`loaf.resources.competition`).
-    """
+    """Lifecycle of a trading-competition round (leaderboard / competition info)."""
 
     DRAFT = "DRAFT"
     PENDING = "PENDING"

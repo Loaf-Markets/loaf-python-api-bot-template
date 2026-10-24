@@ -51,7 +51,7 @@ class L2Market(TypedDict):
     on the property signs (the SDK reads it for you)."""
 
     chainId: int  # the chain the proxy is on, not what an order signs
-    proxyAddress: str  # the ZkLoaf proxy, or a competition round's vault
+    proxyAddress: str  # the ZkLoaf proxy
     l2ChainId: int
     marketIndex: int
     baseAssetId: int  # the property token's balances row
@@ -171,7 +171,7 @@ class TradeHistoryItem(TypedDict, total=False):
     price: float
     fee: float  # this user's fee, dollars, to 0.001
     executedAt: int
-    proof: Optional[TradeProofStatus]  # may be None; always None for a competition round's trade
+    proof: Optional[TradeProofStatus]  # None with proofs off
 
 
 class L2AssetBalance(TypedDict):
@@ -264,10 +264,9 @@ class CompetitionRound(TypedDict, total=False):
     rules: str
     startsAt: Optional[int]  # unix seconds; the schedule, re-stamped when the round goes ACTIVE
     endsAt: Optional[int]  # likewise, re-stamped when it leaves ACTIVE
-    startingBalanceUsdl: float  # whole play cUSD seeded on the round's vault (+ referral bonus)
     participantBatchSize: int  # how many the queue admits into the round
     status: str  # CompetitionRoundStatus
-    newAssetProperty: Optional[dict[str, Any]]  # the round's market (a GET /trade row)
+    newAssetProperty: Optional[dict[str, Any]]  # the round's headline asset (a GET /trade row)
     prizePool: list[PrizePoolEntry]
     volumeMultiplierTiers: list[VolumeMultiplierTier]
     volumeExponent: float  # e in points = a * volume^e + b * pnl
@@ -291,18 +290,19 @@ class QueuePosition(TypedDict, total=False):
     """Response to ``GET /competition/queue-position``.
 
     ``leaderboardPosition`` is your rank on the currently-served board (live
-    while a round is ACTIVE, your final placement during the break) and
-    ``position`` is your place in the admission queue. Usually only one is set,
-    but both are during the break if you were bottom-culled — back in the queue
-    and still on the frozen board.
+    while a round is ACTIVE, your final placement during the break),
+    ``leaderboardPoints`` your points on it, and ``position`` is your place in
+    the admission queue. Usually only one of the rank and the place is set, but
+    both are during the break if you were bottom-culled — back in the queue and
+    still on the frozen board.
     """
 
     position: Optional[int]  # place in the admission queue, if still queued
     queueCount: int
     leaderboardPosition: Optional[int]  # your rank on the served board
+    leaderboardPoints: Optional[float]  # your points there; None exactly when the rank is
     referralCount: int
     estimatedRoundEntry: Optional[int]  # round that position is on track to enter
-    participant: bool  # a round is PREPARED/ACTIVE and you hold a seat in it
 
 
 __all__ = [

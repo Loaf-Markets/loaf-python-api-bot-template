@@ -2,9 +2,8 @@
 
 The recent activity lists embedded here are capped: ``openOrders`` at 100
 (booked orders + ``PENDING`` / ``ARMED`` conditionals), ``tradeHistory`` and
-``orderHistory`` at 20, ``offeringOrders`` at 50 (empty during a competition
-round), and ``transfers`` at 50. Use :mod:`loaf.resources.history` for deeper,
-paginated history.
+``orderHistory`` at 20, ``offeringOrders`` at 50, and ``transfers`` at 50. Use
+:mod:`loaf.resources.history` for deeper, paginated history.
 """
 
 from __future__ import annotations
@@ -46,10 +45,8 @@ class PortfolioResource(Resource):
         ``transfers`` are your deposits and withdrawals, newest first, keyed by
         ``journalSeq``, each ``amount`` in base units.
 
-        During a competition round the whole read comes from the round's
-        ledger, empty for a non-participant. Raises
-        :class:`~loaf.exceptions.LoafServiceUnavailableError` (503 ``The L2
-        balance is temporarily unavailable; try again in a moment``) while the
-        exchange's balances cannot be read — transient, so retry.
+        Raises :class:`~loaf.exceptions.LoafServiceUnavailableError` (503
+        ``The L2 balance is temporarily unavailable; try again in a moment``)
+        while the exchange's balances cannot be read — transient, so retry.
         """
         return self._client.get("/portfolio/component")

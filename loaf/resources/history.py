@@ -5,7 +5,7 @@
 take ``nextCursor`` from one response and pass it as ``cursor`` to the next.
 Pass back only ``nextCursor`` values: a malformed cursor silently returns the
 first page. Do not derive "has more" from ``total`` (it is capped at 10000, for
-trades too). During a competition round these read the round's ledger.
+trades too).
 """
 
 from __future__ import annotations
@@ -67,10 +67,10 @@ class HistoryResource(Resource):
 
         Trades are final when they match. ``txHash`` is the trade's content
         hash (``0x`` + 64 hex, never ``""``), not an on-chain transaction.
-        ``proof`` is ``None`` (always for a competition round's trade),
-        ``{"status": "PENDING"}``, or ``{"status": "IN_BATCH", batchNumber,
-        l2BlockNumber, rowIndex, l2TradeDigest, batchTxHash, final}`` once a
-        proven batch includes the trade (:class:`~loaf.models.TradeProofStatus`).
+        ``proof`` is ``None`` (proofs off), ``{"status": "PENDING"}``, or
+        ``{"status": "IN_BATCH", batchNumber, l2BlockNumber, rowIndex,
+        l2TradeDigest, batchTxHash, final}`` once a proven batch includes the
+        trade (:class:`~loaf.models.TradeProofStatus`).
         """
         return self._client.get(
             "/history/trades",
@@ -82,8 +82,7 @@ class HistoryResource(Resource):
 
         Returns ``{"cancelledOrders": [{orderId, cancelledAt}]}``. Cancelled
         BOOKED orders only; a cancelled conditional never appears here. Includes
-        the exchange's own cancels: an expired order, an epoch move, a round
-        start.
+        the exchange's own cancels: an expired order or an epoch move.
         """
         return self._client.get("/history/orders/cancelled")
 

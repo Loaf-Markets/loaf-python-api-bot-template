@@ -62,20 +62,6 @@ def test_derive_ws_url():
 
 def test_error_mapping():
     assert isinstance(error_from_response(401, {"error": "no"}), loaf.LoafAuthError)
-    # The market mode's refusals: one class for the three 403 codes, the code kept.
-    for code, message in (
-        ("NOT_TRADEABLE_IN_MODE", "Property is not tradeable in the current market mode"),
-        ("COMPETITION_NOT_STARTED", "The competition round has not started yet"),
-        ("NOT_COMPETITION_PARTICIPANT", "Not a competition participant for the current round"),
-    ):
-        venue = error_from_response(403, {"error": message, "code": code})
-        assert type(venue) is loaf.VenueError
-        assert (venue.status_code, venue.code, venue.message) == (403, code, message)
-    switching = error_from_response(
-        503, {"error": "Market mode is switching; try again in a moment", "code": "VENUE_SWITCHING"}
-    )
-    assert type(switching) is loaf.VenueSwitchingError and switching.code == "VENUE_SWITCHING"
-    assert isinstance(switching, loaf.LoafServiceUnavailableError)
     # The emergency kill switch is a 403 with no machine code — matched on message.
     assert isinstance(
         error_from_response(403, {"error": "Trading is currently halted"}),
@@ -154,11 +140,11 @@ def test_errors_survive_pickle_and_copy():
         assert str(clone) == str(error)
         assert type(clone.last_error) is loaf.LoafServerError
         assert (clone.last_error.status_code, clone.last_error.message) == (502, "x")
-    venue = error_from_response(403, {"error": "x", "code": "NOT_COMPETITION_PARTICIPANT"})
-    for clone in (pickle.loads(pickle.dumps(venue)), copy.copy(venue), copy.deepcopy(venue)):
-        assert type(clone) is loaf.VenueError
-        assert (clone.status_code, clone.code) == (403, "NOT_COMPETITION_PARTICIPANT")
-        assert str(clone) == str(venue)
+    coded = error_from_response(403, {"error": "x", "code": "COMPETITION_NOT_ENABLED"})
+    for clone in (pickle.loads(pickle.dumps(coded)), copy.copy(coded), copy.deepcopy(coded)):
+        assert type(clone) is loaf.LoafForbiddenError
+        assert (clone.status_code, clone.code) == (403, "COMPETITION_NOT_ENABLED")
+        assert str(clone) == str(coded)
     limited = error_from_response(429, {"error": "slow"}, retry_after=3.0, request_id="r1")
     clone = pickle.loads(pickle.dumps(limited))
     assert type(clone) is loaf.LoafRateLimitError

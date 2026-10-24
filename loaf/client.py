@@ -96,15 +96,13 @@ _NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
 _NOT_PLACED_503_TEXTS = (
     "your order was not placed",
     "nothing was done",
-    "trading temporarily unavailable. please try again shortly.",
     "the l2 balance is temporarily unavailable",
 )
 
 
 def _definitely_not_placed(error: LoafAPIError) -> bool:
-    return error.status_code == 503 and (
-        error.code == "VENUE_SWITCHING"
-        or any(t in error.message.lower() for t in _NOT_PLACED_503_TEXTS)
+    return error.status_code == 503 and any(
+        t in error.message.lower() for t in _NOT_PLACED_503_TEXTS
     )
 
 
@@ -412,9 +410,8 @@ class LoafClient:
         and 5xx are re-sent up to ``max_retries`` times, after a short jittered
         pause; the exchange admits one order per account and order number, so a
         repeat is answered as a duplicate, never a second order. 4xx (429
-        included) and a 503 ``VENUE_SWITCHING`` are final. If any attempt may
-        have landed and no 200 settled it, raises
-        :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
+        included) is final. If any attempt may have landed and no 200 settled
+        it, raises :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
 
         ``ambiguous=True`` (resubmit): an earlier attempt may already have
         landed, so anything but a 200 raises ``OrderOutcomeUnknownError``.
@@ -455,11 +452,9 @@ class LoafClient:
                     ambiguous, retryable = True, False
                 else:
                     error = self._build_error(response)
-                    if response.status_code >= 500 and not _definitely_not_placed(error):
+                    retryable = response.status_code >= 500
+                    if retryable and not _definitely_not_placed(error):
                         ambiguous = True
-                    # VENUE_SWITCHING is an answer, not a lost reply: the body belongs to the
-                    # market mode that is ending.
-                    retryable = response.status_code >= 500 and error.code != "VENUE_SWITCHING"
             if not retryable or attempt >= self.max_retries:
                 break
             # Jitter only: every reply carries RateLimit-Reset, and a signed price goes stale.

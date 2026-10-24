@@ -19,24 +19,19 @@ class MarketResource(Resource):
         """``GET /trade`` — every non-delisted property (PENDING and LIVE) with
         market data + a 24h sparkline.
 
-        While a trading-competition round is PREPARED or ACTIVE
-        (``competitionModeActive``), only competition properties are listed, and
-        only the round's market has ``hasL2Market``. Outside a round they are
-        listed too (``isCompetition`` true) but cannot be traded. A row is
-        tradeable when ``status == "LIVE"`` and ``hasL2Market`` (halts, a real
-        market's trading hours and round eligibility still apply).
+        A row is tradeable when ``status == "LIVE"`` and ``hasL2Market`` (halts
+        and trading hours still apply).
 
-        Returns ``{"properties": [...], "competitionModeActive": bool}``. Each
-        item has ``propertyId``, ``ticker`` (the identifier every other call
-        takes), ``tokenName`` (the display name), ``contractAddress``,
-        ``propertyType``, ``marketPrice``, ``dailyReferencePrice``,
-        ``volume24h``, ``status``, ``isCompetition``, ``hasL2Market``,
+        Returns ``{"properties": [...]}``. Each item has ``propertyId``,
+        ``ticker`` (the identifier every other call takes), ``tokenName`` (the
+        display name), ``contractAddress``, ``propertyType``, ``marketPrice``,
+        ``dailyReferencePrice``, ``volume24h``, ``status``, ``hasL2Market``,
         ``candlesticks`` (trailing-24h hourly OHLCV sparkline only — use
         :meth:`candles` for real chart history), etc.
 
         ``contractAddress`` is the property token's address. Orders do not sign
-        it, but a real market refuses them while it is ``None`` (the token is
-        not deployed yet). ``marketPrice`` is ``0`` when the exchange has no
+        it, but the exchange refuses them while it is ``None`` (the token is not
+        deployed yet). ``marketPrice`` is ``0`` when the exchange has no
         reference yet.
         """
         return self._client.get("/trade", auth=False)
@@ -46,20 +41,16 @@ class MarketResource(Resource):
 
         Returns the ``property``, a ``propertyList`` selector, current
         ``orderBook`` snapshot (``bids``/``asks`` price levels), ``recentTrades``,
-        ``volume24h``, ``dailyReferencePrice``, ``liquidity``,
-        ``competitionModeActive`` and market-hours metadata (real markets only:
-        a competition round keeps no trading hours). ``ticker`` is 1-4 uppercase
-        letters or digits (``"OPRA"``, not ``"opra"``); every REST call that
-        takes one refuses anything else before sending. Candle history is NOT
-        included — fetch it from the dedicated :meth:`candles` endpoint.
+        ``volume24h``, ``dailyReferencePrice``, ``liquidity`` and market-hours
+        metadata. ``ticker`` is 1-4 uppercase letters or digits (``"OPRA"``,
+        not ``"opra"``); every REST call that takes one refuses anything else
+        before sending. Candle history is NOT included — fetch it from the
+        dedicated :meth:`candles` endpoint.
 
         ``property.l2Market`` is ``{chainId, proxyAddress, l2ChainId,
         marketIndex, baseAssetId, quoteAssetId}``, the market every order on the
         property signs (the SDK reads it for you), or ``None``: the property
-        cannot be traded now. A real property keeps its own during a
-        competition round although only the round's market trades then (orders
-        are taken only where ``property.isCompetition ==
-        competitionModeActive``). ``property`` has no ``marketPrice``: the
+        cannot be traded now. ``property`` has no ``marketPrice``: the
         reference MARKET orders are priced from is the ``propertyList`` entry
         with the same ``ticker``.
 

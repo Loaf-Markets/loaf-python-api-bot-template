@@ -28,7 +28,6 @@ from loaf import LoafClient, OrderOutcomeUnknownError, k1
 from loaf._l2 import (
     AccountState,
     L2State,
-    Market,
     TradingKey,
     market_of,
     read_account,
@@ -87,8 +86,6 @@ OPEN_ORDER_CAP = (
     "orders on it before placing a new one."
 )
 BALANCE_UNAVAILABLE = "The L2 balance is temporarily unavailable; try again in a moment"
-NOT_TRADEABLE = "Property is not tradeable in the current market mode"
-SWITCHING = "Market mode is switching; try again in a moment"
 INDEX_USED = "l2 order_index: already used by the account; re-sign with the next index"
 INDEX_NOT_RESERVED = (
     "l2 order_index: not inside a range reserved to the account; reserve one with "
@@ -116,10 +113,6 @@ DAY_MS = 86_400_000
 
 def error_reply(status: int, message: str, **kwargs: Any) -> httpx.Response:
     return httpx.Response(status, json={"error": message}, **kwargs)
-
-
-def coded_reply(status: int, message: str, code: str) -> httpx.Response:
-    return httpx.Response(status, json={"error": message, "code": code})
 
 
 def duplicate_reply(order_id: int = 7) -> httpx.Response:
@@ -164,11 +157,10 @@ def freeze(l2_clock: SimpleNamespace, at_ms: int | None = None) -> int:
     return now_ms
 
 
-def pool(client: LoafClient) -> tuple[L2State, Market, AccountState]:
+def pool(client: LoafClient) -> tuple[L2State, AccountState]:
     """The client's L2 state with the account read, as a first placement on OPRA leaves it."""
     l2 = client.orders._l2
-    market = market_of(property_detail(), "OPRA")
-    return l2, market, l2.account(market, L2_PUBLIC_KEY, "OPRA")
+    return l2, l2.account(L2_PUBLIC_KEY, "OPRA")
 
 
 # --------------------------------------------------------------------------- #
@@ -236,11 +228,11 @@ def test_context_reads(exchange, trading_client):
 
 
 def test_reservations_double_up_to_64(exchange, trading_client):
-    l2, market, account = pool(trading_client())
+    l2, account = pool(trading_client())
     reserved_for = []  # the order (1-based) each reservation was made for
     for order in range(1, 129):  # single orders: one number each
         before = len(exchange.posts("/l2/order-indices"))
-        first, _, _ = l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)
+        first, _, _ = l2.take(account, 1, DEFAULT_ORDER_TTL_MS)
         assert first == 4096 + order
         if len(exchange.posts("/l2/order-indices")) > before:
             reserved_for.append(order)
@@ -275,8 +267,8 @@ def test_short_tail_is_abandoned(exchange, trading_client):
     ]
 
 
-def test_tickers_on_one_vault_share_the_account_and_the_block(exchange, trading_client):
-    # Another market on the same vault (proxy and L2 chain): its own market index and asset.
+def test_tickers_share_the_account_and_the_block(exchange, trading_client):
+    # Another market: its own market index and asset.
     exchange.details["MUS"] = property_detail(
         "MUS", l2_market={**MARKET, "marketIndex": 2051, "baseAssetId": 7}
     )
@@ -285,58 +277,12 @@ def test_tickers_on_one_vault_share_the_account_and_the_block(exchange, trading_
     orders.limit_buy("OPRA", 10, 167.49)  # reserves 2: one number left
     sent = len(exchange.requests)
     orders.limit_buy("MUS", 10, 167.49)
-    # Its own market read; the account and the order numbers are the vault's.
+    # Its own market read; the account and the order numbers are shared.
     assert routes(exchange.requests[sent:]) == ["GET /trade/MUS", "POST /orders"]
     assert len(exchange.gets("/l2/keys")) == 1
     body = exchange.bodies("/orders")[-1]
     assert (body["l2MarketIndex"], body["l2BaseAssetId"], body["l2OrderIndex"]) == (2051, 7, 4099)
     assert (body["l2AccountIndex"], body["l2Epoch"]) == (5, 2)
-
-
-def test_an_account_on_another_vault_replaces_the_block(exchange, trading_client):
-    # A market on another vault (the fake answers the same key there; the exchange would not).
-    exchange.details["MUS"] = property_detail(
-        "MUS", l2_market={**MARKET, "proxyAddress": "0x" + "22" * 20}
-    )
-    orders = trading_client().orders
-    orders.limit_buy("OPRA", 10, 167.49)
-    orders.limit_buy("OPRA", 10, 167.49)  # reserves 2: one number left on OPRA's vault
-    for ticker in ("MUS", "OPRA"):
-        sent = len(exchange.requests)
-        orders.limit_buy(ticker, 10, 167.49)
-        # The account is read on each vault, and no block is ever used on another.
-        assert routes(exchange.requests[sent:]) == [
-            f"GET /trade/{ticker}",
-            "GET /l2/keys",
-            "POST /l2/order-indices",
-            "POST /orders",
-        ]
-    assert counts(exchange) == [1, 2, 4, 8]
-    assert indices(exchange) == [4097, 4098, 4100, 4104]
-
-
-def test_a_refused_read_on_another_vault_keeps_the_account_and_the_block(
-    exchange, trading_client
-):
-    # A market on another vault, where another trading key is in force (a round's market).
-    exchange.details["MUS"] = property_detail(
-        "MUS", l2_market={**MARKET, "proxyAddress": "0x" + "22" * 20}
-    )
-    orders = trading_client().orders
-    orders.limit_buy("OPRA", 10, 167.49)
-    orders.limit_buy("OPRA", 10, 167.49)  # reserves 2: one number left on OPRA's vault
-    exchange.keys = {**KEYS, "journaledKey": OTHER_KEY}  # what MUS's vault would answer
-    for _ in range(2):  # nothing is kept for MUS's vault: each attempt reads the account
-        sent = len(exchange.requests)
-        with pytest.raises(loaf.LoafConfigError, match="not the trading key in force on MUS's"):
-            orders.limit_buy("MUS", 10, 167.49)
-        assert routes(exchange.requests[sent:]) == ["GET /trade/MUS", "GET /l2/keys"]
-    exchange.keys = dict(KEYS)
-    sent = len(exchange.requests)
-    orders.limit_buy("OPRA", 10, 167.49)
-    # OPRA's vault keeps its account and the block's last number.
-    assert routes(exchange.requests[sent:]) == ["POST /orders"]
-    assert indices(exchange) == [4097, 4098, 4099]
 
 
 def test_unknown_ticker_404(exchange, trading_client):
@@ -396,46 +342,6 @@ def test_unusable_l2_market(exchange, trading_client, l2_market, field):
     assert routes(exchange.requests) == ["GET /trade/OPRA"]
 
 
-@pytest.mark.parametrize(
-    "competition, mode, l2_market, why",
-    [
-        (False, True, MARKET, "a competition round is on, and only its market trades"),
-        (True, False, MARKET, "it is a competition market, which trades only during its round"),
-        # Another round's market: during a round only the round's own has an l2Market.
-        (True, True, None, "a competition round is on, and only its market trades"),
-    ],
-)
-def test_market_mode_mismatch_refused_locally(
-    exchange, trading_client, competition, mode, l2_market, why
-):
-    exchange.details["OPRA"] = property_detail(
-        competition=competition, mode=mode, l2_market=l2_market
-    )
-    with pytest.raises(loaf.VenueError) as info:
-        trading_client().orders.limit_buy("OPRA", 10, 167.49)
-    assert (info.value.status_code, info.value.code) == (0, "NOT_TRADEABLE_IN_MODE")
-    assert info.value.message == f"OPRA is not tradeable in the current market mode: {why}"
-    # The account is never read for a market the current mode does not trade.
-    assert routes(exchange.requests) == ["GET /trade/OPRA"]
-
-
-def test_local_venue_error_drops_the_cached_market_and_account(exchange, trading_client):
-    orders = trading_client().orders
-    orders.limit_buy("OPRA", 10, 167.49)  # caches the market and the account
-    exchange.details["OPRA"] = property_detail(mode=True)  # a round started
-    with pytest.raises(loaf.VenueError):
-        orders.market_buy("OPRA", 1)  # a MARKET order reads the property every time
-    exchange.details["OPRA"] = property_detail()  # the round ended
-    sent = len(exchange.requests)
-    orders.limit_buy("OPRA", 10, 167.49)
-    assert routes(exchange.requests[sent:]) == [
-        "GET /trade/OPRA",
-        "GET /l2/keys",
-        "POST /l2/order-indices",
-        "POST /orders",
-    ]
-
-
 # --------------------------------------------------------------------------- #
 # Account refusals: nothing kept, reserved or posted
 # --------------------------------------------------------------------------- #
@@ -443,9 +349,7 @@ def test_local_venue_error_drops_the_cached_market_and_account(exchange, trading
 NOT_ENABLED = (
     "Trading is not enabled on your account on OPRA's market (no trading key is in force): open "
     "OPRA on the Loaf web app's Trade page, enable trading there and wait for it to take effect, "
-    "then set LOAF_SECRET_KEY to the key in force: the web app's Show trading key (README §2), or "
-    "on a competition round's market python -m loaf.secret_key --ticker OPRA (README, "
-    "Competition rounds)."
+    "then set LOAF_SECRET_KEY to the key in force: the web app's Show trading key (README §2)."
 )
 NOT_IN_FORCE = "LOAF_SECRET_KEY is not the trading key in force on OPRA's market"
 
@@ -456,7 +360,7 @@ NOT_IN_FORCE = "LOAF_SECRET_KEY is not the trading key in force on OPRA's market
         (
             None,
             loaf.LoafConfigError,
-            "You have no trading account on OPRA's market yet: on a real market, deposit",
+            "You have no trading account on OPRA's market yet: deposit in the Loaf web app first.",
         ),
         ({"journaledKey": None}, loaf.LoafConfigError, NOT_ENABLED),
         ({"epoch": None}, loaf.LoafConfigError, NOT_ENABLED),
@@ -484,17 +388,8 @@ def test_account_refusals(exchange, trading_client, keys, error, message):
         with pytest.raises(error, match=re.escape(message)) as info:
             orders.limit_buy("OPRA", 10, 167.49)
         assert type(info.value) is error
-    assert routes(exchange.requests) == ["GET /trade/OPRA", "GET /l2/keys"] * 2
-
-
-def test_no_seat_on_a_rounds_market(exchange, trading_client):
-    # Only the round's participants have an account on its market: the account read refuses
-    # before anything is reserved or sent.
-    exchange.details["ARNA"] = property_detail("ARNA", competition=True, mode=True)
-    exchange.keys = None
-    with pytest.raises(loaf.LoafConfigError, match=re.escape("queue_position().participant")):
-        trading_client().orders.limit_buy("ARNA", 10, 167.49)
-    assert routes(exchange.requests) == ["GET /trade/ARNA", "GET /l2/keys"]
+    # The market is kept, so the second order reads the account alone.
+    assert routes(exchange.requests) == ["GET /trade/OPRA", "GET /l2/keys", "GET /l2/keys"]
 
 
 def test_key_not_in_force_names_the_remedy(exchange, trading_client):
@@ -502,7 +397,6 @@ def test_key_not_in_force_names_the_remedy(exchange, trading_client):
     with pytest.raises(loaf.LoafConfigError) as info:
         trading_client().orders.limit_buy("OPRA", 10, 167.49)
     assert "the web app's Show trading key" in str(info.value)
-    assert "python -m loaf.secret_key --ticker OPRA" in str(info.value)
     assert "re-arm your stops and takes" in str(info.value)
 
 
@@ -569,18 +463,19 @@ def test_reservation_too_soon_twice_raises(exchange, trading_client, l2_clock):
 
 
 @pytest.mark.parametrize(
-    "answer",
+    "answer, reads",
     [
-        {"accountIndex": True},
-        {"firstIndex": 0},
-        {"count": 0},
-        {"firstIndex": 2**40 - 1, "count": 2},  # its last index does not fit 40 bits
-        {"reservedAtMs": 0},
-        {"reservedAtMs": 2**53},
-        {"reservedAtMs": True},
+        ({"accountIndex": True}, []),
+        ({"accountIndex": 6}, ["GET /l2/keys"]),  # another account's range
+        ({"firstIndex": 0}, []),
+        ({"count": 0}, []),
+        ({"firstIndex": 2**40 - 1, "count": 2}, []),  # its last index does not fit 40 bits
+        ({"reservedAtMs": 0}, []),
+        ({"reservedAtMs": 2**53}, []),
+        ({"reservedAtMs": True}, []),
     ],
 )
-def test_unusable_reservation(exchange, trading_client, answer):
+def test_unusable_reservation(exchange, trading_client, answer, reads):
     now_ms = time.time_ns() // 1_000_000
     usable = {"accountIndex": 5, "firstIndex": 4097, "count": 1, "reservedAtMs": now_ms}
     exchange.queue("/l2/order-indices", httpx.Response(201, json={**usable, **answer}))
@@ -594,8 +489,22 @@ def test_unusable_reservation(exchange, trading_client, answer):
     assert exchange.posts("/orders") == []
     sent = len(exchange.requests)
     orders.limit_buy("OPRA", 10, 167.49)
-    # The account is kept (a reservation naming another account is a switch: test_venue_window).
-    assert routes(exchange.requests[sent:]) == ["POST /l2/order-indices", "POST /orders"]
+    # The account is kept, unless the range was another account's: then it is read again.
+    assert routes(exchange.requests[sent:]) == reads + ["POST /l2/order-indices", "POST /orders"]
+
+
+def test_another_accounts_range_drops_the_account_and_its_block(exchange, trading_client):
+    l2, account = pool(trading_client())
+    l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 1
+    l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 2: one number left
+    exchange.keys = {**KEYS, "accountIndex": 6}  # now account 6, with the same key in force
+    with pytest.raises(loaf.LoafServerError, match="no order can be signed in"):
+        l2.take(account, 3, DEFAULT_ORDER_TTL_MS)  # needs 3: the reservation names account 6
+    fresh = l2.account(L2_PUBLIC_KEY, "OPRA")
+    assert fresh == AccountState(6, 2) and len(exchange.gets("/l2/keys")) == 2
+    # Account 5's last number is never signed for account 6: a new block.
+    assert l2.take(fresh, 1, DEFAULT_ORDER_TTL_MS)[0] == 4104
+    assert counts(exchange) == [1, 2, 4, 4]
 
 
 @pytest.mark.parametrize(
@@ -687,7 +596,8 @@ def test_clock_hours_ahead(exchange, trading_client, l2_clock):
             "l2 order indices: the engine did not confirm the reservation; reserve again",
             loaf.LoafServiceUnavailableError,
         ),
-        (404, "Not found", loaf.LoafNotFoundError),  # only the no-account 404 is a switch
+        (404, "Not found", loaf.LoafNotFoundError),
+        (404, NO_ACCOUNT, loaf.LoafNotFoundError),
     ],
 )
 def test_other_reservation_refusals_propagate(
@@ -699,26 +609,6 @@ def test_other_reservation_refusals_propagate(
     assert (type(info.value), info.value.message) == (error, message)
     assert l2_clock.slept == [] and counts(exchange) == [1]  # no wait, no second reservation
     assert exchange.posts("/orders") == []
-
-
-def test_venue_refusal_of_a_reservation(exchange, trading_client):
-    participants_only = "Not a competition participant for the current round"
-    exchange.queue(
-        "/l2/order-indices", coded_reply(403, participants_only, "NOT_COMPETITION_PARTICIPANT")
-    )
-    orders = trading_client().orders
-    with pytest.raises(loaf.VenueError) as info:
-        orders.limit_buy("OPRA", 10, 167.49)
-    assert (info.value.status_code, info.value.code) == (403, "NOT_COMPETITION_PARTICIPANT")
-    assert exchange.posts("/orders") == []
-    sent = len(exchange.requests)
-    orders.limit_buy("OPRA", 10, 167.49)
-    assert routes(exchange.requests[sent:]) == [
-        "GET /trade/OPRA",
-        "GET /l2/keys",
-        "POST /l2/order-indices",
-        "POST /orders",
-    ]
 
 
 def test_expiry_read_after_the_reservation(exchange, l2_clock):
@@ -1335,9 +1225,7 @@ def test_transient_failure_resent_identically(exchange, trading_client, failure)
         NOT_PLACED,
         "Trading is temporarily unavailable for this property. Your order was not placed — "
         "please try again in a moment.",
-        "Trading temporarily unavailable. Please try again shortly.",  # the eligibility check
         "Trading is temporarily unavailable; your order was not placed, try again in a moment",
-        "The market mode could not be read; your order was not placed, try again in a moment",
         "l2 account: the trading account could not be read; nothing was done, try again in a "
         "moment",
         "l2 signature: the order signature could not be checked; your order was not placed, "
@@ -1357,20 +1245,6 @@ def test_503_not_placed_exhausted(exchange, trading_client, message):
     sent = len(exchange.requests)
     orders.limit_buy("OPRA", 10, 167.49)
     assert routes(exchange.requests[sent:]) == ["POST /orders"]
-
-
-def test_venue_switching_is_final(exchange, trading_client):
-    orders = trading_client().orders
-    orders.limit_buy("OPRA", 10, 167.49)  # caches the market and the account
-    exchange.queue("/orders", coded_reply(503, SWITCHING, "VENUE_SWITCHING"))
-    with pytest.raises(loaf.VenueSwitchingError) as info:
-        orders.limit_buy("OPRA", 10, 167.49)
-    assert (info.value.status_code, info.value.code) == (503, "VENUE_SWITCHING")
-    assert len(exchange.posts("/orders")) == 2  # one POST: the body belongs to the old mode
-    sent = len(exchange.requests)
-    orders.limit_buy("OPRA", 10, 167.49)
-    assert routes(exchange.requests[sent:]) == ["GET /trade/OPRA", "GET /l2/keys", "POST /orders"]
-    assert indices(exchange) == [4097, 4098, 4098]  # not placed: its number is signed again
 
 
 @pytest.mark.parametrize(
@@ -1450,22 +1324,6 @@ def test_one_ambiguous_attempt_makes_the_outcome_unknown(exchange, trading_clien
     assert type(info.value.last_error) is last
     orders.limit_buy("OPRA", 10, 167.49)
     assert indices(exchange) == [4097] * 4 + [4098]  # never the unknown order's number
-
-
-def test_ambiguous_then_venue_switching_is_unknown(exchange, trading_client):
-    orders = trading_client().orders
-    exchange.queue(
-        "/orders", httpx.ReadTimeout("timed out"), coded_reply(503, SWITCHING, "VENUE_SWITCHING")
-    )
-    with pytest.raises(OrderOutcomeUnknownError) as info:
-        orders.limit_buy("OPRA", 10, 167.49)
-    # The switch refused the re-send; the first attempt may have landed on the ledger being left.
-    assert isinstance(info.value.last_error, loaf.VenueSwitchingError)
-    assert info.value.attempts == 2
-    first, second = exchange.posts("/orders")
-    assert second == first
-    orders.limit_buy("OPRA", 10, 167.49)
-    assert indices(exchange) == [4097, 4097, 4098]  # never the unknown order's number
 
 
 @pytest.mark.parametrize(
@@ -1788,47 +1646,32 @@ def test_response_hook_raising_on_a_5xx_is_unknown(exchange):
 
 
 @pytest.mark.parametrize(
-    "status, message, code, error",
+    "status, message, error",
     [
-        (400, STALE_EPOCH, None, loaf.LoafValidationError),
-        (400, WRONG_CHAIN, None, loaf.LoafValidationError),
+        (400, STALE_EPOCH, loaf.LoafValidationError),
+        (400, WRONG_CHAIN, loaf.LoafValidationError),
         (
             400,
             "l2 market: the market index is not the property's market",
-            None,
             loaf.LoafValidationError,
         ),
         (
             400,
             "l2 asset: the base asset id is not the market's base asset",
-            None,
             loaf.LoafValidationError,
         ),
         # Matched anywhere in the text: a leg's refusal comes prefixed with its key.
-        (401, "tp: " + BAD_SIGNATURE, None, loaf.LoafAuthError),
-        (401, "l2 key: this trading key has been disabled", None, loaf.LoafAuthError),
-        (401, "l2 account: no trading account has this account index", None, loaf.LoafAuthError),
-        (403, NOT_TRADEABLE, "NOT_TRADEABLE_IN_MODE", loaf.VenueError),
-        (
-            403,
-            "The competition round has not started yet",
-            "COMPETITION_NOT_STARTED",
-            loaf.VenueError,
-        ),
-        (
-            403,
-            "Not a competition participant for the current round",
-            "NOT_COMPETITION_PARTICIPANT",
-            loaf.VenueError,
-        ),
+        (401, "tp: " + BAD_SIGNATURE, loaf.LoafAuthError),
+        (401, "l2 key: this trading key has been disabled", loaf.LoafAuthError),
+        (401, "l2 account: no trading account has this account index", loaf.LoafAuthError),
     ],
 )
 def test_context_refusal_rereads_market_and_account(
-    exchange, trading_client, status, message, code, error
+    exchange, trading_client, status, message, error
 ):
     orders = trading_client().orders
     orders.limit_buy("OPRA", 10, 167.49)
-    exchange.queue("/orders", httpx.Response(status, json={"error": message, "code": code}))
+    exchange.queue("/orders", error_reply(status, message))
     with pytest.raises(error) as info:
         orders.limit_buy("OPRA", 10, 167.49)  # reserves 2 and takes 4098
     assert type(info.value) is error
@@ -1880,40 +1723,29 @@ def test_unknown_outcome_still_invalidates(exchange, trading_client, message, re
 
 
 def test_refusal_of_an_older_account_keeps_a_fresh_read(exchange, trading_client):
-    l2, market, account = pool(trading_client())
-    l2.remember("OPRA", market)
+    l2, account = pool(trading_client())
+    l2.remember("OPRA", market_of(property_detail(), "OPRA"))
     epoch_refusal = error_from_response(400, {"error": STALE_EPOCH})
     # An order signed with the account as it was before another thread read it again.
     l2.after_refusal("OPRA", account._replace(epoch=1), None, epoch_refusal)
     assert l2.market("OPRA") is None  # the market is dropped whatever it was
-    assert l2.cached_account(market) == account
+    assert l2.account(L2_PUBLIC_KEY, "OPRA") == account
+    assert len(exchange.gets("/l2/keys")) == 1  # the fresh read is kept
     l2.after_refusal("OPRA", account, None, epoch_refusal)
-    assert l2.cached_account(market) is None
+    l2.account(L2_PUBLIC_KEY, "OPRA")
+    assert len(exchange.gets("/l2/keys")) == 2  # dropped: read again
 
 
 def test_index_refusal_of_a_replaced_block_keeps_the_new_one(exchange, trading_client):
-    l2, market, account = pool(trading_client())
-    _, old, _ = l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 1
-    _, new, _ = l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)  # another thread: reserves 2
+    l2, account = pool(trading_client())
+    _, old, _ = l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 1
+    _, new, _ = l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # another thread: reserves 2
     assert new is not old
     # The refusal of an order from the old block arrives after the new one was reserved.
     l2.after_refusal("OPRA", account, old, error_from_response(400, {"error": INDEX_USED}))
-    first, block, _ = l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)
+    first, block, _ = l2.take(account, 1, DEFAULT_ORDER_TTL_MS)
     assert (first, block) == (4099, new)
     assert counts(exchange) == [1, 2]
-
-
-def test_take_refuses_another_vault(exchange, trading_client):
-    l2, market, account = pool(trading_client())
-    l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 1
-    _, block, _ = l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 2: one left
-    other = market._replace(proxy_address="0x" + "22" * 20)
-    with pytest.raises(loaf.VenueSwitchingError) as info:
-        l2.take(other, account, 1, DEFAULT_ORDER_TTL_MS)
-    assert (info.value.status_code, info.value.code) == (0, "VENUE_SWITCHING")
-    # Nothing handed out, nothing reserved.
-    assert block.next == 4099 and counts(exchange) == [1, 2]
-    assert l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)[0] == 4099
 
 
 # --------------------------------------------------------------------------- #
@@ -1958,53 +1790,53 @@ def test_unknown_outcome_keeps_its_numbers(exchange, trading_client):
 
 
 def test_give_back_below_the_latest_numbers(exchange, trading_client):
-    l2, market, account = pool(trading_client())
+    l2, account = pool(trading_client())
     for _ in range(3):  # reserves 1, then 2
-        l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)
-    older, block, _ = l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 4
-    newer, same, _ = l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)
+        l2.take(account, 1, DEFAULT_ORDER_TTL_MS)
+    older, block, _ = l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 4
+    newer, same, _ = l2.take(account, 1, DEFAULT_ORDER_TTL_MS)
     assert (older, newer, same) == (4100, 4101, block)
     l2.give_back(block, older, 1)  # a later order holds the next number: kept for later
     assert block.next == 4102
     # An order with a leg takes consecutive numbers, never the one given back...
-    assert l2.take(market, account, 2, DEFAULT_ORDER_TTL_MS)[:2] == (4102, block)
+    assert l2.take(account, 2, DEFAULT_ORDER_TTL_MS)[:2] == (4102, block)
     # ...which the next single order signs.
-    assert l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)[:2] == (older, block)
+    assert l2.take(account, 1, DEFAULT_ORDER_TTL_MS)[:2] == (older, block)
     # The block has no number left at its end, and one given back still serves an order.
     assert block.next == block.end
     l2.give_back(block, newer, 1)
-    assert l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)[:2] == (newer, block)
+    assert l2.take(account, 1, DEFAULT_ORDER_TTL_MS)[:2] == (newer, block)
     assert counts(exchange) == [1, 2, 4]
 
 
 def test_concurrent_refusals_give_their_numbers_back(exchange, trading_client):
     # Four orders in flight at once, each refused after the next took its number: only the last
     # one's is the block's latest.
-    l2, market, account = pool(trading_client())
+    l2, account = pool(trading_client())
     for _ in range(3):  # reserves 1, then 2
-        l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)
-    taken = [l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS) for _ in range(4)]  # reserves 4
+        l2.take(account, 1, DEFAULT_ORDER_TTL_MS)
+    taken = [l2.take(account, 1, DEFAULT_ORDER_TTL_MS) for _ in range(4)]  # reserves 4
     block = taken[0][1]
     for first, _, _ in taken:
         l2.give_back(block, first, 1)
     # The last one's number goes back to the block's end; the others are kept for later.
     assert (block.next, block.returned) == (4103, [(4100, 1), (4101, 1), (4102, 1)])
-    again = [l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)[0] for _ in range(4)]
+    again = [l2.take(account, 1, DEFAULT_ORDER_TTL_MS)[0] for _ in range(4)]
     assert again == [first for first, _, _ in taken] == [4100, 4101, 4102, 4103]
     assert counts(exchange) == [1, 2, 4]  # nothing reserved for them
 
 
 def test_a_span_given_back_is_kept_whole(exchange, trading_client):
-    l2, market, account = pool(trading_client())
-    l2.take(market, account, 3, DEFAULT_ORDER_TTL_MS)  # reserves 3
-    l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 6
-    first, block, _ = l2.take(market, account, 3, DEFAULT_ORDER_TTL_MS)
-    l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)  # a later order holds the next number
+    l2, account = pool(trading_client())
+    l2.take(account, 3, DEFAULT_ORDER_TTL_MS)  # reserves 3
+    l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 6
+    first, block, _ = l2.take(account, 3, DEFAULT_ORDER_TTL_MS)
+    l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # a later order holds the next number
     l2.give_back(block, first, 3)
     # A single order takes the block's next number, never part of the three...
-    assert l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)[:2] == (4105, block)
+    assert l2.take(account, 1, DEFAULT_ORDER_TTL_MS)[:2] == (4105, block)
     # ...which the next order with two legs signs.
-    assert l2.take(market, account, 3, DEFAULT_ORDER_TTL_MS)[:2] == (first, block)
+    assert l2.take(account, 3, DEFAULT_ORDER_TTL_MS)[:2] == (first, block)
     assert counts(exchange) == [3, 6]
 
 
@@ -2013,240 +1845,21 @@ def test_a_number_given_back_serves_only_expiries_its_block_admits(
 ):
     now = freeze(l2_clock)
     exchange.reserved_at_ms = now
-    l2, market, account = pool(trading_client())
+    l2, account = pool(trading_client())
     for _ in range(3):  # reserves 1, then 2
-        l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)
-    first, block, _ = l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 4
-    second = l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)[0]
-    l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)  # a later order holds the next number
+        l2.take(account, 1, DEFAULT_ORDER_TTL_MS)
+    first, block, _ = l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 4
+    second = l2.take(account, 1, DEFAULT_ORDER_TTL_MS)[0]
+    l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # a later order holds the next number
     for given_back in (first, second):
         l2.give_back(block, given_back, 1)
     # Ten hours on, the block's range still admits a 7-day order...
     exchange.reserved_at_ms = freeze(l2_clock, now + 10 * HOUR_MS)
-    assert l2.take(market, account, 1, DEFAULT_ORDER_TTL_MS)[:2] == (first, block)
+    assert l2.take(account, 1, DEFAULT_ORDER_TTL_MS)[:2] == (first, block)
     # ...but not a max-life one, which the exchange would refuse when it books it (a stop or take
     # only when it fires, so it would FAIL then): that one signs a number from a fresh range.
-    assert l2.take(market, account, 1, MAX_ORDER_TTL_MS)[0] == 4104
+    assert l2.take(account, 1, MAX_ORDER_TTL_MS)[0] == 4104
     assert counts(exchange) == [1, 2, 4, 8]
-
-
-# --------------------------------------------------------------------------- #
-# The market-mode window: an account read that contradicts the trading key right
-# after the SDK saw the market mode switch is the switch still settling
-# --------------------------------------------------------------------------- #
-
-
-def _refused_by_the_exchange(exchange: FakeExchange, orders: Any) -> None:
-    orders.limit_buy("OPRA", 10, 167.49)
-    exchange.queue("/orders", coded_reply(403, NOT_TRADEABLE, "NOT_TRADEABLE_IN_MODE"))
-    with pytest.raises(loaf.VenueError):
-        orders.limit_buy("OPRA", 10, 167.49)
-
-
-def _refused_locally(exchange: FakeExchange, orders: Any) -> None:
-    orders.limit_buy("OPRA", 10, 167.49)
-    exchange.details["OPRA"] = property_detail(mode=True)  # a round started
-    with pytest.raises(loaf.VenueError):
-        orders.market_buy("OPRA", 1)  # a MARKET order reads the property every time
-    exchange.details["OPRA"] = property_detail()  # a stale detail: still the old mode
-
-
-def _switching(exchange: FakeExchange, orders: Any) -> None:
-    orders.limit_buy("OPRA", 10, 167.49)
-    exchange.queue("/orders", coded_reply(503, SWITCHING, "VENUE_SWITCHING"))
-    with pytest.raises(loaf.VenueSwitchingError):
-        orders.limit_buy("OPRA", 10, 167.49)
-
-
-def _reserved_on_the_other_ledger(exchange: FakeExchange, orders: Any) -> None:
-    orders.limit_buy("OPRA", 10, 167.49)  # its block of one is used up
-    now_ms = time.time_ns() // 1_000_000
-    other = {"accountIndex": 9, "firstIndex": 1, "count": 2, "reservedAtMs": now_ms}
-    exchange.queue("/l2/order-indices", httpx.Response(201, json=other))
-    with pytest.raises(loaf.VenueSwitchingError, match="switched while this order") as info:
-        orders.limit_buy("OPRA", 10, 167.49)
-    assert (info.value.status_code, info.value.code) == (0, "VENUE_SWITCHING")
-
-
-def _reserved_with_no_account(exchange: FakeExchange, orders: Any) -> None:
-    orders.limit_buy("OPRA", 10, 167.49)  # its block of one is used up
-    exchange.queue("/l2/order-indices", error_reply(404, NO_ACCOUNT))
-    with pytest.raises(loaf.VenueSwitchingError, match="switched while this order") as info:
-        orders.limit_buy("OPRA", 10, 167.49)
-    assert (info.value.status_code, info.value.code) == (0, "VENUE_SWITCHING")
-
-
-def _reserved_with_no_account_on_the_retry(exchange: FakeExchange, orders: Any) -> None:
-    orders.limit_buy("OPRA", 10, 167.49)  # its block of one is used up
-    exchange.queue(
-        "/l2/order-indices", error_reply(422, RESERVED_TOO_SOON), error_reply(404, NO_ACCOUNT)
-    )
-    with pytest.raises(loaf.VenueSwitchingError, match="switched while this order") as info:
-        orders.limit_buy("OPRA", 10, 167.49)
-    assert (info.value.status_code, info.value.code) == (0, "VENUE_SWITCHING")
-
-
-@pytest.mark.parametrize(
-    "refusal, opened_at",
-    [
-        (_refused_by_the_exchange, 1_000.0),
-        (_switching, 1_000.0),
-        (_reserved_on_the_other_ledger, 1_000.0),
-        (_reserved_with_no_account, 1_000.0),
-        (_reserved_with_no_account_on_the_retry, 1_000.0),
-        # The stale read at 1_119 shows the other mode again: the window counts from it.
-        (_refused_locally, 1_119.0),
-    ],
-)
-@pytest.mark.parametrize(
-    "keys, message",
-    [
-        (None, "You have no trading account on OPRA's market yet"),
-        ({**KEYS, "accountIndex": 9, "journaledKey": OTHER_KEY}, NOT_IN_FORCE),
-    ],
-)
-def test_venue_window(exchange, trading_client, l2_clock, refusal, opened_at, keys, message):
-    l2_clock.monotonic = lambda: 1_000.0
-    orders = trading_client().orders
-    refusal(exchange, orders)
-    exchange.keys = keys  # the account is read on the other ledger
-    l2_clock.monotonic = lambda: 1_119.0
-    sent = len(exchange.requests)
-    with pytest.raises(loaf.VenueSwitchingError) as info:
-        orders.limit_buy("OPRA", 10, 167.49)
-    assert (info.value.status_code, info.value.code) == (0, "VENUE_SWITCHING")
-    assert isinstance(info.value.__cause__, loaf.LoafConfigError)
-    assert message in str(info.value.__cause__)
-    assert routes(exchange.requests[sent:]) == ["GET /trade/OPRA", "GET /l2/keys"]
-    l2_clock.monotonic = lambda: opened_at + 119  # the window is still open
-    with pytest.raises(loaf.VenueSwitchingError):
-        orders.limit_buy("OPRA", 10, 167.49)
-    # Past two minutes the same answer is a setup to fix.
-    l2_clock.monotonic = lambda: opened_at + 121
-    sent = len(exchange.requests)
-    with pytest.raises(loaf.LoafConfigError, match=re.escape(message)):
-        orders.limit_buy("OPRA", 10, 167.49)
-    assert routes(exchange.requests[sent:]) == ["GET /trade/OPRA", "GET /l2/keys"]
-
-
-def test_own_switching_error_does_not_reopen_the_window(exchange, trading_client, l2_clock):
-    l2_clock.monotonic = lambda: 1_000.0
-    orders = trading_client().orders
-    _refused_by_the_exchange(exchange, orders)
-    exchange.keys = None
-    l2_clock.monotonic = lambda: 1_060.0
-    for _ in range(2):
-        with pytest.raises(loaf.VenueSwitchingError):
-            orders.limit_buy("OPRA", 10, 167.49)
-    l2_clock.monotonic = lambda: 1_121.0  # past the exchange's refusal's window, not the SDK's own
-    with pytest.raises(loaf.LoafConfigError, match="deposit"):
-        orders.limit_buy("OPRA", 10, 167.49)
-
-
-def test_refusals_while_a_mode_lasts_do_not_hold_the_window_open(
-    exchange, trading_client, l2_clock
-):
-    l2_clock.monotonic = lambda: 1_000.0
-    exchange.details["MUS"] = property_detail("MUS")
-    orders = trading_client().orders
-    orders.limit_buy("MUS", 10, 167.49)  # before the round
-    # A round starts. MUS, a real market, is refused on every tick; the round's market, on its
-    # own vault, names the round's trading key, which this client does not hold.
-    round_market = {**MARKET, "proxyAddress": "0x" + "22" * 20}
-    exchange.details = {
-        "MUS": property_detail("MUS", mode=True),
-        "ARNA": property_detail("ARNA", l2_market=round_market, competition=True, mode=True),
-    }
-    exchange.keys = {**KEYS, "accountIndex": 9, "journaledKey": OTHER_KEY}
-    raised = []
-    for tick in range(8):  # every 30 s
-        l2_clock.monotonic = lambda at=1_000.0 + 30 * tick: at
-        with pytest.raises(loaf.VenueError):
-            orders.market_buy("MUS", 1)  # a MARKET order reads the property every time
-        with pytest.raises((loaf.VenueSwitchingError, loaf.LoafConfigError)) as info:
-            orders.limit_buy("ARNA", 10, 167.49)
-        raised.append(type(info.value))
-    # The switch seen at 1_000 opened the window for two minutes, and the refusals since did not
-    # hold it open: the configuration error then surfaces.
-    assert raised == [loaf.VenueSwitchingError] * 4 + [loaf.LoafConfigError] * 4
-
-
-def test_a_switch_seen_in_a_property_read_opens_the_window(exchange, trading_client, l2_clock):
-    exchange.details["MUS"] = property_detail("MUS", mode=True)  # a round is on
-    orders = trading_client().orders
-    for tick in range(4):  # MUS, a real market, is refused on every tick of the round
-        l2_clock.monotonic = lambda at=1_000.0 + 30 * tick: at
-        with pytest.raises(loaf.VenueError):
-            orders.limit_buy("MUS", 10, 167.49)
-    # The round ends: a fresh read shows the real mode, while the round's ledger, which holds
-    # no account of yours, still answers the account read.
-    exchange.details["MUS"] = property_detail("MUS")
-    exchange.keys = None
-    l2_clock.monotonic = lambda: 1_120.0
-    with pytest.raises(loaf.VenueSwitchingError):
-        orders.limit_buy("MUS", 10, 167.49)
-    l2_clock.monotonic = lambda: 1_241.0
-    with pytest.raises(loaf.LoafConfigError, match="no trading account"):
-        orders.limit_buy("MUS", 10, 167.49)
-
-
-@pytest.mark.parametrize(
-    "seen",
-    [
-        # Another thread's property read shows the round...
-        lambda l2: l2.note_mode(property_detail("MUS", mode=True)),
-        # ...or the exchange refuses another thread's order for the market mode.
-        lambda l2: l2.after_refusal(
-            "MUS",
-            None,
-            None,
-            error_from_response(403, {"error": NOT_TRADEABLE, "code": "NOT_TRADEABLE_IN_MODE"}),
-        ),
-    ],
-    ids=["property-read", "refusal"],
-)
-def test_a_switch_seen_during_an_account_read_counts_for_it(exchange, seen):
-    reading, release = threading.Event(), threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/l2/keys" and exchange.keys is None:
-            reading.set()  # the account read is in flight until the test releases it
-            release.wait(10)
-        return exchange.handler(request)
-
-    http = httpx.Client(transport=httpx.MockTransport(handler), base_url=BASE)
-    orders = LoafClient(
-        api_key="testkey", secret_key=L2_SECRET, base_url=BASE, http_client=http
-    ).orders
-    orders.limit_buy("OPRA", 10, 167.49)  # the real mode is seen
-    exchange.queue("/orders", error_reply(400, STALE_EPOCH))
-    with pytest.raises(loaf.LoafValidationError):
-        orders.limit_buy("OPRA", 10, 167.49)  # the account is read again next time
-    # The round's ledger already answers that read, while the detail, still stale, shows the
-    # real mode.
-    exchange.keys = None
-    raised: list[Exception] = []
-
-    def place() -> None:
-        try:
-            orders.limit_buy("OPRA", 10, 167.49)
-        except loaf.LoafError as exc:
-            raised.append(exc)
-
-    placing = threading.Thread(target=place)
-    placing.start()
-    assert reading.wait(10)
-    other = threading.Thread(target=seen, args=(orders._l2,))
-    other.start()
-    deadline = time.monotonic() + 3  # the switch is noted while the account read is in flight
-    while orders._l2._switch_seen_at == float("-inf") and time.monotonic() < deadline:
-        time.sleep(0.01)
-    release.set()
-    placing.join(10)
-    other.join(10)
-    (error,) = raised
-    assert isinstance(error, loaf.VenueSwitchingError)
-    assert isinstance(error.__cause__, loaf.LoafConfigError)
 
 
 # --------------------------------------------------------------------------- #
