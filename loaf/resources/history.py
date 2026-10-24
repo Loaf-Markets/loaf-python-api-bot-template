@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
+from ..exceptions import LoafError
 from .base import Resource
 
 
@@ -101,15 +102,20 @@ class HistoryResource(Resource):
     # -- Convenience: iterate every page transparently -------------------- #
 
     def iter_orders(self, *, page_size: int = 100) -> Iterator[Any]:
-        """Yield every order across all pages using cursor pagination."""
+        """Yield every order across all pages using cursor pagination. A
+        ``nextCursor`` the server already gave raises
+        :class:`~loaf.exceptions.LoafError` instead of paging forever."""
         yield from self._iter("/history/orders", "orders", page_size)
 
     def iter_trades(self, *, page_size: int = 100) -> Iterator[Any]:
-        """Yield every trade across all pages using cursor pagination."""
+        """Yield every trade across all pages using cursor pagination. A
+        ``nextCursor`` the server already gave raises
+        :class:`~loaf.exceptions.LoafError` instead of paging forever."""
         yield from self._iter("/history/trades", "trades", page_size)
 
     def _iter(self, path: str, key: str, page_size: int) -> Iterator[Any]:
         cursor: str | None = None
+        followed: set[str] = set()
         while True:
             page = self._client.get(path, params={"pageSize": page_size, "cursor": cursor})
             for item in page.get(key, []) or []:
@@ -117,3 +123,6 @@ class HistoryResource(Resource):
             cursor = page.get("nextCursor")
             if not cursor:
                 return
+            if cursor in followed:
+                raise LoafError(f"GET {path} answered a nextCursor it had already given; stopped paging")
+            followed.add(cursor)

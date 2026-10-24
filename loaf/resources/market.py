@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
+from ..exceptions import LoafError
 from .base import Resource, _check_ticker
 
 
@@ -116,7 +117,9 @@ class MarketResource(Resource):
         Note the ordering: pages are walked backwards in time and each page is
         yielded newest -> oldest, so the stream is strictly reverse-chronological.
         A page that stays busy (503, see :meth:`candles`) raises
-        :class:`~loaf.exceptions.LoafServiceUnavailableError` mid-iteration.
+        :class:`~loaf.exceptions.LoafServiceUnavailableError` mid-iteration,
+        and a page whose ``oldestTs`` is not before the ``to`` it was asked for
+        raises :class:`~loaf.exceptions.LoafError` instead of paging forever.
         """
         to: int | None = None
         while True:
@@ -125,6 +128,11 @@ class MarketResource(Resource):
                 yield candle
             if not page.get("hasMore") or page.get("oldestTs") is None:
                 return
+            if to is not None and not page["oldestTs"] < to:
+                raise LoafError(
+                    f"GET /trade/{ticker}/candles answered oldestTs {page['oldestTs']} for to={to}; "
+                    "stopped paging"
+                )
             to = page["oldestTs"]
 
     # -- Trades (the tape's backfill) -------------------------------------- #

@@ -800,8 +800,9 @@ headers (snapshot at `loaf.last_rate_limit`). Order placements, cancels,
 order-number reservations, portfolio reads and competition queue/payout calls
 are additionally limited **per account** (a placement counts for the account
 it is signed for), so rotating IPs doesn't raise the ceiling. Reads are retried
-automatically on 429, 503 and network errors, with backoff that honours
-`RateLimit-Reset` / `Retry-After`; the reads a placement makes before it signs
+automatically on 429, 503 and network errors, with backoff that honours a
+positive `RateLimit-Reset` / `Retry-After` (one of 0 or less backs off
+exponentially, as with none); the reads a placement makes before it signs
 raise a 429 at once instead, since a late order is stale. Order placements are
 re-sent unchanged on network errors and server errors after a short jittered
 pause, not the rate-limit headers (see **Signing & retries**), but never on a
