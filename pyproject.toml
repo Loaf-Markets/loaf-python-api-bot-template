@@ -14,8 +14,8 @@ keywords = ["loaf", "trading", "real-estate", "api", "sdk", "bot", "websocket"]
 
 # Runtime dependencies are intentionally minimal.
 dependencies = [
-    "httpx>=0.27",        # REST client (timeouts, HTTP/2, clean errors)
-    "websockets>=12.0",   # real-time market & portfolio feeds
+    "httpx>=0.27",               # REST client (timeouts, HTTP/2, clean errors)
+    "websockets>=12.0",          # real-time market & portfolio feeds
 ]
 
 [project.optional-dependencies]
@@ -23,6 +23,9 @@ dependencies = [
 dotenv = ["python-dotenv>=1.0"]
 # `pip install -e ".[dev]"` for the test suite.
 dev = ["pytest>=8.0"]
+# `pip install -e ".[wallet]"` for python -m loaf.secret_key, which signs with your wallet key to
+# derive your trading key (EIP-712 and keccak). The trading client itself needs neither.
+wallet = ["eth-account>=0.13,<0.15", "eth-utils>=2"]
 
 [project.urls]
 Homepage = "https://loafmarkets.com"

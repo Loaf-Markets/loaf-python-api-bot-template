@@ -3,6 +3,9 @@
 This DOES place a real (limit) order, priced far from the market so it rests on
 the book rather than filling. Review it before running against a live account.
 
+It needs both keys: LOAF_SECRET_KEY signs the order, and LOAF_API_KEY reads
+your trading account and cancels the order again.
+
     python examples/03_place_order.py
 """
 
@@ -21,34 +24,45 @@ except ImportError:
 
 def main() -> None:
     client = LoafClient()
+    if client.public_key is None:
+        raise SystemExit("Set LOAF_SECRET_KEY to place orders (see README §2).")
+    if not client.api_key:
+        raise SystemExit(
+            "Set LOAF_API_KEY too, to read your trading account and cancel the order "
+            "(see README §2)."
+        )
 
-    # Pick a property to trade.
-    properties = client.market.properties().get("properties") or []
-    if not properties:
-        raise SystemExit("No properties available.")
-    prop = properties[0]
-    detail = client.market.property(prop.tokenName)
+    # Pick a property you can trade now: LIVE, with an L2 market.
+    tradeable = [
+        p
+        for p in client.market.properties().get("properties") or []
+        if p.get("status") == "LIVE" and p.get("hasL2Market")
+    ]
+    if not tradeable:
+        raise SystemExit("No tradeable properties right now.")
+    prop = tradeable[0]
+    detail = client.market.property(prop.ticker)
     book = detail.get("orderBook")
     best_bid = book.bids[0].price if book and book.get("bids") else (prop.marketPrice or 1.0)
 
     # A passive limit BUY well below the best bid (unlikely to fill immediately).
     price = round(best_bid * 0.80, 2)
-    print(f"Placing LIMIT BUY 1 {prop.tokenName} @ {price} (best bid {best_bid})")
+    print(f"Placing LIMIT BUY 1 {prop.ticker} @ {price} (best bid {best_bid})")
 
     try:
-        result = client.orders.limit_buy(prop.tokenName, quantity=1, price=price)
-    except loaf.CompetitionEligibilityError:
-        raise SystemExit(
-            "Not admitted to the active competition round — check "
-            "client.competition.queue_position() for your place in the queue."
-        )
-    except loaf.TradingHaltedError:
-        raise SystemExit("Trading is currently halted platform-wide. Try again later.")
-    except loaf.LoafValidationError as exc:
-        raise SystemExit(f"Rejected: {exc.message} {exc.details}")
+        result = client.orders.limit_buy(prop.ticker, quantity=1, price=price)
+    except loaf.LoafConfigError as exc:  # your trading key or account: the message says what to do
+        raise SystemExit(str(exc))
+    except loaf.LoafAPIError as exc:  # halted, market closed, order refused, rate limited
+        raise SystemExit(f"Refused: {exc}")
+    except loaf.OrderOutcomeUnknownError as exc:
+        # Unsure whether it landed: re-send the same signed order to find out (the
+        # same order if it landed, placed now if not), then cancel it below. If this
+        # raises again, look for the order in client.history.orders().
+        result = client.orders.resubmit(exc.signed_body)
 
     order_id = result.orderId
-    print(f"Accepted. orderId={order_id}")
+    print(f"Accepted. orderId={order_id} status={result.status} left={result.quantityLeft}")
 
     # See it among active orders.
     active = client.history.active_orders().get("activeOrders") or []
@@ -59,8 +73,8 @@ def main() -> None:
     try:
         client.orders.cancel(order_id)
         print("Cancelled.")
-    except loaf.LoafConflictError:
-        print("Order was no longer cancellable (likely already filled/cancelled).")
+    except (loaf.LoafConflictError, loaf.LoafValidationError) as exc:
+        print(f"No longer cancellable: {exc.message}")
 
     client.close()
 

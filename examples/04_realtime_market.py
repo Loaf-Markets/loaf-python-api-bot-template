@@ -24,7 +24,7 @@ def main() -> None:
     if not properties:
         raise SystemExit("No properties available.")
     prop = properties[0]
-    print(f"Streaming {prop.tokenName} (id {prop.propertyId}). Ctrl-C to stop.\n")
+    print(f"Streaming {prop.ticker} (id {prop.propertyId}). Ctrl-C to stop.\n")
 
     ws = client.websocket()
 
@@ -34,10 +34,16 @@ def main() -> None:
         ask = msg.asks[0] if msg.get("asks") else None
         print(f"BOOK  bid={bid.price if bid else '-':<10} ask={ask.price if ask else '-'}")
 
+    last_trade_id = 0
+
     @ws.on_trades
     def on_trades(msg):
-        for t in (msg.get("trades") or [])[:1]:  # newest
-            print(f"TRADE {t.aggressorSide} {t.quantity} @ {t.price}")
+        nonlocal last_trade_id
+        # Newest first; each (re)subscription brings the recent trades again: skip those printed.
+        for t in reversed(msg.get("trades") or []):
+            if t.tradeId > last_trade_id:
+                last_trade_id = t.tradeId
+                print(f"TRADE {t.aggressorSide} {t.quantity} @ {t.price}")
 
     @ws.on_mark_price
     def on_mark(msg):
@@ -45,12 +51,12 @@ def main() -> None:
 
     @ws.on_property_halt
     def on_halt(msg):
-        print(f"HALT  {msg.tokenName} -> {'HALTED' if msg.isHalted else 'RESUMED'}")
+        print(f"HALT  {msg.ticker} -> {'HALTED' if msg.isHalted else 'RESUMED'}")
 
-    ws.subscribe_orderbook(prop.tokenName)
-    ws.subscribe_trades(prop.tokenName)
-    ws.subscribe_mark_price(prop.tokenName)
-    ws.subscribe_property_status(prop.tokenName)
+    ws.subscribe_orderbook(prop.ticker)
+    ws.subscribe_trades(prop.ticker)
+    ws.subscribe_mark_price(prop.ticker)
+    ws.subscribe_property_status(prop.ticker)
 
     ws.run_forever()  # blocking until Ctrl-C
 

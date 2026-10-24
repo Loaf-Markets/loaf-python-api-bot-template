@@ -41,14 +41,8 @@ class ConditionalOrderType(_StrEnum):
 
 
 class TimeInForce(_StrEnum):
-    #: Good-til-cancelled. The default; recommended for bots.
+    #: Good-til-cancelled — the only value the exchange accepts; order rows carry it.
     GTC = "GTC"
-    #: Immediate-or-cancel.
-    IOC = "IOC"
-    #: Fill-or-kill.
-    FOK = "FOK"
-    #: Good-til-date. Requires a future unix-seconds ``deadline``.
-    GTD = "GTD"
 
 
 class OrderStatus(_StrEnum):
@@ -56,7 +50,6 @@ class OrderStatus(_StrEnum):
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
-    REJECTED = "REJECTED"
 
 
 class ConditionalOrderStatus(_StrEnum):
@@ -67,21 +60,6 @@ class ConditionalOrderStatus(_StrEnum):
     #: Triggered and booked — follow ``placedOrderId`` from here for the fills.
     PLACED = "PLACED"
     FAILED = "FAILED"
-    CANCELLED = "CANCELLED"
-
-
-class TradeStatus(_StrEnum):
-    SETTLING = "SETTLING"
-    SETTLED = "SETTLED"
-    SETTLEMENT_FAILED = "SETTLEMENT_FAILED"
-
-
-class OfferingOrderStatus(_StrEnum):
-    """Status of an IPO/offering subscription order."""
-
-    PENDING = "PENDING"
-    ALLOCATED = "ALLOCATED"
-    REJECTED = "REJECTED"
     CANCELLED = "CANCELLED"
 
 
@@ -96,17 +74,6 @@ class IpoStatus(_StrEnum):
     LIVE = "LIVE"
     CLOSED = "CLOSED"
     CANCELLED = "CANCELLED"
-
-
-class TransferType(_StrEnum):
-    DEPOSIT = "DEPOSIT"
-    WITHDRAWAL = "WITHDRAWAL"
-
-
-class TransferStatus(_StrEnum):
-    PENDING = "PENDING"
-    CONFIRMED = "CONFIRMED"
-    REJECTED = "REJECTED"
 
 
 class CandleResolution(_StrEnum):
@@ -149,19 +116,17 @@ class WSMessageType(_StrEnum):
     TRADES_BATCH = "trades_batch"
     CANDLE_UPDATE = "candle_update"
     MARK_PRICE = "mark_price"
-    IPO_ALLOCATION_UPDATE = "ipo_allocation_update"
     VOLUME_UPDATE = "volume_update"
     LEADERBOARD_UPDATE = "leaderboard_update"
     PROPERTY_HALT = "property_halt"
+    ROUND_UPDATE = "round_update"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"
-    POSITION_UPDATE = "position_update"
     ORDER_STATUS = "order_status"
     ORDER_UPDATE = "order_update"
     TRADE_NEW = "trade_new"
+    ORDER_QUEUE = "order_queue"
     LIFETIME_VOLUME_UPDATE = "lifetime_volume_update"
-    TRANSFER_UPDATE = "transfer_update"
-    OFFERING_ORDER_UPDATE = "offering_order_update"
 
 
 #: The four ``type`` values that mark an order row as a conditional (stop / take).

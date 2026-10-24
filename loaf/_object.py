@@ -5,7 +5,7 @@ for every shape (which would break whenever the backend adds a field), parsed
 responses are wrapped in :class:`LoafObject` — a ``dict`` subclass whose keys
 are also reachable as attributes, recursively::
 
-    book = client.market.property("opera").orderBook
+    book = client.market.property("OPRA").orderBook
     book["bids"][0]["price"]   # dict access
     book.bids[0].price         # attribute access — identical
 

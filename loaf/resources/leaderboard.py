@@ -12,13 +12,20 @@ class LeaderboardResource(Resource):
         """``GET /leaderboard`` — the current competition leaderboard. (public)
 
         Returns ``{roundNumber, roundName, roundRules, roundStatus,
-        bottomCullPercent, volumeMultiplierTiers, entries, totalParticipants,
-        newAssetProperty}``, where ``bottomCullPercent`` is the share (0-100) of
-        lowest-ranked participants dropped when the round ends. An entry is
-        ``rank``, ``handle``, ``walletAddress`` and ``points`` (``points`` is
-        rounded to two decimals). Serves a live board while a round is ``ACTIVE``
-        or the last round's frozen snapshot between rounds. Raises 404 when no
-        round/snapshot exists.
+        bottomCullPercent, volumeMultiplierTiers, volumeExponent, pnlMultiplier,
+        entries, totalParticipants, newAssetProperty}``, where
+        ``bottomCullPercent`` is the share (0-100) of lowest-ranked participants
+        dropped when the round ends. An entry is ``rank``, ``handle``,
+        ``walletAddress`` and ``points``, rounded to two decimals:
+        ``a * volume ** volumeExponent + pnlMultiplier * pnl``, where ``a`` is
+        the multiplier of the highest ``volumeMultiplierTiers`` tier the volume
+        reaches (1 below the first).
+
+        The board is live while a round is ``ACTIVE``, and while it is
+        ``ENDING`` until its board is frozen; then it is the newest frozen board.
+        During the next round's PREPARED that is still the previous round's, so
+        check ``roundNumber``. Raises :class:`~loaf.exceptions.LoafNotFoundError`
+        (404 ``No active competition round``) when there is no board.
 
         ``entries`` is truncated to the top N the server is configured to serve,
         so take the participant count from ``totalParticipants`` (everyone
@@ -39,6 +46,6 @@ class LeaderboardResource(Resource):
         For live updates, prefer subscribing to the ``leaderboard`` WebSocket
         channel (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_leaderboard`)
         over polling — the server pushes a ``leaderboard_update`` whenever the
-        board changes.
+        board changes (no frame on subscribe: seed from this read).
         """
         return self._client.get("/leaderboard", auth=False)
