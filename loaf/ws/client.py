@@ -264,7 +264,7 @@ class LoafWebSocketClient:
         quantity - quantityLeft always.
 
         ``CANCELLED`` also arrives for cancels you did not request: the
-        exchange's sweep 24 h before the order's ``expiryMs``, an epoch move (a
+        exchange's sweep 72 h before the order's ``expiryMs``, an epoch move (a
         trading-key reset or a cancel-all sent on chain), a closed market, a BUY
         that can no longer fund a fill within its hold (budget exhausted), an
         aggressing SELL at K1's bound (its remainder does not rest), your own

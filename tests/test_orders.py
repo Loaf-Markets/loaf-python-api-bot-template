@@ -529,7 +529,7 @@ def test_block_too_old_for_the_expiry_is_replaced(exchange, trading_client, l2_c
     orders = trading_client().orders
     orders.limit_buy("OPRA", 10, 167.49)
     orders.limit_buy("OPRA", 10, 167.49)  # reserves 2: one number left
-    # 42 days on, a 7-day order expires 50 days after that block's reservation: later than
+    # 42 days on, a 7-day order expires 52 days after that block's reservation: later than
     # the exchange admits on it (K1's longest order life).
     later = now + 42 * DAY_MS
     freeze(l2_clock, later)
@@ -863,7 +863,7 @@ def test_expiry_is_now_plus_buffer_plus_ttl(exchange, trading_client, l2_clock):
     orders = trading_client().orders
     orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90)
     body = exchange.bodies("/orders")[-1]
-    expiry = now + 86_400_000 + 604_800_000  # 24 h of buffer, then 7 days of life
+    expiry = now + 259_200_000 + 604_800_000  # 72 h of buffer, then 7 days of life
     assert body["l2ExpiryMs"] == body["tp"]["l2ExpiryMs"] == body["sl"]["l2ExpiryMs"] == expiry
     for ttl in (60_000, MAX_ORDER_TTL_MS):
         orders.limit_buy("OPRA", 10, 167.49, ttl_ms=ttl)
@@ -877,7 +877,7 @@ def test_ttl_refused_locally(exchange, trading_client, ttl):
     assert info.value.status_code == 0
     assert info.value.message == (
         "ttl_ms must be a whole number of milliseconds from 60,000 (one minute) to "
-        f"4,141,458,432 (about 47.9 days) (got {ttl!r})"
+        f"3,968,658,432 (about 45.9 days) (got {ttl!r})"
     )
     assert exchange.requests == []
 

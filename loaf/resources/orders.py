@@ -19,9 +19,9 @@ placed are reused by later orders; a restart leaves the unused rest of a block
 unused.
 
 **Order life.** Every order expires. ``ttl_ms=`` sets how long it may rest
-(default 7 days, from one minute to about 47.9 days): the SDK signs the expiry
-``l2ExpiryMs`` = now + 24 hours + ``ttl_ms`` (``expiryMs`` on order rows), and
-the exchange stops filling the order 24 hours before it and cancels it (a
+(default 7 days, from one minute to about 45.9 days): the SDK signs the expiry
+``l2ExpiryMs`` = now + 72 hours + ``ttl_ms`` (``expiryMs`` on order rows), and
+the exchange stops filling the order 72 hours before it and cancels it (a
 ``CANCELLED`` you did not request). TP/SL legs share their
 parent's life. An ARMED stop, take or leg is not cancelled when its life ends:
 it keeps its open-order slot until you cancel it or it fires, and FAILS if it
@@ -244,7 +244,7 @@ class OrdersResource(Resource):
                 at ``trigger x (1 - leg_max_slippage_bps/10,000)``, so after a
                 gap past that price it rests instead of selling.
             ttl_ms: how long the order may rest, in whole milliseconds, from
-                60,000 (one minute) to 4,141,458,432 (about 47.9 days); default
+                60,000 (one minute) to 3,968,658,432 (about 45.9 days); default
                 604,800,000 (7 days). The exchange then stops filling it and
                 cancels it; its TP/SL legs share its life. A bot's quotes
                 should die with the bot: give them a short one.
@@ -662,7 +662,7 @@ class OrdersResource(Resource):
         order of the old epoch.
 
         Needs neither the trading key nor the API key. Once the order can no
-        longer rest (its ``l2ExpiryMs`` minus 24 hours has passed) nothing is
+        longer rest (its ``l2ExpiryMs`` minus 72 hours has passed) nothing is
         sent, since the exchange refuses it then: the
         ``OrderOutcomeUnknownError`` has ``attempts`` 0 and the reason in
         ``last_error``. Stop resubmitting it: find it in ``history.orders()`` by
@@ -925,7 +925,8 @@ def _ttl(ttl_ms: Any) -> int:
     if not whole or not MIN_ORDER_TTL_MS <= int(ttl_ms) <= MAX_ORDER_TTL_MS:
         raise _client_validation_error(
             f"ttl_ms must be a whole number of milliseconds from {MIN_ORDER_TTL_MS:,} (one "
-            f"minute) to {MAX_ORDER_TTL_MS:,} (about 47.9 days) (got {ttl_ms!r})"
+            f"minute) to {MAX_ORDER_TTL_MS:,} (about {MAX_ORDER_TTL_MS / 86_400_000:.1f} days) "
+            f"(got {ttl_ms!r})"
         )
     return int(ttl_ms)
 

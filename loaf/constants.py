@@ -79,9 +79,10 @@ L2_FEE_RATE_CAP = 7_000
 # Order life (milliseconds)
 # --------------------------------------------------------------------------- #
 
-#: An order stops filling at its signed ``l2ExpiryMs`` minus this (24 hours), and the exchange
-#: refuses one whose expiry is already inside it. The SDK signs now + this + the order's ttl.
-L2_BUFFER_MS = 86_400_000
+#: An order stops filling at its signed ``l2ExpiryMs`` minus this (72 hours since
+#: l2-settle-schema 0.27.0; 24 hours before), and the exchange refuses one whose expiry is already
+#: inside it. The SDK signs now + this + the order's ttl.
+L2_BUFFER_MS = 259_200_000
 
 #: K1's longest order life (about 49.3 days): an order's expiry may lie at most this far past the
 #: reservation of its order number, and at most this less one margin past the exchange's clock.
@@ -96,7 +97,7 @@ DEFAULT_ORDER_TTL_MS = 604_800_000
 #: The shortest ``ttl_ms=`` accepted: one minute.
 MIN_ORDER_TTL_MS = 60_000
 
-#: The longest ``ttl_ms=`` accepted (about 47.9 days): the longest order life, less one margin
+#: The longest ``ttl_ms=`` accepted (about 45.9 days): the longest order life, less one margin
 #: for each clock and the buffer.
 MAX_ORDER_TTL_MS = L2_MAX_ORDER_LIFE_MS - 2 * L2_ORDER_LIFE_MARGIN_MS - L2_BUFFER_MS
 

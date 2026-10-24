@@ -120,7 +120,7 @@ class OrderOutcomeUnknownError(LoafError):
             "placed now at the signed price), or find it in history.orders() by its expiryMs "
             f"{signed_body.get('l2ExpiryMs')} (every status; openOrders shows only resting "
             "orders). A history miss proves nothing while it can still rest (until its expiryMs "
-            "minus 24 hours)."
+            "minus 72 hours)."
         )
 
 

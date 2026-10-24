@@ -34,7 +34,7 @@ class HistoryResource(Resource):
         one is capped — another reason not to derive "has more" from it.
 
         Rows carry ``expiryMs`` (unix ms, the signed expiry): a booked order
-        rests until ``expiryMs`` minus 24 h, and the exchange then cancels it; a
+        rests until ``expiryMs`` minus 72 h, and the exchange then cancels it; a
         stop or take that fires after then FAILS. ``filledQuantity`` is an
         unrounded float difference (0.2 tokens can read
         ``0.19999999999999998``): compare it with a tolerance, and rely on

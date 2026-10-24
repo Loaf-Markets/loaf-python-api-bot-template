@@ -132,7 +132,7 @@ def test_errors_survive_pickle_and_copy():
         "(the same order if it landed; if not, it is placed now at the signed price), or find "
         "it in history.orders() by its expiryMs 1800000000000 (every status; openOrders shows "
         "only resting orders). A history miss proves nothing while it can still rest (until its "
-        "expiryMs minus 24 hours)."
+        "expiryMs minus 72 hours)."
     )
     for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
         assert type(clone) is loaf.OrderOutcomeUnknownError
