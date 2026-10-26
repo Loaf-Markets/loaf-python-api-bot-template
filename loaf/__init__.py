@@ -22,8 +22,10 @@ from .constants import (
     DEFAULT_MAX_SLIPPAGE_BPS,
     L2_BUFFER_MS,
     L2_FEE_RATE_CAP,
+    MAX_POOL,
     MAX_PRICE_DECIMALS,
     MAX_QUANTITY_DECIMALS,
+    PERPS_SPOT_SIDE,
 )
 from .enums import (
     CONDITIONAL_ORDER_TYPES,
@@ -53,7 +55,11 @@ from .exceptions import (
     LoafServerError,
     LoafServiceUnavailableError,
     LoafValidationError,
+    MarketHaltedError,
+    MarketStateError,
     OrderOutcomeUnknownError,
+    PerpsOutcomeUnknownError,
+    PriceHeldError,
     TradingHaltedError,
 )
 from .money import bps_to_fraction, fraction_to_bps, from_base_units, worst_price
@@ -70,8 +76,10 @@ __all__ = [
     "DEFAULT_MAX_SLIPPAGE_BPS",
     "L2_BUFFER_MS",
     "L2_FEE_RATE_CAP",
+    "MAX_POOL",
     "MAX_PRICE_DECIMALS",
     "MAX_QUANTITY_DECIMALS",
+    "PERPS_SPOT_SIDE",
     # enums
     "OrderSide",
     "OrderType",
@@ -97,10 +105,14 @@ __all__ = [
     "LoafConfigError",
     "LoafConnectionError",
     "OrderOutcomeUnknownError",
+    "PerpsOutcomeUnknownError",
     "LoafAPIError",
     "LoafAuthError",
     "LoafForbiddenError",
     "TradingHaltedError",
+    "MarketStateError",
+    "MarketHaltedError",
+    "PriceHeldError",
     "LoafValidationError",
     "LoafNotFoundError",
     "LoafConflictError",

@@ -8,13 +8,15 @@ preserved at runtime even though they are not listed here.
 
 Every monetary field is in plain dollars and every quantity in plain tokens
 (see :mod:`loaf.money`), except ``balances`` and a transfer's ``amount``:
-decimal strings in the token's base units (:func:`loaf.from_base_units`).
-Timestamps are unix seconds, except ``expiryMs`` (unix milliseconds).
+decimal strings in the token's base units (:func:`loaf.from_base_units`), and
+the perps shapes, in the exchange engine's units
+(:meth:`loaf.resources.perps.PerpsResource.positions`). Timestamps are unix
+seconds, except ``expiryMs`` (unix milliseconds).
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, TypedDict
+from typing import Any, Optional, TypedDict, Union
 
 
 class PriceLevel(TypedDict):
@@ -46,16 +48,101 @@ class CandleHistory(TypedDict, total=False):
     hasMore: bool  # at least one older candle exists before oldestTs
 
 
-class L2Market(TypedDict):
-    """``property.l2Market`` of ``GET /trade/{ticker}``: the L2 market every order
-    on the property signs (the SDK reads it for you)."""
+class L2SpotMarket(TypedDict):
+    """``property.l2Market`` of ``GET /trade/{ticker}`` for a spot market: the L2
+    market every order on the property signs (the SDK reads it for you)."""
 
+    kind: str  # "spot"
     chainId: int  # the chain the proxy is on, not what an order signs
     proxyAddress: str  # the ZkLoaf proxy
     l2ChainId: int
-    marketIndex: int
+    marketIndex: int  # 2048 to 4094
     baseAssetId: int  # the property token's balances row
     quoteAssetId: int  # the cash balances row
+
+
+class L2PerpsMarket(TypedDict):
+    """``property.l2Market`` for a perps market, and each row of
+    ``perps.markets()``: a perpetual future settled in USDC, with the terms its
+    orders are admitted against."""
+
+    kind: str  # "perps"
+    chainId: int
+    proxyAddress: str
+    l2ChainId: int
+    marketIndex: int  # 0 to 254
+    quoteAssetId: int  # 3, USDC; a perps market has no base asset
+    status: str  # "ACTIVE", or "EXPIRED": no more orders; positions leave by perps.exit()
+    sem: int  # the market's size extension multiplier
+    qem: str  # its quote extension multiplier, a decimal string (it can pass 2^53)
+    takerFee: int  # per 1,000,000; an order's signed fee-rate cap must cover it
+    makerFee: int
+    risk: int  # the maintenance margin factor per 65,536 (initial margin is twice it)
+    band: int  # how far (bp) an order's price may sit from the index; 0: no bound
+    flags: int  # PERPS_FLAG_CROSS (pool 0 may trade it) | PERPS_FLAG_REDUCE_ONLY
+    oiCap: int  # the open-interest cap, in base units
+    minBase: int  # the least signed quantity of an order that adds to a position; 0: none
+    minQuote: int  # the least quote (signed quantity x signed price / 10) of one; 0: none
+    quoteLimit: int  # the most quote of any order; 0: none
+
+
+#: ``property.l2Market``: a spot or a perps market, by ``kind``.
+L2Market = Union[L2SpotMarket, L2PerpsMarket]
+
+
+class PerpsMarkets(TypedDict):
+    """``perps.markets()``: every perps market, ascending by ``marketIndex``."""
+
+    markets: list[L2PerpsMarket]
+
+
+class PerpsPosition(TypedDict, total=False):
+    """One open position of a pool. Amounts are decimal strings in the engine's units."""
+
+    market: int  # the perps market, 0 to 254
+    base: str  # signed, in base units (an order's signed quantity): + long, - short
+    fundingIndex: str  # the funding index it last settled at, 32.32 fixed point
+    entryQuote: str  # the quote of the fills that opened and grew it
+    entryPrice: str  # 10 x entryQuote / |base|, in the market's price units
+    fundingOwed: str  # extended USDC units: positive pays, negative receives
+    notional: str  # |base| x index x qem, extended USDC units
+    liquidationPrice: Optional[str]  # the index past which the pool is liquidatable, or None
+    adlRank: Optional[int]  # where served: 1 (deleveraged last) to 5 (first); None: unranked
+
+
+class PerpsPool(TypedDict):
+    """One margin pool of yours: its collateral and positions."""
+
+    pool: int  # 0, the cross pool, or 1 to 7
+    collateral: str  # signed, extended USDC units
+    value: Optional[str]  # collateral + each position's signed notional - its funding owed
+    requirement: Optional[str]  # maintenance margin, extended USDC units x 65,536
+    liquidatable: Optional[bool]  # value < 0 or value x 65,536 < requirement
+    initialMarginOk: Optional[bool]  # value x 65,536 >= 2 x requirement: collateral may leave
+    positions: list[PerpsPosition]  # ascending by market, at most 8
+
+
+class PerpsAccount(TypedDict):
+    """``perps.positions()``: your pools that hold anything, ascending."""
+
+    l2AccountIndex: int
+    pools: list[PerpsPool]
+
+
+class PerpsFunding(TypedDict):
+    """One row of ``perps.funding()``."""
+
+    pool: int
+    market: int
+    fundingIndex: str
+    fundingOwed: str  # extended USDC units: positive pays, negative receives
+
+
+class PerpsOpAccepted(TypedDict):
+    """The 202 to a perps allocate or exit."""
+
+    journalSeq: int  # its place in the exchange's journal
+    duplicate: bool  # a re-send of an op applied before: nothing was applied again
 
 
 class TradeTick(TypedDict, total=False):
@@ -310,7 +397,15 @@ __all__ = [
     "OrderBook",
     "Candle",
     "CandleHistory",
+    "L2SpotMarket",
+    "L2PerpsMarket",
     "L2Market",
+    "PerpsMarkets",
+    "PerpsPosition",
+    "PerpsPool",
+    "PerpsAccount",
+    "PerpsFunding",
+    "PerpsOpAccepted",
     "TradeTick",
     "OrderResult",
     "OrderAck",

@@ -8,10 +8,14 @@ Every error the API can return is mapped to a specific exception so a bot can
     │                               key not in force, a clock hours ahead)
     ├── LoafConnectionError         network failure / timeout / a body that failed to decompress
     ├── OrderOutcomeUnknownError    a signed order may be live; the SDK could not confirm it
+    ├── PerpsOutcomeUnknownError    a signed perps allocate or exit may have been applied
     └── LoafAPIError                the server returned an HTTP error
         ├── LoafAuthError                 401  bad/expired credentials, or an order's signature or key
         ├── LoafForbiddenError            403  generic forbidden
-        │   └── TradingHaltedError        403  "…halted…", or 400 from the exchange's engine
+        │   ├── TradingHaltedError        403  "…halted…", or 400 from the exchange's engine
+        │   └── MarketStateError          403  the market's state refuses the order (.state)
+        │       ├── MarketHaltedError     403  the market is halted (a TradingHaltedError too)
+        │       └── PriceHeldError        403  reduce-only while its latest price waits for review
         ├── LoafValidationError           400  validation or order-rule refusal (or local, status 0)
         ├── LoafNotFoundError             404
         ├── LoafConflictError             409  (e.g. a cancel that lost the race, a prize already claimed)
@@ -124,6 +128,56 @@ class OrderOutcomeUnknownError(LoafError):
         )
 
 
+class PerpsOutcomeUnknownError(LoafError):
+    """A signed perps allocate or exit may or may not have been applied; the SDK
+    could not find out.
+
+    Raised by :meth:`~loaf.resources.perps.PerpsResource.allocate` (and its
+    ``add_margin`` / ``return_margin``) and
+    :meth:`~loaf.resources.perps.PerpsResource.exit` after a timeout or a
+    server-side failure that the SDK's own identical re-sends did not settle,
+    and by :meth:`~loaf.resources.perps.PerpsResource.resubmit` on anything but
+    a 202. Never sign the same intent afresh while it may have been applied: a
+    fresh op signs the next nonce, so both could apply.
+
+    Re-send it unchanged with ``perps.resubmit(error.signed_body)`` instead.
+    The exchange applies one op per nonce and answers a re-send of an applied
+    one as its duplicate (``duplicate: True``) whatever its expiry, so a 202
+    settles it: applied before, or applied now. A 422 to a re-send made once
+    the op's ``l2ExpiryMs`` has passed (allow a few minutes for clocks)
+    settles it the other way: it was not applied and never will be. Before
+    then an earlier attempt may still be on its way.
+
+    Deliberately NOT a :class:`LoafConnectionError`, nor an
+    :class:`OrderOutcomeUnknownError` (whose ``signed_body`` is an order).
+
+    Attributes:
+        signed_body: The exact body that was sent (its nonce, expiry and
+            signatures). It holds no key, but sending it needs none beyond
+            your API key: keep it out of logs and alerts (the message leaves
+            the signatures out).
+        attempts: How many times the SDK tried to send it.
+        last_error: The last attempt's error (also ``__cause__``).
+    """
+
+    def __init__(
+        self, *, signed_body: dict[str, Any], attempts: int, last_error: Exception
+    ) -> None:
+        self.signed_body = signed_body
+        self.attempts = attempts
+        self.last_error = last_error
+        kind = "allocate" if "fromSide" in signed_body else "exit"
+        super().__init__(
+            f"Could not confirm whether the {kind} of account "
+            f"{signed_body.get('l2AccountIndex')} at nonce {signed_body.get('l2Nonce')} was "
+            f"applied after {attempts} attempt(s) (last error: {last_error}). It may have been "
+            "applied. Never sign it afresh: re-send it unchanged with "
+            "perps.resubmit(error.signed_body), whose 202 settles it (duplicate: applied before; "
+            f"otherwise applied now). Once its l2ExpiryMs {signed_body.get('l2ExpiryMs')} has "
+            "passed, a 422 to a resubmit means it was never applied."
+        )
+
+
 class LoafAPIError(LoafError):
     """The server returned an HTTP error status.
 
@@ -205,6 +259,50 @@ class TradingHaltedError(LoafForbiddenError):
     """
 
 
+class MarketStateError(LoafForbiddenError):
+    """403 — the market's own state refuses the order now; nothing was placed.
+
+    ``state`` is the exchange engine's name for it:
+
+    * ``MARKET_HALTED`` — ``Trading is halted on this market``
+      (:class:`MarketHaltedError`, also a :class:`TradingHaltedError`): no
+      order is taken.
+    * ``MARKET_CLOSED`` — ``This market is outside its trading hours``: no
+      order is taken until it opens.
+    * ``REDUCE_ONLY`` — ``This market is reduce-only: it takes only orders
+      that reduce a position``; or, as a :class:`PriceHeldError`, reduce-only
+      while its latest price waits for review.
+    * ``PRICE_STALE`` — ``This market's price is stale: it takes only orders
+      that reduce a position``, until a fresh price arrives.
+
+    In the last two an order that only reduces your position (a perps
+    ``reduce_only=True`` order) is still taken. Back off and retry later;
+    there is no client-side fix.
+
+    Attributes:
+        state: ``MARKET_HALTED``, ``MARKET_CLOSED``, ``REDUCE_ONLY`` or
+            ``PRICE_STALE``.
+    """
+
+    def __init__(self, *args: Any, state: str, **kwargs: Any) -> None:
+        self.state = state
+        super().__init__(*args, **kwargs)
+
+
+class MarketHaltedError(MarketStateError, TradingHaltedError):
+    """403 ``Trading is halted on this market``: the market's own halt (``state``
+    ``MARKET_HALTED``). A :class:`TradingHaltedError` too, so code that backs
+    off on halts catches it either way."""
+
+
+class PriceHeldError(MarketStateError):
+    """403 ``This market is reduce-only while its latest price waits for review:
+    it takes only orders that reduce a position``: the market's newest price is
+    held for an operator's review, and until it is signed off the market is
+    reduce-only (``state`` ``REDUCE_ONLY``). A ``reduce_only=True`` order is
+    still taken; retry the rest later."""
+
+
 class LoafValidationError(LoafAPIError):
     """400 — request validation failed. See :attr:`details` for field errors.
 
@@ -255,6 +353,24 @@ class LoafServiceUnavailableError(LoafServerError):
     """
 
 
+# The exchange's 403 texts for an order its market's state refuses, each whole (none carries a
+# code), with the error each raises and the engine's name for the state.
+_MARKET_STATE_TEXTS: dict[str, tuple[type[MarketStateError], str]] = {
+    "Trading is halted on this market": (MarketHaltedError, "MARKET_HALTED"),
+    "This market is outside its trading hours": (MarketStateError, "MARKET_CLOSED"),
+    "This market is reduce-only: it takes only orders that reduce a position": (
+        MarketStateError,
+        "REDUCE_ONLY",
+    ),
+    "This market's price is stale: it takes only orders that reduce a position": (
+        MarketStateError,
+        "PRICE_STALE",
+    ),
+    "This market is reduce-only while its latest price waits for review: it takes only orders "
+    "that reduce a position": (PriceHeldError, "REDUCE_ONLY"),
+}
+
+
 def _client_validation_error(message: str, details: list[str] | None = None) -> LoafValidationError:
     """Build a validation error for input rejected locally (no HTTP round-trip)."""
     return LoafValidationError(message, status_code=0, details=details)
@@ -294,7 +410,10 @@ def error_from_response(
     if status_code == 401:
         return LoafAuthError(message, **kwargs)
     if status_code == 403:
-        # The halt rejection carries no machine code — match on the message.
+        # The market-state and halt rejections carry no machine code — match on the message.
+        if message in _MARKET_STATE_TEXTS:
+            cls, state = _MARKET_STATE_TEXTS[message]
+            return cls(message, state=state, **kwargs)
         if "halted" in message.lower():
             return TradingHaltedError(message, **kwargs)
         return LoafForbiddenError(message, **kwargs)

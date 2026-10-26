@@ -48,12 +48,15 @@ class MarketResource(Resource):
         before sending. Candle history is NOT included — fetch it from the
         dedicated :meth:`candles` endpoint.
 
-        ``property.l2Market`` is ``{chainId, proxyAddress, l2ChainId,
-        marketIndex, baseAssetId, quoteAssetId}``, the market every order on the
-        property signs (the SDK reads it for you), or ``None``: the property
-        cannot be traded now. ``property`` has no ``marketPrice``: the
-        reference MARKET orders are priced from is the ``propertyList`` entry
-        with the same ``ticker``.
+        ``property.l2Market`` is the market every order on the property signs
+        (the SDK reads it for you), by its ``kind``: a spot market's ``{kind:
+        "spot", chainId, proxyAddress, l2ChainId, marketIndex, baseAssetId,
+        quoteAssetId}`` (:class:`~loaf.models.L2SpotMarket`), or a perps
+        market's, with its ``status`` and terms and no base asset
+        (:class:`~loaf.models.L2PerpsMarket`, as ``perps.markets()`` lists
+        it); or ``None``: the property cannot be traded now. ``property`` has
+        no ``marketPrice``: the reference MARKET orders are priced from is the
+        ``propertyList`` entry with the same ``ticker``.
 
         ``recentTrades`` holds the newest trades first (at most 20), each with a
         ``txHash``: the trade's content hash (``0x`` + 64 hex), not an on-chain

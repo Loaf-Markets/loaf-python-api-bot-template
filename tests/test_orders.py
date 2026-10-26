@@ -48,6 +48,7 @@ from conftest import (
     L2_SECRET,
     MARKET,
     NO_ACCOUNT,
+    PERPS_MARKET,
     FakeExchange,
     property_detail,
     routes,
@@ -324,7 +325,12 @@ def test_server_without_the_l2_exchange(exchange, trading_client):
         ({**MARKET, "proxyAddress": MARKET["proxyAddress"][:-1]}, "proxyAddress"),
         ({**MARKET, "l2ChainId": 0}, "l2ChainId"),
         ({**MARKET, "l2ChainId": 2130706433}, "l2ChainId"),
+        ({k: v for k, v in MARKET.items() if k != "kind"}, "kind"),
+        ({**MARKET, "kind": "futures"}, "kind"),
         ({**MARKET, "marketIndex": 4096}, "marketIndex"),
+        ({**MARKET, "marketIndex": 4095}, "marketIndex"),
+        ({**MARKET, "marketIndex": 2047}, "marketIndex"),  # below the spot markets
+        ({**MARKET, "marketIndex": 4}, "marketIndex"),  # a perps market's index
         ({k: v for k, v in MARKET.items() if k != "marketIndex"}, "marketIndex"),
         ({**MARKET, "baseAssetId": 0}, "baseAssetId"),
         ({**MARKET, "baseAssetId": 63}, "baseAssetId"),
@@ -332,6 +338,15 @@ def test_server_without_the_l2_exchange(exchange, trading_client):
         ({**MARKET, "quoteAssetId": 63}, "quoteAssetId"),
         ({**MARKET, "quoteAssetId": 6}, "quoteAssetId"),  # the base asset's id
         (MARKET["proxyAddress"], "l2Market"),
+        # A perps market: its index, its quote asset (USDC, 3) and its status.
+        ({**PERPS_MARKET, "chainId": 0}, "chainId"),
+        ({**PERPS_MARKET, "marketIndex": 255}, "marketIndex"),
+        ({**PERPS_MARKET, "marketIndex": 2050}, "marketIndex"),  # a spot market's index
+        ({**PERPS_MARKET, "marketIndex": -1}, "marketIndex"),
+        ({**PERPS_MARKET, "quoteAssetId": 4}, "quoteAssetId"),
+        ({**PERPS_MARKET, "quoteAssetId": "3"}, "quoteAssetId"),
+        ({k: v for k, v in PERPS_MARKET.items() if k != "status"}, "status"),
+        ({**PERPS_MARKET, "status": "HALTED"}, "status"),
     ],
 )
 def test_unusable_l2_market(exchange, trading_client, l2_market, field):

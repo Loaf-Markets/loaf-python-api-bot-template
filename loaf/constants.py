@@ -1,8 +1,8 @@
 """Protocol constants for the Loaf API.
 
 These capture the wire-level contract every client must honour: numeric
-precision limits, order limits and defaults, and the timing rules of signed
-orders.
+precision limits, order limits and defaults, the timing rules of signed
+orders, and the perps markets' pools and the life of a signed allocate or exit.
 """
 
 from __future__ import annotations
@@ -105,3 +105,33 @@ MAX_ORDER_TTL_MS = L2_MAX_ORDER_LIFE_MS - 2 * L2_ORDER_LIFE_MARGIN_MS - L2_BUFFE
 #: order needs up to this, doubling each time, so a process that stops after a few orders leaves
 #: few of them unused.
 L2_ORDER_INDEX_BLOCK = 64
+
+# --------------------------------------------------------------------------- #
+# Perps
+# --------------------------------------------------------------------------- #
+
+#: The highest perps market index: markets 0 to 254 are perps markets, 2048 to 4094 spot ones.
+PERPS_LAST = 254
+
+#: The highest margin pool: pool 0 is the cross pool, 1 to 7 are isolated pools.
+MAX_POOL = 7
+
+#: An allocate's side for your spot USDC balance, beside the pools 0 to 7.
+PERPS_SPOT_SIDE = 255
+
+#: The quote asset of every perps market: USDC.
+PERPS_QUOTE_ASSET_ID = 3
+
+#: A perps market's ``flags``: its cross pool (0) may trade it.
+PERPS_FLAG_CROSS = 1
+
+#: A perps market's ``flags``: it is reduce-only, and no order may add to a position.
+PERPS_FLAG_REDUCE_ONLY = 2
+
+#: How long a signed allocate or exit stays valid when ``ttl_ms=`` is omitted: 10 minutes. The
+#: exchange applies it only before its ``l2ExpiryMs`` (now + this), so an outcome left unknown
+#: is settled once that has passed.
+DEFAULT_PERPS_OP_TTL_MS = 600_000
+
+#: The longest ``ttl_ms=`` an allocate or exit accepts: one day.
+MAX_PERPS_OP_TTL_MS = 86_400_000

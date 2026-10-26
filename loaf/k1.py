@@ -8,7 +8,13 @@ for byte (``tests/k1-sign.json``).
   32-byte seed, and its 40-byte public key, the point ``sk G`` of ECgFp5
   (Pornin, ePrint 2022/274) in K1's encoding;
 * :func:`order_message`: the 32 bytes an order signs, K1's Poseidon2 digest of
-  its 12 signed fields, once they pass the checks the engine makes;
+  its 12 signed fields, once they pass the checks the engine makes; a perps
+  order signs its pool and reduce-only bit where a spot order signs its base
+  asset (:func:`perps_base_field`);
+* :func:`allocate_message` and :func:`exit_message`: the 32 bytes a perps
+  allocate (USDC moved between the spot balance and a margin pool, or between
+  two pools) and a perps exit (the close of a position in an expired market)
+  sign, likewise checked;
 * :func:`sign` and :func:`verify`: the Schnorr pair ``(s, e)``, 40 bytes
   little-endian each.
 
@@ -79,10 +85,13 @@ def order_message(
 
     The arguments are the order's 12 signed fields, its body keys in snake case:
     integers, with ``price`` and ``quantity`` already scaled (x1000 and x10),
-    and ``is_ask`` true for a SELL. A field the engine would refuse is refused
-    first, as the web app's signer refuses it: ``Width`` with ``l2 width:
-    <field> out of range``, or ``QuoteAboveK1`` / ``FeeAboveK1`` when the whole
-    quantity at the price, or the fee cap's fee on it, does not fit 48 bits.
+    and ``is_ask`` true for a SELL. On a perps market (``l2_market_index`` at
+    most 254) ``l2_base_asset_id`` is the order's pool byte, 0 to 15
+    (:func:`perps_base_field`); on a spot market it is the base asset, 1 to 62.
+    A field the engine would refuse is refused first, as the web app's signer
+    refuses it: ``Width`` with ``l2 width: <field> out of range``, or
+    ``QuoteAboveK1`` / ``FeeAboveK1`` when the whole quantity at the price, or
+    the fee cap's fee on it, does not fit 48 bits.
     """
     if not isinstance(is_ask, bool):
         raise TypeError(f"is_ask must be a bool, not {type(is_ask).__name__}")
@@ -96,7 +105,10 @@ def order_message(
     _width("price", price, 1, 2**32 - 1)
     _width("l2_fee_rate_cap", l2_fee_rate_cap, 0, 2**20 - 1)
     _width("l2_expiry_ms", l2_expiry_ms, 0, _MAX_48)
-    _width("l2_base_asset_id", l2_base_asset_id, 1, 62)
+    if l2_market_index <= _PERPS_LAST:  # a perps market has no base asset: the pool byte
+        _width("l2_base_asset_id", l2_base_asset_id, 0, _MAX_POOL | _PERPS_REDUCE_ONLY)
+    else:
+        _width("l2_base_asset_id", l2_base_asset_id, 1, 62)
     _width("l2_quote_asset_id", l2_quote_asset_id, 1, 62)
     if quantity * price // 10 > _MAX_48:
         raise K1Error(
@@ -123,6 +135,81 @@ def order_message(
         quantity,
         l2_expiry_ms,
     )
+
+
+def perps_base_field(pool: int, reduce_only: bool) -> int:
+    """A perps order's signed base-asset field, :func:`order_message`'s
+    ``l2_base_asset_id`` on a perps market: its margin pool (0, the cross pool,
+    to 7), plus 8 when it is reduce-only (its fills may only shrink the
+    position).
+
+    A perps market has no base asset: the order's body sends ``l2Pool`` and
+    ``l2ReduceOnly`` where a spot order's sends ``l2BaseAssetId``. A pool
+    outside 0 to 7 is refused, ``Width`` with ``l2 width: l2_pool out of
+    range``: its bits would reach the reduce-only bit.
+    """
+    if not isinstance(reduce_only, bool):
+        raise TypeError(f"reduce_only must be a bool, not {type(reduce_only).__name__}")
+    _width("l2_pool", pool, 0, _MAX_POOL)
+    return pool | (_PERPS_REDUCE_ONLY if reduce_only else 0)
+
+
+def allocate_message(
+    *,
+    l2_chain_id: int,
+    l2_account_index: int,
+    from_side: int,
+    to_side: int,
+    amount: int,
+    l2_nonce: int,
+    l2_expiry_ms: int,
+) -> bytes:
+    """K1's allocate message: the 32 bytes a perps allocate signs with the
+    account's api key 0. It moves ``amount`` USDC ticks from ``from_side`` to
+    ``to_side``, each a margin pool (0 to 7) or 255, the spot USDC balance.
+
+    The arguments are its signed fields, its body keys in snake case, with
+    ``amount`` an integer (the body's decimal string) and ``l2_nonce`` api key
+    0's next nonce. A field the engine would refuse is refused first, in the
+    engine's order, then the chain id: ``Width`` with ``l2 width: <field> out
+    of range``. Two equal sides are refused by the exchange (K1's rule), not
+    here: the message carries them.
+    """
+    _width("l2_account_index", l2_account_index, 0, _MAX_OP_ACCOUNT)
+    _side("from_side", from_side)
+    _side("to_side", to_side)
+    _width("amount", amount, 1, _AMOUNT_LIMIT - 1)
+    _width("l2_nonce", l2_nonce, 0, _MAX_48)
+    _width("l2_expiry_ms", l2_expiry_ms, 0, _MAX_48)
+    _width("l2_chain_id", l2_chain_id, 0, _KB_P - 1)
+    return _allocate_message(
+        l2_chain_id, l2_account_index, from_side, to_side, amount, l2_nonce, l2_expiry_ms
+    )
+
+
+def exit_message(
+    *,
+    l2_chain_id: int,
+    l2_account_index: int,
+    pool: int,
+    market: int,
+    l2_nonce: int,
+    l2_expiry_ms: int,
+) -> bytes:
+    """K1's exit message: the 32 bytes a perps exit signs with the account's api
+    key 0. It closes the position margin pool ``pool`` (0 to 7) holds in perps
+    market ``market`` (0 to 254), an expired one.
+
+    The arguments are its signed fields, its body keys in snake case, refused
+    as :func:`allocate_message` refuses them.
+    """
+    _width("l2_account_index", l2_account_index, 0, _MAX_OP_ACCOUNT)
+    _width("pool", pool, 0, _MAX_POOL)
+    _width("market", market, 0, _PERPS_LAST)
+    _width("l2_nonce", l2_nonce, 0, _MAX_48)
+    _width("l2_expiry_ms", l2_expiry_ms, 0, _MAX_48)
+    _width("l2_chain_id", l2_chain_id, 0, _KB_P - 1)
+    return _exit_message(l2_chain_id, l2_account_index, pool, market, l2_nonce, l2_expiry_ms)
 
 
 def sign(sk: bytes, message: bytes, aux: bytes) -> tuple[bytes, bytes]:
@@ -193,11 +280,32 @@ _MAX_48 = (1 << 48) - 1
 _M24 = (1 << 24) - 1
 _M64 = (1 << 64) - 1
 
+# Perps: markets 0 to 254 are perps markets; a pool is 0 (the cross pool) to 7, and a perps
+# order's base-asset field carries the reduce-only bit above it. An allocate's side is a pool or
+# the spot balance (255), its amount below 2^60; the account of an allocate or exit is at most
+# 2^48 - 2, the engine's largest account index.
+_PERPS_LAST = 254
+_MAX_POOL = 7
+_PERPS_REDUCE_ONLY = 8
+_SPOT_SIDE = 255
+_AMOUNT_LIMIT = 1 << 60
+_MAX_OP_ACCOUNT = _MAX_48 - 1
+# Element 1 of an allocate and an exit message, api key 0's (its index shifts in above them).
+_ALLOCATE_TAG = 23
+_EXIT_TAG = 25
+
 
 def _width(field: str, value: int, low: int, high: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{field} must be an int, not {type(value).__name__}")
     if not low <= value <= high:
+        raise K1Error("Width", f"l2 width: {field} out of range")
+
+
+def _side(field: str, value: int) -> None:
+    """An allocate's side: a pool, 0 to 7, or the spot balance, 255."""
+    _width(field, value, 0, _SPOT_SIDE)
+    if _MAX_POOL < value < _SPOT_SIDE:
         raise K1Error("Width", f"l2 width: {field} out of range")
 
 
@@ -215,15 +323,51 @@ def _order_message(
     base_amount: int,
     expiry: int,
 ) -> bytes:
-    """The order message of fields in range, unchecked: the KoalaBear sponge
-    digest m of the order's 16 elements, sent as P_i = m[2i] + 2^31 m[2i+1],
-    each 8 bytes little-endian."""
+    """The order message of fields in range, unchecked: its 16 elements' digest
+    (:func:`_digest`)."""
     word = 149 + (is_ask << 16) + (base_asset << 17) + (quote_asset << 23)  # 149: a settle order
-    elements = (
+    return _digest((
         chain_id, word, market, price & _M24, price >> 24, fee_cap,
         account & _M24, account >> 24, index & _M24, index >> 24, epoch & _M24, epoch >> 24,
         base_amount & _M24, base_amount >> 24, expiry & _M24, expiry >> 24,
-    )
+    ))
+
+
+def _allocate_message(
+    chain_id: int,
+    account: int,
+    from_side: int,
+    to_side: int,
+    amount: int,
+    nonce: int,
+    expiry: int,
+) -> bytes:
+    """The allocate message of fields in range, unchecked: chain id; tag 23; the
+    account (low 24, middle 24 bits); the sides; the amount (low 24, middle 24,
+    the bits above 48); the nonce and the expiry (low 24, middle 24 bits each);
+    three zeros."""
+    return _digest((
+        chain_id, _ALLOCATE_TAG, account & _M24, account >> 24 & _M24, from_side, to_side,
+        amount & _M24, amount >> 24 & _M24, amount >> 48,
+        nonce & _M24, nonce >> 24 & _M24, expiry & _M24, expiry >> 24 & _M24, 0, 0, 0,
+    ))
+
+
+def _exit_message(
+    chain_id: int, account: int, pool: int, market: int, nonce: int, expiry: int
+) -> bytes:
+    """The exit message of fields in range, unchecked: chain id; tag 25; the
+    account (low 24, middle 24 bits); the pool; the market; the nonce and the
+    expiry (low 24, middle 24 bits each); six zeros."""
+    return _digest((
+        chain_id, _EXIT_TAG, account & _M24, account >> 24 & _M24, pool, market,
+        nonce & _M24, nonce >> 24 & _M24, expiry & _M24, expiry >> 24 & _M24, 0, 0, 0, 0, 0, 0,
+    ))
+
+
+def _digest(elements: tuple[int, ...]) -> bytes:
+    """A message's 16 KoalaBear elements to the 32 bytes signed: their sponge digest
+    m, sent as P_i = m[2i] + 2^31 m[2i+1], each 8 bytes little-endian."""
     # Rate 8, the input length (16) in lane 8, each chunk overwriting lanes 0..7.
     state = _permute([*elements[:8], 16, 0, 0, 0, 0, 0, 0, 0], _KB16)
     state[:8] = elements[8:]

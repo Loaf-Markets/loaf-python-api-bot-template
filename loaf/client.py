@@ -37,6 +37,7 @@ from .exceptions import (
     LoafConnectionError,
     LoafServerError,
     OrderOutcomeUnknownError,
+    PerpsOutcomeUnknownError,
     error_from_response,
 )
 
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     from .resources.market import MarketResource
     from .resources.offerings import OfferingsResource
     from .resources.orders import OrdersResource
+    from .resources.perps import PerpsResource
     from .resources.portfolio import PortfolioResource
     from .ws.client import LoafWebSocketClient
 
@@ -100,10 +102,16 @@ _NOT_PLACED_503_TEXTS = (
 )
 
 
-def _definitely_not_placed(error: LoafAPIError) -> bool:
-    return error.status_code == 503 and any(
-        t in error.message.lower() for t in _NOT_PLACED_503_TEXTS
-    )
+# The same for a perps allocate or exit: nothing was journaled, so nothing was applied.
+_NOT_APPLIED_503_TEXTS = (
+    "nothing was journaled",
+    "your perps request was not submitted",
+)
+
+
+def _definitely_not_placed(error: LoafAPIError, perps: bool = False) -> bool:
+    texts = _NOT_APPLIED_503_TEXTS if perps else _NOT_PLACED_503_TEXTS
+    return error.status_code == 503 and any(t in error.message.lower() for t in texts)
 
 
 # $LOAF_MAX_SLIPPAGE_BPS: a plain whole number from 0 to 9999 (leading zeros allowed).
@@ -148,20 +156,22 @@ class LoafClient:
     Args:
         api_key: The API key from the Loaf web app (API -> Generate API Token),
             sent as ``Authorization: Bearer`` on reads, cancels, the
-            WebSocket, and the two account requests an order needs
-            (``GET /l2/keys``, ``POST /l2/order-indices``). It is never sent on
-            an order placement. If omitted, read from ``$LOAF_API_KEY``.
+            WebSocket, the two account requests an order needs
+            (``GET /l2/keys``, ``POST /l2/order-indices``) and perps allocates
+            and exits. It is never sent on an order placement. If omitted,
+            read from ``$LOAF_API_KEY``.
             Public endpoints work without one; other authenticated calls raise
             :class:`LoafConfigError`.
         base_url: REST base URL including the ``/api`` suffix. If omitted, read
             from ``$LOAF_API_BASE_URL``, else :data:`~loaf.constants.DEFAULT_BASE_URL`.
-        secret_key: Your trading key, which signs every order locally and is
-            never sent: the 80 hex characters (no ``0x``) the web app shows
+        secret_key: Your trading key, which signs every order (and perps
+            allocate and exit) locally and is never sent: the 80 hex
+            characters (no ``0x``) the web app shows
             under Show trading key (README §2). If omitted, read from
             ``$LOAF_SECRET_KEY`` (prefer the environment variable: an
             explicit ``secret_key=`` argument can show up in tools that
             capture call frames). Without it everything works except placing
-            orders.
+            orders and moving perps margin.
         ws_url: Override the WebSocket URL. If omitted it is derived from
             ``base_url`` (``https://host/api`` -> ``wss://host/ws``) or read from
             ``$LOAF_WS_URL``.
@@ -179,10 +189,11 @@ class LoafClient:
             :data:`~loaf.constants.DEFAULT_PLACEMENT_TIMEOUT` (45 s) for the
             answer, and follow this argument even with your own ``http_client``.
         max_retries: Automatic retries for transient failures. Reads retry 429,
-            503 and network errors. Signed placements retry network errors and
-            5xx by re-sending the identical signed order after a short pause,
-            which cannot place twice; each attempt can wait out the placement
-            timeout, so lower this (e.g. ``1``) for a latency-sensitive loop.
+            503 and network errors. Signed placements (and perps allocates and
+            exits) retry network errors and 5xx by re-sending the identical
+            signed body after a short pause, which cannot place twice; each
+            attempt can wait out the placement timeout, so lower this (e.g.
+            ``1``) for a latency-sensitive loop.
             Cancels and other POSTs are never retried.
         verify: TLS verification for REST and the WebSocket (only the WebSocket
             with your own ``http_client``): an ``ssl.SSLContext``, such as
@@ -268,6 +279,7 @@ class LoafClient:
         from .resources.market import MarketResource
         from .resources.offerings import OfferingsResource
         from .resources.orders import OrdersResource
+        from .resources.perps import PerpsResource
         from .resources.portfolio import PortfolioResource
 
         #: Public market data: properties, candles, info pages.
@@ -276,6 +288,8 @@ class LoafClient:
         self.offerings: OfferingsResource = OfferingsResource(self)
         #: Trading: place (signed with your trading key) and cancel orders, stop & take orders.
         self.orders: OrdersResource = OrdersResource(self)
+        #: Perps: markets, your pools and positions, margin moves and exits (signed like orders).
+        self.perps: PerpsResource = PerpsResource(self)
         #: Balances, positions, and recent activity.
         self.portfolio: PortfolioResource = PortfolioResource(self)
         #: Paginated order & trade history.
@@ -403,7 +417,9 @@ class LoafClient:
         names ``journaledKey``), or ``None`` when no ``LOAF_SECRET_KEY`` is set."""
         return self._l2_key.public_key if self._l2_key is not None else None
 
-    def _send_signed(self, path: str, body: dict, *, ambiguous: bool = False) -> Any:
+    def _send_signed(
+        self, path: str, body: dict, *, ambiguous: bool = False, perps: bool = False
+    ) -> Any:
         """POST a signed placement, re-sending the identical bytes on transient failures.
 
         No ``Authorization`` header: the signature authenticates. Network errors
@@ -415,9 +431,23 @@ class LoafClient:
 
         ``ambiguous=True`` (resubmit): an earlier attempt may already have
         landed, so anything but a 200 raises ``OrderOutcomeUnknownError``.
+
+        ``perps=True``: a signed perps allocate or exit. It carries your API key
+        too (the exchange checks the account is yours) and is settled by a 202
+        ``{journalSeq, duplicate}``; the exchange applies one op per account and
+        nonce and answers a repeat of an applied one as its duplicate. It raises
+        :class:`~loaf.exceptions.PerpsOutcomeUnknownError` instead.
         """
         content = _json.dumps(body, separators=(",", ":"), allow_nan=False).encode()
         headers = {"Content-Type": "application/json"}
+        if perps:
+            if not self.api_key:
+                raise LoafConfigError(
+                    f"POST {path} requires authentication but no API key is set. "
+                    f"Pass api_key=... or set ${ENV_API_KEY}."
+                )
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        settled_by = "journalSeq" if perps else "orderId"
         timeout = self._placement_timeout
         attempt = 0
         while True:
@@ -442,10 +472,11 @@ class LoafClient:
                         result = self._parse_body(response)
                     except ValueError:  # labelled JSON but not JSON
                         result = response.text
-                    if isinstance(result, dict) and "orderId" in result:
+                    if isinstance(result, dict) and settled_by in result:
                         return result
                     error = LoafServerError(
-                        "Unexpected response to an order placement",
+                        "Unexpected response to a perps op" if perps
+                        else "Unexpected response to an order placement",
                         status_code=response.status_code,
                         body=result,
                     )
@@ -453,7 +484,7 @@ class LoafClient:
                 else:
                     error = self._build_error(response)
                     retryable = response.status_code >= 500
-                    if retryable and not _definitely_not_placed(error):
+                    if retryable and not _definitely_not_placed(error, perps):
                         ambiguous = True
             if not retryable or attempt >= self.max_retries:
                 break
@@ -461,7 +492,8 @@ class LoafClient:
             self._sleep_backoff(attempt)
             attempt += 1
         if ambiguous:
-            raise OrderOutcomeUnknownError(
+            unknown = PerpsOutcomeUnknownError if perps else OrderOutcomeUnknownError
+            raise unknown(
                 signed_body=copy.deepcopy(body), attempts=attempt + 1, last_error=error
             ) from error
         raise error

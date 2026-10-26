@@ -193,6 +193,7 @@ Create one `LoafClient` and reach everything through grouped resources:
 | `loaf.market` | properties, property detail, candle history, trade backfill, info pages (all public) |
 | `loaf.offerings` | IPO offerings: list, detail |
 | `loaf.orders` | place (signed) / cancel / cancel-all orders, stop & take (conditional) orders |
+| `loaf.perps` | perps markets, your margin pools and positions, margin moves and exits (signed) |
 | `loaf.portfolio` | balances, positions, recent activity |
 | `loaf.history` | paginated order & trade history, cancelled & active orders |
 | `loaf.leaderboard` | competition leaderboard |
@@ -230,6 +231,14 @@ orders.cancel_conditional(order_id)   POST   /orders/conditional/cancel
 orders.cancel_row(order)              (routes a row to the right cancel)
 orders.cancel_all()                   POST   /orders/cancel-all
 
+perps.markets() / market(index)       GET    /l2/perps/markets
+perps.positions() / pool / position   GET    /l2/perps/positions
+perps.funding()                       (each position's funding, from /l2/perps/positions)
+perps.allocate / add_margin / return_margin
+                                      POST   /l2/allocations        (signed; with API key)
+perps.exit(market, pool=)             POST   /l2/exits              (signed; with API key)
+perps.resubmit(signed_body)           POST   /l2/allocations or /l2/exits (re-send unchanged)
+
 portfolio.component()                 GET    /portfolio/component
 
 history.orders() / trades()           GET    /history/orders, /history/trades
@@ -247,7 +256,8 @@ competition.submit_payout_details()   POST   /competition/payout-details
 
 Placements are signed with your trading key and carry no API key. For your
 orders the SDK also reads `GET /l2/keys` and reserves order numbers with
-`POST /l2/order-indices`, both with your API key.
+`POST /l2/order-indices`, both with your API key. A perps allocate or exit is
+signed with your trading key too, and also carries your API key.
 
 Candle history is a dedicated, paginated endpoint (the property detail response
 does not include it):
@@ -355,6 +365,13 @@ raises `TradingHaltedError` (403). A platform-wide halt blocks cancels too,
 except `orders.cancel_conditional()`, which is database-only and stays
 available (see **Stop & take orders** below). `TradingHaltedError` also covers
 the exchange engine's own halts (a 400): wait them out; cancels still work.
+
+The exchange engine also keeps each market's own state, and refuses an order
+it does not take now with `MarketStateError` (403), its `.state` the reason:
+`MARKET_HALTED` (`MarketHaltedError`, a `TradingHaltedError` too),
+`MARKET_CLOSED`, `REDUCE_ONLY`, or `PRICE_STALE`; and `PriceHeldError` (state
+`REDUCE_ONLY`) while a perps market's latest price waits for review. A
+reduce-only or stale-price market still takes an order that reduces a position.
 
 To see a halt coming instead of discovering it on a rejected order, subscribe to
 the property's status channel:
@@ -555,6 +572,56 @@ conditional does not carry. `loaf.history.active_orders()` and
 Derive triggers with `round(mark * 0.95, 2)`: an unrounded float product carries
 17 decimals and the SDK rejects it locally before the request goes out.
 
+### Perps
+
+A property whose `l2Market` has `kind` `"perps"` trades a perpetual future
+settled in USDC: a BUY opens or grows a long (or shrinks a short), a SELL the
+other way round. Your margin is USDC held in **pools**: pool 0, the cross pool,
+and the isolated pools 1 to 7, each holding at most 8 positions margined by
+that pool's collateral alone. Fund a pool from your spot USDC, trade from it,
+and move what is left back:
+
+```python
+loaf.perps.markets()                                  # every perps market, public
+loaf.perps.add_margin(5_000_000, pool=0)              # USDC ticks (below): spot -> pool 0
+loaf.orders.limit_buy("PERP", quantity=2, price=101.5, pool=0)   # a long from pool 0
+loaf.orders.limit_sell("PERP", quantity=2, price=104, pool=0, reduce_only=True)
+loaf.perps.position(market=4, pool=0)                 # base, entryPrice, liquidationPrice, ...
+loaf.perps.return_margin(1_000_000, pool=0)           # pool 0 -> spot
+```
+
+- **Orders** take `pool=` (0 by default) and `reduce_only=True` (its fills
+  may only shrink the pool's position), signed with the order; both are
+  refused on a spot market. TP/SL legs are refused on a perps order: arm each
+  as its own reduce-only stop or take (`create_conditional(..., reduce_only=True)`)
+  on the side that closes the position (a SELL for a long, a BUY for a short).
+- **Allocates** (`add_margin`, `return_margin`, `allocate(amount, from_side=,
+  to_side=)`, a side a pool or `loaf.PERPS_SPOT_SIDE`, 255, your spot balance)
+  and **exits** (`exit(market, pool=)`: closes your position in an EXPIRED
+  market, which takes no orders) are signed with your trading key and sent
+  with your API key. Each spends your account's next nonce, the counter your
+  withdrawals spend too; the SDK reads it for every op. One applied elsewhere
+  between that read and the send makes the exchange refuse this one (422,
+  `l2 money: the nonce is not the api key's nonce …`): send it again. An op is
+  valid for `ttl_ms` (default 10 minutes).
+- **Retries** work as for orders: timeouts and 5xx re-send the same signed
+  body, which the exchange applies once at most (`duplicate: True` on a repeat
+  of an applied one). Any error but `PerpsOutcomeUnknownError` means it was
+  not applied; on that one, `loaf.perps.resubmit(e.signed_body)`, never a
+  fresh op for the same intent.
+- **Units** are the exchange engine's, not dollars. An allocate's `amount`
+  is a whole number of USDC ticks: USDC base units over USDC's tick size, which
+  the vault contract's `assetConfig` holds for asset 3 (the SDK reads no
+  chain). `positions()` serves amounts as decimal strings: collateral, value,
+  funding owed and notional in extended USDC units, a position's `base` in an
+  order's signed quantity units (tokens x 10, negative for a short), prices in
+  the market's price units (its docstring has the rest).
+- **Market state.** A perps market can refuse orders for its own state (403,
+  `MarketStateError` with `.state`): halted, outside its trading hours,
+  reduce-only, its price stale, or reduce-only while its latest price waits
+  for review (`PriceHeldError`). In the last three a `reduce_only=True` order
+  is still taken.
+
 ---
 
 ## Competition rounds
@@ -594,6 +661,9 @@ quantities in **tokens** — for what you send and the market data you receive:
   token's base units (`"1500000"` is 1.5 of a 6-decimal token). Turn one into an
   exact `Decimal` of tokens with `loaf.from_base_units(row.available, row.decimals)`.
 - A trade's `fee` is in dollars, to 0.001.
+- **Perps** amounts are the exchange engine's units (see **Perps**): an
+  allocate's `amount` in USDC ticks, and `perps.positions()` values as decimal
+  strings.
 - `*Bps` fields are raw basis points (`30` = 0.30%); use `loaf.bps_to_fraction`.
 - `*Percent` / `*Percentage` fields are already percentages (`5.2` = 5.2%).
 
@@ -764,6 +834,9 @@ except loaf.OrderOutcomeUnknownError as e:
     ...   # may be live or filled: resubmit(e.signed_body) if still wanted, else check history.orders()
 except loaf.TradingHaltedError:
     ...   # halted — back off and retry later
+except loaf.MarketStateError as e:
+    ...   # 403: the market's own state (e.state) — reduce-only, price stale or held
+          # (PriceHeldError), closed: back off, or send only reduce_only=True orders
 except loaf.LoafConfigError:
     ...   # e.g. your trading key is no longer in force — stop and alert: set the
           # key in force (§2), restart, and re-arm your stops
@@ -792,6 +865,12 @@ force, trading is not enabled, you have no trading account yet, or this
 machine's clock is hours ahead; the message says what to do. A
 bad per-order `max_slippage_bps=` / `leg_max_slippage_bps=` / `ttl_ms=` is a
 local `LoafValidationError` (status_code 0).
+
+A perps allocate or exit raises the same errors, with
+`PerpsOutcomeUnknownError` in place of `OrderOutcomeUnknownError` (re-send it
+with `loaf.perps.resubmit(e.signed_body)`); its refusals by the exchange's
+rules (above your available spot USDC, a pool left under initial margin, the
+nonce) are plain `LoafAPIError`s with status 422, and applied nothing.
 
 ## Rate limits & retries
 
@@ -835,8 +914,9 @@ pytest
 The suite runs fully offline against an in-memory mock transport and a local
 WebSocket server (no live server, no real key). It covers K1 signing (checked
 against the exchange's known answers), the web app's trading-key derivation
-vectors, the order flow, order-number reservations, stop & take orders, retries,
-input validation, pagination, error mapping, and the WebSocket client. Without
+vectors, the order flow, order-number reservations, stop & take orders, perps
+orders, reads, margin moves and exits, retries, input validation, pagination,
+error mapping, and the WebSocket client. Without
 the `wallet` extra the trading-key helper's tests are skipped, and without
 `dotenv` its `.env` tests are.
 
@@ -848,7 +928,8 @@ the `wallet` extra the trading-key helper's tests are skipped, and without
   (`/portfolio/position/{ticker}/pnl-card`, `/leaderboard/card`,
   `/competition/queue-position/card`) are **not** wrapped — do those in the
   Loaf web app. So are deposits, withdrawals, and enabling or resetting your
-  trading key.
+  trading key. (Moving USDC between your spot balance and your perps pools is
+  wrapped: `loaf.perps`.)
 - Create your API key in the web app. Nothing else is needed for the private
   WebSocket channel — the API key identifies the account it streams.
 - IPO subscriptions are not wrapped: each purchase is signed by your account

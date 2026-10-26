@@ -13,6 +13,7 @@ import os
 import pickle
 import subprocess
 import sys
+import typing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,8 @@ from loaf._object import LoafObject, parse
 from loaf.exceptions import error_from_response
 from loaf.money import bps_to_fraction, fraction_to_bps
 from loaf.ws.client import derive_ws_url
+
+from conftest import MARKET_STATES
 
 BASE = "http://test/api"
 
@@ -78,6 +81,10 @@ def test_error_mapping():
         error_from_response(403, {"error": "Trading halted for this property"}),
         loaf.TradingHaltedError,
     )
+    assert not isinstance(
+        error_from_response(403, {"error": "Trading halted for this property"}),
+        loaf.MarketStateError,
+    )
     closed = error_from_response(403, {"error": "Trading is currently closed"})
     assert type(closed) is loaf.LoafForbiddenError  # not a halt
     # The daily price band is a 400.
@@ -112,6 +119,21 @@ def test_error_mapping():
     )
     assert isinstance(missing, loaf.LoafNotFoundError)
     assert missing.message == "Cannot GET /trade"
+
+
+@pytest.mark.parametrize("message, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])
+def test_market_state_errors(message, cls, state):
+    error = error_from_response(403, {"error": message})
+    assert type(error) is cls and (error.state, error.status_code) == (state, 403)
+    assert isinstance(error, loaf.LoafForbiddenError)
+    # Code that backs off on halts catches the market's own halt too.
+    assert isinstance(error, loaf.TradingHaltedError) is (state == "MARKET_HALTED")
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
+        assert type(clone) is cls and (clone.state, clone.status_code) == (state, 403)
+        assert str(clone) == str(error)
+    # Only the whole text, and only as a 403.
+    assert not isinstance(error_from_response(403, {"error": message + "."}), loaf.MarketStateError)
+    assert not isinstance(error_from_response(400, {"error": message}), loaf.MarketStateError)
 
 
 def test_errors_survive_pickle_and_copy():
@@ -154,6 +176,45 @@ def test_errors_survive_pickle_and_copy():
     assert str(clone) == str(limited)
 
 
+def test_perps_outcome_unknown_survives_pickle_and_copy():
+    allocate = {
+        "l2ChainId": 4242,
+        "l2AccountIndex": 5,
+        "fromSide": 255,
+        "toSide": 0,
+        "amount": "5000000",
+        "l2Nonce": 3,
+        "l2ExpiryMs": 1_800_000_000_000,
+        "l2SigS": "ab" * 40,
+        "l2SigE": "cd" * 40,
+    }
+    error = loaf.PerpsOutcomeUnknownError(
+        signed_body=allocate, attempts=4, last_error=error_from_response(502, {"error": "x"})
+    )
+    assert str(error) == (
+        "Could not confirm whether the allocate of account 5 at nonce 3 was applied after 4 "
+        "attempt(s) (last error: HTTP 502: x). It may have been applied. Never sign it afresh: "
+        "re-send it unchanged with perps.resubmit(error.signed_body), whose 202 settles it "
+        "(duplicate: applied before; otherwise applied now). Once its l2ExpiryMs 1800000000000 "
+        "has passed, a 422 to a resubmit means it was never applied."
+    )
+    assert "ab" * 40 not in str(error)  # the signatures stay out of the message
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
+        assert type(clone) is loaf.PerpsOutcomeUnknownError
+        assert (clone.signed_body, clone.attempts) == (allocate, 4)
+        assert str(clone) == str(error)
+        assert type(clone.last_error) is loaf.LoafServerError
+    # Neither a connection error nor an order's unknown outcome.
+    assert not isinstance(error, (loaf.LoafConnectionError, loaf.OrderOutcomeUnknownError))
+    exit_body = {
+        k: v for k, v in allocate.items() if k not in ("fromSide", "toSide", "amount")
+    } | {"pool": 2, "market": 9}
+    unknown = loaf.PerpsOutcomeUnknownError(
+        signed_body=exit_body, attempts=1, last_error=error_from_response(502, {"error": "x"})
+    )
+    assert str(unknown).startswith("Could not confirm whether the exit of account 5 at nonce 3")
+
+
 def test_is_conditional_order():
     # `type` is the discriminator: `status` is not (CANCELLED belongs to both spaces).
     for t in ("STOP_LIMIT", "STOP_MARKET", "TAKE_LIMIT", "TAKE_MARKET"):
@@ -170,7 +231,9 @@ def test_models_list_every_shape():
         if isinstance(value, type) and issubclass(value, dict)
         and value.__module__ == models.__name__
     }
-    assert set(models.__all__) == shapes
+    # ... and L2Market, the union of a property's two kinds of market.
+    assert set(models.__all__) == shapes | {"L2Market"}
+    assert typing.get_args(models.L2Market) == (models.L2SpotMarket, models.L2PerpsMarket)
     assert models.OrderQueueEntry.__required_keys__ == {
         "orderId", "side", "price", "quantity", "quantityAhead", "ordersAhead"
     }

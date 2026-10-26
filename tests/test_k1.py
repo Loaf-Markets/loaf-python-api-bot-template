@@ -1,9 +1,9 @@
-"""K1 signing, offline: K1's known answers, the order checks the web app's signer
-makes, and the curve's own vectors.
+"""K1 signing, offline: K1's known answers, the order, allocate and exit checks
+the web app's signer makes, and the curve's own vectors.
 
-``k1-sign.json`` holds K1's known answers for keys, signatures and orders, the
-vectors the matching engine and the web app run too: a match here means a
-signature made by this SDK verifies there.
+``k1-sign.json`` holds K1's known answers for keys, signatures, orders, perps
+allocates and exits, the vectors the matching engine and the web app run too: a
+match here means a signature made by this SDK verifies there.
 """
 
 from __future__ import annotations
@@ -19,7 +19,17 @@ from typing import Any
 import pytest
 
 from loaf import k1
-from loaf.k1 import K1Error, key_from_seed, order_message, public_key, sign, verify
+from loaf.k1 import (
+    K1Error,
+    allocate_message,
+    exit_message,
+    key_from_seed,
+    order_message,
+    perps_base_field,
+    public_key,
+    sign,
+    verify,
+)
 
 KAT_FILE = Path(__file__).with_name("k1-sign.json")
 KAT = json.loads(KAT_FILE.read_text())
@@ -45,7 +55,8 @@ REFUSED_FIELD = {
     "E_MSG_EXPIRY": "l2_expiry_ms",
 }
 # The engine's widths of an order's fields, in its parse order, and the chain id's, below the
-# KoalaBear modulus, which comes last.
+# KoalaBear modulus, which comes last. KAT order 0 is on market 7, a perps market, whose base-asset
+# field is the order's pool byte (a spot market's is its base asset, 1 to 62).
 WIDTHS = [
     ("l2_account_index", 0, 2**48 - 1),
     ("l2_market_index", 0, 4095),
@@ -55,11 +66,43 @@ WIDTHS = [
     ("price", 1, 2**32 - 1),
     ("l2_fee_rate_cap", 0, 2**20 - 1),
     ("l2_expiry_ms", 0, 2**48 - 1),
-    ("l2_base_asset_id", 1, 62),
+    ("l2_base_asset_id", 0, 15),
     ("l2_quote_asset_id", 1, 62),
     ("l2_chain_id", 0, 2130706432),
 ]
 ORDER_REFUSALS = [v for v in KAT["message_refusals"] if v["kind"] == "order"]
+# An allocate's and an exit's wire keys in message order.
+ALLOCATE_KEYS = (
+    "l2ChainId", "l2AccountIndex", "fromSide", "toSide", "amount", "l2Nonce", "l2ExpiryMs",
+)
+EXIT_KEYS = ("l2ChainId", "l2AccountIndex", "pool", "market", "l2Nonce", "l2ExpiryMs")
+# The tag byte each kind's KAT signatures repeat as aux.
+OP_TAGS = {"allocates": 23, "exits": 25}
+# The field each message refusal code of an allocate or an exit names.
+OP_REFUSED_FIELD = {
+    "E_MSG_CHAIN_ID": "l2_chain_id",
+    "E_MSG_ACCOUNT": "l2_account_index",
+    "E_MSG_NONCE": "l2_nonce",
+    "E_MSG_EXPIRY": "l2_expiry_ms",
+}
+OP_REFUSALS = [v for v in KAT["message_refusals"] if v["kind"] in ("allocate", "exit")]
+# The engine's widths of an allocate's fields beside its sides (a pool, 0 to 7, or 255), and of
+# an exit's, in its parse order, the chain id last.
+ALLOCATE_WIDTHS = [
+    ("l2_account_index", 0, 2**48 - 2),
+    ("amount", 1, 2**60 - 1),
+    ("l2_nonce", 0, 2**48 - 1),
+    ("l2_expiry_ms", 0, 2**48 - 1),
+    ("l2_chain_id", 0, 2130706432),
+]
+EXIT_WIDTHS = [
+    ("l2_account_index", 0, 2**48 - 2),
+    ("pool", 0, 7),
+    ("market", 0, 254),
+    ("l2_nonce", 0, 2**48 - 1),
+    ("l2_expiry_ms", 0, 2**48 - 1),
+    ("l2_chain_id", 0, 2130706432),
+]
 SK0, PK0 = bytes.fromhex(KAT["keys"][0]["sk"]), bytes.fromhex(KAT["keys"][0]["pk"])
 
 
@@ -72,7 +115,18 @@ def fields(vector: dict[str, Any]) -> dict[str, Any]:
     return {snake(k): v for k, v in vector.items() if k not in ("m", "kind", "code")}
 
 
+def op_fields(vector: dict[str, Any]) -> dict[str, Any]:
+    """An allocate's or exit's fields as its message function's keywords, the amount an int."""
+    return {
+        snake(k): int(v) if k == "amount" else v
+        for k, v in vector.items()
+        if k not in ("m", "pk", "aux", "sig", "kind", "code")
+    }
+
+
 ORDER0 = fields(KAT["orders"][0])
+ALLOCATE0 = op_fields(KAT["allocates"][0])
+EXIT0 = op_fields(KAT["exits"][0])
 
 
 def refused(code: str, call: Any, *args: Any, **kwargs: Any) -> K1Error:
@@ -89,7 +143,7 @@ def refused(code: str, call: Any, *args: Any, **kwargs: Any) -> K1Error:
 
 def test_kat_file_is_unchanged():
     digest = hashlib.sha256(KAT_FILE.read_bytes()).hexdigest()
-    assert digest == "1a7a716158a8aa893268c9b121a37c858a6af51b18dd3a4582c71bdf007c570e"
+    assert digest == "68b2c48b5a67f4ccb501a27cc24e2caa0a77b4efe571354ac99d8201588ca1e2"
 
 
 @pytest.mark.parametrize("v", KAT["keys"], ids=lambda v: v["seed"][:8])
@@ -150,6 +204,56 @@ def test_kat_message_refusals_cover_every_order_field():
     assert {v["code"] for v in ORDER_REFUSALS} == {*REFUSED_FIELD, "E_UNKNOWN_KEY"}
 
 
+@pytest.mark.parametrize("v", KAT["allocates"], ids=["typical", "maxima", "zeros"])
+def test_kat_allocate_messages(v):
+    assert k1._allocate_message(*(int(v[key]) for key in ALLOCATE_KEYS)).hex() == v["m"]
+
+
+@pytest.mark.parametrize("v", KAT["exits"], ids=["typical", "maxima", "zeros"])
+def test_kat_exit_messages(v):
+    assert k1._exit_message(*(v[key] for key in EXIT_KEYS)).hex() == v["m"]
+
+
+@pytest.mark.parametrize(
+    "kind, i", [(kind, i) for kind in OP_TAGS for i in range(3)], ids=lambda x: str(x)
+)
+def test_kat_allocate_and_exit_signatures(kind, i):
+    # Vector i is signed with key i, aux its kind's tag byte repeated.
+    v, key = KAT[kind][i], KAT["keys"][i]
+    assert v["pk"] == key["pk"] and v["aux"] == f"{OP_TAGS[kind]:02x}" * 32
+    m = bytes.fromhex(v["m"])
+    s, e = sign(bytes.fromhex(key["sk"]), m, bytes.fromhex(v["aux"]))
+    assert (s + e).hex() == v["sig"]
+    verify(bytes.fromhex(v["pk"]), m, s, e)
+
+
+def test_kat_allocates_and_exits_outside_the_engines_widths_are_refused_by_name():
+    # The typical vectors, and the zero exit, are ones the engine parses; the maxima carry an
+    # account past its largest index, and the zero allocate moves nothing.
+    assert allocate_message(**ALLOCATE0).hex() == KAT["allocates"][0]["m"]
+    assert exit_message(**EXIT0).hex() == KAT["exits"][0]["m"]
+    assert exit_message(**op_fields(KAT["exits"][2])).hex() == KAT["exits"][2]["m"]
+    for call, v, field in (
+        (allocate_message, KAT["allocates"][1], "l2_account_index"),
+        (allocate_message, KAT["allocates"][2], "amount"),
+        (exit_message, KAT["exits"][1], "l2_account_index"),
+    ):
+        error = refused("Width", call, **op_fields(v))
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+@pytest.mark.parametrize("v", OP_REFUSALS, ids=lambda v: f"{v['kind']}-{v['code']}")
+def test_kat_allocate_and_exit_message_refusals(v):
+    call = allocate_message if v["kind"] == "allocate" else exit_message
+    error = refused("Width", call, **op_fields(v))
+    assert str(error) == f"l2 width: {OP_REFUSED_FIELD[v['code']]} out of range"
+
+
+def test_kat_message_refusals_cover_every_allocate_and_exit_limit():
+    for kind in ("allocate", "exit"):
+        assert {v["code"] for v in OP_REFUSALS if v["kind"] == kind} == set(OP_REFUSED_FIELD)
+
+
 # --------------------------------------------------------------------------- #
 # Orders as the web app signs them
 # --------------------------------------------------------------------------- #
@@ -192,6 +296,39 @@ def test_order_field_widths(field, low, high):
         assert str(error) == f"l2 width: {field} out of range"
 
 
+def test_a_spot_orders_base_asset_width():
+    # Markets above 254 are spot markets: the field is the base asset, 1 to 62.
+    for market in (255, 2050, 4095):
+        spot = {**ORDER0, "l2_market_index": market}
+        for value in (1, 62):
+            assert len(order_message(**{**spot, "l2_base_asset_id": value})) == 32
+        for value in (0, 63):
+            error = refused("Width", order_message, **{**spot, "l2_base_asset_id": value})
+            assert str(error) == "l2 width: l2_base_asset_id out of range"
+
+
+@pytest.mark.parametrize(
+    "pool, reduce_only, field",
+    [(0, False, 0), (0, True, 8), (1, False, 1), (3, True, 11), (7, False, 7), (7, True, 15)],
+)
+def test_perps_base_field(pool, reduce_only, field):
+    assert perps_base_field(pool, reduce_only) == field
+    # KAT order 0 is a perps order of pool 1, not reduce-only: the same message.
+    if (pool, reduce_only) == (1, False):
+        message = order_message(**{**ORDER0, "l2_base_asset_id": field})
+        assert message.hex() == KAT["orders"][0]["m"]
+
+
+def test_perps_base_field_refusals():
+    for pool in (-1, 8, 15):
+        error = refused("Width", perps_base_field, pool, False)
+        assert str(error) == "l2 width: l2_pool out of range"
+    with pytest.raises(TypeError, match="l2_pool"):
+        perps_base_field(True, False)
+    with pytest.raises(TypeError, match="reduce_only"):
+        perps_base_field(0, 1)
+
+
 def test_k1_bounds_on_the_orders_largest_fill():
     # The quote, quantity x price / 10 rounded down: 2^48 - 1 (from 2^48 - 0.8) fits, 2^48 does not.
     no_fee = {**ORDER0, "l2_fee_rate_cap": 0}
@@ -230,6 +367,106 @@ def test_the_first_refusal_is_the_engines():
 def test_order_fields_have_their_json_types(edit):
     with pytest.raises(TypeError, match=next(iter(edit))):
         order_message(**{**ORDER0, **edit})
+
+
+# --------------------------------------------------------------------------- #
+# Allocates and exits as the web app signs them
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"l2_chain_id": 1819238759}, {"l2_account_index": 6}, {"from_side": 0}, {"to_side": 3},
+        {"amount": 123456789013}, {"l2_nonce": 4}, {"l2_expiry_ms": 1700000001},
+    ],
+    ids=lambda edit: next(iter(edit)),
+)
+def test_every_allocate_field_moves_the_message(edit):
+    assert allocate_message(**{**ALLOCATE0, **edit}).hex() != KAT["allocates"][0]["m"]
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"l2_chain_id": 1819238759}, {"l2_account_index": 6}, {"pool": 3}, {"market": 8},
+        {"l2_nonce": 4}, {"l2_expiry_ms": 1700000001},
+    ],
+    ids=lambda edit: next(iter(edit)),
+)
+def test_every_exit_field_moves_the_message(edit):
+    assert exit_message(**{**EXIT0, **edit}).hex() != KAT["exits"][0]["m"]
+
+
+@pytest.mark.parametrize("field, low, high", ALLOCATE_WIDTHS)
+def test_allocate_field_widths(field, low, high):
+    for value in (low, high):
+        assert len(allocate_message(**{**ALLOCATE0, field: value})) == 32
+    for value in (low - 1, high + 1):
+        error = refused("Width", allocate_message, **{**ALLOCATE0, field: value})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+@pytest.mark.parametrize("field", ["from_side", "to_side"])
+def test_allocate_sides(field):
+    # A side is a pool or the spot balance, 255. Two equal sides are the exchange's to refuse.
+    for side in (0, 7, 255):
+        assert len(allocate_message(**{**ALLOCATE0, field: side})) == 32
+    for side in (-1, 8, 254, 256):
+        error = refused("Width", allocate_message, **{**ALLOCATE0, field: side})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+@pytest.mark.parametrize("field, low, high", EXIT_WIDTHS)
+def test_exit_field_widths(field, low, high):
+    for value in (low, high):
+        assert len(exit_message(**{**EXIT0, field: value})) == 32
+    for value in (low - 1, high + 1):
+        error = refused("Width", exit_message, **{**EXIT0, field: value})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+@pytest.mark.parametrize(
+    "call, op, out",
+    [
+        (
+            allocate_message,
+            ALLOCATE0,
+            [
+                ("l2_account_index", 2**48 - 1), ("from_side", 8), ("to_side", 8),
+                ("amount", 2**60), ("l2_nonce", 2**48), ("l2_expiry_ms", 2**48),
+                ("l2_chain_id", 2130706433),
+            ],
+        ),
+        (exit_message, EXIT0, [(field, high + 1) for field, _, high in EXIT_WIDTHS]),
+    ],
+    ids=["allocate", "exit"],
+)
+def test_an_ops_first_refusal_is_the_engines(call, op, out):
+    # Every field out of range: each is named in turn, in the engine's order, as the ones before it
+    # are put right.
+    terms = {**op, **dict(out)}
+    for field, _ in out:
+        assert str(refused("Width", call, **terms)) == f"l2 width: {field} out of range"
+        terms[field] = op[field]
+    assert call(**terms).hex() == (
+        KAT["allocates"][0]["m"] if call is allocate_message else KAT["exits"][0]["m"]
+    )
+
+
+@pytest.mark.parametrize(
+    "call, op, edit",
+    [
+        (allocate_message, ALLOCATE0, {"amount": "123456789012"}),
+        (allocate_message, ALLOCATE0, {"from_side": True}),
+        (allocate_message, ALLOCATE0, {"l2_nonce": 3.0}),
+        (exit_message, EXIT0, {"pool": "2"}),
+        (exit_message, EXIT0, {"market": False}),
+    ],
+)
+def test_allocate_and_exit_fields_have_their_types(call, op, edit):
+    with pytest.raises(TypeError, match=next(iter(edit))):
+        call(**{**op, **edit})
 
 
 # --------------------------------------------------------------------------- #

@@ -3,7 +3,9 @@ trading account and the order numbers reserved to it.
 
 Internal. :class:`~loaf.resources.orders.OrdersResource` keeps one
 :class:`L2State`; ``python -m loaf.secret_key`` shares :func:`market_of` and
-:func:`read_account`.
+:func:`read_account`; :class:`~loaf.resources.perps.PerpsResource` signs its
+allocates and exits with the :class:`TradingKey` at the nonce
+:func:`read_signing_account` reads.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ from .constants import (
     L2_MAX_ORDER_LIFE_MS,
     L2_ORDER_INDEX_BLOCK,
     L2_ORDER_LIFE_MARGIN_MS,
+    PERPS_LAST,
+    PERPS_QUOTE_ASSET_ID,
 )
 from .exceptions import (
     LoafAPIError,
@@ -55,6 +59,9 @@ _MAX_48 = 2**48 - 1
 _MAX_ORDER_INDEX = 2**40 - 1
 _MAX_SAFE_INT = 2**53 - 1
 _KB_MODULUS = 2_130_706_433  # an L2 chain id is a KoalaBear element, below this prime
+# A spot market's index; a perps market's is 0 to PERPS_LAST.
+_SPOT_FIRST, _SPOT_LAST = 2_048, 4_094
+_PERPS_STATUSES = ("ACTIVE", "EXPIRED")
 
 _RESERVED_TOO_SOON = "l2 order_index: the account's last reservation is less than 1 s old"
 
@@ -79,8 +86,8 @@ _INDEX_TEXTS = (
 
 
 class TradingKey:
-    """The account's trading key (K1 api key 0 on one vault): signs orders; the secret
-    never leaves it."""
+    """The account's trading key (K1 api key 0 on one vault): signs orders, and perps
+    allocates and exits; the secret never leaves it."""
 
     __slots__ = ("_secret", "public_key")
 
@@ -109,9 +116,10 @@ class TradingKey:
         #: ``0x`` + 80 lowercase hex: ``GET /l2/keys``'s ``journaledKey`` while it is in force.
         self.public_key = "0x" + public.hex()
 
-    def sign(self, message: bytes) -> tuple[str, str]:
-        """``(l2SigS, l2SigE)`` of a K1 order message, 80 lowercase hex each (32 fresh random
-        bytes per signature, so two signatures of the same terms differ)."""
+    def sign(self, message: bytes, what: str = "order") -> tuple[str, str]:
+        """``(l2SigS, l2SigE)`` of a K1 message (``what`` it signs, an order's by default), 80
+        lowercase hex each (32 fresh random bytes per signature, so two signatures of the same
+        terms differ)."""
         try:
             s, e = k1.sign(self._secret, message, os.urandom(32))
         except Exception as exc:
@@ -120,7 +128,7 @@ class TradingKey:
             return s.hex(), e.hex()
         # Raised outside the except: neither the traceback nor __context__ reaches k1.sign's frame,
         # which holds the secret scalar and the nonce.
-        raise LoafError(f"Signing the order failed ({failure}); nothing was sent.")
+        raise LoafError(f"Signing the {what} failed ({failure}); nothing was sent.")
 
     def __repr__(self) -> str:
         # getattr: crash reporters repr the key whose __init__ refused it, which has no public key.
@@ -139,8 +147,14 @@ class Market(NamedTuple):
     proxy_address: str
     l2_chain_id: int
     market_index: int
+    #: A spot market's base asset; 0 on a perps market, which has none (an order signs its pool).
     base_asset_id: int
     quote_asset_id: int
+    #: ``"spot"`` or ``"perps"``.
+    kind: str
+    #: A perps market's ``status``: ``"ACTIVE"``, or ``"EXPIRED"`` (it takes no more orders).
+    #: ``None`` on a spot market, which is served only while it is active.
+    status: str | None
 
 
 class AccountState(NamedTuple):
@@ -197,14 +211,10 @@ def market_of(detail: Any, ticker: str) -> Market:
             status_code=200,
             body=raw,
         )
-    return Market(
-        raw["chainId"],
-        raw["proxyAddress"],
-        raw["l2ChainId"],
-        raw["marketIndex"],
-        raw["baseAssetId"],
-        raw["quoteAssetId"],
-    )
+    custody = (raw["chainId"], raw["proxyAddress"], raw["l2ChainId"], raw["marketIndex"])
+    if raw["kind"] == "perps":
+        return Market(*custody, 0, raw["quoteAssetId"], "perps", raw["status"])
+    return Market(*custody, raw["baseAssetId"], raw["quoteAssetId"], "spot", None)
 
 
 def parse_keys(answer: Any) -> tuple[int, int | None, str | None]:
@@ -242,6 +252,34 @@ def read_account(client: LoafClient, ticker: str) -> tuple[int, int, str]:
         LoafConfigError: you have no trading account yet, or no trading key is in
             force on it.
     """
+    account_index, epoch, journaled, _ = _read_keys(client, ticker)
+    return account_index, epoch, journaled
+
+
+def read_signing_account(client: LoafClient) -> tuple[int, int, str]:
+    """``GET /l2/keys`` — what a signed allocate or exit names: ``(account_index,
+    nonce, journaled_key)``: your trading account, api key 0's next nonce
+    (``withdrawalNonce``: your withdrawals spend the same counter) and the
+    trading key in force.
+
+    Raises:
+        LoafConfigError: you have no trading account yet, or no trading key is
+            in force on it.
+        LoafServerError: a field no op could be signed with.
+    """
+    account_index, _, journaled, answer = _read_keys(client, None)
+    nonce = answer.get("withdrawalNonce")
+    if not _whole(nonce, 0, _MAX_48):
+        raise LoafServerError(
+            "GET /l2/keys answered an unusable withdrawalNonce", status_code=200, body=answer
+        )
+    return account_index, nonce, journaled
+
+
+def _read_keys(client: LoafClient, ticker: str | None) -> tuple[int, int, str, Mapping[str, Any]]:
+    """``GET /l2/keys``: ``(account_index, epoch, journaled_key, answer)`` once a trading
+    key is in force; the refusals name ``ticker``'s market, if given."""
+    where = "" if ticker is None else f" on {ticker}'s market"
     try:
         # No publicKey: the caller compares journaledKey with its own key itself.
         answer = client._request("GET", "/l2/keys", params={"apiKeyIndex": 0}, before_order=True)
@@ -249,18 +287,21 @@ def read_account(client: LoafClient, ticker: str) -> tuple[int, int, str]:
         if exc.message != NO_ACCOUNT:
             raise
         raise LoafConfigError(
-            f"You have no trading account on {ticker}'s market yet: deposit in the Loaf web app "
-            "first."
+            f"You have no trading account{where} yet: deposit in the Loaf web app first."
         ) from exc
-    account_index, epoch, journaled = parse_keys(answer)
+    account_index, epoch, journaled = parse_keys(answer)  # a mapping, once it parses
     if epoch is None or journaled is None or journaled == _DISABLED_KEY:
-        raise LoafConfigError(
-            f"Trading is not enabled on your account on {ticker}'s market (no trading key is in "
-            f"force): open {ticker} on the Loaf web app's Trade page, enable trading there and "
-            "wait for it to take effect, then set LOAF_SECRET_KEY to the key in force: the web "
-            "app's Show trading key (README §2)."
+        enable = (
+            "enable trading on the Loaf web app's Trade page"
+            if ticker is None
+            else f"open {ticker} on the Loaf web app's Trade page, enable trading there"
         )
-    return account_index, epoch, journaled
+        raise LoafConfigError(
+            f"Trading is not enabled on your account{where} (no trading key is in force): "
+            f"{enable} and wait for it to take effect, then set LOAF_SECRET_KEY to the key in "
+            "force: the web app's Show trading key (README §2)."
+        )
+    return account_index, epoch, journaled, answer
 
 
 class L2State:
@@ -431,17 +472,32 @@ def _whole(value: object, low: int, high: int) -> TypeGuard[int]:
 
 
 def _unusable_market_field(raw: Any) -> str | None:
-    """The first field of a ``property.l2Market`` no order can sign, in schema order."""
+    """The first field of a ``property.l2Market`` no order can sign, in schema order: its
+    ``kind``, the custody, then a spot market's index and assets, or a perps market's
+    index, quote asset (USDC) and status. A perps market's other terms are not signed."""
     if not isinstance(raw, Mapping):
         return "l2Market"
+    kind = raw.get("kind")
+    if kind not in ("spot", "perps"):
+        return "kind"
     proxy = raw.get("proxyAddress")
-    base, quote = raw.get("baseAssetId"), raw.get("quoteAssetId")
-    checks = (
+    checks = [
         ("chainId", _whole(raw.get("chainId"), 1, _MAX_SAFE_INT)),
         ("proxyAddress", isinstance(proxy, str) and _ADDRESS_RE.fullmatch(proxy) is not None),
         ("l2ChainId", _whole(raw.get("l2ChainId"), 1, _KB_MODULUS - 1)),
-        ("marketIndex", _whole(raw.get("marketIndex"), 0, 4095)),
-        ("baseAssetId", _whole(base, 1, 62)),
-        ("quoteAssetId", _whole(quote, 1, 62) and quote != base),
-    )
+    ]
+    quote = raw.get("quoteAssetId")
+    if kind == "perps":
+        checks += [
+            ("marketIndex", _whole(raw.get("marketIndex"), 0, PERPS_LAST)),
+            ("quoteAssetId", _is_int(quote) and quote == PERPS_QUOTE_ASSET_ID),
+            ("status", raw.get("status") in _PERPS_STATUSES),
+        ]
+    else:
+        base = raw.get("baseAssetId")
+        checks += [
+            ("marketIndex", _whole(raw.get("marketIndex"), _SPOT_FIRST, _SPOT_LAST)),
+            ("baseAssetId", _whole(base, 1, 62)),
+            ("quoteAssetId", _whole(quote, 1, 62) and quote != base),
+        ]
     return next((field for field, ok in checks if not ok), None)

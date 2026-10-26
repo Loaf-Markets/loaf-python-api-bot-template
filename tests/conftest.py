@@ -1,6 +1,6 @@
 """Shared fixtures for the offline tests: an in-memory exchange, a trading client
-wired to it, an independent signature check, and a search of traceback frames for
-secrets.
+wired to it, independent signature checks (orders, perps allocates and exits), and
+a search of traceback frames for secrets.
 
 Only public test keys appear here: never use them for real funds.
 """
@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 import pytest
 
+import loaf
 from loaf import LoafClient, k1
 from loaf.constants import DEFAULT_TIMEOUT
 
@@ -30,8 +31,9 @@ L2_SECRET = KAT["keys"][0]["sk"]
 L2_PUBLIC_KEY = "0x" + KAT["keys"][0]["pk"]
 ACCOUNT_INDEX = 5
 EPOCH = 2
-# A property's l2Market as the exchange serves it.
+# A property's l2Market as the exchange serves it: a spot market.
 MARKET = {
+    "kind": "spot",
     "chainId": 421614,
     "proxyAddress": "0x" + "11" * 20,
     "l2ChainId": 4242,
@@ -39,6 +41,96 @@ MARKET = {
     "baseAssetId": 6,
     "quoteAssetId": 3,
 }
+# A perps market, as a perps property's l2Market and GET /l2/perps/markets serve it.
+PERPS_MARKET = {
+    "kind": "perps",
+    "chainId": 421614,
+    "proxyAddress": "0x" + "11" * 20,
+    "l2ChainId": 4242,
+    "marketIndex": 4,
+    "quoteAssetId": 3,
+    "status": "ACTIVE",
+    "sem": 1000,
+    "qem": "1000000",
+    "takerFee": 500,
+    "makerFee": 200,
+    "risk": 3277,
+    "band": 500,
+    "flags": 1,
+    "oiCap": 1_000_000_000,
+    "minBase": 0,
+    "minQuote": 0,
+    "quoteLimit": 0,
+}
+# GET /l2/perps/positions: pool 0 holds a long in market 4, pool 2 a short in market 9.
+PERPS_ACCOUNT = {
+    "l2AccountIndex": ACCOUNT_INDEX,
+    "pools": [
+        {
+            "pool": 0,
+            "collateral": "5000000000000",
+            "value": "5100000000000",
+            "requirement": "16384000000000000",
+            "liquidatable": False,
+            "initialMarginOk": True,
+            "positions": [
+                {
+                    "market": 4,
+                    "base": "20",
+                    "fundingIndex": "4294967296",
+                    "entryQuote": "203000",
+                    "entryPrice": "101500",
+                    "fundingOwed": "-1200",
+                    "notional": "2050000000000",
+                    "liquidationPrice": "52000",
+                    "adlRank": 2,
+                }
+            ],
+        },
+        {
+            "pool": 2,
+            "collateral": "300000000000",
+            "value": None,
+            "requirement": None,
+            "liquidatable": None,
+            "initialMarginOk": None,
+            "positions": [
+                {
+                    "market": 9,
+                    "base": "-5",
+                    "fundingIndex": "-12",
+                    "entryQuote": "50000",
+                    "entryPrice": "100000",
+                    "fundingOwed": "35",
+                    "notional": "490000000000",
+                    "liquidationPrice": None,
+                    "adlRank": None,
+                }
+            ],
+        },
+    ],
+}
+# A perps market's state refusals: the exchange's 403 text, the error it raises, and its state.
+MARKET_STATES = [
+    ("Trading is halted on this market", loaf.MarketHaltedError, "MARKET_HALTED"),
+    ("This market is outside its trading hours", loaf.MarketStateError, "MARKET_CLOSED"),
+    (
+        "This market is reduce-only: it takes only orders that reduce a position",
+        loaf.MarketStateError,
+        "REDUCE_ONLY",
+    ),
+    (
+        "This market's price is stale: it takes only orders that reduce a position",
+        loaf.MarketStateError,
+        "PRICE_STALE",
+    ),
+    (
+        "This market is reduce-only while its latest price waits for review: it takes only "
+        "orders that reduce a position",
+        loaf.PriceHeldError,
+        "REDUCE_ONLY",
+    ),
+]
 # GET /l2/keys for an account whose trading key is in force.
 KEYS = {
     "accountIndex": ACCOUNT_INDEX,
@@ -49,6 +141,8 @@ KEYS = {
 }
 # The 404 text of GET /l2/keys and POST /l2/order-indices for a user with no trading account.
 NO_ACCOUNT = "l2 account: no L2 account for this user"
+# The exchange's 422 for a perps op not signed at the account's api key 0 nonce.
+NONCE_REFUSAL = "l2 money: the nonce is not the api key's nonce (tx_nonce == api_key.nonce)"
 
 _ENV_VARS = (
     "LOAF_API_KEY",
@@ -85,6 +179,7 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     clock = SimpleNamespace(sleep=slept.append, slept=slept, time_ns=time.time_ns)
     monkeypatch.setattr("loaf._l2.time", clock)
     monkeypatch.setattr("loaf.resources.orders.time", clock)
+    monkeypatch.setattr("loaf.resources.perps.time", clock)  # an allocate's or exit's expiry
     return clock
 
 
@@ -129,6 +224,12 @@ class FakeExchange:
       up, at ``reserved_at_ms`` (``None``: the real clock's now).
     * ``POST /orders`` and ``/orders/conditional`` place the order: 200 with a
       fresh ``orderId`` (and one per attached leg).
+    * ``GET /l2/perps/markets`` lists ``perps_markets``; ``GET /l2/perps/positions``
+      serves ``perps_account`` (404 without a trading account).
+    * ``POST /l2/allocations`` and ``/l2/exits`` apply a signed op at the account's
+      nonce (``keys["withdrawalNonce"]``, which moves up by one): 202 with the next
+      ``journalSeq``; a re-send of an applied op is its duplicate, and any other op
+      off the nonce is refused (422).
 
     ``queue(path, *replies)`` makes ``path`` (without ``/api``) answer with each
     reply in turn before any of that: an ``httpx.Response``, or an exception to
@@ -144,6 +245,11 @@ class FakeExchange:
         self._lock = threading.Lock()
         self._next_index = 4097
         self._next_id = 0
+        self.perps_markets: list[dict[str, Any]] = [dict(PERPS_MARKET)]
+        self.perps_account: dict[str, Any] = json.loads(json.dumps(PERPS_ACCOUNT))
+        # The ops applied, by nonce: (their body, their journal seq).
+        self.applied: dict[int, tuple[bytes, int]] = {}
+        self._next_seq = 1000
 
     def queue(self, path: str, *replies: Any) -> None:
         with self._lock:
@@ -186,6 +292,14 @@ class FakeExchange:
                     "reservedAtMs": reserved_at,
                 },
             )
+        if route == "GET /l2/perps/markets":
+            return httpx.Response(200, json={"markets": self.perps_markets})
+        if route == "GET /l2/perps/positions":
+            if self.keys is None:
+                return httpx.Response(404, json={"error": NO_ACCOUNT})
+            return httpx.Response(200, json=self.perps_account)
+        if route in ("POST /l2/allocations", "POST /l2/exits"):
+            return self._apply(request.content)
         if route == "POST /orders/conditional":
             self._next_id += 1
             return httpx.Response(200, json={"success": True, "orderId": self._next_id})
@@ -206,6 +320,21 @@ class FakeExchange:
                 },
             )
         return httpx.Response(404, json={"error": "Not found"})
+
+    def _apply(self, content: bytes) -> httpx.Response:
+        """A signed perps op: applied once, at the account's nonce (signatures are not
+        checked here: verify_op does that)."""
+        nonce = json.loads(content)["l2Nonce"]
+        if nonce in self.applied:
+            body, seq = self.applied[nonce]
+            if body == content:
+                return httpx.Response(202, json={"journalSeq": seq, "duplicate": True})
+        if self.keys is None or nonce != self.keys["withdrawalNonce"]:
+            return httpx.Response(422, json={"error": NONCE_REFUSAL})
+        self._next_seq += 1
+        self.applied[nonce] = (content, self._next_seq)
+        self.keys["withdrawalNonce"] = nonce + 1
+        return httpx.Response(202, json={"journalSeq": self._next_seq, "duplicate": False})
 
     def _listing(self) -> dict:
         rows = []
@@ -272,13 +401,18 @@ def verify_order(body: dict, leg: str | None = None) -> None:
     from the SDK's own values: price x 1000 and quantity x 10 rounded like
     ``Math.round``; a leg signs a SELL of the parent's quantity at its own price,
     with its own order index and expiry; a conditional signs the order it books
-    (its own side and price).
+    (its own side and price). A perps order signs its ``l2Pool`` and
+    ``l2ReduceOnly`` as its base-asset field.
     """
     signed = body if leg is None else body[leg]
+    if "l2Pool" in body:
+        base_field = k1.perps_base_field(body["l2Pool"], body["l2ReduceOnly"])
+    else:
+        base_field = body["l2BaseAssetId"]
     message = k1.order_message(
         l2_chain_id=body["l2ChainId"],
         l2_market_index=body["l2MarketIndex"],
-        l2_base_asset_id=body["l2BaseAssetId"],
+        l2_base_asset_id=base_field,
         l2_quote_asset_id=body["l2QuoteAssetId"],
         is_ask=leg is not None or body["side"] == "SELL",
         price=js_round(signed["price"], 1000),
@@ -294,6 +428,38 @@ def verify_order(body: dict, leg: str | None = None) -> None:
         message,
         bytes.fromhex(signed["l2SigS"]),
         bytes.fromhex(signed["l2SigE"]),
+    )
+
+
+def verify_op(body: dict) -> None:
+    """Check the signature of a posted perps allocate or exit ``body`` under
+    ``L2_PUBLIC_KEY``, or raise :class:`loaf.k1.K1Error`: its message rebuilt from the
+    JSON, the allocate's amount from its decimal string."""
+    if "fromSide" in body:
+        assert isinstance(body["amount"], str)
+        message = k1._allocate_message(
+            body["l2ChainId"],
+            body["l2AccountIndex"],
+            body["fromSide"],
+            body["toSide"],
+            int(body["amount"]),
+            body["l2Nonce"],
+            body["l2ExpiryMs"],
+        )
+    else:
+        message = k1._exit_message(
+            body["l2ChainId"],
+            body["l2AccountIndex"],
+            body["pool"],
+            body["market"],
+            body["l2Nonce"],
+            body["l2ExpiryMs"],
+        )
+    k1.verify(
+        bytes.fromhex(L2_PUBLIC_KEY[2:]),
+        message,
+        bytes.fromhex(body["l2SigS"]),
+        bytes.fromhex(body["l2SigE"]),
     )
 
 

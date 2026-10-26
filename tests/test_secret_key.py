@@ -94,10 +94,11 @@ NONCE_0, NONCE_3, _ = VECTORS
 
 # MUS's l2Market in the tests of main(): the vault the first two vectors sign for.
 VAULT = {
+    "kind": "spot",
     "chainId": 421614,
     "proxyAddress": PROXY,
     "l2ChainId": 304,
-    "marketIndex": 0,
+    "marketIndex": 2048,
     "baseAssetId": 2,
     "quoteAssetId": 3,
 }
@@ -276,7 +277,7 @@ def test_only_live_l2_markets_count(helper, capsys):
         "DLST": delisted,
         "NOL2": property_detail("NOL2", l2_market=None),
         "MUS": helper.details["MUS"],
-        "OPRA": property_detail("OPRA", l2_market=dict(VAULT, marketIndex=1)),
+        "OPRA": property_detail("OPRA", l2_market=dict(VAULT, marketIndex=2049)),
     }
     assert run(capsys)[:2] == (0, PRINTED)
     assert routes(helper.requests) == ["GET /trade", "GET /trade/MUS", "GET /l2/keys"]
@@ -562,7 +563,7 @@ def test_unknown_ticker(helper, capsys):
 @pytest.mark.parametrize("argv, ticker", [([], "MUS"), (["--ticker", "OPRA"], "OPRA")])
 def test_no_trading_account(helper, capsys, argv, ticker):
     # The refusal names the market the account was read for, by default the first live one.
-    helper.details["OPRA"] = property_detail("OPRA", l2_market=dict(VAULT, marketIndex=1))
+    helper.details["OPRA"] = property_detail("OPRA", l2_market=dict(VAULT, marketIndex=2049))
     helper.keys = None  # 404 l2 account: no L2 account for this user
     assert refused(capsys, *argv) == (
         f"You have no trading account on {ticker}'s market yet: deposit in the Loaf web app "
