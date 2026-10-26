@@ -1,7 +1,7 @@
 """Order placement against an in-memory exchange: the signed L2 bodies, what the
-SDK reads for them (the property's market, your trading account, order numbers),
-MARKET pricing, TP/SL legs, conditionals, the order life, retries, resubmit, what
-a refusal invalidates, the order numbers a definite refusal gives back, and the
+SDK reads for them (the market, your trading account, order numbers), MARKET
+pricing, TP/SL legs, conditionals, the order life, retries, resubmit, what a
+refusal invalidates, the order numbers a definite refusal gives back, and the
 trading key's handling.
 
 Signatures are checked with ``conftest.verify_order``, which rebuilds the signed
@@ -46,23 +46,25 @@ from conftest import (
     KEYS,
     L2_PUBLIC_KEY,
     L2_SECRET,
-    MARKET,
+    MARKET_INDEX,
+    MARKET_L2,
     NO_ACCOUNT,
     FakeExchange,
-    property_detail,
+    market_detail,
     routes,
     secret_locals,
     verify_order,
 )
 
-# The SDK sends the keys in this fixed order.
+# The SDK sends the keys in this fixed order: no ticker, the signed l2MarketIndex is the market.
 ORDER_KEYS = (
-    "ticker price quantity side type timeInForce l2ChainId l2AccountIndex l2MarketIndex "
-    "l2OrderIndex l2Epoch l2FeeRateCap l2ExpiryMs l2BaseAssetId l2QuoteAssetId l2SigS l2SigE"
+    "price quantity side type timeInForce l2ChainId l2AccountIndex l2MarketIndex l2OrderIndex "
+    "l2Epoch l2FeeRateCap l2ExpiryMs l2BaseAssetId l2QuoteAssetId l2SigS l2SigE"
 ).split()
-CONDITIONAL_KEYS = ORDER_KEYS[:5] + ["triggerPrice"] + ORDER_KEYS[5:]
+CONDITIONAL_KEYS = ORDER_KEYS[:4] + ["triggerPrice"] + ORDER_KEYS[4:]
 LEG_KEYS = "triggerPrice price l2OrderIndex l2ExpiryMs l2SigS l2SigE".split()
-# What every order on OPRA signs besides its own terms: MARKET and the account in KEYS.
+# What every order on OPRA signs besides its own terms: its market (MARKET_INDEX, MARKET_L2) and
+# the account in KEYS.
 CONTEXT = {
     "l2ChainId": 4242,
     "l2AccountIndex": 5,
@@ -82,9 +84,10 @@ NOT_PLACED = (
     "please try again in a moment."
 )
 OPEN_ORDER_CAP = (
-    "You have reached the limit of 100 open orders on this property. Cancel some open "
+    "You have reached the limit of 100 open orders on this market. Cancel some open "
     "orders on it before placing a new one."
 )
+DELISTED = "This market has been delisted and is no longer available for trading"
 BALANCE_UNAVAILABLE = "The L2 balance is temporarily unavailable; try again in a moment"
 INDEX_USED = "l2 order_index: already used by the account; re-sign with the next index"
 INDEX_NOT_RESERVED = (
@@ -174,7 +177,6 @@ def test_limit_body_signed_no_bearer(exchange, trading_client):
     body = json.loads(request.content)
     assert list(body) == ORDER_KEYS
     assert unsigned(body) == {
-        "ticker": "OPRA",
         "price": 167.49,
         "quantity": 10.0,
         "side": "BUY",
@@ -199,7 +201,7 @@ def test_limit_body_signed_no_bearer(exchange, trading_client):
 
 
 # --------------------------------------------------------------------------- #
-# What an order reads: the property's market, the account, order numbers
+# What an order reads: the market, the account, order numbers
 # --------------------------------------------------------------------------- #
 
 
@@ -269,8 +271,8 @@ def test_short_tail_is_abandoned(exchange, trading_client):
 
 def test_tickers_share_the_account_and_the_block(exchange, trading_client):
     # Another market: its own market index and asset.
-    exchange.details["MUS"] = property_detail(
-        "MUS", l2_market={**MARKET, "marketIndex": 2051, "baseAssetId": 7}
+    exchange.details["MUS"] = market_detail(
+        "MUS", market_index=2051, l2={**MARKET_L2, "baseAssetId": 7}
     )
     orders = trading_client().orders
     orders.limit_buy("OPRA", 10, 167.49)
@@ -286,18 +288,18 @@ def test_tickers_share_the_account_and_the_block(exchange, trading_client):
 
 
 def test_unknown_ticker_404(exchange, trading_client):
-    with pytest.raises(loaf.LoafNotFoundError, match="Property not found"):
+    with pytest.raises(loaf.LoafNotFoundError, match="Market not found"):
         trading_client().orders.limit_buy("ATLS", 10, 167.49)
     assert routes(exchange.requests) == ["GET /trade/ATLS"]
 
 
 # --------------------------------------------------------------------------- #
-# Market refusals: nothing follows the property read
+# Market refusals: nothing follows the market read
 # --------------------------------------------------------------------------- #
 
 
-def test_null_l2_market_refused_locally(exchange, trading_client):
-    exchange.details["OPRA"] = property_detail(l2_market=None)
+def test_null_l2_refused_locally(exchange, trading_client):
+    exchange.details["OPRA"] = market_detail(l2=None)
     orders = trading_client().orders
     for _ in range(2):
         with pytest.raises(
@@ -308,38 +310,61 @@ def test_null_l2_market_refused_locally(exchange, trading_client):
     assert routes(exchange.requests) == ["GET /trade/OPRA"] * 2  # never cached
 
 
-def test_server_without_the_l2_exchange(exchange, trading_client):
-    exchange.details["OPRA"] = property_detail(l2_market=...)
-    with pytest.raises(loaf.LoafConfigError, match="LOAF_API_BASE_URL"):
+def test_server_without_the_exchange(exchange, trading_client):
+    # A server from before markets answers a property; another JSON API answers no market either.
+    exchange.details["OPRA"] = {"property": {"ticker": "OPRA", "status": "LIVE", "isHalted": False}}
+    with pytest.raises(loaf.LoafConfigError) as info:
         trading_client().orders.limit_buy("OPRA", 10, 167.49)
+    assert str(info.value) == (
+        "GET /trade/OPRA answered no market: this server does not run the exchange this SDK "
+        "trades on (check LOAF_API_BASE_URL)."
+    )
     assert routes(exchange.requests) == ["GET /trade/OPRA"]
 
 
 @pytest.mark.parametrize(
-    "l2_market, field",
+    "market_index, l2, field",
     [
-        ({**MARKET, "chainId": 0}, "chainId"),
-        ({**MARKET, "chainId": True}, "chainId"),
-        ({**MARKET, "chainId": "421614"}, "chainId"),
-        ({**MARKET, "proxyAddress": MARKET["proxyAddress"][:-1]}, "proxyAddress"),
-        ({**MARKET, "l2ChainId": 0}, "l2ChainId"),
-        ({**MARKET, "l2ChainId": 2130706433}, "l2ChainId"),
-        ({**MARKET, "marketIndex": 4096}, "marketIndex"),
-        ({k: v for k, v in MARKET.items() if k != "marketIndex"}, "marketIndex"),
-        ({**MARKET, "baseAssetId": 0}, "baseAssetId"),
-        ({**MARKET, "baseAssetId": 63}, "baseAssetId"),
-        ({**MARKET, "quoteAssetId": 0}, "quoteAssetId"),
-        ({**MARKET, "quoteAssetId": 63}, "quoteAssetId"),
-        ({**MARKET, "quoteAssetId": 6}, "quoteAssetId"),  # the base asset's id
-        (MARKET["proxyAddress"], "l2Market"),
+        (4096, MARKET_L2, "marketIndex"),  # past K1's 12 bits
+        (-1, MARKET_L2, "marketIndex"),
+        (True, MARKET_L2, "marketIndex"),
+        (..., MARKET_L2, "marketIndex"),
+        (MARKET_INDEX, ..., "l2"),
+        (MARKET_INDEX, MARKET_L2["proxyAddress"], "l2"),
+        (MARKET_INDEX, {**MARKET_L2, "chainId": 0}, "l2.chainId"),
+        (MARKET_INDEX, {**MARKET_L2, "chainId": True}, "l2.chainId"),
+        (MARKET_INDEX, {**MARKET_L2, "chainId": "421614"}, "l2.chainId"),
+        (
+            MARKET_INDEX,
+            {**MARKET_L2, "proxyAddress": MARKET_L2["proxyAddress"][:-1]},
+            "l2.proxyAddress",
+        ),
+        (MARKET_INDEX, {**MARKET_L2, "l2ChainId": 0}, "l2.l2ChainId"),
+        (MARKET_INDEX, {**MARKET_L2, "l2ChainId": 2130706433}, "l2.l2ChainId"),
+        (MARKET_INDEX, {**MARKET_L2, "baseAssetId": 0}, "l2.baseAssetId"),
+        (MARKET_INDEX, {**MARKET_L2, "baseAssetId": 63}, "l2.baseAssetId"),
+        (MARKET_INDEX, {**MARKET_L2, "quoteAssetId": 0}, "l2.quoteAssetId"),
+        (MARKET_INDEX, {**MARKET_L2, "quoteAssetId": 63}, "l2.quoteAssetId"),
+        (MARKET_INDEX, {**MARKET_L2, "quoteAssetId": 6}, "l2.quoteAssetId"),  # the base's id
     ],
 )
-def test_unusable_l2_market(exchange, trading_client, l2_market, field):
-    exchange.details["OPRA"] = property_detail(l2_market=l2_market)
-    message = f"GET /trade/OPRA answered an unusable property.l2Market ({field})"
+def test_unusable_market(exchange, trading_client, market_index, l2, field):
+    exchange.details["OPRA"] = market_detail(market_index=market_index, l2=l2)
+    message = f"GET /trade/OPRA answered an unusable market.{field}"
     with pytest.raises(loaf.LoafServerError, match=re.escape(message)):
         trading_client().orders.limit_buy("OPRA", 10, 167.49)
     assert routes(exchange.requests) == ["GET /trade/OPRA"]
+
+
+@pytest.mark.parametrize("market_index", [0, 254, 2048, 4094, 4095])
+def test_any_12_bit_market_index_is_signed(exchange, trading_client, market_index):
+    # 0 is a market (a perp's), never "none". The SDK checks only K1's 12 bits; the exchange
+    # knows its markets.
+    exchange.details["OPRA"] = market_detail(market_index=market_index)
+    trading_client().orders.limit_buy("OPRA", 10, 167.49)
+    (body,) = exchange.bodies("/orders")
+    assert body["l2MarketIndex"] == market_index
+    verify_order(body)
 
 
 # --------------------------------------------------------------------------- #
@@ -413,7 +438,14 @@ def test_other_keys_404_propagates(exchange, trading_client):
         orders.limit_buy("OPRA", 10, 167.49)
     assert type(info.value) is loaf.LoafNotFoundError
     assert orders.limit_buy("OPRA", 10, 167.49).orderId == 1
-    assert len(exchange.gets("/l2/keys")) == 2
+    # A read's 404 says nothing of the market, which is kept.
+    assert routes(exchange.requests) == [
+        "GET /trade/OPRA",
+        "GET /l2/keys",
+        "GET /l2/keys",
+        "POST /l2/order-indices",
+        "POST /orders",
+    ]
 
 
 def test_read_account(exchange, trading_client):
@@ -510,7 +542,7 @@ def test_another_accounts_range_drops_the_account_and_its_block(exchange, tradin
 @pytest.mark.parametrize(
     "path, message",
     [
-        ("/trade/OPRA", "GET /trade/OPRA answered no property"),
+        ("/trade/OPRA", "GET /trade/OPRA answered no market"),
         ("/l2/keys", "GET /l2/keys answered an unusable accountIndex"),
         ("/l2/order-indices", "POST /l2/order-indices answered a range no order can be signed in"),
     ],
@@ -750,7 +782,6 @@ def test_conditional_market_price_derived(exchange, trading_client):
     body = exchange.bodies("/orders/conditional")[-1]
     assert list(body) == CONDITIONAL_KEYS
     assert unsigned(body) == {
-        "ticker": "OPRA",
         "price": 88.2,  # books at up to 2% below the trigger
         "quantity": 5.0,
         "side": "SELL",
@@ -993,15 +1024,20 @@ def test_pricing_refusals(exchange, trading_client, method, args, kwargs, messag
 @pytest.mark.parametrize(
     "detail",
     [
-        property_detail(market_price=0),  # the exchange has no reference yet
+        market_detail(market_price=0),  # the exchange has no reference yet
         {
-            **property_detail(),
-            "propertyList": [{"ticker": "MUS", "tokenName": "Musgrave", "marketPrice": 50}],
+            **market_detail(),
+            "marketList": [{"ticker": "MUS", "name": "Musgrave", "marketPrice": 50}],
         },
         # Matched on the ticker: an entry whose display name happens to read OPRA is not it.
         {
-            **property_detail(),
-            "propertyList": [{"ticker": "MUS", "tokenName": "OPRA", "marketPrice": 50}],
+            **market_detail(),
+            "marketList": [{"ticker": "MUS", "name": "OPRA", "marketPrice": 50}],
+        },
+        # Nor is another market of its asset: the perp's ticker is not the spot market's.
+        {
+            **market_detail(),
+            "marketList": [{"ticker": "OPRA-PERP", "name": "Opera", "marketPrice": 50}],
         },
     ],
 )
@@ -1223,7 +1259,7 @@ def test_transient_failure_resent_identically(exchange, trading_client, failure)
     "message",
     [
         NOT_PLACED,
-        "Trading is temporarily unavailable for this property. Your order was not placed — "
+        "Trading is temporarily unavailable for this market. Your order was not placed — "
         "please try again in a moment.",
         "Trading is temporarily unavailable; your order was not placed, try again in a moment",
         "l2 account: the trading account could not be read; nothing was done, try again in a "
@@ -1443,7 +1479,7 @@ def test_conditional_timeout_resent_identically(exchange, trading_client):
 
 def test_placement_timeout(exchange, trading_client):
     trading_client().orders.limit_buy("OPRA", 10, 167.49)
-    # The property, the account and the reservation keep the client's timeout; the
+    # The market, the account and the reservation keep the client's timeout; the
     # placement waits out the engine.
     assert [r.extensions["timeout"]["read"] for r in exchange.requests] == [30.0, 30.0, 30.0, 45.0]
 
@@ -1502,10 +1538,10 @@ def test_placement_backoff_ignores_rate_limit_headers(exchange, trading_client, 
     del sleeps[:]
     replies = [
         httpx.Response(503, json={"error": "busy"}, headers={"RateLimit-Reset": "57"}),
-        httpx.Response(200, json={"properties": []}),
+        httpx.Response(200, json={"markets": []}),
     ]
     http = httpx.Client(transport=httpx.MockTransport(lambda r: replies.pop(0)), base_url=BASE)
-    LoafClient(base_url=BASE, http_client=http).market.properties()
+    LoafClient(base_url=BASE, http_client=http).market.list()
     assert sleeps == [57.0]
 
 
@@ -1650,11 +1686,7 @@ def test_response_hook_raising_on_a_5xx_is_unknown(exchange):
     [
         (400, STALE_EPOCH, loaf.LoafValidationError),
         (400, WRONG_CHAIN, loaf.LoafValidationError),
-        (
-            400,
-            "l2 market: the market index is not the property's market",
-            loaf.LoafValidationError,
-        ),
+        (400, "l2 market: the order's L2 market is not active", loaf.LoafValidationError),
         (
             400,
             "l2 asset: the base asset id is not the market's base asset",
@@ -1681,6 +1713,54 @@ def test_context_refusal_rereads_market_and_account(
     # The market and the account are read again; the refused order's number is signed again.
     assert routes(exchange.requests[sent:]) == ["GET /trade/OPRA", "GET /l2/keys", "POST /orders"]
     assert indices(exchange) == [4097, 4098, 4098]
+
+
+@pytest.mark.parametrize(
+    "status, message, error",
+    [
+        (404, "Market not found", loaf.LoafNotFoundError),
+        (403, DELISTED, loaf.LoafForbiddenError),
+        (403, "This market is not yet available for trading", loaf.LoafForbiddenError),
+    ],
+    ids=["no-market", "delisted", "pending"],
+)
+def test_market_refusal_rereads_the_market(exchange, trading_client, status, message, error):
+    # The order names its market by the signed index alone: refused as no market, or as one that
+    # does not trade, it reads the ticker's market again, which may be another one by now.
+    orders = trading_client().orders
+    orders.limit_buy("OPRA", 10, 167.49)
+    exchange.queue("/orders", error_reply(status, message))
+    with pytest.raises(error) as info:
+        orders.limit_buy("OPRA", 10, 167.49)  # reserves 2 and takes 4098
+    assert type(info.value) is error
+    exchange.details["OPRA"] = market_detail(market_index=2052)  # OPRA's market now
+    sent = len(exchange.requests)
+    orders.limit_buy("OPRA", 10, 167.49)
+    # The market alone is read again; the refused order's number is signed again.
+    assert routes(exchange.requests[sent:]) == ["GET /trade/OPRA", "POST /orders"]
+    assert [body["l2MarketIndex"] for body in exchange.bodies("/orders")] == [2050, 2050, 2052]
+    assert indices(exchange) == [4097, 4098, 4098]
+
+
+@pytest.mark.parametrize(
+    "message, error",
+    [
+        ("Trading halted for this market", loaf.TradingHaltedError),
+        ("Trading is currently halted", loaf.TradingHaltedError),
+        ("Trading on this market has not started yet", loaf.LoafForbiddenError),
+    ],
+)
+def test_halt_or_start_not_reached_keeps_the_market(exchange, trading_client, message, error):
+    # The market is the ticker's still: an order placed until it trades reads nothing again.
+    orders = trading_client().orders
+    orders.limit_buy("OPRA", 10, 167.49)
+    exchange.queue("/orders", error_reply(403, message))
+    with pytest.raises(error) as info:
+        orders.limit_buy("OPRA", 10, 167.49)
+    assert type(info.value) is error
+    sent = len(exchange.requests)
+    orders.limit_buy("OPRA", 10, 167.49)
+    assert routes(exchange.requests[sent:]) == ["POST /orders"]
 
 
 @pytest.mark.parametrize(
@@ -1724,7 +1804,7 @@ def test_unknown_outcome_still_invalidates(exchange, trading_client, message, re
 
 def test_refusal_of_an_older_account_keeps_a_fresh_read(exchange, trading_client):
     l2, account = pool(trading_client())
-    l2.remember("OPRA", market_of(property_detail(), "OPRA"))
+    l2.remember("OPRA", market_of(market_detail(), "OPRA"))
     epoch_refusal = error_from_response(400, {"error": STALE_EPOCH})
     # An order signed with the account as it was before another thread read it again.
     l2.after_refusal("OPRA", account._replace(epoch=1), None, epoch_refusal)
@@ -1757,12 +1837,12 @@ def test_index_refusal_of_a_replaced_block_keeps_the_new_one(exchange, trading_c
     "replies",
     [
         lambda: [error_reply(400, OPEN_ORDER_CAP)],
-        lambda: [error_reply(403, "Trading is currently closed")],
+        lambda: [error_reply(403, DELISTED)],
         lambda: [error_reply(429, "Too many requests for this account. Please slow down.")],
         lambda: [error_reply(503, NOT_PLACED) for _ in range(4)],
         lambda: [httpx.ConnectError("unreachable") for _ in range(4)],
     ],
-    ids=["400-cap", "403-closed", "429", "503-not-placed", "connect-error"],
+    ids=["400-cap", "403-delisted", "429", "503-not-placed", "connect-error"],
 )
 def test_definite_refusal_gives_the_numbers_back(exchange, trading_client, replies):
     orders = trading_client().orders
@@ -2241,8 +2321,12 @@ def test_wallet_key_in_the_environment_refused(monkeypatch):
     [
         ("opra", "BUY"),  # sent exactly as given: never upper-cased for you
         ("Opra", "BUY"),
-        ("OPERA", "BUY"),  # at most 4
+        ("OPERAHOUSES", "BUY"),  # at most 10, -PERP aside
+        ("OPERAHOUSES-PERP", "BUY"),
         ("", "BUY"),
+        ("-PERP", "BUY"),
+        ("OPR-perp", "BUY"),
+        ("OPR-SPOT", "BUY"),
         ("OP-1", "BUY"),
         ("OP/R", "BUY"),
         (" OPR", "BUY"),
@@ -2262,10 +2346,11 @@ def test_ticker_and_side_validation(exchange, trading_client, ticker, side):
     assert exchange.requests == []
 
 
-@pytest.mark.parametrize("ticker", ["A", "MUS", "OPRA", "X1", "1234"])
+@pytest.mark.parametrize("ticker", ["A", "MUS", "OPRA", "X1", "1234", "OPERAHOUSE", "H100-PERP"])
 def test_ticker_accepted(exchange, trading_client, ticker):
-    exchange.details[ticker] = property_detail(ticker)
+    exchange.details[ticker] = market_detail(ticker, market_index=7)
     trading_client().orders.limit_buy(ticker, 1, 100)
     (body,) = exchange.bodies("/orders")
-    assert body["ticker"] == ticker
+    # The ticker names the market to read; the body names it by the index it signs.
+    assert "ticker" not in body and body["l2MarketIndex"] == 7
     assert len(exchange.gets(f"/trade/{ticker}")) == 1

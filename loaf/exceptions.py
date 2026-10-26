@@ -54,11 +54,10 @@ class LoafConfigError(LoafError):
 
     From an order placement (nothing was placed):
 
-    * your trading key is not the one in force on the property's market (it was
-      reset in the web app, or it belongs to another vault): get the key in
-      force again (README §2), restart, and cancel and re-arm every stop and
-      take, because those signed with the old key stay ARMED and FAIL when they
-      fire;
+    * your trading key is not the one in force on the market (it was reset in
+      the web app, or it belongs to another vault): get the key in force again
+      (README §2), restart, and cancel and re-arm every stop and take, because
+      those signed with the old key stay ARMED and FAIL when they fire;
     * trading is not enabled on your account, or you have no trading account
       yet: act in the web app (deposit first);
     * this machine's clock is hours ahead of the exchange's: synchronize it.
@@ -191,9 +190,9 @@ class TradingHaltedError(LoafForbiddenError):
     was placed.
 
     403 ``Trading is currently halted`` (platform-wide) or ``Trading halted for
-    this property``. A platform-wide halt also blocks
+    this market``. A platform-wide halt also blocks
     :meth:`~loaf.resources.orders.OrdersResource.cancel` and ``cancel_all`` (a
-    single-property halt does not). The one exception is
+    single-market halt does not). The one exception is
     :meth:`~loaf.resources.orders.OrdersResource.cancel_conditional`, which is
     database-only and stays available — during a platform halt it is your only
     way to pull a resting stop before the reopen.

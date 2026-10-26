@@ -11,6 +11,8 @@ your trading account and cancels the order again.
 
 from __future__ import annotations
 
+import time
+
 import loaf
 from loaf import LoafClient
 
@@ -32,28 +34,34 @@ def main() -> None:
             "(see README §2)."
         )
 
-    # Pick a property you can trade now: LIVE, with an L2 market.
+    # Pick a market you can trade now: LIVE, not halted, with an L2 market, its trading
+    # started (tradingStartsAt None or passed). A halt since this read still refuses the
+    # order (caught below).
+    now = time.time()
     tradeable = [
-        p
-        for p in client.market.properties().get("properties") or []
-        if p.get("status") == "LIVE" and p.get("hasL2Market")
+        m
+        for m in client.market.list().get("markets") or []
+        if m.get("status") == "LIVE"
+        and not m.get("isHalted")
+        and m.get("hasL2Market")
+        and (m.get("tradingStartsAt") is None or m.tradingStartsAt <= now)
     ]
     if not tradeable:
-        raise SystemExit("No tradeable properties right now.")
-    prop = tradeable[0]
-    detail = client.market.property(prop.ticker)
+        raise SystemExit("No tradeable markets right now.")
+    market = tradeable[0]
+    detail = client.market.get(market.ticker)
     book = detail.get("orderBook")
-    best_bid = book.bids[0].price if book and book.get("bids") else (prop.marketPrice or 1.0)
+    best_bid = book.bids[0].price if book and book.get("bids") else (market.marketPrice or 1.0)
 
     # A passive limit BUY well below the best bid (unlikely to fill immediately).
     price = round(best_bid * 0.80, 2)
-    print(f"Placing LIMIT BUY 1 {prop.ticker} @ {price} (best bid {best_bid})")
+    print(f"Placing LIMIT BUY 1 {market.ticker} @ {price} (best bid {best_bid})")
 
     try:
-        result = client.orders.limit_buy(prop.ticker, quantity=1, price=price)
+        result = client.orders.limit_buy(market.ticker, quantity=1, price=price)
     except loaf.LoafConfigError as exc:  # your trading key or account: the message says what to do
         raise SystemExit(str(exc))
-    except loaf.LoafAPIError as exc:  # halted, market closed, order refused, rate limited
+    except loaf.LoafAPIError as exc:  # halted, order refused, rate limited
         raise SystemExit(f"Refused: {exc}")
     except loaf.OrderOutcomeUnknownError as exc:
         # Unsure whether it landed: re-send the same signed order to find out (the

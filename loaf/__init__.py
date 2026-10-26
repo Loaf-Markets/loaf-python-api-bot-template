@@ -6,7 +6,7 @@ Quick start::
 
     loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_SECRET_KEY
     print(loaf.portfolio.component().balances)
-    print(loaf.market.properties())
+    print(loaf.market.list())
     loaf.orders.limit_buy("MUS", quantity=10, price=167.49)   # signed with your trading key
 
 See the README for the full guide.
@@ -27,15 +27,17 @@ from .constants import (
 )
 from .enums import (
     CONDITIONAL_ORDER_TYPES,
+    AssetKind,
     CandleResolution,
     CompetitionRoundStatus,
     ConditionalOrderStatus,
     ConditionalOrderType,
     IpoStatus,
+    MarketStatus,
+    MarketType,
     OrderSide,
     OrderStatus,
     OrderType,
-    PropertyStatus,
     TimeInForce,
     WSMessageType,
     is_conditional_order,
@@ -79,7 +81,9 @@ __all__ = [
     "TimeInForce",
     "OrderStatus",
     "ConditionalOrderStatus",
-    "PropertyStatus",
+    "MarketType",
+    "MarketStatus",
+    "AssetKind",
     "IpoStatus",
     "CandleResolution",
     "CompetitionRoundStatus",

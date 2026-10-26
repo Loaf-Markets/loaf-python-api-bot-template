@@ -11,6 +11,8 @@ your trading account, reads the row back and cancels it.
 
 from __future__ import annotations
 
+import time
+
 import loaf
 from loaf import LoafClient
 
@@ -32,18 +34,24 @@ def main() -> None:
             "(see README §2)."
         )
 
-    # Pick a property you can trade now: LIVE, with an L2 market.
+    # Pick a market you can trade now: LIVE, not halted, with an L2 market, its trading
+    # started (tradingStartsAt None or passed). A halt since this read still refuses the
+    # order (caught below).
+    now = time.time()
     tradeable = [
-        p
-        for p in client.market.properties().get("properties") or []
-        if p.get("status") == "LIVE" and p.get("hasL2Market")
+        m
+        for m in client.market.list().get("markets") or []
+        if m.get("status") == "LIVE"
+        and not m.get("isHalted")
+        and m.get("hasL2Market")
+        and (m.get("tradingStartsAt") is None or m.tradingStartsAt <= now)
     ]
     if not tradeable:
-        raise SystemExit("No tradeable properties right now.")
-    prop = tradeable[0]
-    detail = client.market.property(prop.ticker)
+        raise SystemExit("No tradeable markets right now.")
+    market = tradeable[0]
+    detail = client.market.get(market.ticker)
     book = detail.get("orderBook")
-    mark = book.bids[0].price if book and book.get("bids") else (prop.marketPrice or 1.0)
+    mark = book.bids[0].price if book and book.get("bids") else (market.marketPrice or 1.0)
 
     # A STOP BUY fires when the mark RISES to the trigger, so a trigger 50%
     # above the market just rests. (A stop SELL would need tokens to sell when it
@@ -53,12 +61,12 @@ def main() -> None:
     # slippage ($LOAF_MAX_SLIPPAGE_BPS, default 2%). That price x quantity must be
     # at least $10; your cash is checked only when it fires.
     books_at = loaf.worst_price(trigger, "BUY", client.max_slippage_bps)
-    print(f"Arming STOP_MARKET BUY 1 {prop.ticker} @ trigger {trigger} "
+    print(f"Arming STOP_MARKET BUY 1 {market.ticker} @ trigger {trigger} "
           f"(books at up to {books_at}; rounded toward the trigger; mark {mark})")
 
     try:
         result = client.orders.create_conditional(
-            prop.ticker,
+            market.ticker,
             "BUY",
             quantity=1,
             type="STOP_MARKET",
@@ -71,7 +79,7 @@ def main() -> None:
             f"Refused: {exc}. If this says 'would trigger immediately', the trigger "
             "was too close to the mark."
         )
-    except loaf.LoafAPIError as exc:  # halted, market closed, rate limited
+    except loaf.LoafAPIError as exc:  # halted, rate limited
         raise SystemExit(f"Refused: {exc}")
     except loaf.OrderOutcomeUnknownError as exc:
         # Unsure whether it was armed: re-send the same signed order to find out (the

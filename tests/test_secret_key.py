@@ -21,7 +21,7 @@ import loaf
 from loaf import LoafClient, k1, secret_key
 from loaf.secret_key import L2_KEY_WARNING, l2_key_typed_data, main
 
-from conftest import BASE, FakeExchange, property_detail, routes, secret_locals
+from conftest import BASE, FakeExchange, market_detail, routes, secret_locals
 
 # The helper's `wallet` extra: without it there is nothing to test here.
 Account = pytest.importorskip("eth_account").Account
@@ -92,12 +92,11 @@ VECTORS = [
 ]
 NONCE_0, NONCE_3, _ = VECTORS
 
-# MUS's l2Market in the tests of main(): the vault the first two vectors sign for.
+# MUS's market.l2 in the tests of main(): the vault the first two vectors sign for.
 VAULT = {
     "chainId": 421614,
     "proxyAddress": PROXY,
     "l2ChainId": 304,
-    "marketIndex": 0,
     "baseAssetId": 2,
     "quoteAssetId": 3,
 }
@@ -173,7 +172,7 @@ def helper(
     """``exchange``, ready for main(): it lists MUS, on the vectors' vault, and account 7,
     whose key in force is the wallet's at key nonce 3; the wallet key and an API key are
     set in the environment."""
-    exchange.details = {"MUS": property_detail("MUS", l2_market=VAULT)}
+    exchange.details = {"MUS": market_detail("MUS", market_index=2049, l2=VAULT)}
     exchange.keys = account("0x" + NONCE_3.public_key)
     monkeypatch.setenv("LOAF_WALLET_PRIVATE_KEY", WALLET_KEY)
     monkeypatch.setenv("LOAF_API_KEY", API_KEY)
@@ -270,13 +269,13 @@ def test_key_in_force_at_key_nonce_0(helper, capsys, candidates):
 def test_only_live_l2_markets_count(helper, capsys):
     # Listed ahead of MUS: a delisted market and one without an L2 market. OPRA, the next live
     # L2 market, is never read.
-    delisted = property_detail("DLST")
-    delisted["property"]["status"] = "DELISTED"
+    delisted = market_detail("DLST")
+    delisted["market"]["status"] = "DELISTED"
     helper.details = {
         "DLST": delisted,
-        "NOL2": property_detail("NOL2", l2_market=None),
+        "NOL2": market_detail("NOL2", l2=None),
         "MUS": helper.details["MUS"],
-        "OPRA": property_detail("OPRA", l2_market=dict(VAULT, marketIndex=1)),
+        "OPRA": market_detail("OPRA", market_index=2050, l2=VAULT),
     }
     assert run(capsys)[:2] == (0, PRINTED)
     assert routes(helper.requests) == ["GET /trade", "GET /trade/MUS", "GET /l2/keys"]
@@ -391,7 +390,8 @@ def test_help(capsys):
     [
         ["--ticker"],
         ["--ticker", "mus"],
-        ["--ticker", "MUSIC"],
+        ["--ticker", "MUSICHALLS1"],  # 11 characters
+        ["--ticker", "MUS-perp"],
         # The wallet key where it does not belong, which argparse's own messages would repeat.
         ["--wallet-key", WALLET_KEY],
         [WALLET_KEY[2:]],
@@ -408,9 +408,9 @@ def test_usage_errors(helper, capsys, clients, argv):
     assert WALLET_KEY[2:] not in err.lower()
     assert " ".join(err.split()) == (  # argparse wraps the usage line to the terminal's width
         "usage: python -m loaf.secret_key [-h] [--ticker TICKER] python -m loaf.secret_key: error: the "
-        "only argument is --ticker, a property's ticker (1-4 uppercase letters or digits, e.g. "
-        "MUS). The wallet key is read from LOAF_WALLET_PRIVATE_KEY, never from an argument "
-        "(README §2)."
+        "only argument is --ticker, a market's ticker (1-10 uppercase letters or digits, -PERP "
+        "appended for a perp, e.g. MUS). The wallet key is read from LOAF_WALLET_PRIVATE_KEY, "
+        "never from an argument (README §2)."
     )
     assert clients == []
 
@@ -525,24 +525,33 @@ def test_api_key_shaped_like_a_wallet_key(helper, capsys, monkeypatch):
     assert helper.requests == []
 
 
-@pytest.mark.parametrize("server", ["before the L2 exchange", "no Loaf API"])
-def test_server_without_the_l2_exchange(helper, capsys, server):
-    if server == "before the L2 exchange":
-        helper.details = {"MUS": property_detail("MUS", l2_market=...)}
+@pytest.mark.parametrize("server", ["before markets", "no Loaf API"])
+def test_server_without_the_exchange(helper, capsys, server):
+    if server == "before markets":  # it listed properties
+        listing = {"properties": [{"ticker": "MUS", "status": "LIVE", "hasL2Market": True}]}
+        helper.queue("/trade", httpx.Response(200, json=listing))
     else:
         helper.queue("/trade", httpx.Response(200, text="<!doctype html><title>Loaf</title>"))
     assert refused(capsys) == (
-        "GET /trade lists no hasL2Market: this server does not run the exchange this SDK trades "
-        "on (check LOAF_API_BASE_URL).\n"
+        "GET /trade lists no markets with hasL2Market: this server does not run the exchange this "
+        "SDK trades on (check LOAF_API_BASE_URL).\n"
     )
 
 
-@pytest.mark.parametrize("why", ["no l2Market", "not live"])
+def test_ticker_on_a_server_without_the_exchange(helper, capsys):
+    helper.details["MUS"] = {"property": {"ticker": "MUS", "status": "LIVE", "isHalted": False}}
+    assert refused(capsys, "--ticker", "MUS") == (
+        "GET /trade/MUS answered no market: this server does not run the exchange this SDK "
+        "trades on (check LOAF_API_BASE_URL).\n"
+    )
+
+
+@pytest.mark.parametrize("why", ["no l2", "not live"])
 def test_no_live_l2_market(helper, capsys, why):
-    if why == "no l2Market":
-        helper.details = {"MUS": property_detail("MUS", l2_market=None)}
+    if why == "no l2":
+        helper.details = {"MUS": market_detail("MUS", market_index=2049, l2=None)}
     else:
-        helper.details["MUS"]["property"]["status"] = "PENDING"
+        helper.details["MUS"]["market"]["status"] = "PENDING"
     assert refused(capsys) == (
         "No live market has an L2 market right now, so there is no vault to derive a key for "
         "(pass --ticker to name one).\n"
@@ -551,18 +560,18 @@ def test_no_live_l2_market(helper, capsys, why):
 
 
 def test_ticker_without_an_l2_market(helper, capsys):
-    helper.details["MUS"] = property_detail("MUS", l2_market=None)
+    helper.details["MUS"] = market_detail("MUS", market_index=2049, l2=None)
     assert "MUS has no L2 market right now" in refused(capsys, "--ticker", "MUS")
 
 
 def test_unknown_ticker(helper, capsys):
-    assert refused(capsys, "--ticker", "ZZZ") == "HTTP 404: Property not found\n"
+    assert refused(capsys, "--ticker", "ZZZ") == "HTTP 404: Market not found\n"
 
 
 @pytest.mark.parametrize("argv, ticker", [([], "MUS"), (["--ticker", "OPRA"], "OPRA")])
 def test_no_trading_account(helper, capsys, argv, ticker):
     # The refusal names the market the account was read for, by default the first live one.
-    helper.details["OPRA"] = property_detail("OPRA", l2_market=dict(VAULT, marketIndex=1))
+    helper.details["OPRA"] = market_detail("OPRA", market_index=2050, l2=VAULT)
     helper.keys = None  # 404 l2 account: no L2 account for this user
     assert refused(capsys, *argv) == (
         f"You have no trading account on {ticker}'s market yet: deposit in the Loaf web app "

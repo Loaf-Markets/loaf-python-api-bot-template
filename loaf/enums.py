@@ -63,10 +63,26 @@ class ConditionalOrderStatus(_StrEnum):
     CANCELLED = "CANCELLED"
 
 
-class PropertyStatus(_StrEnum):
+class MarketType(_StrEnum):
+    """A market's type, which its index decides (a perp's ticker ends in ``-PERP``)."""
+
+    SPOT = "SPOT"
+    PERP = "PERP"
+
+
+class MarketStatus(_StrEnum):
     PENDING = "PENDING"
     LIVE = "LIVE"
     DELISTED = "DELISTED"
+
+
+class AssetKind(_StrEnum):
+    """What an asset is: a market's ``kind`` is its asset's."""
+
+    PROPERTY = "PROPERTY"
+    COMMODITY = "COMMODITY"
+    CRYPTO = "CRYPTO"
+    INDEX = "INDEX"
 
 
 class IpoStatus(_StrEnum):
@@ -118,7 +134,7 @@ class WSMessageType(_StrEnum):
     MARK_PRICE = "mark_price"
     VOLUME_UPDATE = "volume_update"
     LEADERBOARD_UPDATE = "leaderboard_update"
-    PROPERTY_HALT = "property_halt"
+    MARKET_HALT = "market_halt"
     ROUND_UPDATE = "round_update"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"

@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Mapping, NoReturn, Sequence
 
 from . import k1
-from ._l2 import _TICKER_RE, Market, market_of, read_account
+from ._l2 import _MARKET_TICKER_RE, Market, market_of, read_account
 from .client import LoafClient
 from .constants import ENV_API_KEY, ENV_BASE_URL, ENV_SECRET_KEY, ENV_WALLET_PRIVATE_KEY
 from .exceptions import LoafConfigError, LoafError
@@ -72,7 +72,7 @@ def l2_key_typed_data(
 ) -> dict[str, Any]:
     """The EIP-712 typed data whose signature by ``wallet`` seeds the trading key, byte for
     byte the web app's: domain ``Loaf L2 Key`` version 2 on ``chain_id`` (the vault's chain,
-    ``l2Market.chainId``) with no verifying contract, and an ``L2Key`` message binding the
+    ``market.l2.chainId``) with no verifying contract, and an ``L2Key`` message binding the
     vault (``proxy_address``, ``l2_chain_id``), the account, its api key 0, ``key_nonce`` (one
     per key change the wallet made on the vault) and :data:`L2_KEY_WARNING`.
 
@@ -119,7 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--ticker",
         type=_ticker,
-        help="a property on the vault to derive the key for, e.g. MUS (default: the first live "
+        help="a market on the vault to derive the key for, e.g. MUS (default: the first live "
         "L2 market's)",
     )
     ticker = parser.parse_args(argv).ticker
@@ -272,15 +272,15 @@ def _vault(client: LoafClient, ticker: str | None) -> tuple[str, Market]:
     if ticker is not None:
         return ticker, market_of(client.get(f"/trade/{ticker}", auth=False), ticker)
     listing = client.get("/trade", auth=False)
-    rows = listing.get("properties") if isinstance(listing, Mapping) else None
-    # The L2 exchange lists hasL2Market on every property; an older server does not, and a host
+    rows = listing.get("markets") if isinstance(listing, Mapping) else None
+    # The exchange lists markets, each with hasL2Market; an older server lists none, and a host
     # that is no Loaf API lists nothing.
     if not isinstance(rows, list) or any(
         not isinstance(row, Mapping) or "hasL2Market" not in row for row in rows
     ):
         raise LoafConfigError(
-            "GET /trade lists no hasL2Market: this server does not run the exchange this SDK "
-            f"trades on (check {ENV_BASE_URL})."
+            "GET /trade lists no markets with hasL2Market: this server does not run the exchange "
+            f"this SDK trades on (check {ENV_BASE_URL})."
         )
     tickers: list[str] = [
         row["ticker"] for row in rows if row.get("status") == "LIVE" and row["hasL2Market"] is True
@@ -302,15 +302,15 @@ class _Parser(argparse.ArgumentParser):
         self.print_usage(sys.stderr)
         self.exit(
             2,
-            f"{self.prog}: error: the only argument is --ticker, a property's ticker (1-4 "
-            "uppercase letters or digits, e.g. MUS). The wallet key is read from "
-            f"{ENV_WALLET_PRIVATE_KEY}, never from an argument (README §2).\n",
+            f"{self.prog}: error: the only argument is --ticker, a market's ticker (1-10 "
+            "uppercase letters or digits, -PERP appended for a perp, e.g. MUS). The wallet key "
+            f"is read from {ENV_WALLET_PRIVATE_KEY}, never from an argument (README §2).\n",
         )
 
 
 def _ticker(value: str) -> str:
     """``--ticker``: a bad value is a usage error."""
-    if not _TICKER_RE.fullmatch(value):
+    if not _MARKET_TICKER_RE.fullmatch(value):
         raise ValueError
     return value
 

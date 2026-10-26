@@ -31,7 +31,7 @@ Action = Callable[[Any], Awaitable[None]]
 
 async def _push_book(ws: Any) -> None:
     await ws.send(json.dumps({
-        "type": "orderbook_update", "propertyId": 1,
+        "type": "orderbook_update", "marketIndex": 2050,
         "bids": [{"price": 100.0, "quantity": 1.0}], "asks": [], "timestamp": 0,
     }))
 
@@ -126,7 +126,7 @@ class _Server:
                     for channel in added:
                         if channel.startswith("trades:") and self.recent_trades:
                             await self._send(
-                                ws, type="trades_batch", propertyId=1, trades=self.recent_trades
+                                ws, type="trades_batch", marketIndex=2050, trades=self.recent_trades
                             )
                 else:
                     await self._send(ws, type="echo", data=frame)

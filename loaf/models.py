@@ -23,7 +23,7 @@ class PriceLevel(TypedDict):
 
 
 class OrderBook(TypedDict, total=False):
-    propertyId: int
+    marketIndex: int
     bids: list[PriceLevel]
     asks: list[PriceLevel]
 
@@ -46,15 +46,14 @@ class CandleHistory(TypedDict, total=False):
     hasMore: bool  # at least one older candle exists before oldestTs
 
 
-class L2Market(TypedDict):
-    """``property.l2Market`` of ``GET /trade/{ticker}``: the L2 market every order
-    on the property signs (the SDK reads it for you)."""
+class MarketL2(TypedDict):
+    """``market.l2`` of ``GET /trade/{ticker}``: with the market's ``marketIndex``, what
+    every order on the market signs, and its custody (the SDK reads both for you)."""
 
     chainId: int  # the chain the proxy is on, not what an order signs
     proxyAddress: str  # the ZkLoaf proxy
     l2ChainId: int
-    marketIndex: int
-    baseAssetId: int  # the property token's balances row
+    baseAssetId: int  # the asset token's balances row
     quoteAssetId: int  # the cash balances row
 
 
@@ -63,7 +62,7 @@ class TradeTick(TypedDict, total=False):
     or a ``market.trades`` row (oldest first)."""
 
     tradeId: int
-    propertyId: int
+    marketIndex: int
     txHash: str  # the trade's content hash (0x + 64 hex), not an on-chain transaction
     aggressorSide: str  # OrderSide of the taker
     price: float
@@ -110,8 +109,10 @@ class OrderHistoryItem(TypedDict, total=False):
     """
 
     id: int
-    propertyId: int
-    ticker: str  # "" on a conditional for a delisted/uncached property — key on propertyId
+    marketIndex: int  # the order's market: the index it signed
+    # The market's, a delisted one's too; "" only for a market no asset is bound to: key on
+    # marketIndex.
+    ticker: str
     side: str  # OrderSide
     type: str  # OrderType, or ConditionalOrderType — THIS is the discriminator
     timeInForce: str
@@ -162,8 +163,8 @@ class TradeProofStatus(TypedDict, total=False):
 class TradeHistoryItem(TypedDict, total=False):
     tradeId: int
     orderId: int  # this user's order the fill belongs to
-    propertyId: int
-    ticker: str
+    marketIndex: int
+    ticker: str  # the market's
     txHash: str  # the trade's content hash (0x + 64 hex), not an on-chain transaction
     side: str  # OrderSide, relative to this user
     role: str  # "MAKER" | "TAKER": the resting order is the MAKER, the aggressor's the TAKER
@@ -186,14 +187,17 @@ class L2AssetBalance(TypedDict):
     available: str  # total minus hold: what a new order can use
 
 
-class Position(TypedDict, total=False):
-    """A held property: facts only. An L2 holding's amounts are its ``balances`` row."""
+class Holding(TypedDict, total=False):
+    """A held asset's token: facts only. An L2 holding's amounts are its ``balances`` row."""
 
-    propertyId: int
-    ticker: str
-    tokenName: str  # display name
-    totalTokens: float  # the property's total token supply
+    ticker: str  # the asset's, its spot market's too
+    marketIndex: Optional[int]  # its spot market's, which mark_price frames name; None without one
+    name: str  # the asset's display name
+    kind: str  # AssetKind
+    totalTokens: Optional[float]  # a property's token supply; None for any other kind
     averageEntryPrice: Optional[float]  # None when the cost is unknown
+    # The mark when read: its spot market's for an L2 holding; an IPO allocation's unit price
+    # until it trades.
     marketPrice: float
     isIpoAllocation: bool
     assetId: int  # L2 holding only: its balances row
@@ -205,7 +209,7 @@ class Position(TypedDict, total=False):
 class PortfolioComponent(TypedDict, total=False):
     balances: list[L2AssetBalance]  # the whole L2 book; a missing row is 0
     lifetimeVolume: float  # dollars traded over the account's lifetime
-    positions: list[Position]
+    holdings: list[Holding]
     applicableFees: dict[str, int]  # {takerFeeBps, makerFeeBps}
     offeringOrders: list[dict[str, Any]]
     openOrders: list[OrderHistoryItem]  # booked orders + PENDING/ARMED conditionals, merged
@@ -266,7 +270,7 @@ class CompetitionRound(TypedDict, total=False):
     endsAt: Optional[int]  # likewise, re-stamped when it leaves ACTIVE
     participantBatchSize: int  # how many the queue admits into the round
     status: str  # CompetitionRoundStatus
-    newAssetProperty: Optional[dict[str, Any]]  # the round's headline asset (a GET /trade row)
+    newAssetMarket: Optional[dict[str, Any]]  # the round's new asset's market (a GET /trade row)
     prizePool: list[PrizePoolEntry]
     volumeMultiplierTiers: list[VolumeMultiplierTier]
     volumeExponent: float  # e in points = a * volume^e + b * pnl
@@ -310,7 +314,7 @@ __all__ = [
     "OrderBook",
     "Candle",
     "CandleHistory",
-    "L2Market",
+    "MarketL2",
     "TradeTick",
     "OrderResult",
     "OrderAck",
@@ -320,7 +324,7 @@ __all__ = [
     "TradeProofStatus",
     "TradeHistoryItem",
     "L2AssetBalance",
-    "Position",
+    "Holding",
     "PortfolioComponent",
     "LeaderboardEntry",
     "PrizePoolEntry",

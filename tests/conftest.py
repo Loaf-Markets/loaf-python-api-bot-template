@@ -30,12 +30,12 @@ L2_SECRET = KAT["keys"][0]["sk"]
 L2_PUBLIC_KEY = "0x" + KAT["keys"][0]["pk"]
 ACCOUNT_INDEX = 5
 EPOCH = 2
-# A property's l2Market as the exchange serves it.
-MARKET = {
+# OPRA's market index and its market.l2, as the exchange serves them.
+MARKET_INDEX = 2050
+MARKET_L2 = {
     "chainId": 421614,
     "proxyAddress": "0x" + "11" * 20,
     "l2ChainId": 4242,
-    "marketIndex": 2050,
     "baseAssetId": 6,
     "quoteAssetId": 3,
 }
@@ -95,33 +95,38 @@ def l2_clock(_no_sleep: SimpleNamespace) -> SimpleNamespace:
     return _no_sleep
 
 
-def property_detail(
-    ticker: str = "OPRA", *, l2_market: Any = MARKET, market_price: float = 160
+def market_detail(
+    ticker: str = "OPRA",
+    *,
+    market_index: Any = MARKET_INDEX,
+    l2: Any = MARKET_L2,
+    market_price: float = 160,
 ) -> dict:
     """A ``GET /trade/{ticker}`` body with the fields order placement reads.
 
-    ``l2_market=...`` leaves ``l2Market`` out, as a server that predates the L2
-    exchange does.
+    ``market_index=...`` or ``l2=...`` leaves that field out.
     """
-    prop: dict[str, Any] = {
+    market: dict[str, Any] = {
+        "marketIndex": market_index,
         "ticker": ticker,
-        "tokenName": _NAMES.get(ticker, ticker),
+        "type": "PERP" if ticker.endswith("-PERP") else "SPOT",
         "status": "LIVE",
         "isHalted": False,
+        "tradingStartsAt": None,
+        "l2": l2,
     }
-    if l2_market is not ...:
-        prop["l2Market"] = l2_market
-    listed = [{"ticker": ticker, "tokenName": prop["tokenName"], "marketPrice": market_price}]
-    if ticker != "MUS":  # another property ahead of it: the reference is found by its ticker
-        listed.insert(0, {"ticker": "MUS", "tokenName": "Musgrave", "marketPrice": 50})
-    return {"property": prop, "propertyList": listed}
+    market = {k: v for k, v in market.items() if v is not ...}
+    listed = [{"ticker": ticker, "name": _NAMES.get(ticker, ticker), "marketPrice": market_price}]
+    if ticker != "MUS":  # another market ahead of it: the reference is found by its ticker
+        listed.insert(0, {"ticker": "MUS", "name": "Musgrave", "marketPrice": 50})
+    return {"market": market, "marketList": listed}
 
 
 class FakeExchange:
     """The exchange's routes an order uses, in memory, for ``httpx.MockTransport``.
 
     * ``GET /trade`` lists ``details``; ``GET /trade/{ticker}`` serves
-      ``details[ticker]``, and an unknown ticker is a 404 ``Property not found``.
+      ``details[ticker]``, and an unknown ticker is a 404 ``Market not found``.
       Replace an entry to change what they serve.
     * ``GET /l2/keys`` serves ``keys``; ``None`` is the 404 of a user with no
       trading account.
@@ -137,7 +142,7 @@ class FakeExchange:
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
-        self.details: dict[str, dict] = {"OPRA": property_detail()}
+        self.details: dict[str, dict] = {"OPRA": market_detail()}
         self.keys: dict[str, Any] | None = dict(KEYS)
         self.reserved_at_ms: int | None = None
         self._queues: dict[str, list[Any]] = {}
@@ -165,7 +170,7 @@ class FakeExchange:
         if route.startswith("GET /trade/"):
             detail = self.details.get(route[len("GET /trade/") :])
             if detail is None:
-                return httpx.Response(404, json={"error": "Property not found"})
+                return httpx.Response(404, json={"error": "Market not found"})
             return httpx.Response(200, json=detail)
         if route == "GET /l2/keys":
             if self.keys is None:
@@ -210,12 +215,15 @@ class FakeExchange:
     def _listing(self) -> dict:
         rows = []
         for ticker, detail in self.details.items():
-            prop = detail["property"]
-            row = {"ticker": ticker, "status": prop["status"]}
-            if "l2Market" in prop:  # a server that predates the L2 exchange lists no hasL2Market
-                row["hasL2Market"] = prop["l2Market"] is not None
-            rows.append(row)
-        return {"properties": rows}
+            market = detail["market"]
+            rows.append({
+                "ticker": ticker,
+                "status": market["status"],
+                "isHalted": market["isHalted"],
+                "tradingStartsAt": market.get("tradingStartsAt"),
+                "hasL2Market": market.get("l2") is not None,
+            })
+        return {"markets": rows}
 
     def posts(self, path: str) -> list[bytes]:
         """The raw bodies POSTed to ``path`` (e.g. ``"/orders"``), in order."""

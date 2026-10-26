@@ -7,7 +7,7 @@ Typical usage::
 
     @ws.on_orderbook
     def handle_book(msg):
-        print(msg.propertyId, msg.bids[0].price)
+        print(msg.marketIndex, msg.bids[0].price)
 
     ws.subscribe_orderbook("OPRA")
     ws.subscribe_trades("OPRA")
@@ -20,9 +20,9 @@ Or run it in the background and keep using the REST client::
         ws.subscribe_portfolio()          # your own account's private stream
         ...                               # do other work; handlers fire live
 
-Channels (``"type:key"`` strings — market-data channels key by the property's
-``ticker``, exact case: ``orderbook:opra`` is refused; ``portfolio``,
-``leaderboard`` and ``competition`` have no key):
+Channels (``"type:key"`` strings — market channels key by the market's
+``ticker``, exact case, a perp's ending in ``-PERP``: ``orderbook:opra`` is
+refused; ``portfolio``, ``leaderboard`` and ``competition`` have no key):
 
 ==================  ========  ===========================================
 Channel             Auth      What you receive
@@ -32,7 +32,7 @@ trades:{ticker}     public    every trade, at most one frame per 100 ms (the rec
 chart:{ticker}      public    OHLCV candle updates (note: singular "chart")
 markprice:{ticker}  public    canonical mark price (1s, on change)
 volume:{ticker}     public    rolling-24h traded volume (replaces ``volume24h``)
-property:{ticker}   public    halt / resume status for one property
+market:{ticker}     public    halt / resume status for one market
 leaderboard         public    competition leaderboard (top entries) on change
 competition         public    round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT)
 portfolio           PRIVATE   your order transitions, fills, queue places and whole L2 balance book
@@ -190,13 +190,13 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.ORDERBOOK_UPDATE, handler)
 
     def on_trades(self, handler: Handler | None = None) -> Any:
-        """A property's public trades (``trades_batch``: ``{propertyId, trades}``,
+        """A market's public trades (``trades_batch``: ``{marketIndex, trades}``,
         each a :class:`~loaf.models.TradeTick`).
 
-        Every trade is pushed, in at most one frame per property every 100 ms:
+        Every trade is pushed, in at most one frame per market every 100 ms:
         each frame holds every trade printed since the previous one, newest
         first. Right after the subscription (so on every connection, before
-        :meth:`on_connect`), one frame brings the property's recent trades, if
+        :meth:`on_connect`), one frame brings the market's recent trades, if
         any, up to 20, once; after a reconnect it repeats trades you already
         hold, so dedupe by ``tradeId``. For the trades missed while the feed
         was down, see :meth:`loaf.resources.market.MarketResource.trades`.
@@ -207,23 +207,32 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.CANDLE_UPDATE, handler)
 
     def on_mark_price(self, handler: Handler | None = None) -> Any:
+        """A market's canonical mark price (``mark_price``: ``{marketIndex,
+        price}``), checked once a second and pushed on change.
+
+        Every ``markprice`` channel you subscribe feeds this one handler, and a
+        frame names its market by ``marketIndex`` alone, never by ticker: match
+        on it. A holding's ``marketIndex`` is its spot market's
+        (:meth:`loaf.resources.portfolio.PortfolioResource.component`); ``None``
+        means no spot market, so no frame values it.
+        """
         return self.on(WSMessageType.MARK_PRICE, handler)
 
     def on_volume(self, handler: Handler | None = None) -> Any:
-        """A property's rolling-24h traded volume changed (``volume_update``:
-        ``{propertyId, volume24h}``). Replaces the REST ``volume24h``."""
+        """A market's rolling-24h traded volume changed (``volume_update``:
+        ``{marketIndex, volume24h}``). Replaces the REST ``volume24h``."""
         return self.on(WSMessageType.VOLUME_UPDATE, handler)
 
-    def on_property_halt(self, handler: Handler | None = None) -> Any:
-        """A property was halted or resumed (``property_halt``:
-        ``{propertyId, ticker, isHalted}``).
+    def on_market_halt(self, handler: Handler | None = None) -> Any:
+        """A market was halted or resumed (``market_halt``:
+        ``{marketIndex, ticker, isHalted}``).
 
-        ``isHalted`` is the EFFECTIVE state — the property's own flag OR'd with
+        ``isHalted`` is the EFFECTIVE state — the market's own flag OR'd with
         the platform-wide kill switch — so assign it straight over the
         ``isHalted`` you seeded from REST. While it is true, order placement on
-        that property raises :class:`~loaf.exceptions.TradingHaltedError`.
+        that market raises :class:`~loaf.exceptions.TradingHaltedError`.
         """
-        return self.on(WSMessageType.PROPERTY_HALT, handler)
+        return self.on(WSMessageType.MARKET_HALT, handler)
 
     def on_leaderboard(self, handler: Handler | None = None) -> Any:
         """The competition leaderboard changed (``leaderboard_update``:
@@ -235,7 +244,7 @@ class LoafWebSocketClient:
     def on_round_update(self, handler: Handler | None = None) -> Any:
         """A competition round changed status (``round_update``: ``{roundNumber,
         status, startsAt, endsAt, arenaTicker}``, times in unix seconds,
-        ``arenaTicker`` the round's headline asset, if any).
+        ``arenaTicker`` the ticker of the round's new asset, if any).
 
         A round changes nothing about trading. Delivery is best-effort:
         ``competition.info()`` catches you up (after a reconnect, say), but keep
@@ -265,11 +274,11 @@ class LoafWebSocketClient:
 
         ``CANCELLED`` also arrives for cancels you did not request: the
         exchange's sweep 72 h before the order's ``expiryMs``, an epoch move (a
-        trading-key reset or a cancel-all sent on chain), a closed market, a BUY
-        that can no longer fund a fill within its hold (budget exhausted), an
-        aggressing SELL at K1's bound (its remainder does not rest), your own
-        order crossing your resting one (self-trade), and a firing stop freeing
-        funds by cancelling your resting orders.
+        trading-key reset or a cancel-all sent on chain), a delisted (or
+        unlisted) market, a BUY that can no longer fund a fill within its hold
+        (budget exhausted), an aggressing SELL at K1's bound (its remainder does
+        not rest), your own order crossing your resting one (self-trade), and a
+        firing stop freeing funds by cancelling your resting orders.
         """
         return self.on(WSMessageType.ORDER_STATUS, handler)
 
@@ -281,7 +290,7 @@ class LoafWebSocketClient:
         which a conditional does not carry. Every conditional transition
         publishes one of these, TP/SL legs included (they are conditional rows).
         A firing conditional also cancels your own resting orders on that side
-        of that property to free its funds, so you can receive ``CANCELLED``
+        of that market to free its funds, so you can receive ``CANCELLED``
         frames for orders you never cancelled.
 
         For a booked order it is sent after the exchange commits and carries the
@@ -312,22 +321,22 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.TRADE_NEW, handler)
 
     def on_order_queue(self, handler: Handler | None = None) -> Any:
-        """Your resting orders' places in one property's book (``order_queue``:
-        ``{propertyId, orders}``).
+        """Your resting orders' places in one market's book (``order_queue``:
+        ``{marketIndex, orders}``).
 
         ``orders`` lists your orders resting there, bids best first, then asks
         best first, each ``{orderId, side, price, quantity, quantityAhead,
         ordersAhead}`` (:class:`~loaf.models.OrderQueueEntry`): ``quantity`` is
         its unfilled remainder, ``ordersAhead`` how many orders at its price
         are ahead of it (time priority) and ``quantityAhead`` their unfilled
-        tokens. The frame is absolute for ``propertyId``: replace what you hold
+        tokens. The frame is absolute for ``marketIndex``: replace what you hold
         for it, and an empty list means none of your orders rests there now.
         Each time a connection newly subscribes ``portfolio`` with your API
         key, as the client does on every connection (subscribing again while
-        subscribed sends nothing), one arrives for each property where you
+        subscribed sends nothing), one arrives for each market where you
         have resting orders (before or after :meth:`on_connect` on a new
         connection), then another whenever your entries there change. A
-        property where none rests sends nothing, and no REST read serves queue
+        market where none rests sends nothing, and no REST read serves queue
         places, so drop every list you hold in :meth:`on_disconnect` and,
         after you :meth:`unsubscribe` ``portfolio``, at the
         ``subscription_confirmed`` that answers it (frames sent before it can
@@ -396,7 +405,7 @@ class LoafWebSocketClient:
         dropped some or restarted without a clean shutdown (a clean restart
         closes nothing). It closes every connection holding ``portfolio`` and,
         about 2 s after the last bus reconnect or engine-side loss, every one
-        holding the ``trades`` channel of a property that traded since or whose
+        holding the ``trades`` channel of a market that traded since or whose
         recent trades the server had missed: each at most once every 30 s, and
         a connection holding both only once. An API-key connection can also
         get ``resync`` so that its key is checked again.
@@ -441,16 +450,16 @@ class LoafWebSocketClient:
         return self.subscribe(f"markprice:{ticker}")
 
     def subscribe_volume(self, ticker: str) -> LoafWebSocketClient:
-        """Rolling-24h traded volume pushes for a property (seed from the REST
+        """Rolling-24h traded volume pushes for a market (seed from the REST
         ``volume24h``, then let ``volume_update`` frames replace it)."""
         return self.subscribe(f"volume:{ticker}")
 
-    def subscribe_property_status(self, ticker: str) -> LoafWebSocketClient:
-        """Halt/resume pushes for a property (the ``property:{ticker}``
-        channel — property status, not market data). Seed from the REST
-        ``market.property(ticker).property.isHalted``, then let
-        ``property_halt`` frames replace it."""
-        return self.subscribe(f"property:{ticker}")
+    def subscribe_market_status(self, ticker: str) -> LoafWebSocketClient:
+        """Halt/resume pushes for a market (the ``market:{ticker}`` channel —
+        market status, not market data). Seed from the REST
+        ``market.get(ticker).market.isHalted``, then let ``market_halt`` frames
+        replace it."""
+        return self.subscribe(f"market:{ticker}")
 
     def subscribe_leaderboard(self) -> LoafWebSocketClient:
         """Live competition-leaderboard updates (no id — one global channel)."""

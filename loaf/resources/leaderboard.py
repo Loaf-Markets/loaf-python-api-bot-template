@@ -13,7 +13,7 @@ class LeaderboardResource(Resource):
 
         Returns ``{roundNumber, roundName, roundRules, roundStatus,
         bottomCullPercent, volumeMultiplierTiers, volumeExponent, pnlMultiplier,
-        entries, totalParticipants, newAssetProperty}``, where
+        entries, totalParticipants, newAssetMarket}``, where
         ``bottomCullPercent`` is the share (0-100) of lowest-ranked participants
         dropped when the round ends. An entry is ``rank``, ``handle``,
         ``walletAddress`` and ``points``, rounded to two decimals:
