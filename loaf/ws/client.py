@@ -22,7 +22,8 @@ Or run it in the background and keep using the REST client::
 
 Channels (``"type:key"`` strings — market-data channels key by the property's
 ``ticker``, exact case: ``orderbook:opra`` is refused; ``portfolio``,
-``leaderboard`` and ``competition`` have no key):
+``leaderboard`` and ``competition`` have no key, and ``perps:markets`` is one
+channel for every perps market):
 
 ==================  ========  ===========================================
 Channel             Auth      What you receive
@@ -33,6 +34,7 @@ chart:{ticker}      public    OHLCV candle updates (note: singular "chart")
 markprice:{ticker}  public    canonical mark price (1s, on change)
 volume:{ticker}     public    rolling-24h traded volume (replaces ``volume24h``)
 property:{ticker}   public    halt / resume status for one property
+perps:markets       public    every perps market's live state, about once a second
 leaderboard         public    competition leaderboard (top entries) on change
 competition         public    round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT)
 portfolio           PRIVATE   your order transitions, fills, queue places and whole L2 balance book
@@ -225,6 +227,14 @@ class LoafWebSocketClient:
         that property raises :class:`~loaf.exceptions.TradingHaltedError`.
         """
         return self.on(WSMessageType.PROPERTY_HALT, handler)
+
+    def on_perps_markets_live(self, handler: Handler | None = None) -> Any:
+        """Every perps market's live state (``perps_markets_live``: ``{markets}``,
+        the whole list as :meth:`loaf.resources.perps.PerpsResource.markets_live`
+        serves it), about once a second while you hold ``perps:markets``:
+        replace what you hold. A second the exchange could not read the engine
+        pushes nothing; bound a row's age by its ``asOfMs``."""
+        return self.on(WSMessageType.PERPS_MARKETS_LIVE, handler)
 
     def on_leaderboard(self, handler: Handler | None = None) -> Any:
         """The competition leaderboard changed (``leaderboard_update``:
@@ -452,6 +462,11 @@ class LoafWebSocketClient:
         ``market.property(ticker).property.isHalted``, then let
         ``property_halt`` frames replace it."""
         return self.subscribe(f"property:{ticker}")
+
+    def subscribe_perps_markets(self) -> LoafWebSocketClient:
+        """Every perps market's live state (no id — one global channel), about once
+        a second: see :meth:`on_perps_markets_live`."""
+        return self.subscribe("perps:markets")
 
     def subscribe_leaderboard(self) -> LoafWebSocketClient:
         """Live competition-leaderboard updates (no id — one global channel)."""

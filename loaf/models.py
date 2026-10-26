@@ -150,6 +150,80 @@ class PerpsFunding(TypedDict):
     fundingOwed: str  # extended USDC units: positive pays, negative receives
 
 
+class PerpsHeldPrice(TypedDict):
+    """A perps market's newest price report held for an operator's answer."""
+
+    price: int
+    observedAtMs: int
+
+
+class PerpsMarketLive(TypedDict):
+    """One row of ``perps.markets_live()``: a perps market's live state, the engine's."""
+
+    marketIndex: int  # 0 to 254
+    indexPrice: int  # the accepted index (0 before the first report), as of observedAtMs
+    observedAtMs: int
+    openInterest: str  # base units, a decimal string
+    fundingIndex: str  # 32.32 fixed point, signed, a decimal string
+    tickAtMs: int  # the last funding tick
+    nextTickAtMs: int  # when the next is due; 0: none (an expired or unpriced market)
+    fundingPeriodMs: int  # the period premiumSampleBp and fundingRateCbp are per
+    premiumSampleBp: Optional[int]  # what a tick would apply now; None: the market is not rated
+    fundingRateCbp: Optional[int]  # centi-bp per period; None with premiumSampleBp
+    heldPrice: Optional[PerpsHeldPrice]  # while one stands, no order that can add risk is admitted
+    halted: bool  # the engine's trading pause: every new order refused
+    riskOnly: bool  # the engine's risk-only mode: only orders that reduce, and no withdrawal
+    asOfMs: int  # the engine clock halted, riskOnly, tradingState and stateReason are as of
+    tradingState: Optional[str]  # OPEN, REDUCE_ONLY, PRICE_STALE or HALTED; None: no book
+    stateReason: Optional[str]  # why an order that adds risk is refused; None: one is admitted
+
+
+class PerpsMarketsLive(TypedDict):
+    """``perps.markets_live()``, and a ``perps_markets_live`` frame's ``markets``."""
+
+    markets: list[PerpsMarketLive]
+
+
+class PerpsFundingTick(TypedDict):
+    """One applied funding tick of a perps market."""
+
+    journalSeq: int
+    sampleBp: int  # the premium sample, bp per period
+    rateCbp: int  # the rate the funding index moved by, centi-bp per period
+    moved: bool  # False: the index was stale, so the tick paid nothing
+    fundingIndex: str  # after the tick, 32.32 fixed point, signed, a decimal string
+    indexPrice: int
+    tickAtMs: int
+
+
+class PerpsFundingTicks(TypedDict):
+    """``perps.funding_ticks()``: newest first."""
+
+    ticks: list[PerpsFundingTick]
+
+
+class PerpsClose(TypedDict):
+    """One of your positions closed by the engine or by an exit."""
+
+    journalSeq: int
+    atMs: int  # its commit's clock
+    kind: str  # LIQUIDATION, DELEVERAGE (auto-deleveraging), EXIT or SETTLE (an expired market)
+    market: int
+    pool: int
+    side: str  # the position's: LONG or SHORT
+    baseAfter: str  # its signed base after the close, a decimal string: "0" closed, never flipped
+    price: int
+    base: str  # the close's base units, a decimal string
+    quote: int
+    fee: int  # yours
+
+
+class PerpsCloses(TypedDict):
+    """``perps.closes()``: newest first."""
+
+    closes: list[PerpsClose]
+
+
 class PerpsOpAccepted(TypedDict):
     """The 202 to a perps allocate or exit."""
 
@@ -424,6 +498,13 @@ __all__ = [
     "PerpsPool",
     "PerpsAccount",
     "PerpsFunding",
+    "PerpsHeldPrice",
+    "PerpsMarketLive",
+    "PerpsMarketsLive",
+    "PerpsFundingTick",
+    "PerpsFundingTicks",
+    "PerpsClose",
+    "PerpsCloses",
     "PerpsOpAccepted",
     "TradeTick",
     "OrderResult",

@@ -119,6 +119,9 @@ MAX_POOL = 7
 #: An allocate's side for your spot USDC balance, beside the pools 0 to 7.
 PERPS_SPOT_SIDE = 255
 
+#: The most rows one page of a perps history read (funding ticks, closes) holds.
+PERPS_HISTORY_MAX = 200
+
 #: The quote asset of every perps market: USDC.
 PERPS_QUOTE_ASSET_ID = 3
 

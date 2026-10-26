@@ -64,6 +64,7 @@ from ..constants import (
     MAX_PERPS_OP_TTL_MS,
     MAX_POOL,
     MIN_ORDER_TTL_MS,
+    PERPS_HISTORY_MAX,
     PERPS_LAST,
     PERPS_QUOTE_ASSET_ID,
     PERPS_SPOT_SIDE,
@@ -134,7 +135,8 @@ class PerpsResource(Resource):
 
         The exchange's edge caches it for 5 s: a market that has just expired
         can still show ``ACTIVE`` that long. A market's live state (its index
-        price, funding rate and open interest) is not served yet.
+        price, funding, open interest and trading state) is
+        :meth:`markets_live`'s.
         """
         return self._client.get("/l2/perps/markets", auth=False)
 
@@ -157,6 +159,73 @@ class PerpsResource(Resource):
             if isinstance(row, Mapping) and row.get("marketIndex") == index:
                 return row
         return None
+
+    def markets_live(self) -> Any:
+        """``GET /l2/perps/markets/live`` — every perps market's live state,
+        ascending by index, at most about a second old. Public.
+
+        Returns ``{"markets": [...]}`` (:class:`~loaf.models.PerpsMarketsLive`),
+        each row the engine's state, which the exchange never derives:
+
+        * ``tradingState`` — ``OPEN``, ``REDUCE_ONLY``, ``PRICE_STALE`` or
+          ``HALTED``, least to most restrictive — and ``stateReason``, why it
+          refuses an order that adds risk (``None`` while it admits one); both
+          ``None`` when the engine holds no book of the market;
+        * ``halted``, the engine's trading pause (every new order refused),
+          and ``riskOnly``, its risk-only mode: whatever ``tradingState`` says,
+          every order that adds risk, and every withdrawal, is answered
+          unavailable, so an ``OPEN`` market admits only an order that reduces;
+        * ``asOfMs``, the engine clock those four are as of: bound their age
+          by it;
+        * ``indexPrice``, the accepted index (0 before the first report), as of
+          ``observedAtMs``; ``openInterest`` (base units) and ``fundingIndex``
+          (32.32 fixed point, signed), decimal strings;
+        * ``tickAtMs`` and ``nextTickAtMs``, the last funding tick and when the
+          next is due (0: none, an expired or unpriced market), and
+          ``fundingPeriodMs``, the period ``premiumSampleBp`` (bp) and
+          ``fundingRateCbp`` (centi-bp) are per: what a tick would apply now,
+          ``None`` when the market is not rated;
+        * ``heldPrice``, ``{price, observedAtMs}``: the newest price report,
+          held for an operator's answer, while no order that can add to a
+          position is admitted; ``None`` when there is none.
+
+        The ``perps:markets`` channel pushes the same list about once a second
+        (:meth:`~loaf.ws.client.LoafWebSocketClient.on_perps_markets_live`).
+
+        Raises:
+            LoafServiceUnavailableError: the exchange could not read the
+                engine's state; try again in a moment.
+        """
+        return self._client.get("/l2/perps/markets/live", auth=False)
+
+    def market_live(self, market: int) -> Any:
+        """Perps market ``market``'s row of :meth:`markets_live`
+        (:class:`~loaf.models.PerpsMarketLive`), or ``None`` when it is not listed."""
+        index = _ranged(market, "market", 0, PERPS_LAST, "a perps market index")
+        for row in _list_of(self.markets_live(), "markets"):
+            if isinstance(row, Mapping) and row.get("marketIndex") == index:
+                return row
+        return None
+
+    def funding_ticks(
+        self, market: int, *, limit: int | None = None, before: int | None = None
+    ) -> Any:
+        """``GET /l2/perps/funding`` — perps market ``market``'s applied funding
+        ticks, newest first. Public.
+
+        Returns ``{"ticks": [...]}`` (:class:`~loaf.models.PerpsFundingTicks`),
+        at most ``limit`` (1 to 200; the exchange's default is 50), each
+        ``{journalSeq, sampleBp, rateCbp, moved, fundingIndex, indexPrice,
+        tickAtMs}``: the premium sample (bp per period), the rate the funding
+        index moved by (centi-bp per period) and whether it moved (a stale
+        index pays nothing), the funding index after it (32.32 fixed point,
+        signed, a decimal string), the index price and the tick's clock. For
+        the next page, pass the last row's ``journalSeq`` as ``before``.
+        """
+        index = _ranged(market, "market", 0, PERPS_LAST, "a perps market index")
+        return self._client.get(
+            "/l2/perps/funding", params={"market": index, **_page(limit, before)}, auth=False
+        )
 
     # -- Your pools and positions ------------------------------------------- #
 
@@ -217,6 +286,25 @@ class PerpsResource(Resource):
             if isinstance(row, Mapping) and row.get("market") == index:
                 return row
         return None
+
+    def closes(self, *, limit: int | None = None, before: int | None = None) -> Any:
+        """``GET /l2/perps/closes`` — your positions closed by the engine or by an
+        exit, newest first, paged as :meth:`funding_ticks`.
+
+        Returns ``{"closes": [...]}`` (:class:`~loaf.models.PerpsCloses`), each
+        ``{journalSeq, atMs, kind, market, pool, side, baseAfter, price, base,
+        quote, fee}``: ``kind`` is ``LIQUIDATION``, ``DELEVERAGE``
+        (auto-deleveraging), ``EXIT`` or ``SETTLE`` (the engine closing the rest
+        of an expired market's position); ``side`` is the position's (``LONG``
+        or ``SHORT``) and ``baseAfter`` its signed base after the close, a
+        decimal string (``"0"``: closed; a close never flips it); ``price``,
+        ``base`` (a decimal string) and ``quote`` are the close's fill, ``fee``
+        yours, in the engine's units; ``atMs`` is its commit's clock.
+
+        Raises:
+            LoafNotFoundError: you have no trading account yet.
+        """
+        return self._client.get("/l2/perps/closes", params=_page(limit, before))
 
     def funding(self) -> list[Any]:
         """The funding of each of your open positions, from :meth:`positions`:
@@ -577,6 +665,16 @@ def _ranged(value: Any, field: str, low: int, high: int, what: str) -> int:
             f"{field} must be {what}, a whole number from {low:,} to {high:,} (got {value!r})"
         )
     return int(value)
+
+
+def _page(limit: Any, before: Any) -> dict[str, Any]:
+    """A history read's ``limit`` and ``before`` (a ``journalSeq``), checked; ``None`` is not
+    sent."""
+    if limit is not None:
+        limit = _ranged(limit, "limit", 1, PERPS_HISTORY_MAX, "a page size")
+    if before is not None:
+        before = _ranged(before, "before", 1, 2**53 - 1, "a journalSeq")
+    return {"limit": limit, "before": before}
 
 
 def _pool(pool: Any) -> int:

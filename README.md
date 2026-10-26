@@ -233,6 +233,10 @@ orders.cancel_all()                   POST   /orders/cancel-all
 
 perps.markets() / market(index)       GET    /l2/perps/markets
 perps.collateral()                    (its collateral: USDC's decimals and tick size)
+perps.markets_live() / market_live    GET    /l2/perps/markets/live (index, funding, trading state)
+perps.funding_ticks(market, limit=, before=)
+                                      GET    /l2/perps/funding      (applied funding ticks)
+perps.closes(limit=, before=)         GET    /l2/perps/closes       (liquidations, ADL, exits; API key)
 perps.positions() / pool / position   GET    /l2/perps/positions
 perps.funding()                       (each position's funding, from /l2/perps/positions)
 perps.allocate / add_margin / return_margin
@@ -584,6 +588,7 @@ and move what is left back:
 
 ```python
 loaf.perps.markets()                                  # every perps market, public
+loaf.perps.market_live(4)                             # tradingState, riskOnly, index, funding rate
 loaf.perps.add_margin(5_000, pool=0)                  # 5,000 USDC: spot -> pool 0
 loaf.orders.limit_buy("PERP", quantity=2, price=101.5, pool=0)   # a long from pool 0
 loaf.orders.limit_sell("PERP", quantity=2, price=104, pool=0, reduce_only=True)
@@ -617,6 +622,7 @@ loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
   `GET /l2/perps/markets` serves (`perps.collateral()`: ticks = amount x
   10^`decimals` / `tickSize`). It refuses an amount that is not a whole number
   of ticks, and a reply without a usable collateral: it never assumes one.
+  An exit moves no amount, so it never needs the collateral.
   The reads are the engine's units: `positions()` serves amounts as decimal
   strings, collateral, value, funding owed and notional in extended units
   (ticks x the collateral's `extensionMultiplier`), a position's `base` in an
@@ -626,7 +632,11 @@ loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
   `MarketStateError` with `.state`): halted, outside its trading hours,
   reduce-only, its price stale, or reduce-only while its latest price waits
   for review (`PriceHeldError`). In the last three a `reduce_only=True` order
-  is still taken.
+  is still taken. `perps.markets_live()` (and the `perps:markets` channel)
+  serves each market's state as the engine decides it, before you send:
+  `tradingState`, `stateReason`, `halted`, `heldPrice`, and `riskOnly` (the
+  engine's risk-only mode: only an order that reduces is taken, and no
+  withdrawal, whatever `tradingState` says), all as of `asOfMs`.
 
 ---
 
@@ -716,6 +726,7 @@ Channels:
 | `volume:{ticker}` | public | `on_volume` | rolling-24h traded volume (replaces `volume24h`) |
 | `property:{ticker}` | public | `on_property_halt` | halt / resume status for that property |
 | `leaderboard` | public | `on_leaderboard` | competition leaderboard (top entries), on change |
+| `perps:markets` | public | `on_perps_markets_live` | every perps market's live state, as `perps.markets_live()` serves it, about once a second — replace what you hold |
 | `competition` | public | `on_round_update` | round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT); no initial frame — seed from `competition.info()` |
 | `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_order_queue`, `on_lifetime_volume` | your account deltas, and your resting orders' places in their books |
 

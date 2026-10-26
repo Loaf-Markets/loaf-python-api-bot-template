@@ -28,7 +28,10 @@ from conftest import (
     MARKET_STATES,
     NONCE_REFUSAL,
     PERPS_ACCOUNT,
+    PERPS_CLOSE,
     PERPS_COLLATERAL,
+    PERPS_FUNDING_TICK,
+    PERPS_LIVE,
     PERPS_MARKET,
     property_detail,
     routes,
@@ -92,6 +95,35 @@ def test_markets_and_market(exchange, trading_client):
     assert [request.headers.get("authorization") for request in gets] == [None] * 4
 
 
+def test_live_state_and_funding_ticks_are_public(exchange, trading_client):
+    perps = trading_client(api_key=None).perps
+    assert perps.markets_live() == {"markets": [PERPS_LIVE]}
+    assert perps.market_live(4) == PERPS_LIVE
+    assert perps.market_live(5) is None
+    assert perps.funding_ticks(4) == {"ticks": [PERPS_FUNDING_TICK]}
+    perps.funding_ticks(4, limit=200, before=812)
+    assert [dict(r.url.params) for r in exchange.gets("/l2/perps/funding")] == [
+        {"market": "4"},
+        {"market": "4", "limit": "200", "before": "812"},
+    ]
+    assert len(exchange.gets("/l2/perps/markets/live")) == 3
+    assert [r.headers.get("authorization") for r in exchange.requests] == [None] * 5
+
+
+def test_closes(exchange, trading_client):
+    perps = trading_client().perps
+    assert perps.closes() == {"closes": [PERPS_CLOSE]}
+    perps.closes(limit=1, before=990)
+    gets = exchange.gets("/l2/perps/closes")
+    assert [dict(r.url.params) for r in gets] == [{}, {"limit": "1", "before": "990"}]
+    assert {r.headers["authorization"] for r in gets} == {"Bearer testkey"}
+    with pytest.raises(loaf.LoafConfigError, match="API key"):
+        trading_client(api_key=None).perps.closes()
+    exchange.keys = None
+    with pytest.raises(loaf.LoafNotFoundError):
+        perps.closes()
+
+
 def test_positions_pools_and_funding(exchange, trading_client):
     perps = trading_client().perps
     assert perps.positions() == PERPS_ACCOUNT
@@ -132,6 +164,14 @@ def test_positions_need_a_trading_account_and_an_api_key(exchange, trading_clien
         lambda perps: perps.pool(1.0),
         lambda perps: perps.position(255),
         lambda perps: perps.position(4, pool=-1),
+        lambda perps: perps.market_live(255),
+        lambda perps: perps.funding_ticks(-1),
+        lambda perps: perps.funding_ticks(4, limit=0),
+        lambda perps: perps.funding_ticks(4, limit=201),
+        lambda perps: perps.funding_ticks(4, before=0),
+        lambda perps: perps.closes(limit=True),
+        lambda perps: perps.closes(before=2**53),
+        lambda perps: perps.closes(before="990"),
     ],
 )
 def test_reads_check_their_arguments_locally(exchange, trading_client, read):

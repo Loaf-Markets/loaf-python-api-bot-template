@@ -72,6 +72,48 @@ PERPS_COLLATERAL = {
     "tickSize": "10000",
     "extensionMultiplier": "100",
 }
+# GET /l2/perps/markets/live: market 4 open, rated, in the engine's risk-only mode.
+PERPS_LIVE = {
+    "marketIndex": 4,
+    "indexPrice": 2500,
+    "observedAtMs": 1_800_000_000_000,
+    "openInterest": "18446744073709551615",
+    "fundingIndex": "-4294967296",
+    "tickAtMs": 1_800_000_000_000,
+    "nextTickAtMs": 1_800_003_600_000,
+    "fundingPeriodMs": 3_600_000,
+    "premiumSampleBp": -3,
+    "fundingRateCbp": -250,
+    "heldPrice": {"price": 2600, "observedAtMs": 1_800_000_001_000},
+    "halted": False,
+    "riskOnly": True,
+    "asOfMs": 1_800_000_001_250,
+    "tradingState": "OPEN",
+    "stateReason": None,
+}
+# GET /l2/perps/funding and GET /l2/perps/closes: one row each.
+PERPS_FUNDING_TICK = {
+    "journalSeq": 812,
+    "sampleBp": -3,
+    "rateCbp": -250,
+    "moved": True,
+    "fundingIndex": "-4294967296",
+    "indexPrice": 2500,
+    "tickAtMs": 1_800_000_000_000,
+}
+PERPS_CLOSE = {
+    "journalSeq": 990,
+    "atMs": 1_800_000_002_000,
+    "kind": "LIQUIDATION",
+    "market": 9,
+    "pool": 2,
+    "side": "SHORT",
+    "baseAfter": "0",
+    "price": 2610,
+    "base": "18446744073709551615",
+    "quote": 4_814_784,
+    "fee": 2_407,
+}
 PERPS_ACCOUNT = {
     "l2AccountIndex": ACCOUNT_INDEX,
     "pools": [
@@ -153,7 +195,12 @@ NO_ACCOUNT = "l2 account: no L2 account for this user"
 # The exchange's 422 for a perps op not signed at the account's api key 0 nonce.
 NONCE_REFUSAL = "l2 money: the nonce is not the api key's nonce (tx_nonce == api_key.nonce)"
 # The perps routes that take a user (an API key): the rest of the fake checks no credentials.
-_PERPS_AUTHED = ("GET /l2/perps/positions", "POST /l2/allocations", "POST /l2/exits")
+_PERPS_AUTHED = (
+    "GET /l2/perps/positions",
+    "GET /l2/perps/closes",
+    "POST /l2/allocations",
+    "POST /l2/exits",
+)
 
 _ENV_VARS = (
     "LOAF_API_KEY",
@@ -236,9 +283,11 @@ class FakeExchange:
     * ``POST /orders`` and ``/orders/conditional`` place the order: 200 with a
       fresh ``orderId`` (and one per attached leg).
     * ``GET /l2/perps/markets`` lists ``perps_markets`` and ``perps_collateral``
-      (``None``: no collateral key); ``GET /l2/perps/positions``
-      serves ``perps_account`` (404 without a trading account). It and the two
-      perps ops below answer 401 without an API key (``Authorization: Bearer``).
+      (``None``: no collateral key), ``/markets/live`` ``perps_live`` and
+      ``/funding`` ``PERPS_FUNDING_TICK``; ``GET /l2/perps/positions`` serves
+      ``perps_account`` and ``/closes`` ``PERPS_CLOSE`` (both 404 without a
+      trading account). Those two and the two perps ops below answer 401
+      without an API key (``Authorization: Bearer``).
     * ``POST /l2/allocations`` and ``/l2/exits`` apply a signed op at the account's
       nonce (``keys["withdrawalNonce"]``, which moves up by one): 202 with the next
       ``journalSeq``; a re-send of an applied op is its duplicate, and any other op
@@ -261,6 +310,7 @@ class FakeExchange:
         self.perps_markets: list[dict[str, Any]] = [dict(PERPS_MARKET)]
         self.perps_collateral: dict[str, Any] | None = dict(PERPS_COLLATERAL)
         self.perps_account: dict[str, Any] = json.loads(json.dumps(PERPS_ACCOUNT))
+        self.perps_live: list[dict[str, Any]] = [json.loads(json.dumps(PERPS_LIVE))]
         # The ops applied, by nonce: (their body, their journal seq).
         self.applied: dict[int, tuple[bytes, int]] = {}
         self._next_seq = 1000
@@ -315,9 +365,15 @@ class FakeExchange:
             if self.perps_collateral is not None:
                 reply["collateral"] = self.perps_collateral
             return httpx.Response(200, json=reply)
-        if route == "GET /l2/perps/positions":
+        if route == "GET /l2/perps/markets/live":
+            return httpx.Response(200, json={"markets": self.perps_live})
+        if route == "GET /l2/perps/funding":
+            return httpx.Response(200, json={"ticks": [PERPS_FUNDING_TICK]})
+        if route in ("GET /l2/perps/positions", "GET /l2/perps/closes"):
             if self.keys is None:
                 return httpx.Response(404, json={"error": NO_ACCOUNT})
+            if route == "GET /l2/perps/closes":
+                return httpx.Response(200, json={"closes": [PERPS_CLOSE]})
             return httpx.Response(200, json=self.perps_account)
         if route in ("POST /l2/allocations", "POST /l2/exits"):
             return self._apply(request.content)

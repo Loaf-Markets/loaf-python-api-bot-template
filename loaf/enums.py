@@ -120,6 +120,7 @@ class WSMessageType(_StrEnum):
     LEADERBOARD_UPDATE = "leaderboard_update"
     PROPERTY_HALT = "property_halt"
     ROUND_UPDATE = "round_update"
+    PERPS_MARKETS_LIVE = "perps_markets_live"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"
     ORDER_STATUS = "order_status"

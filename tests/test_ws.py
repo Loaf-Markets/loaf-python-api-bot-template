@@ -100,9 +100,10 @@ def test_channel_helpers():
     ws.subscribe_leaderboard()
     ws.subscribe_competition()
     ws.subscribe_portfolio()
+    ws.subscribe_perps_markets()
     assert ws._channels == {
         "orderbook:OPRA", "trades:OPRA", "chart:OPRA", "markprice:OPRA", "volume:OPRA",
-        "property:OPRA", "leaderboard", "competition", "portfolio",
+        "property:OPRA", "leaderboard", "competition", "portfolio", "perps:markets",
     }
 
 
@@ -175,6 +176,17 @@ def test_round_update_reaches_on_round_update():
     }
     ws._dispatch(json.dumps(round_update))
     assert seen == [round_update]
+
+
+def test_perps_markets_live_reaches_its_handler():
+    ws = _client()
+    seen = []
+    ws.on_perps_markets_live(seen.append)
+    live = {"marketIndex": 4, "riskOnly": True, "asOfMs": 1_800_000_001_250, "tradingState": "OPEN"}
+    ws._dispatch(_frame(type="perps_markets_live", markets=[live], timestamp=0))
+    (frame,) = seen
+    assert frame.markets == [live]
+    assert frame.markets[0].riskOnly is True
 
 
 def test_balances_update_keeps_base_unit_strings():
