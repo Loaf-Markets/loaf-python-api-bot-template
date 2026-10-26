@@ -63,6 +63,15 @@ PERPS_MARKET = {
     "quoteLimit": 0,
 }
 # GET /l2/perps/positions: pool 0 holds a long in market 4, pool 2 a short in market 9.
+# The perps markets' collateral: USDC of 6 decimals, a tick of 10,000 base units (0.01 USDC), and
+# 100 extended units a tick.
+PERPS_COLLATERAL = {
+    "assetId": 3,
+    "symbol": "USDC",
+    "decimals": 6,
+    "tickSize": "10000",
+    "extensionMultiplier": "100",
+}
 PERPS_ACCOUNT = {
     "l2AccountIndex": ACCOUNT_INDEX,
     "pools": [
@@ -226,7 +235,8 @@ class FakeExchange:
       up, at ``reserved_at_ms`` (``None``: the real clock's now).
     * ``POST /orders`` and ``/orders/conditional`` place the order: 200 with a
       fresh ``orderId`` (and one per attached leg).
-    * ``GET /l2/perps/markets`` lists ``perps_markets``; ``GET /l2/perps/positions``
+    * ``GET /l2/perps/markets`` lists ``perps_markets`` and ``perps_collateral``
+      (``None``: no collateral key); ``GET /l2/perps/positions``
       serves ``perps_account`` (404 without a trading account). It and the two
       perps ops below answer 401 without an API key (``Authorization: Bearer``).
     * ``POST /l2/allocations`` and ``/l2/exits`` apply a signed op at the account's
@@ -249,6 +259,7 @@ class FakeExchange:
         self._next_index = 4097
         self._next_id = 0
         self.perps_markets: list[dict[str, Any]] = [dict(PERPS_MARKET)]
+        self.perps_collateral: dict[str, Any] | None = dict(PERPS_COLLATERAL)
         self.perps_account: dict[str, Any] = json.loads(json.dumps(PERPS_ACCOUNT))
         # The ops applied, by nonce: (their body, their journal seq).
         self.applied: dict[int, tuple[bytes, int]] = {}
@@ -300,7 +311,10 @@ class FakeExchange:
                 },
             )
         if route == "GET /l2/perps/markets":
-            return httpx.Response(200, json={"markets": self.perps_markets})
+            reply: dict[str, Any] = {"markets": self.perps_markets}
+            if self.perps_collateral is not None:
+                reply["collateral"] = self.perps_collateral
+            return httpx.Response(200, json=reply)
         if route == "GET /l2/perps/positions":
             if self.keys is None:
                 return httpx.Response(404, json={"error": NO_ACCOUNT})

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -27,6 +28,7 @@ from conftest import (
     MARKET_STATES,
     NONCE_REFUSAL,
     PERPS_ACCOUNT,
+    PERPS_COLLATERAL,
     PERPS_MARKET,
     property_detail,
     routes,
@@ -82,11 +84,12 @@ def perps_exchange(exchange):
 
 def test_markets_and_market(exchange, trading_client):
     perps = trading_client(api_key=None).perps  # public: no API key needed
-    assert perps.markets() == {"markets": [PERPS_MARKET]}
+    assert perps.markets() == {"markets": [PERPS_MARKET], "collateral": PERPS_COLLATERAL}
     assert perps.market(4) == PERPS_MARKET
     assert perps.market(5) is None
+    assert perps.collateral() == PERPS_COLLATERAL
     gets = exchange.gets("/l2/perps/markets")
-    assert [request.headers.get("authorization") for request in gets] == [None] * 3
+    assert [request.headers.get("authorization") for request in gets] == [None] * 4
 
 
 def test_positions_pools_and_funding(exchange, trading_client):
@@ -153,16 +156,17 @@ def test_market_of_a_perps_property():
 def test_add_margin(exchange, trading_client, l2_clock):
     l2_clock.time_ns = lambda: NOW_MS * 1_000_000
     exchange.keys["withdrawalNonce"] = 3
-    answer = trading_client().perps.add_margin(5_000_000, pool=2)
+    answer = trading_client().perps.add_margin(50, pool=2)
     assert answer == {"journalSeq": 1001, "duplicate": False}
     (body,) = exchange.bodies("/l2/allocations")
     assert list(body) == ALLOCATE_KEYS
+    assert body["amount"] == "5000"  # 50 USDC in the collateral's ticks of 0.01 USDC
     assert {key: body[key] for key in ALLOCATE_KEYS[:7]} == {
         "l2ChainId": 4242,
         "l2AccountIndex": ACCOUNT_INDEX,
         "fromSide": loaf.PERPS_SPOT_SIDE,
         "toSide": 2,
-        "amount": "5000000",
+        "amount": "5000",
         "l2Nonce": 3,
         "l2ExpiryMs": NOW_MS + DEFAULT_PERPS_OP_TTL_MS,
     }
@@ -181,10 +185,10 @@ def test_add_margin(exchange, trading_client, l2_clock):
 def test_return_margin_and_a_move_between_pools(exchange, trading_client):
     perps = trading_client().perps
     perps.return_margin(7)
-    perps.allocate(2**60 - 1, from_side=0, to_side=7)
+    perps.allocate(Decimal("11529215046068469.75"), from_side=0, to_side=7)  # 2^60 - 1 ticks
     first, second = exchange.bodies("/l2/allocations")
     assert [(b["fromSide"], b["toSide"], b["amount"], b["l2Nonce"]) for b in (first, second)] == [
-        (0, 255, "7", 0),
+        (0, 255, "700", 0),
         (0, 7, str(2**60 - 1), 1),
     ]
     for body in (first, second):
@@ -243,10 +247,11 @@ def test_an_op_signs_fresh_randomness(exchange, trading_client):
         (lambda p: p.allocate(5, from_side=8, to_side=0), "from_side must be a margin pool"),
         (lambda p: p.allocate(5, from_side=255, to_side=254), "to_side must be a margin pool"),
         (lambda p: p.allocate(5, from_side=True, to_side=0), "from_side must be a margin pool"),
-        (lambda p: p.allocate(0, from_side=255, to_side=0), "amount must be a number of USDC"),
-        (lambda p: p.allocate(2**60, from_side=255, to_side=0), "amount must be"),
-        (lambda p: p.add_margin(1.5), "amount must be"),
-        (lambda p: p.add_margin("5"), "amount must be"),
+        (lambda p: p.allocate(0, from_side=255, to_side=0), "amount must be positive"),
+        (lambda p: p.add_margin(-1.5), "amount must be positive"),
+        (lambda p: p.add_margin("5"), "amount must be a number"),
+        (lambda p: p.add_margin(True), "amount must be a number"),
+        (lambda p: p.add_margin(float("inf")), "amount must be a finite number"),
         (lambda p: p.add_margin(5, pool=8), "pool must be a margin pool"),
         (lambda p: p.return_margin(5, pool=True), "pool must be a margin pool"),
         (lambda p: p.return_margin(5, pool=255), "pool must be a margin pool"),
@@ -262,6 +267,78 @@ def test_op_arguments_are_checked_locally(exchange, trading_client, call, messag
         call(trading_client().perps)
     assert info.value.status_code == 0
     assert exchange.requests == []
+
+
+def test_an_amount_is_whole_ticks_of_the_served_collateral(exchange, trading_client):
+    perps = trading_client().perps
+    for amount in (Decimal("12.34"), 0.01, 1.5, 7):
+        perps.add_margin(amount)
+    amounts = [body["amount"] for body in exchange.bodies("/l2/allocations")]
+    assert amounts == ["1234", "1", "150", "700"]  # ticks of 0.01 USDC
+    # Not a whole number of ticks, or past one allocate's range: refused once the collateral is
+    # read, and nothing is signed or sent.
+    for amount, message in (
+        (
+            Decimal("12.345"),
+            "amount must be a whole number of ticks of 0.01 USDC (got Decimal('12.345'))",
+        ),
+        (0.001, "amount must be from 0.01 USDC (one tick) to 11,529,215,046,068,469.75 USDC"),
+        (Decimal("11529215046068469.76"), "to 11,529,215,046,068,469.75 USDC (2^60 - 1 ticks)"),
+    ):
+        with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
+            perps.add_margin(amount)
+        assert info.value.status_code == 0
+    assert len(exchange.bodies("/l2/allocations")) == 4
+    assert len(exchange.gets("/l2/perps/markets")) == 1
+
+
+def test_an_amount_is_counted_in_the_collateral_served_not_an_assumed_one(
+    exchange, trading_client
+):
+    # 18 decimals and a tick of 10^12 base units (0.000001): what the reply says, not USDC's 6.
+    exchange.perps_collateral = dict(PERPS_COLLATERAL, decimals=18, tickSize=str(10**12))
+    trading_client().perps.add_margin(Decimal("0.000003"))
+    (body,) = exchange.bodies("/l2/allocations")
+    assert body["amount"] == "3"
+    verify_op(body)
+
+
+@pytest.mark.parametrize(
+    "collateral",
+    [
+        None,
+        "USDC",
+        {k: v for k, v in PERPS_COLLATERAL.items() if k != "tickSize"},
+        dict(PERPS_COLLATERAL, assetId=2),
+        dict(PERPS_COLLATERAL, assetId=3.0),
+        dict(PERPS_COLLATERAL, symbol=""),
+        dict(PERPS_COLLATERAL, decimals=256),
+        dict(PERPS_COLLATERAL, decimals="6"),
+        dict(PERPS_COLLATERAL, decimals=True),
+        dict(PERPS_COLLATERAL, tickSize="0"),
+        dict(PERPS_COLLATERAL, tickSize=10000),
+        dict(PERPS_COLLATERAL, tickSize="010000"),
+        dict(PERPS_COLLATERAL, tickSize=str(2**128)),
+        dict(PERPS_COLLATERAL, extensionMultiplier=str(2**56)),
+        dict(PERPS_COLLATERAL, extensionMultiplier=None),
+    ],
+    ids=[
+        "missing", "not-an-object", "no-tickSize", "assetId-2", "assetId-float", "symbol-empty",
+        "decimals-256", "decimals-text", "decimals-bool", "tickSize-0", "tickSize-number",
+        "tickSize-leading-zero", "tickSize-2^128", "extension-2^56", "extension-missing",
+    ],
+)
+def test_a_reply_without_a_usable_collateral_is_a_server_error(
+    exchange, trading_client, collateral
+):
+    exchange.perps_collateral = collateral
+    perps = trading_client().perps
+    # Never a silent default: no amount is counted, and no op signed, without the served one.
+    for call in (lambda: perps.add_margin(5), lambda: perps.exit(4), perps.collateral):
+        with pytest.raises(loaf.LoafServerError, match="answered no usable collateral"):
+            call()
+    assert exchange.posts("/l2/allocations") == exchange.posts("/l2/exits") == []
+    assert routes(exchange.requests) == ["GET /l2/perps/markets"] * 3
 
 
 def test_ops_need_both_keys(exchange, trading_client):

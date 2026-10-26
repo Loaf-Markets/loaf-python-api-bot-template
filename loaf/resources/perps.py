@@ -6,7 +6,7 @@ with ``pool=`` and ``reduce_only=``
 (:class:`~loaf.resources.orders.OrdersResource`); this resource reads the
 markets and your positions, and moves your margin::
 
-    loaf.perps.add_margin(5_000_000, pool=0)       # USDC ticks: spot balance -> pool 0
+    loaf.perps.add_margin(5_000, pool=0)           # 5,000 USDC: spot balance -> pool 0
     loaf.orders.limit_buy("PRP1", quantity=2, price=101.5, pool=0)
     loaf.perps.position(market=4, pool=0)
 
@@ -35,11 +35,14 @@ which the exchange applies once at most (it answers a repeat of an applied op
 (its nonce stays unspent); on that one, ``resubmit(error.signed_body)``, and
 never sign the same intent afresh while it may have been applied.
 
-**Units.** The exchange engine's, not dollars. An allocate's ``amount`` is a
-whole number of USDC ticks: USDC base units (6 decimals) over USDC's tick size,
-which the vault contract's ``assetConfig`` holds for asset 3 (the SDK reads no
-chain). The reads serve every amount of 64 bits or more as a decimal string;
-:meth:`PerpsResource.positions` lists their units.
+**Units.** An allocate's ``amount`` is in USDC (``12.5`` is 12.5 USDC). The
+exchange moves whole ticks of it: the SDK turns the amount into ticks with the
+collateral ``GET /l2/perps/markets`` serves (:meth:`PerpsResource.collateral`:
+ticks = amount x 10^``decimals`` / ``tickSize``), and refuses an amount that is
+not a whole number of ticks, or a reply without a usable collateral (it never
+assumes one). The reads are the engine's units, not dollars: every amount of
+64 bits or more is a decimal string, and :meth:`PerpsResource.positions` lists
+their units.
 """
 
 from __future__ import annotations
@@ -47,7 +50,9 @@ from __future__ import annotations
 import numbers
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from decimal import Context, Decimal, localcontext
+from fractions import Fraction
+from typing import TYPE_CHECKING, Any, Callable, Mapping, NamedTuple
 
 from .. import k1
 from .._l2 import _KB_MODULUS, _is_int, _whole, read_signing_account
@@ -60,6 +65,7 @@ from ..constants import (
     MAX_POOL,
     MIN_ORDER_TTL_MS,
     PERPS_LAST,
+    PERPS_QUOTE_ASSET_ID,
     PERPS_SPOT_SIDE,
 )
 from ..exceptions import (
@@ -68,13 +74,29 @@ from ..exceptions import (
     LoafServerError,
     _client_validation_error,
 )
+from ..money import _BASE_UNITS_RE, _to_decimal
 from .base import Resource
 
 if TYPE_CHECKING:
     from .._l2 import TradingKey
     from ..client import LoafClient
 
-_ALLOCATE_LIMIT = 2**60  # an allocate's amount is below it
+_ALLOCATE_LIMIT = 2**60  # an allocate's amount, in ticks, is below it
+_TICK_SIZE_LIMIT = 2**128  # the collateral's tickSize is below it
+_EXTENSION_LIMIT = 2**56  # and its extensionMultiplier
+_EXACT = Context(prec=100)  # every collateral bound below fits in it
+
+
+class _Collateral(NamedTuple):
+    """``GET /l2/perps/markets``' collateral, checked: ``row`` as served, ``tick`` one tick in
+    the token's units and ``most`` the largest allocate (2^60 - 1 ticks), both exact."""
+
+    row: Mapping[str, Any]
+    symbol: str
+    decimals: int
+    tick_size: int
+    tick: Decimal
+    most: Decimal
 
 _SIGNED_OP_STRS = ("l2SigS", "l2SigE")
 _SIGNED_OP_INTS = ("l2ChainId", "l2AccountIndex", "l2Nonce", "l2ExpiryMs")
@@ -87,16 +109,20 @@ class PerpsResource(Resource):
         super().__init__(client)
         # One op at a time: each signs the nonce GET /l2/keys serves, which only an applied op moves.
         self._lock = threading.Lock()
-        #: The L2 chain id every op signs, read with the perps markets; dropped on its refusal.
-        self._l2_chain_id: int | None = None
+        #: The L2 chain id every op signs and the collateral an allocate's amount is counted in,
+        #: read once with the perps markets (under ``_terms_lock``); dropped on the chain id's
+        #: refusal.
+        self._terms_lock = threading.Lock()
+        self._market_terms: tuple[int, _Collateral] | None = None
 
     # -- Markets ------------------------------------------------------------ #
 
     def markets(self) -> Any:
         """``GET /l2/perps/markets`` — every perps market, ascending by index. Public.
 
-        Returns ``{"markets": [...]}`` (:class:`~loaf.models.PerpsMarkets`).
-        Each row is the market as a property's ``l2Market`` serves it
+        Returns ``{"markets": [...], "collateral": {...}}``
+        (:class:`~loaf.models.PerpsMarkets`); :meth:`collateral` reads the
+        second. Each row is the market as a property's ``l2Market`` serves it
         (:class:`~loaf.models.L2PerpsMarket`): ``marketIndex`` (0 to 254),
         ``status`` (``ACTIVE``, or ``EXPIRED``: it takes no orders and its
         positions leave by exits), the custody (``chainId``, ``proxyAddress``,
@@ -111,6 +137,18 @@ class PerpsResource(Resource):
         price, funding rate and open interest) is not served yet.
         """
         return self._client.get("/l2/perps/markets", auth=False)
+
+    def collateral(self) -> Any:
+        """The ``collateral`` of :meth:`markets`: the one asset every margin pool holds,
+        USDC (:class:`~loaf.models.PerpsCollateral`): its ``symbol`` and ``decimals``,
+        ``tickSize`` (its base units per tick: an allocate moves whole ticks) and
+        ``extensionMultiplier`` (the reads' extended units per tick), the last two
+        decimal strings. Neither changes once the asset is registered.
+
+        Raises:
+            LoafServerError: the reply has no usable collateral.
+        """
+        return _collateral_of(self.markets()).row
 
     def market(self, market: int) -> Any:
         """Perps market ``market``'s row of :meth:`markets`, or ``None`` when it is not listed."""
@@ -134,7 +172,9 @@ class PerpsResource(Resource):
           position's signed notional less its funding owed) and a position's
           ``fundingOwed`` (positive pays, negative receives) and ``notional``
           (|base| x index x the market's ``qem``) are in the money book's
-          extended USDC units: USDC ticks x USDC's extension multiplier;
+          extended units: ticks x the collateral's ``extensionMultiplier``
+          (:meth:`collateral`), so USDC = extended / ``extensionMultiplier``
+          x ``tickSize`` / 10^``decimals``;
         * a pool's ``requirement`` (its maintenance margin) is in those units
           x 65,536; ``liquidatable`` is ``value < 0`` or ``value x 65,536 <
           requirement``, and ``initialMarginOk`` (collateral may leave the
@@ -181,8 +221,8 @@ class PerpsResource(Resource):
     def funding(self) -> list[Any]:
         """The funding of each of your open positions, from :meth:`positions`:
         ``[{pool, market, fundingIndex, fundingOwed}]``
-        (:class:`~loaf.models.PerpsFunding`), ``fundingOwed`` in extended USDC
-        units (positive pays, negative receives) and ``fundingIndex`` the
+        (:class:`~loaf.models.PerpsFunding`), ``fundingOwed`` in extended units
+        (:meth:`positions`; positive pays, negative receives) and ``fundingIndex`` the
         funding index it last settled at. The pool's value counts what it owes,
         and the exchange moves it at the pool's next refresh."""
         return [
@@ -201,9 +241,14 @@ class PerpsResource(Resource):
     # -- Margin moves and exits (signed) ------------------------------------ #
 
     def allocate(
-        self, amount: int, *, from_side: int, to_side: int, ttl_ms: int | None = None
+        self,
+        amount: float | Decimal,
+        *,
+        from_side: int,
+        to_side: int,
+        ttl_ms: int | None = None,
     ) -> Any:
-        """``POST /l2/allocations`` — move ``amount`` USDC ticks from ``from_side``
+        """``POST /l2/allocations`` — move ``amount`` USDC from ``from_side``
         to ``to_side``, signed with your trading key.
 
         Each side is a margin pool, 0 (the cross pool) to 7, or
@@ -212,8 +257,10 @@ class PerpsResource(Resource):
         the moves to and from your spot balance.
 
         Args:
-            amount: USDC ticks (see the module's Units), a whole number from 1
-                to 2^60 - 1.
+            amount: USDC (a number; a ``Decimal`` for exact cents): a whole
+                number of the collateral's ticks (:meth:`collateral`, see the
+                module's Units), from one tick to 2^60 - 1 of them. Checked
+                once the collateral is read; nothing is rounded.
             from_side: where the USDC leaves.
             to_side: where it goes.
             ttl_ms: how long the signed op stays valid, in whole milliseconds,
@@ -231,6 +278,8 @@ class PerpsResource(Resource):
             LoafConfigError: no trading key or API key; your trading key is not
                 the one in force; no trading account; trading not enabled; no
                 perps market listed yet.
+            LoafServerError: the perps markets' reply has no usable
+                collateral, or chain id.
             LoafValidationError: refused locally (``status_code`` 0, nothing
                 sent) or by the exchange (400).
             LoafAPIError: 422, the exchange refused it by its rules, with the
@@ -242,7 +291,9 @@ class PerpsResource(Resource):
                 :meth:`resubmit` it, never sign it afresh.
         """
         key = self._credentials()
-        ticks = _ranged(amount, "amount", 1, _ALLOCATE_LIMIT - 1, "a number of USDC ticks")
+        value = _to_decimal(amount, "amount")
+        if value <= 0:
+            raise _client_validation_error(f"amount must be positive (got {amount!r})")
         source = _side(from_side, "from_side")
         target = _side(to_side, "to_side")
         if source == target:
@@ -251,6 +302,7 @@ class PerpsResource(Resource):
                 "from one to the other"
             )
         ttl = _op_ttl(ttl_ms)
+        ticks = _ticks(value, amount, self._terms()[1])
 
         def message(chain_id: int, account_index: int, nonce: int, expiry_ms: int) -> bytes:
             return k1.allocate_message(
@@ -266,13 +318,17 @@ class PerpsResource(Resource):
         terms = {"fromSide": source, "toSide": target, "amount": str(ticks)}
         return self._submit("/l2/allocations", "allocate", key, terms, ttl, message)
 
-    def add_margin(self, amount: int, *, pool: int = 0, ttl_ms: int | None = None) -> Any:
-        """Move ``amount`` USDC ticks from your spot balance into margin pool
+    def add_margin(
+        self, amount: float | Decimal, *, pool: int = 0, ttl_ms: int | None = None
+    ) -> Any:
+        """Move ``amount`` USDC from your spot balance into margin pool
         ``pool`` (0, the cross pool, to 7). See :meth:`allocate`."""
         return self.allocate(amount, from_side=PERPS_SPOT_SIDE, to_side=_pool(pool), ttl_ms=ttl_ms)
 
-    def return_margin(self, amount: int, *, pool: int = 0, ttl_ms: int | None = None) -> Any:
-        """Move ``amount`` USDC ticks out of margin pool ``pool`` (0 to 7) back to
+    def return_margin(
+        self, amount: float | Decimal, *, pool: int = 0, ttl_ms: int | None = None
+    ) -> Any:
+        """Move ``amount`` USDC out of margin pool ``pool`` (0 to 7) back to
         your spot balance. The exchange refuses it (422) when it would leave the
         pool below initial margin (twice its maintenance requirement), while
         the price of an active market the pool holds is stale, or above what
@@ -370,7 +426,7 @@ class PerpsResource(Resource):
         """Read what the op signs (the chain id, your account and its nonce), sign it at
         now + ``ttl`` and send it; one op at a time, so no two sign the same nonce."""
         with self._lock:
-            chain_id = self._chain_id()
+            chain_id = self._terms()[0]
             account_index, nonce, journaled = read_signing_account(self._client)
             if journaled != key.public_key:
                 raise LoafConfigError(
@@ -399,12 +455,14 @@ class PerpsResource(Resource):
                 return self._client._send_signed(path, body, perps=True)
             except LoafAPIError as exc:
                 if exc.status_code < 500 and exc.message.startswith("l2 chain id:"):
-                    self._l2_chain_id = None  # the deployment moved: read it again
+                    self._market_terms = None  # the deployment moved: read it again
                 raise
 
-    def _chain_id(self) -> int:
-        """The L2 chain id every op signs: the perps markets', read once (under the lock)."""
-        if self._l2_chain_id is None:
+    def _terms(self) -> tuple[int, _Collateral]:
+        """The L2 chain id every op signs and the collateral: the perps markets', read once."""
+        with self._terms_lock:
+            if self._market_terms is not None:
+                return self._market_terms
             answer = self._client._request(
                 "GET", "/l2/perps/markets", auth=False, before_order=True
             )
@@ -426,8 +484,74 @@ class PerpsResource(Resource):
                     status_code=200,
                     body=answer,
                 )
-            self._l2_chain_id = chain_id
-        return self._l2_chain_id
+            self._market_terms = (chain_id, _collateral_of(answer))
+            return self._market_terms
+
+
+def _collateral_of(answer: Any) -> _Collateral:
+    """The perps markets' ``collateral``, checked as served (Shared-Types' perpsCollateralSchema),
+    or :class:`LoafServerError`: an amount is never counted in an assumed tick."""
+    row = answer.get("collateral") if isinstance(answer, Mapping) else None
+
+    def unusable(field: str) -> LoafServerError:
+        return LoafServerError(
+            f"GET /l2/perps/markets answered no usable collateral ({field}): an allocate's amount "
+            "is counted in its decimals and tickSize, which the SDK never assumes",
+            status_code=200,
+            body=answer,
+        )
+
+    if not isinstance(row, Mapping):
+        raise unusable("collateral")
+    if row.get("assetId") != PERPS_QUOTE_ASSET_ID or not _is_int(row.get("assetId")):
+        raise unusable("collateral.assetId")
+    symbol = row.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        raise unusable("collateral.symbol")
+    decimals = row.get("decimals")
+    if not _whole(decimals, 0, 255):
+        raise unusable("collateral.decimals")
+    tick_size = _decimal_string(row.get("tickSize"), _TICK_SIZE_LIMIT - 1)
+    if tick_size is None:
+        raise unusable("collateral.tickSize")
+    if _decimal_string(row.get("extensionMultiplier"), _EXTENSION_LIMIT - 1) is None:
+        raise unusable("collateral.extensionMultiplier")
+    with localcontext(_EXACT):
+        tick = Decimal(tick_size).scaleb(-decimals)
+        most = (Decimal(tick_size) * (_ALLOCATE_LIMIT - 1)).scaleb(-decimals)
+    return _Collateral(row, symbol, decimals, tick_size, tick, most)
+
+
+def _decimal_string(value: Any, high: int) -> int | None:
+    """A decimal string from 1 to ``high`` (no sign, no leading zero), as its int."""
+    if not isinstance(value, str) or len(value) > len(str(high)):
+        return None
+    if not _BASE_UNITS_RE.fullmatch(value) or not 1 <= int(value) <= high:
+        return None
+    return int(value)
+
+
+def _ticks(value: Decimal, given: Any, collateral: _Collateral) -> int:
+    """An allocate's ``amount`` (USDC) as the whole number of ticks it signs: amount x
+    10^decimals / tickSize, exactly, or refused (never rounded)."""
+    symbol = collateral.symbol
+    if not collateral.tick <= value <= collateral.most:
+        raise _client_validation_error(
+            f"amount must be from {_plain(collateral.tick)} {symbol} (one tick) to "
+            f"{_plain(collateral.most, ',')} {symbol} (2^60 - 1 ticks) (got {given!r})"
+        )
+    ticks = Fraction(value) * 10**collateral.decimals / collateral.tick_size
+    if ticks.denominator != 1:
+        raise _client_validation_error(
+            f"amount must be a whole number of ticks of {_plain(collateral.tick)} {symbol} "
+            f"(got {given!r})"
+        )
+    return int(ticks)
+
+
+def _plain(value: Decimal, grouping: str = "") -> str:
+    """``value`` without its trailing zeros or an exponent: 0.01, 11,529,215,046,068,469.75."""
+    return format(value.normalize(_EXACT), grouping + "f")
 
 
 def _ranged(value: Any, field: str, low: int, high: int, what: str) -> int:

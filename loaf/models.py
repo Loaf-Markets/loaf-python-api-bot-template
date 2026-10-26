@@ -90,10 +90,22 @@ class L2PerpsMarket(TypedDict):
 L2Market = Union[L2SpotMarket, L2PerpsMarket]
 
 
+class PerpsCollateral(TypedDict):
+    """``perps.collateral()``: the one asset every margin pool holds (USDC)."""
+
+    assetId: int  # 3
+    symbol: str
+    decimals: int  # the token's: a display amount is base units / 10^decimals
+    tickSize: str  # the token's base units per tick, a decimal string: an allocate moves ticks
+    extensionMultiplier: str  # the reads' extended units per tick, a decimal string
+
+
 class PerpsMarkets(TypedDict):
-    """``perps.markets()``: every perps market, ascending by ``marketIndex``."""
+    """``perps.markets()``: every perps market, ascending by ``marketIndex``, and the
+    collateral their pools hold."""
 
     markets: list[L2PerpsMarket]
+    collateral: PerpsCollateral
 
 
 class PerpsPosition(TypedDict, total=False):
@@ -400,6 +412,7 @@ __all__ = [
     "L2SpotMarket",
     "L2PerpsMarket",
     "L2Market",
+    "PerpsCollateral",
     "PerpsMarkets",
     "PerpsPosition",
     "PerpsPool",

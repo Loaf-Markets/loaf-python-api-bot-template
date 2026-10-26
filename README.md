@@ -232,6 +232,7 @@ orders.cancel_row(order)              (routes a row to the right cancel)
 orders.cancel_all()                   POST   /orders/cancel-all
 
 perps.markets() / market(index)       GET    /l2/perps/markets
+perps.collateral()                    (its collateral: USDC's decimals and tick size)
 perps.positions() / pool / position   GET    /l2/perps/positions
 perps.funding()                       (each position's funding, from /l2/perps/positions)
 perps.allocate / add_margin / return_margin
@@ -583,11 +584,11 @@ and move what is left back:
 
 ```python
 loaf.perps.markets()                                  # every perps market, public
-loaf.perps.add_margin(5_000_000, pool=0)              # USDC ticks (below): spot -> pool 0
+loaf.perps.add_margin(5_000, pool=0)                  # 5,000 USDC: spot -> pool 0
 loaf.orders.limit_buy("PERP", quantity=2, price=101.5, pool=0)   # a long from pool 0
 loaf.orders.limit_sell("PERP", quantity=2, price=104, pool=0, reduce_only=True)
 loaf.perps.position(market=4, pool=0)                 # base, entryPrice, liquidationPrice, ...
-loaf.perps.return_margin(1_000_000, pool=0)           # pool 0 -> spot
+loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
 ```
 
 - **Orders** take `pool=` (0 by default) and `reduce_only=True` (its fills
@@ -611,11 +612,14 @@ loaf.perps.return_margin(1_000_000, pool=0)           # pool 0 -> spot
   of an applied one). Any error but `PerpsOutcomeUnknownError` means it was
   not applied; on that one, `loaf.perps.resubmit(e.signed_body)`, never a
   fresh op for the same intent.
-- **Units** are the exchange engine's, not dollars. An allocate's `amount`
-  is a whole number of USDC ticks: USDC base units over USDC's tick size, which
-  the vault contract's `assetConfig` holds for asset 3 (the SDK reads no
-  chain). `positions()` serves amounts as decimal strings: collateral, value,
-  funding owed and notional in extended USDC units, a position's `base` in an
+- **Units.** An allocate's `amount` is in USDC. The exchange moves whole
+  ticks of it, so the SDK counts the amount in the collateral that
+  `GET /l2/perps/markets` serves (`perps.collateral()`: ticks = amount x
+  10^`decimals` / `tickSize`). It refuses an amount that is not a whole number
+  of ticks, and a reply without a usable collateral: it never assumes one.
+  The reads are the engine's units: `positions()` serves amounts as decimal
+  strings, collateral, value, funding owed and notional in extended units
+  (ticks x the collateral's `extensionMultiplier`), a position's `base` in an
   order's signed quantity units (tokens x 10, negative for a short), prices in
   the market's price units (its docstring has the rest).
 - **Market state.** A perps market can refuse orders for its own state (403,
