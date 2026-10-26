@@ -191,7 +191,8 @@ class LoafWebSocketClient:
 
     def on_trades(self, handler: Handler | None = None) -> Any:
         """A property's public trades (``trades_batch``: ``{propertyId, trades}``,
-        each a :class:`~loaf.models.TradeTick`).
+        each a :class:`~loaf.models.TradeTick`; on a perps market a liquidation
+        take too, ``isLiquidation: True``, which may have no ``txHash``).
 
         Every trade is pushed, in at most one frame per property every 100 ms:
         each frame holds every trade printed since the previous one, newest

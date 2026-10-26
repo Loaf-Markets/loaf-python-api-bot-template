@@ -159,15 +159,21 @@ class PerpsOpAccepted(TypedDict):
 
 class TradeTick(TypedDict, total=False):
     """A public trade: the detail's ``recentTrades`` or a ``trades_batch`` frame (newest first),
-    or a ``market.trades`` row (oldest first)."""
+    or a ``market.trades`` row (oldest first).
+
+    On a perps market the tape also carries liquidation takes: a liquidated position taken
+    against a resting order. A take has ``isLiquidation: True`` and is no trade: it may have no
+    ``txHash``, and its ``aggressorSide`` is the liquidated side. A trade always has its
+    ``txHash``, and ``isLiquidation`` absent or ``False``."""
 
     tradeId: int
     propertyId: int
     txHash: str  # the trade's content hash (0x + 64 hex), not an on-chain transaction
-    aggressorSide: str  # OrderSide of the taker
+    aggressorSide: str  # OrderSide of the taker (a take's: the liquidated side)
     price: float
     quantity: float
     timestamp: int
+    isLiquidation: bool  # True on a liquidation take; absent or False on a trade
 
 
 class OrderResult(TypedDict, total=False):

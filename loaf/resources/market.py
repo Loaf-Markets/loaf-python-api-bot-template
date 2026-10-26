@@ -148,7 +148,9 @@ class MarketResource(Resource):
         Returns ``{"trades": [...]}``: at most ``limit`` (1-1000) trades whose
         ``tradeId`` is above ``after_trade_id`` (0: from the first), each
         ``{tradeId, propertyId, txHash, aggressorSide, price, quantity,
-        timestamp}`` as the channel pushes it. While a page comes back full,
+        timestamp}`` as the channel pushes it (a perps market's liquidation
+        take has ``isLiquidation: True`` and may have no ``txHash``:
+        :class:`~loaf.models.TradeTick`). While a page comes back full,
         pass its last ``tradeId`` as ``after_trade_id`` for the next; stop at
         an empty or short page, or one whose last ``tradeId`` is not above the
         ``after_trade_id`` you sent.

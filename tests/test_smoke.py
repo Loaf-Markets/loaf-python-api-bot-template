@@ -384,6 +384,26 @@ def test_candles_params_and_no_auth():
     assert seen["params"] == {"resolution": "1d", "to": "1700000000"}
 
 
+def test_a_liquidation_take_on_the_tape():
+    # A perps tape row may be a liquidation take: isLiquidation true and, being no trade, no
+    # txHash. It parses like a trade, and the model says so.
+    trade = {
+        "tradeId": 41, "propertyId": 7, "txHash": "0x" + "ab" * 32, "aggressorSide": "BUY",
+        "price": 101.5, "quantity": 2, "timestamp": 1_700_000_000_000,
+    }
+    take = {
+        "tradeId": 42, "propertyId": 7, "aggressorSide": "SELL", "price": 99.25, "quantity": 1,
+        "timestamp": 1_700_000_000_500, "isLiquidation": True,
+    }
+    client = make_client(lambda request: httpx.Response(200, json={"trades": [trade, take]}))
+    first, second = client.market.trades("PRP1").trades
+    assert first == trade and first.get("isLiquidation") is None
+    assert second == take and second.isLiquidation is True and "txHash" not in second
+    hints = typing.get_type_hints(models.TradeTick)
+    assert hints["isLiquidation"] is bool and hints["txHash"] is str
+    assert {"isLiquidation", "txHash"} <= models.TradeTick.__optional_keys__
+
+
 def test_trades_params_and_no_auth():
     sent = []
     tape = [{"tradeId": 41, "price": 160.5}, {"tradeId": 44, "price": 161}]  # oldest first
