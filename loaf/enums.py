@@ -41,14 +41,8 @@ class ConditionalOrderType(_StrEnum):
 
 
 class TimeInForce(_StrEnum):
-    #: Good-til-cancelled. The default; recommended for bots.
+    #: Good-til-cancelled — the only value the exchange accepts; order rows carry it.
     GTC = "GTC"
-    #: Immediate-or-cancel.
-    IOC = "IOC"
-    #: Fill-or-kill.
-    FOK = "FOK"
-    #: Good-til-date. Requires a future unix-seconds ``deadline``.
-    GTD = "GTD"
 
 
 class OrderStatus(_StrEnum):
@@ -56,7 +50,6 @@ class OrderStatus(_StrEnum):
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
-    REJECTED = "REJECTED"
 
 
 class ConditionalOrderStatus(_StrEnum):
@@ -70,25 +63,26 @@ class ConditionalOrderStatus(_StrEnum):
     CANCELLED = "CANCELLED"
 
 
-class TradeStatus(_StrEnum):
-    SETTLING = "SETTLING"
-    SETTLED = "SETTLED"
-    SETTLEMENT_FAILED = "SETTLEMENT_FAILED"
+class MarketType(_StrEnum):
+    """A market's type, which its index decides (a perp's ticker ends in ``-PERP``)."""
+
+    SPOT = "SPOT"
+    PERP = "PERP"
 
 
-class OfferingOrderStatus(_StrEnum):
-    """Status of an IPO/offering subscription order."""
-
-    PENDING = "PENDING"
-    ALLOCATED = "ALLOCATED"
-    REJECTED = "REJECTED"
-    CANCELLED = "CANCELLED"
-
-
-class PropertyStatus(_StrEnum):
+class MarketStatus(_StrEnum):
     PENDING = "PENDING"
     LIVE = "LIVE"
     DELISTED = "DELISTED"
+
+
+class AssetKind(_StrEnum):
+    """What an asset is: a market's ``kind`` is its asset's."""
+
+    PROPERTY = "PROPERTY"
+    COMMODITY = "COMMODITY"
+    CRYPTO = "CRYPTO"
+    INDEX = "INDEX"
 
 
 class IpoStatus(_StrEnum):
@@ -96,17 +90,6 @@ class IpoStatus(_StrEnum):
     LIVE = "LIVE"
     CLOSED = "CLOSED"
     CANCELLED = "CANCELLED"
-
-
-class TransferType(_StrEnum):
-    DEPOSIT = "DEPOSIT"
-    WITHDRAWAL = "WITHDRAWAL"
-
-
-class TransferStatus(_StrEnum):
-    PENDING = "PENDING"
-    CONFIRMED = "CONFIRMED"
-    REJECTED = "REJECTED"
 
 
 class CandleResolution(_StrEnum):
@@ -149,19 +132,17 @@ class WSMessageType(_StrEnum):
     TRADES_BATCH = "trades_batch"
     CANDLE_UPDATE = "candle_update"
     MARK_PRICE = "mark_price"
-    IPO_ALLOCATION_UPDATE = "ipo_allocation_update"
     VOLUME_UPDATE = "volume_update"
     LEADERBOARD_UPDATE = "leaderboard_update"
-    PROPERTY_HALT = "property_halt"
+    MARKET_HALT = "market_halt"
+    ROUND_UPDATE = "round_update"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"
-    POSITION_UPDATE = "position_update"
     ORDER_STATUS = "order_status"
     ORDER_UPDATE = "order_update"
     TRADE_NEW = "trade_new"
+    ORDER_QUEUE = "order_queue"
     LIFETIME_VOLUME_UPDATE = "lifetime_volume_update"
-    TRANSFER_UPDATE = "transfer_update"
-    OFFERING_ORDER_UPDATE = "offering_order_update"
 
 
 #: The four ``type`` values that mark an order row as a conditional (stop / take).

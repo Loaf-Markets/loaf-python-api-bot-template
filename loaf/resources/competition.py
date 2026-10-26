@@ -1,9 +1,9 @@
 """Trading competition: rounds info, your queue position, prize payout details.
 
-While a competition round is ACTIVE, order placement is restricted to admitted
-participants (a non-admitted account gets
-:class:`~loaf.exceptions.CompetitionEligibilityError`), so a bot should check
-its standing here. Outside an active round trading is unrestricted.
+A round is normal trading scored over a window, and changes nothing about
+trading. The queue admits participants; each one's trading from the round's
+start (or their admission, if later) until its end is scored on the
+leaderboard.
 """
 
 from __future__ import annotations
@@ -23,10 +23,10 @@ class CompetitionResource(Resource):
         flag; ``makerFeeBps``/``takerFeeBps`` are the base (lowest volume tier)
         fees. ``rounds`` is EVERY round in full, newest first (``None`` when
         none exist), each with ``roundNumber``, ``name``, ``rules``,
-        ``startsAt``/``endsAt``, ``startingBalanceUsdl``,
-        ``participantBatchSize`` (how many the queue admits into the round),
-        ``status``, ``newAssetProperty`` (the round's headline asset, or
-        ``None``), ``prizePool``, ``volumeMultiplierTiers``,
+        ``startsAt``/``endsAt``, ``participantBatchSize`` (how many the queue
+        admits into the round), ``status``, ``newAssetMarket`` (the market of
+        the round's new asset: its trade-list row, or ``None``), ``prizePool``,
+        ``volumeMultiplierTiers``, ``volumeExponent``, ``pnlMultiplier``,
         ``bottomCullPercent`` and ``winners``. See
         :class:`~loaf.models.CompetitionRound`.
 
@@ -38,6 +38,9 @@ class CompetitionResource(Resource):
 
             rounds = loaf.competition.info().rounds or []
             live = next((r for r in rounds if r.status == "ACTIVE"), None)
+
+        A round's actual start and end re-stamp its ``startsAt`` / ``endsAt``
+        (until then they hold the schedule, if any).
 
         A ``prizePool`` entry is ``{place, amount}`` or, for a BAND,
         ``{place, toPlace, amount}`` — ``toPlace`` is inclusive and ``amount``
@@ -67,13 +70,14 @@ class CompetitionResource(Resource):
     def queue_position(self) -> Any:
         """``GET /competition/queue-position`` — your own competition standing.
 
-        Returns ``{position, queueCount, leaderboardPosition, referralCount,
-        estimatedRoundEntry}``. ``leaderboardPosition`` is your rank on the
-        board currently being served — live while a round is ``ACTIVE``, your
-        final placement in the round that just ended during the break. It ranks
-        you against the FULL board, so it is set even when you place below the
-        cut ``leaderboard.get()`` serves, and is ``None`` when you are not on
-        the board at all. ``position`` is your place in the admission queue and
+        Returns ``{position, queueCount, leaderboardPosition, leaderboardPoints,
+        referralCount, estimatedRoundEntry}``. ``leaderboardPosition`` is your
+        rank on the board currently being served — live while a round is
+        ``ACTIVE``, your final placement in the round that just ended during the
+        break — and ``leaderboardPoints`` your points on it. Both come from the
+        FULL board, so they are set even when you place below the cut
+        ``leaderboard.get()`` serves, and are ``None`` when you are not on the
+        board at all. ``position`` is your place in the admission queue and
         ``estimatedRoundEntry`` the round number that position is on track to
         get you into (both ``None`` once you are admitted, or when you are not
         eligible to queue). Usually only ``position`` or ``leaderboardPosition``
@@ -81,8 +85,9 @@ class CompetitionResource(Resource):
         if you were bottom-culled — back in the queue and still on the frozen
         board.
 
-        Raises :class:`~loaf.exceptions.LoafServiceUnavailableError` (503) while
-        the shared queue snapshot is being rebuilt — transient, so retry.
+        Raises :class:`~loaf.exceptions.LoafServiceUnavailableError` (503
+        ``Queue position is being refreshed; please retry shortly``) while the
+        shared queue snapshot is being rebuilt — transient, so retry.
         """
         return self._client.get("/competition/queue-position")
 
@@ -90,12 +95,14 @@ class CompetitionResource(Resource):
         """``GET /competition/payout-details`` — have you claimed your prize yet?
 
         The read-only counterpart of :meth:`submit_payout_details`, for the
-        most-recently ENDED round. Returns ``{eligible, roundNumber, place,
-        submission}``: a non-``None`` ``submission`` (``payoutType``,
+        most recent ENDING or ENDED round. Returns ``{eligible, roundNumber,
+        place, submission}``: a non-``None`` ``submission`` (``payoutType``,
         ``walletAddress``, ``email``, ``submittedAt``) means the prize is
         already claimed and a further POST would 409; ``None`` means still
         claimable. Not being a winner — or no round having ended — answers 200
-        with ``eligible: False`` rather than raising.
+        with ``eligible: False`` rather than raising, but every caller gets
+        :class:`~loaf.exceptions.LoafServiceUnavailableError` (503) while the
+        ``ENDING`` round's final results are still being frozen (retry).
         """
         return self._client.get("/competition/payout-details")
 
@@ -104,9 +111,9 @@ class CompetitionResource(Resource):
     ) -> Any:
         """``POST /competition/payout-details`` — nominate where prize money goes.
 
-        For winners of the most-recently ENDED round only. Provide EXACTLY ONE
-        of ``wallet_address`` (an on-chain address) or ``email``. Returns
-        ``{eligible, roundNumber, place, submission}``.
+        For winners of the most recent ENDING or ENDED round only. Provide
+        EXACTLY ONE of ``wallet_address`` (an on-chain address) or ``email``.
+        Returns ``{eligible, roundNumber, place, submission}``.
 
         A claim is ONE-SHOT — the first nomination stands, and re-submitting
         raises :class:`~loaf.exceptions.LoafConflictError` (409) instead of

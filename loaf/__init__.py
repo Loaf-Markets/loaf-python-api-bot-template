@@ -4,9 +4,10 @@ Quick start::
 
     from loaf import LoafClient
 
-    loaf = LoafClient(api_key="your-api-key")     # or set $LOAF_API_KEY
-    print(loaf.portfolio.component().cash)
-    print(loaf.market.properties())
+    loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_SECRET_KEY
+    print(loaf.portfolio.component().balances)
+    print(loaf.market.list())
+    loaf.orders.limit_buy("MUS", quantity=10, price=167.49)   # signed with your trading key
 
 See the README for the full guide.
 """
@@ -18,35 +19,32 @@ from ._version import __version__
 from .client import LoafClient
 from .constants import (
     DEFAULT_BASE_URL,
-    MARKET_ORDER_PRICE,
+    DEFAULT_MAX_SLIPPAGE_BPS,
+    L2_BUFFER_MS,
+    L2_FEE_RATE_CAP,
     MAX_PRICE_DECIMALS,
     MAX_QUANTITY_DECIMALS,
 )
 from .enums import (
     CONDITIONAL_ORDER_TYPES,
+    AssetKind,
     CandleResolution,
     CompetitionRoundStatus,
     ConditionalOrderStatus,
     ConditionalOrderType,
     IpoStatus,
-    OfferingOrderStatus,
+    MarketStatus,
+    MarketType,
     OrderSide,
     OrderStatus,
     OrderType,
-    PropertyStatus,
     TimeInForce,
-    TradeStatus,
-    TransferStatus,
-    TransferType,
     WSMessageType,
     is_conditional_order,
 )
 from .exceptions import (
-    CompetitionEligibilityError,
-    KycRequiredError,
     LoafAPIError,
     LoafAuthError,
-    LoafBusinessRuleError,
     LoafConfigError,
     LoafConflictError,
     LoafConnectionError,
@@ -57,9 +55,10 @@ from .exceptions import (
     LoafServerError,
     LoafServiceUnavailableError,
     LoafValidationError,
+    OrderOutcomeUnknownError,
     TradingHaltedError,
 )
-from .money import bps_to_fraction, fraction_to_bps
+from .money import bps_to_fraction, fraction_to_bps, from_base_units, worst_price
 from .ws import LoafWebSocketClient
 
 __all__ = [
@@ -70,7 +69,9 @@ __all__ = [
     "LoafObject",
     # constants
     "DEFAULT_BASE_URL",
-    "MARKET_ORDER_PRICE",
+    "DEFAULT_MAX_SLIPPAGE_BPS",
+    "L2_BUFFER_MS",
+    "L2_FEE_RATE_CAP",
     "MAX_PRICE_DECIMALS",
     "MAX_QUANTITY_DECIMALS",
     # enums
@@ -80,12 +81,10 @@ __all__ = [
     "TimeInForce",
     "OrderStatus",
     "ConditionalOrderStatus",
-    "TradeStatus",
-    "OfferingOrderStatus",
-    "PropertyStatus",
+    "MarketType",
+    "MarketStatus",
+    "AssetKind",
     "IpoStatus",
-    "TransferType",
-    "TransferStatus",
     "CandleResolution",
     "CompetitionRoundStatus",
     "WSMessageType",
@@ -95,20 +94,20 @@ __all__ = [
     # unit helpers
     "bps_to_fraction",
     "fraction_to_bps",
+    "from_base_units",
+    "worst_price",
     # exceptions
     "LoafError",
     "LoafConfigError",
     "LoafConnectionError",
+    "OrderOutcomeUnknownError",
     "LoafAPIError",
     "LoafAuthError",
     "LoafForbiddenError",
-    "KycRequiredError",
     "TradingHaltedError",
-    "CompetitionEligibilityError",
     "LoafValidationError",
     "LoafNotFoundError",
     "LoafConflictError",
-    "LoafBusinessRuleError",
     "LoafRateLimitError",
     "LoafServerError",
     "LoafServiceUnavailableError",
