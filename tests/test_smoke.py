@@ -7,12 +7,14 @@ pure helpers (basis points, object wrapping, URL derivation, error mapping).
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import os
 import pickle
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -132,7 +134,7 @@ def test_errors_survive_pickle_and_copy():
         "(the same order if it landed; if not, it is placed now at the signed price), or find "
         "it in history.orders() by its expiryMs 1800000000000 (every status; openOrders shows "
         "only resting orders). A history miss proves nothing while it can still rest (until its "
-        "expiryMs minus 24 hours)."
+        "expiryMs minus 72 hours)."
     )
     for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
         assert type(clone) is loaf.OrderOutcomeUnknownError
@@ -275,6 +277,27 @@ def test_rate_limit_not_retried_for_non_idempotent_post():
     assert calls["n"] == 1
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [{"Retry-After": "0"}, {"RateLimit-Reset": "0"}, {"Retry-After": "-3"}, {"Retry-After": "nan"}, {}],
+)
+def test_a_rate_limit_hint_of_zero_or_less_still_backs_off(monkeypatch, headers):
+    slept: list = []
+    monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=slept.append))
+    monkeypatch.setattr("loaf.client.random", SimpleNamespace(uniform=lambda low, high: high))
+    make_client(lambda r: httpx.Response(200, json={}))._sleep_backoff(0, httpx.Response(429, headers=headers))
+    assert slept == [0.5]  # the first exponential step, as with no hint at all
+
+
+@pytest.mark.parametrize("value, expected", [("3", 3.0), ("120", 60.0)])
+def test_a_positive_rate_limit_hint_is_honoured(monkeypatch, value, expected):
+    slept: list = []
+    monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=slept.append))
+    response = httpx.Response(429, headers={"Retry-After": value})
+    make_client(lambda r: httpx.Response(200, json={}))._sleep_backoff(0, response)
+    assert slept == [expected]
+
+
 def test_candles_params_and_no_auth():
     seen = {}
 
@@ -408,6 +431,38 @@ def test_iter_history_follows_the_cursor(key, iterate):
         (f"/api/history/{key}", {"pageSize": "2"}),
         (f"/api/history/{key}", {"pageSize": "2", "cursor": "MTAwOjI"}),
     ]
+
+
+def test_a_repeated_cursor_stops_paging():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.params.get("cursor"))
+        return httpx.Response(200, json={"orders": [{"id": 1}], "nextCursor": "same"})
+
+    pages = make_client(handler).history.iter_orders(page_size=1)
+    assert [next(pages).id, next(pages).id] == [1, 1]
+    with pytest.raises(loaf.LoafError, match="already given"):
+        next(pages)
+    assert sent == [None, "same"]
+
+
+def test_a_candle_page_that_does_not_move_back_stops_paging():
+    pages = {
+        None: {"resolution": "1m", "candles": [{"time": 100}], "oldestTs": 100, "hasMore": True},
+        "100": {"resolution": "1m", "candles": [{"time": 100}], "oldestTs": 100, "hasMore": True},
+    }
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.params.get("to"))
+        return httpx.Response(200, json=pages[request.url.params.get("to")])
+
+    candles = make_client(handler).market.iter_candles("OPRA", "1m")
+    assert [c.time for c in itertools.islice(candles, 2)] == [100, 100]
+    with pytest.raises(loaf.LoafError, match="stopped paging"):
+        next(candles)
+    assert sent == [None, "100"]
 
 
 def test_competition_endpoints():

@@ -521,7 +521,7 @@ class LoafClient:
     def _sleep_backoff(self, attempt: int, response: httpx.Response | None = None) -> None:
         if response is not None:
             hinted = self._retry_after_seconds(response)
-            if hinted is not None:
+            if hinted is not None and hinted > 0:  # a hint of 0 or less would retry at once
                 time.sleep(min(hinted, 60.0))
                 return
         # Exponential backoff with full jitter, capped at 30s; a capped exponent never overflows.

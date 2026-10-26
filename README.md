@@ -375,9 +375,9 @@ not resume a property that is individually halted; the frame accounts for that.
 ### Order life
 
 Every order expires. `ttl_ms=` on any placement sets how long it may rest, from
-one minute (`60_000`) to about 47.9 days; it is 7 days when omitted. The SDK
-signs the expiry `l2ExpiryMs` = now + 24 hours + `ttl_ms` (`expiryMs` on order
-rows): the exchange stops filling the order 24 hours before it and cancels it, a
+one minute (`60_000`) to about 45.9 days; it is 7 days when omitted. The SDK
+signs the expiry `l2ExpiryMs` = now + 72 hours + `ttl_ms` (`expiryMs` on order
+rows): the exchange stops filling the order 72 hours before it and cancels it, a
 `CANCELLED` you did not request. TP/SL legs share their
 parent's life. An ARMED stop, take or leg is not cancelled when its life ends:
 one that fires later FAILS, so cancel and re-arm stops before then (see
@@ -424,7 +424,7 @@ longest `ttl_ms`, weeks for the default and shorter.
     who holds `e.signed_body` can place it the same way, with no key, so keep
     it out of logs and alerts. Otherwise find it in `loaf.history.orders()` by
     its `expiryMs` (`e.signed_body["l2ExpiryMs"]`): a miss proves nothing while
-    it can still rest (until `expiryMs` minus 24 hours, its `ttl_ms` after
+    it can still rest (until `expiryMs` minus 72 hours, its `ttl_ms` after
     signing).
 - **The order-number allowance.** Every order signs an order number reserved to
   your account, and the exchange caps how many an account holds reserved but
@@ -669,7 +669,7 @@ your API key authenticated as, so an anonymous connection is refused with an
   `filledQuantity`.
 - `order_status` `CANCELLED` carries the cancelled remainder in
   `quantityLeft`. It also arrives for orders you never cancelled: the
-  order's expiry (24 h before `expiryMs`), an epoch move (a Reset
+  order's expiry (72 h before `expiryMs`), an epoch move (a Reset
   trading key, or a cancel-all sent on chain), a closed market, a BUY that can
   no longer fund a fill within its hold, your own order crossing a resting one
   of yours (the resting one is cancelled), and a firing stop freeing funds by
@@ -800,8 +800,9 @@ headers (snapshot at `loaf.last_rate_limit`). Order placements, cancels,
 order-number reservations, portfolio reads and competition queue/payout calls
 are additionally limited **per account** (a placement counts for the account
 it is signed for), so rotating IPs doesn't raise the ceiling. Reads are retried
-automatically on 429, 503 and network errors, with backoff that honours
-`RateLimit-Reset` / `Retry-After`; the reads a placement makes before it signs
+automatically on 429, 503 and network errors, with backoff that honours a
+positive `RateLimit-Reset` / `Retry-After` (one of 0 or less backs off
+exponentially, as with none); the reads a placement makes before it signs
 raise a 429 at once instead, since a late order is stale. Order placements are
 re-sent unchanged on network errors and server errors after a short jittered
 pause, not the rate-limit headers (see **Signing & retries**), but never on a
