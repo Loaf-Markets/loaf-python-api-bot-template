@@ -237,8 +237,10 @@ class TradeTick(TypedDict, total=False):
 
     On a perps market the tape also carries liquidation takes: a liquidated position taken
     against a resting order. A take has ``isLiquidation: True`` and is no trade: it has no
-    ``txHash`` key, and its ``aggressorSide`` is the liquidated side. A trade always has its
-    ``txHash``, and ``isLiquidation`` absent or ``False``: read ``tick.get("txHash")``."""
+    ``txHash`` key, its ``aggressorSide`` is the liquidated side, and its ``tradeId`` is the
+    liquidation's journal seq, the ``perpsSeq`` of its maker's ``liquidation_fill``. A trade
+    always has its ``txHash``, and ``isLiquidation`` absent or ``False``: read
+    ``tick.get("txHash")``."""
 
     tradeId: int
     propertyId: int
@@ -341,10 +343,10 @@ class TradeProofStatus(TypedDict, total=False):
 class LiquidationFill(TypedDict):
     """A ``liquidation_fill`` frame's ``fill``: a liquidation took from your resting order on a
     perps market. It is a fill of that order but no trade (no ``tradeId``, no ``txHash``):
-    ``perpsSeq`` names it. You are its maker and pay no fee; amounts are display units, as a
-    trade's."""
+    ``perpsSeq`` names it, and the take's tape print (``isLiquidation: True``) carries it as its
+    ``tradeId``. You are its maker and pay no fee; amounts are display units, as a trade's."""
 
-    perpsSeq: int  # the liquidation's journal seq
+    perpsSeq: int  # the liquidation's journal seq = its tape print's tradeId
     orderId: int  # your order it filled
     propertyId: int
     ticker: str

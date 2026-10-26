@@ -332,7 +332,10 @@ class LoafWebSocketClient:
 
         It is a fill of your order, at its price, but no trade: ``fill`` has
         no ``tradeId`` or ``txHash``, and ``fill.perpsSeq`` (the liquidation's
-        journal seq) names it. ``fill.orderId`` is your order, ``fill.role``
+        journal seq) names it. The take's public print (:meth:`on_trades`,
+        ``isLiquidation: True``) carries the same seq as its ``tradeId``, so
+        a client that follows both the tape and its fills counts the take
+        once by that seq, whichever arrives first. ``fill.orderId`` is your order, ``fill.role``
         ``"MAKER"``, and ``fill.fee`` 0 (a liquidation's maker pays none). The
         order's status moves with an ``order_status`` frame, as with a trade's
         fill, and the balances with ``balances_update``. Count it with your
