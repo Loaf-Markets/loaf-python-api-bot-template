@@ -333,12 +333,35 @@ def test_a_reply_without_a_usable_collateral_is_a_server_error(
 ):
     exchange.perps_collateral = collateral
     perps = trading_client().perps
-    # Never a silent default: no amount is counted, and no op signed, without the served one.
-    for call in (lambda: perps.add_margin(5), lambda: perps.exit(4), perps.collateral):
+    # Never a silent default: no amount is counted, and no allocate signed, without the served
+    # one; each try reads the reply again.
+    for call in (lambda: perps.add_margin(5), perps.collateral, lambda: perps.add_margin(5)):
         with pytest.raises(loaf.LoafServerError, match="answered no usable collateral"):
             call()
-    assert exchange.posts("/l2/allocations") == exchange.posts("/l2/exits") == []
+    assert exchange.posts("/l2/allocations") == []
     assert routes(exchange.requests) == ["GET /l2/perps/markets"] * 3
+
+
+@pytest.mark.parametrize(
+    "collateral",
+    [None, {k: v for k, v in PERPS_COLLATERAL.items() if k != "tickSize"}],
+    ids=["missing", "no-tickSize"],
+)
+def test_an_exit_needs_no_collateral(exchange, trading_client, collateral):
+    # An exit moves no amount: a reply without a usable collateral never blocks it, as nothing
+    # unrelated may block a position's way out.
+    exchange.perps_collateral = collateral
+    perps = trading_client().perps
+    assert perps.exit(4, pool=1) == {"journalSeq": 1001, "duplicate": False}
+    (body,) = exchange.bodies("/l2/exits")
+    assert (body["pool"], body["market"], body["l2ChainId"]) == (1, 4, 4242)
+    verify_op(body)
+    # An allocate still refuses it, and the exit's read stays good for the next exit.
+    with pytest.raises(loaf.LoafServerError, match="answered no usable collateral"):
+        perps.add_margin(5)
+    perps.exit(4, pool=2)
+    assert len(exchange.bodies("/l2/exits")) == 2
+    assert exchange.posts("/l2/allocations") == []
 
 
 def test_ops_need_both_keys(exchange, trading_client):

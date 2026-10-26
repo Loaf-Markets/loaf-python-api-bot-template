@@ -40,9 +40,9 @@ exchange moves whole ticks of it: the SDK turns the amount into ticks with the
 collateral ``GET /l2/perps/markets`` serves (:meth:`PerpsResource.collateral`:
 ticks = amount x 10^``decimals`` / ``tickSize``), and refuses an amount that is
 not a whole number of ticks, or a reply without a usable collateral (it never
-assumes one). The reads are the engine's units, not dollars: every amount of
-64 bits or more is a decimal string, and :meth:`PerpsResource.positions` lists
-their units.
+assumes one; an exit, which moves no amount, never needs it). The reads are the
+engine's units, not dollars: every amount of 64 bits or more is a decimal
+string, and :meth:`PerpsResource.positions` lists their units.
 """
 
 from __future__ import annotations
@@ -109,11 +109,11 @@ class PerpsResource(Resource):
         super().__init__(client)
         # One op at a time: each signs the nonce GET /l2/keys serves, which only an applied op moves.
         self._lock = threading.Lock()
-        #: The L2 chain id every op signs and the collateral an allocate's amount is counted in,
-        #: read once with the perps markets (under ``_terms_lock``); dropped on the chain id's
-        #: refusal.
+        #: The L2 chain id every op signs and the perps markets' reply it came from (whose
+        #: collateral only an allocate reads), read once (under ``_terms_lock``); dropped on the
+        #: chain id's refusal, or when an allocate finds no usable collateral in it.
         self._terms_lock = threading.Lock()
-        self._market_terms: tuple[int, _Collateral] | None = None
+        self._market_terms: tuple[int, Any] | None = None
 
     # -- Markets ------------------------------------------------------------ #
 
@@ -302,7 +302,7 @@ class PerpsResource(Resource):
                 "from one to the other"
             )
         ttl = _op_ttl(ttl_ms)
-        ticks = _ticks(value, amount, self._terms()[1])
+        ticks = _ticks(value, amount, self._collateral())
 
         def message(chain_id: int, account_index: int, nonce: int, expiry_ms: int) -> bytes:
             return k1.allocate_message(
@@ -347,7 +347,9 @@ class PerpsResource(Resource):
         very large one, as much as one exit can carry, and the exchange closes
         the rest itself. It refuses an exit in a market that has not expired,
         or of a pool with no position there (422). ``ttl_ms`` and the answer
-        are as in :meth:`allocate`, and so are the errors.
+        are as in :meth:`allocate`, and so are the errors, but for the
+        collateral: an exit moves no amount, so a perps markets reply without a
+        usable collateral never blocks it.
         """
         key = self._credentials()
         index = _ranged(market, "market", 0, PERPS_LAST, "a perps market index")
@@ -458,8 +460,20 @@ class PerpsResource(Resource):
                     self._market_terms = None  # the deployment moved: read it again
                 raise
 
-    def _terms(self) -> tuple[int, _Collateral]:
-        """The L2 chain id every op signs and the collateral: the perps markets', read once."""
+    def _collateral(self) -> _Collateral:
+        """The collateral an allocate's amount is counted in, from the perps markets' reply. Only
+        an allocate needs it: an exit, which moves no amount, never waits on it."""
+        terms = self._terms()
+        try:
+            return _collateral_of(terms[1])
+        except LoafServerError:
+            with self._terms_lock:
+                if self._market_terms is terms:
+                    self._market_terms = None  # read the reply again next time
+            raise
+
+    def _terms(self) -> tuple[int, Any]:
+        """The L2 chain id every op signs, and the perps markets' reply it came from: read once."""
         with self._terms_lock:
             if self._market_terms is not None:
                 return self._market_terms
@@ -484,7 +498,7 @@ class PerpsResource(Resource):
                     status_code=200,
                     body=answer,
                 )
-            self._market_terms = (chain_id, _collateral_of(answer))
+            self._market_terms = (chain_id, answer)
             return self._market_terms
 
 
