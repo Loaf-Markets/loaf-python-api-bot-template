@@ -178,6 +178,23 @@ def test_round_update_reaches_on_round_update():
     assert seen == [round_update]
 
 
+def test_a_liquidation_fill_reaches_on_liquidation_fill_not_on_trade():
+    # A liquidation took from the user's resting perps order: a fill of it that is no trade.
+    ws = _client()
+    fills, trades = [], []
+    ws.on_liquidation_fill(fills.append)
+    ws.on_trade(trades.append)
+    fill = {
+        "perpsSeq": 990, "orderId": 77, "propertyId": 12, "ticker": "PRP1", "side": "BUY",
+        "role": "MAKER", "quantity": 1.5, "price": 26.1, "fee": 0, "executedAt": 1_800_000_002,
+    }
+    ws._dispatch(_frame(type="liquidation_fill", fill=fill, timestamp=0))
+    assert trades == []
+    (frame,) = fills
+    assert frame.fill == fill
+    assert (frame.fill.orderId, frame.fill.perpsSeq, frame.fill.role) == (77, 990, "MAKER")
+
+
 def test_perps_markets_live_reaches_its_handler():
     ws = _client()
     seen = []

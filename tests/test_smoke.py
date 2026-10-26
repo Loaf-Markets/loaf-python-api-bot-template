@@ -402,6 +402,11 @@ def test_a_liquidation_take_on_the_tape():
     hints = typing.get_type_hints(models.TradeTick)
     assert hints["isLiquidation"] is bool and hints["txHash"] is str
     assert {"isLiquidation", "txHash"} <= models.TradeTick.__optional_keys__
+    # The maker side of a take is the user's liquidation fill: a fill, no trade.
+    assert models.LiquidationFill.__required_keys__ == {
+        "perpsSeq", "orderId", "propertyId", "ticker", "side", "role", "quantity", "price", "fee",
+        "executedAt",
+    }
 
 
 def test_trades_params_and_no_auth():

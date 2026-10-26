@@ -84,3 +84,12 @@ def test_a_reconnect_during_the_read_asks_again(monkeypatch: pytest.MonkeyPatch)
     strategy = _bot(monkeypatch).Strategy(client, "MUS")
     strategy.on_tick()
     assert strategy.needs_seed  # that read began before the feed went live: read again
+
+
+def test_a_liquidation_fill_is_reported_as_a_fill(monkeypatch: pytest.MonkeyPatch, capsys):
+    strategy = _bot(monkeypatch).Strategy(SimpleNamespace(), "PRP1")
+    fill = {"perpsSeq": 990, "orderId": 77, "ticker": "PRP1", "side": "BUY", "quantity": 1.5,
+            "price": 26.1}
+    strategy.on_my_liquidation_fill(LoafObject({"type": "liquidation_fill", "fill": fill}))
+    printed = capsys.readouterr().out
+    assert "FILLED by a liquidation: BUY 1.5 PRP1 @ 26.1 (order #77, seq 990)" in printed

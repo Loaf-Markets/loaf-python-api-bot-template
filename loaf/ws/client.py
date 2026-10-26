@@ -38,6 +38,7 @@ perps:markets       public    every perps market's live state, about once a seco
 leaderboard         public    competition leaderboard (top entries) on change
 competition         public    round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT)
 portfolio           PRIVATE   your order transitions, fills, queue places and whole L2 balance book
+                              (and a liquidation's fill of your resting perps order)
 ==================  ========  ===========================================
 
 Prices and quantities are human units (dollars / tokens); ``balances_update``
@@ -194,7 +195,7 @@ class LoafWebSocketClient:
     def on_trades(self, handler: Handler | None = None) -> Any:
         """A property's public trades (``trades_batch``: ``{propertyId, trades}``,
         each a :class:`~loaf.models.TradeTick`; on a perps market a liquidation
-        take too, ``isLiquidation: True``, which may have no ``txHash``).
+        take too, ``isLiquidation: True``, with no ``txHash``).
 
         Every trade is pushed, in at most one frame per property every 100 ms:
         each frame holds every trade printed since the previous one, newest
@@ -319,8 +320,27 @@ class LoafWebSocketClient:
         only. Match a fill to its order by ``trade.orderId``, not by frame
         order. Delivery is at most once (no replay after a reconnect), so
         reconcile with ``history.trades()``.
+
+        A liquidation's take from one of your resting perps orders fills it
+        but is no trade: it comes to :meth:`on_liquidation_fill`, not here.
         """
         return self.on(WSMessageType.TRADE_NEW, handler)
+
+    def on_liquidation_fill(self, handler: Handler | None = None) -> Any:
+        """A liquidation took from one of your resting orders on a perps market
+        (``liquidation_fill``: ``{fill}``, a :class:`~loaf.models.LiquidationFill`).
+
+        It is a fill of your order, at its price, but no trade: ``fill`` has
+        no ``tradeId`` or ``txHash``, and ``fill.perpsSeq`` (the liquidation's
+        journal seq) names it. ``fill.orderId`` is your order, ``fill.role``
+        ``"MAKER"``, and ``fill.fee`` 0 (a liquidation's maker pays none). The
+        order's status moves with an ``order_status`` frame, as with a trade's
+        fill, and the balances with ``balances_update``. Count it with your
+        trade fills wherever you track an order's fills or your position.
+        Delivery is at most once. A liquidation of your own position closes it
+        instead: see :meth:`loaf.resources.perps.PerpsResource.closes`.
+        """
+        return self.on(WSMessageType.LIQUIDATION_FILL, handler)
 
     def on_order_queue(self, handler: Handler | None = None) -> Any:
         """Your resting orders' places in one property's book (``order_queue``:

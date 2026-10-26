@@ -60,8 +60,10 @@ class MarketResource(Resource):
 
         ``recentTrades`` holds the newest trades first (at most 20), each with a
         ``txHash``: the trade's content hash (``0x`` + 64 hex), not an on-chain
-        transaction. ``orderBook`` is ``None`` when the property is not LIVE or
-        no fresh book is known: treat ``None`` as unknown, not empty.
+        transaction (a perps market's liquidation take has ``isLiquidation:
+        True`` and no ``txHash``: :class:`~loaf.models.TradeTick`).
+        ``orderBook`` is ``None`` when the property is not LIVE or no fresh book
+        is known: treat ``None`` as unknown, not empty.
 
         ``property.isHalted`` is the effective trading-halt flag (this
         property's own state OR'd with the platform-wide kill switch); it is
@@ -149,7 +151,7 @@ class MarketResource(Resource):
         ``tradeId`` is above ``after_trade_id`` (0: from the first), each
         ``{tradeId, propertyId, txHash, aggressorSide, price, quantity,
         timestamp}`` as the channel pushes it (a perps market's liquidation
-        take has ``isLiquidation: True`` and may have no ``txHash``:
+        take has ``isLiquidation: True`` and no ``txHash``:
         :class:`~loaf.models.TradeTick`). While a page comes back full,
         pass its last ``tradeId`` as ``after_trade_id`` for the next; stop at
         an empty or short page, or one whose last ``tradeId`` is not above the

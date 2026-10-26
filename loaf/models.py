@@ -236,13 +236,13 @@ class TradeTick(TypedDict, total=False):
     or a ``market.trades`` row (oldest first).
 
     On a perps market the tape also carries liquidation takes: a liquidated position taken
-    against a resting order. A take has ``isLiquidation: True`` and is no trade: it may have no
-    ``txHash``, and its ``aggressorSide`` is the liquidated side. A trade always has its
-    ``txHash``, and ``isLiquidation`` absent or ``False``."""
+    against a resting order. A take has ``isLiquidation: True`` and is no trade: it has no
+    ``txHash`` key, and its ``aggressorSide`` is the liquidated side. A trade always has its
+    ``txHash``, and ``isLiquidation`` absent or ``False``: read ``tick.get("txHash")``."""
 
     tradeId: int
     propertyId: int
-    txHash: str  # the trade's content hash (0x + 64 hex), not an on-chain transaction
+    txHash: str  # a trade's content hash (0x + 64 hex), not an on-chain tx; absent on a take
     aggressorSide: str  # OrderSide of the taker (a take's: the liquidated side)
     price: float
     quantity: float
@@ -336,6 +336,24 @@ class TradeProofStatus(TypedDict, total=False):
     l2TradeDigest: str  # 64 hex, no 0x
     batchTxHash: Optional[str]  # the transaction that executed the batch; None until then
     final: bool
+
+
+class LiquidationFill(TypedDict):
+    """A ``liquidation_fill`` frame's ``fill``: a liquidation took from your resting order on a
+    perps market. It is a fill of that order but no trade (no ``tradeId``, no ``txHash``):
+    ``perpsSeq`` names it. You are its maker and pay no fee; amounts are display units, as a
+    trade's."""
+
+    perpsSeq: int  # the liquidation's journal seq
+    orderId: int  # your order it filled
+    propertyId: int
+    ticker: str
+    side: str  # OrderSide of your order
+    role: str  # "MAKER"
+    quantity: float
+    price: float
+    fee: float  # dollars; 0 for the maker of a liquidation
+    executedAt: int  # unix seconds
 
 
 class TradeHistoryItem(TypedDict, total=False):
@@ -514,6 +532,7 @@ __all__ = [
     "OrderQueueEntry",
     "TradeProofStatus",
     "TradeHistoryItem",
+    "LiquidationFill",
     "L2AssetBalance",
     "Position",
     "PortfolioComponent",

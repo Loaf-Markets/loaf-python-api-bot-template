@@ -728,7 +728,7 @@ Channels:
 | `leaderboard` | public | `on_leaderboard` | competition leaderboard (top entries), on change |
 | `perps:markets` | public | `on_perps_markets_live` | every perps market's live state, as `perps.markets_live()` serves it, about once a second — replace what you hold |
 | `competition` | public | `on_round_update` | round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT); no initial frame — seed from `competition.info()` |
-| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_order_queue`, `on_lifetime_volume` | your account deltas, and your resting orders' places in their books |
+| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_liquidation_fill`, `on_order_queue`, `on_lifetime_volume` | your account deltas, and your resting orders' places in their books; a liquidation's take from your resting perps order is a fill but no trade: `on_liquidation_fill`, not `on_trade` |
 
 The private channel carries no id: the server resolves it from the account
 your API key authenticated as, so an anonymous connection is refused with an

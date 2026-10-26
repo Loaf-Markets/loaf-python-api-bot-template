@@ -43,6 +43,10 @@ def main() -> None:
     ws.on_trade(lambda m: print(f"FILL {m.trade.side} {m.trade.quantity} "
                                 f"{m.trade.ticker} @ {m.trade.price} "
                                 f"fee={m.trade.fee} #{m.trade.tradeId} {m.trade.txHash[:10]}"))
+    # A liquidation's take from your resting perps order: a fill, but no trade.
+    ws.on_liquidation_fill(lambda m: print(f"LIQUIDATION FILL {m.fill.side} {m.fill.quantity} "
+                                           f"{m.fill.ticker} @ {m.fill.price} "
+                                           f"order #{m.fill.orderId} seq {m.fill.perpsSeq}"))
     # Every ended connection attempt (code None: no connection was made); it reconnects.
     ws.on_disconnect(lambda m: print(f"DISCONNECTED code={m.code} reason={m.reason!r}"))
     ws.on_error(lambda m: print(f"ERROR {m.get('message')}"))
