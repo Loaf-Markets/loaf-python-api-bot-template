@@ -406,15 +406,17 @@ def verify_order(body: dict, leg: str | None = None) -> None:
 
     The 12 signed terms are rebuilt from the JSON as the exchange reads it, not
     from the SDK's own values: price x 1000 and quantity x 10 rounded like
-    ``Math.round``; a leg signs a SELL of the parent's quantity at its own price,
-    with its own order index and expiry; a conditional signs the order it books
-    (its own side and price). A perps order signs its ``l2Pool`` and
-    ``l2ReduceOnly`` as its base-asset field.
+    ``Math.round``; a leg signs an order of the parent's quantity on the other
+    side, at its own price, with its own order index and expiry; a conditional
+    signs the order it books (its own side and price). A perps order signs its
+    ``l2Pool`` and ``l2ReduceOnly`` as its base-asset field, and a perps leg the
+    parent's ``l2Pool`` with the reduce-only bit (Shared-Types' signedLegSchema).
     """
     signed = body if leg is None else body[leg]
     if "l2Pool" in body:
         # The pool byte, built here and not by the SDK: the pool in bits 0-2, reduce-only bit 3.
-        base_field = body["l2Pool"] + (8 if body["l2ReduceOnly"] is True else 0)
+        reduce_only = leg is not None or body["l2ReduceOnly"] is True
+        base_field = body["l2Pool"] + (8 if reduce_only else 0)
     else:
         base_field = body["l2BaseAssetId"]
     message = k1.order_message(
@@ -422,7 +424,7 @@ def verify_order(body: dict, leg: str | None = None) -> None:
         l2_market_index=body["l2MarketIndex"],
         l2_base_asset_id=base_field,
         l2_quote_asset_id=body["l2QuoteAssetId"],
-        is_ask=leg is not None or body["side"] == "SELL",
+        is_ask=(body["side"] == "SELL") != (leg is not None),
         price=js_round(signed["price"], 1000),
         l2_fee_rate_cap=body["l2FeeRateCap"],
         l2_account_index=body["l2AccountIndex"],

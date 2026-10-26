@@ -44,6 +44,11 @@ PERPS_ORDER_KEYS = (
     "ticker price quantity side type timeInForce l2ChainId l2AccountIndex l2MarketIndex "
     "l2OrderIndex l2Epoch l2FeeRateCap l2ExpiryMs l2Pool l2ReduceOnly l2QuoteAssetId l2SigS l2SigE"
 ).split()
+# Shared-Types' signedLegSchema (0.30.0): a leg's own keys, in the order the SDK sends them, and
+# its l2-constants MAX_ORDER_INDEX and MAX_48.
+LEG_KEYS = "triggerPrice price l2OrderIndex l2ExpiryMs l2SigS l2SigE".split()
+MAX_ORDER_INDEX = 1_099_511_627_775
+MAX_48 = 2**48 - 1
 # PRP1, a property on perps market 4.
 PERPS_DETAIL = property_detail("PRP1", l2_market=PERPS_MARKET, market_price=101.5)
 
@@ -576,15 +581,114 @@ def test_an_expired_perps_market_takes_no_orders(exchange, trading_client):
     assert routes(exchange.requests) == ["GET /trade/PRP1"]
 
 
-def test_a_perps_order_takes_no_take_profit_or_stop_loss_legs(perps_exchange, trading_client):
+def check_legs_as_shared_types(body: dict) -> None:
+    """A perps body's legs against Shared-Types 0.30.0: signedLegSchema (each leg strict, its
+    six fields in range) and orderBodySchema's leg rules (the take-profit beyond the stop-loss
+    and, on a LIMIT parent, the parent's price between them, mirrored on a SELL; every order
+    number its own; never on a reduce-only parent)."""
+    legs = [body[leg] for leg in ("tp", "sl") if leg in body]
+    for leg in legs:
+        assert list(leg) == LEG_KEYS
+        assert leg["triggerPrice"] > 0 and leg["price"] > 0
+        assert 1 <= leg["l2OrderIndex"] <= MAX_ORDER_INDEX
+        assert 0 <= leg["l2ExpiryMs"] <= MAX_48
+        assert all(re.fullmatch("[0-9a-f]{80}", leg[sig]) for sig in ("l2SigS", "l2SigE"))
+    short = body["side"] == "SELL"
+
+    def beyond(a: float, b: float) -> bool:
+        return a < b if short else a > b
+
+    tp, sl = body.get("tp"), body.get("sl")
+    if tp and sl:
+        assert beyond(tp["triggerPrice"], sl["triggerPrice"])
+    if body["type"] == "LIMIT":
+        assert not sl or beyond(body["price"], sl["triggerPrice"])
+        assert not tp or beyond(tp["triggerPrice"], body["price"])
+    numbers = [body["l2OrderIndex"]] + [leg["l2OrderIndex"] for leg in legs]
+    assert len(set(numbers)) == len(numbers)
+    assert body["l2ReduceOnly"] is False
+
+
+@pytest.mark.parametrize("side, pool", [("BUY", 0), ("SELL", 3)])
+def test_a_perps_orders_legs_are_reduce_only_on_its_pool_and_side_opposite(
+    perps_exchange, trading_client, side, pool
+):
     orders = trading_client().orders
-    for legs in ({"tp_price": 110}, {"sl_price": 95}, {"tp_price": 110, "sl_price": 95}):
-        with pytest.raises(
-            loaf.LoafValidationError, match="legs cannot be attached to a perps order"
-        ) as info:
-            orders.limit_buy("PRP1", 2, 101.5, **legs)
+    if side == "BUY":
+        res = orders.limit_buy("PRP1", 2, 101.5, pool=pool, tp_price=110, sl_price=95)
+    else:
+        res = orders.limit_sell("PRP1", 2, 101.5, pool=pool, tp_price=95, sl_price=110)
+    (body,) = perps_exchange.bodies("/orders")
+    assert list(body) == PERPS_ORDER_KEYS + ["tp", "sl"]
+    assert (body["l2Pool"], body["l2ReduceOnly"]) == (pool, False)
+    check_legs_as_shared_types(body)
+    # Each leg trades the other way, 2% past its trigger (the client's max slippage): a BUY's
+    # legs sell below theirs, a SELL's buy above.
+    prices = {"BUY": (107.8, 93.1), "SELL": (96.9, 112.2)}[side]
+    assert (body["tp"]["price"], body["sl"]["price"]) == prices
+    assert body["tp"]["l2ExpiryMs"] == body["sl"]["l2ExpiryMs"] == body["l2ExpiryMs"]
+    assert [body["tp"]["l2OrderIndex"], body["sl"]["l2OrderIndex"]] == [
+        body["l2OrderIndex"] + 1,
+        body["l2OrderIndex"] + 2,
+    ]
+    verify_order(body)
+    other = "SELL" if side == "BUY" else "BUY"
+    for leg in ("tp", "sl"):
+        verify_order(body, leg)
+        # A leg is the reduce-only order of the other side in the parent's pool, its own price,
+        # number and expiry: signed as that, it verifies; without the bit, or on the parent's
+        # side, it does not.
+        own = {k: body[leg][k] for k in ("price", "l2OrderIndex", "l2ExpiryMs", "l2SigS", "l2SigE")}
+        verify_order({**body, **own, "side": other, "l2ReduceOnly": True})
+        for edit in ({"side": other, "l2ReduceOnly": False}, {"side": side, "l2ReduceOnly": True}):
+            with pytest.raises(k1.K1Error):
+                verify_order({**body, **own, **edit})
+    assert res.attachedLegIds == [res.orderId + 1, res.orderId + 2]
+
+
+def test_a_perps_market_sell_with_legs(perps_exchange, trading_client):
+    trading_client().orders.market_sell(
+        "PRP1", 2, pool=1, tp_price=90, sl_price=115, leg_max_slippage_bps=500
+    )
+    (body,) = perps_exchange.bodies("/orders")
+    check_legs_as_shared_types(body)
+    assert (body["tp"]["price"], body["sl"]["price"]) == (94.5, 120.75)  # 5% above, buying
+    for leg in ("tp", "sl"):
+        verify_order(body, leg)
+
+
+@pytest.mark.parametrize(
+    "legs, message",
+    [
+        ({"tp_price": 110, "sl_price": 95}, "tp_price must be below sl_price"),
+        ({"tp_price": 100, "sl_price": 100}, "tp_price must be below sl_price"),
+        ({"sl_price": 101.5}, "sl_price must be above the order price"),
+        ({"sl_price": 95}, "sl_price must be above the order price"),
+        ({"tp_price": 101.5}, "tp_price must be below the order price"),
+        ({"tp_price": 110}, "tp_price must be below the order price"),
+    ],
+)
+def test_a_sells_leg_rules_are_mirrored(perps_exchange, trading_client, legs, message):
+    with pytest.raises(loaf.LoafValidationError, match=message) as info:
+        trading_client().orders.limit_sell("PRP1", 2, 101.5, **legs)
+    assert info.value.status_code == 0
+    assert perps_exchange.requests == []
+
+
+def test_a_reduce_only_order_takes_no_legs(perps_exchange, trading_client):
+    orders = trading_client().orders
+    message = (
+        "Take-profit and stop-loss cannot be attached to a reduce-only order: it opens nothing "
+        "for them to close"
+    )
+    for place in (
+        lambda: orders.limit_sell("PRP1", 2, 101.5, reduce_only=True, tp_price=95),
+        lambda: orders.limit_buy("PRP1", 2, 101.5, pool=2, reduce_only=True, sl_price=95),
+    ):
+        with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
+            place()
         assert info.value.status_code == 0
-    assert routes(perps_exchange.requests) == ["GET /trade/PRP1"]  # read once, then remembered
+    assert perps_exchange.requests == []
 
 
 @pytest.mark.parametrize("message, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])

@@ -738,13 +738,24 @@ def test_leg_rules(exchange, trading_client, legs, message):
 
 def test_leg_rules_side_and_market_parent(exchange, trading_client):
     orders = trading_client().orders
-    with pytest.raises(loaf.LoafValidationError, match="only be attached to a BUY"):
-        orders.create("OPRA", "SELL", 1, price=100, sl_price=90)
-    with pytest.raises(TypeError):
-        orders.limit_sell("OPRA", 1, 100, sl_price=90)  # legs protect a BUY only
     with pytest.raises(loaf.LoafValidationError, match="tp_price must be above sl_price"):
         orders.market_buy("OPRA", 1, tp_price=90, sl_price=95)
     assert exchange.requests == []
+    # Spot has no short to protect: a SELL's legs are refused once its market is read (a perps
+    # SELL takes them).
+    message = (
+        "OPRA trades on a spot market: take-profit and stop-loss can only be attached to a BUY "
+        "order there (spot has no short to protect)"
+    )
+    for place in (
+        lambda: orders.create("OPRA", "SELL", 1, price=100, tp_price=90),
+        lambda: orders.limit_sell("OPRA", 1, 100, tp_price=90, sl_price=110),
+        lambda: orders.market_sell("OPRA", 1, reference_price=100, sl_price=110),
+    ):
+        with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
+            place()
+        assert info.value.status_code == 0
+    assert routes(exchange.requests) == ["GET /trade/OPRA"]  # read once, then remembered
 
     # On a MARKET parent the exchange checks the triggers against its own reference. The legs
     # keep the client's max slippage (2% here) whatever the entry's max_slippage_bps is.

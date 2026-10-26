@@ -592,9 +592,11 @@ loaf.perps.return_margin(1_000_000, pool=0)           # pool 0 -> spot
 
 - **Orders** take `pool=` (0 by default) and `reduce_only=True` (its fills
   may only shrink the pool's position), signed with the order; both are
-  refused on a spot market. TP/SL legs are refused on a perps order: arm each
-  as its own reduce-only stop or take (`create_conditional(..., reduce_only=True)`)
-  on the side that closes the position (a SELL for a long, a BUY for a short).
+  refused on a spot market. TP/SL legs (`tp_price=`, `sl_price=`) attach to a
+  perps BUY or SELL, never to a reduce-only order: each leg is a reduce-only
+  order on the other side in the order's pool. A SELL's are mirrored:
+  `tp_price < price < sl_price`, e.g.
+  `limit_sell("PERP", 2, 104, tp_price=95, sl_price=110)`.
 - **Allocates** (`add_margin`, `return_margin`, `allocate(amount, from_side=,
   to_side=)`, a side a pool or `loaf.PERPS_SPOT_SIDE`, 255, your spot balance)
   and **exits** (`exit(market, pool=)`: closes your position in an EXPIRED
