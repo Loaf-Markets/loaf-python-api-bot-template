@@ -1937,6 +1937,7 @@ def test_resubmit_only_while_the_order_can_rest(exchange, trading_client, l2_clo
     assert info.value.__cause__ is refusal
     until = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(rests_until // 1000))
     assert f"could rest only until {until}" in refusal.message
+    assert "(its l2ExpiryMs minus 72 hours)" in refusal.message  # L2_BUFFER_MS
     assert f"expiryMs {body['l2ExpiryMs']}" in refusal.message
     # Nothing expires a stop, a take or a leg: one that landed must be cancelled.
     assert "stays ARMED" in refusal.message

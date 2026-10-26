@@ -1,9 +1,14 @@
 """K1 signing, offline: K1's known answers, the order, allocate and exit checks
 the web app's signer makes, and the curve's own vectors.
 
-``k1-sign.json`` holds K1's known answers for keys, signatures, orders, perps
-allocates and exits, the vectors the matching engine and the web app run too: a
-match here means a signature made by this SDK verifies there.
+``k1-sign.json`` is K1's known-answer file, every line but its ``about`` text (K1's
+names internal documents): keys, signatures, orders, perps allocates and exits,
+the vectors the matching engine and the web app run too, so a match here means a
+signature made by this SDK verifies there. Its withdraws, price reports and order
+batches are messages this SDK does not build (it signs no withdrawal, report or
+batch): they ride along so the file stays K1's line for line, and the reports'
+signatures are checked like the allocates'. To take a new K1 file, copy it and put
+this file's ``about`` line back.
 """
 
 from __future__ import annotations
@@ -76,8 +81,8 @@ ALLOCATE_KEYS = (
     "l2ChainId", "l2AccountIndex", "fromSide", "toSide", "amount", "l2Nonce", "l2ExpiryMs",
 )
 EXIT_KEYS = ("l2ChainId", "l2AccountIndex", "pool", "market", "l2Nonce", "l2ExpiryMs")
-# The tag byte each kind's KAT signatures repeat as aux.
-OP_TAGS = {"allocates": 23, "exits": 25}
+# The tag byte each signed kind's KAT signatures repeat as aux: price reports', allocates', exits'.
+SIGNED_TAGS = {"reports": 21, "allocates": 23, "exits": 25}
 # The field each message refusal code of an allocate or an exit names.
 OP_REFUSED_FIELD = {
     "E_MSG_CHAIN_ID": "l2_chain_id",
@@ -143,7 +148,7 @@ def refused(code: str, call: Any, *args: Any, **kwargs: Any) -> K1Error:
 
 def test_kat_file_is_unchanged():
     digest = hashlib.sha256(KAT_FILE.read_bytes()).hexdigest()
-    assert digest == "68b2c48b5a67f4ccb501a27cc24e2caa0a77b4efe571354ac99d8201588ca1e2"
+    assert digest == "75d479b9b8227acff7e57b34ba96ae8e993d8052361ae583b68eeb855d5289c5"
 
 
 @pytest.mark.parametrize("v", KAT["keys"], ids=lambda v: v["seed"][:8])
@@ -215,12 +220,12 @@ def test_kat_exit_messages(v):
 
 
 @pytest.mark.parametrize(
-    "kind, i", [(kind, i) for kind in OP_TAGS for i in range(3)], ids=lambda x: str(x)
+    "kind, i", [(kind, i) for kind in SIGNED_TAGS for i in range(3)], ids=lambda x: str(x)
 )
-def test_kat_allocate_and_exit_signatures(kind, i):
+def test_kat_report_allocate_and_exit_signatures(kind, i):
     # Vector i is signed with key i, aux its kind's tag byte repeated.
     v, key = KAT[kind][i], KAT["keys"][i]
-    assert v["pk"] == key["pk"] and v["aux"] == f"{OP_TAGS[kind]:02x}" * 32
+    assert v["pk"] == key["pk"] and v["aux"] == f"{SIGNED_TAGS[kind]:02x}" * 32
     m = bytes.fromhex(v["m"])
     s, e = sign(bytes.fromhex(key["sk"]), m, bytes.fromhex(v["aux"]))
     assert (s + e).hex() == v["sig"]

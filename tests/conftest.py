@@ -143,6 +143,8 @@ KEYS = {
 NO_ACCOUNT = "l2 account: no L2 account for this user"
 # The exchange's 422 for a perps op not signed at the account's api key 0 nonce.
 NONCE_REFUSAL = "l2 money: the nonce is not the api key's nonce (tx_nonce == api_key.nonce)"
+# The perps routes that take a user (an API key): the rest of the fake checks no credentials.
+_PERPS_AUTHED = ("GET /l2/perps/positions", "POST /l2/allocations", "POST /l2/exits")
 
 _ENV_VARS = (
     "LOAF_API_KEY",
@@ -225,7 +227,8 @@ class FakeExchange:
     * ``POST /orders`` and ``/orders/conditional`` place the order: 200 with a
       fresh ``orderId`` (and one per attached leg).
     * ``GET /l2/perps/markets`` lists ``perps_markets``; ``GET /l2/perps/positions``
-      serves ``perps_account`` (404 without a trading account).
+      serves ``perps_account`` (404 without a trading account). It and the two
+      perps ops below answer 401 without an API key (``Authorization: Bearer``).
     * ``POST /l2/allocations`` and ``/l2/exits`` apply a signed op at the account's
       nonce (``keys["withdrawalNonce"]``, which moves up by one): 202 with the next
       ``journalSeq``; a re-send of an applied op is its duplicate, and any other op
@@ -266,6 +269,10 @@ class FakeExchange:
 
     def _serve(self, request: httpx.Request) -> httpx.Response:
         route = request.method + " " + request.url.path[len("/api") :]
+        if route in _PERPS_AUTHED and not request.headers.get("authorization", "").startswith(
+            "Bearer "
+        ):
+            return httpx.Response(401, json={"error": "Unauthorized"})
         if route == "GET /trade":
             return httpx.Response(200, json=self._listing())
         if route.startswith("GET /trade/"):
@@ -406,7 +413,8 @@ def verify_order(body: dict, leg: str | None = None) -> None:
     """
     signed = body if leg is None else body[leg]
     if "l2Pool" in body:
-        base_field = k1.perps_base_field(body["l2Pool"], body["l2ReduceOnly"])
+        # The pool byte, built here and not by the SDK: the pool in bits 0-2, reduce-only bit 3.
+        base_field = body["l2Pool"] + (8 if body["l2ReduceOnly"] is True else 0)
     else:
         base_field = body["l2BaseAssetId"]
     message = k1.order_message(
