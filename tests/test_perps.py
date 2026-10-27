@@ -25,6 +25,7 @@ from loaf.constants import DEFAULT_PERPS_OP_TTL_MS, MAX_PERPS_OP_TTL_MS, MIN_ORD
 from conftest import (
     ACCOUNT_INDEX,
     KAT,
+    MARKET_L2,
     MARKET_STATES,
     NONCE_REFUSAL,
     PERPS_ACCOUNT,
@@ -33,7 +34,8 @@ from conftest import (
     PERPS_FUNDING_TICK,
     PERPS_LIVE,
     PERPS_MARKET,
-    property_detail,
+    PERP_L2,
+    market_detail,
     routes,
     verify_op,
     verify_order,
@@ -46,16 +48,16 @@ ALLOCATE_KEYS = (
 EXIT_KEYS = "l2ChainId l2AccountIndex pool market l2Nonce l2ExpiryMs l2SigS l2SigE".split()
 # A perps order's: its pool and reduce-only bit where a spot order's base asset is.
 PERPS_ORDER_KEYS = (
-    "ticker price quantity side type timeInForce l2ChainId l2AccountIndex l2MarketIndex "
-    "l2OrderIndex l2Epoch l2FeeRateCap l2ExpiryMs l2Pool l2ReduceOnly l2QuoteAssetId l2SigS l2SigE"
+    "price quantity side type timeInForce l2ChainId l2AccountIndex l2MarketIndex l2OrderIndex "
+    "l2Epoch l2FeeRateCap l2ExpiryMs l2Pool l2ReduceOnly l2QuoteAssetId l2SigS l2SigE"
 ).split()
 # Shared-Types' signedLegSchema (0.30.0): a leg's own keys, in the order the SDK sends them, and
 # its l2-constants MAX_ORDER_INDEX and MAX_48.
 LEG_KEYS = "triggerPrice price l2OrderIndex l2ExpiryMs l2SigS l2SigE".split()
 MAX_ORDER_INDEX = 1_099_511_627_775
 MAX_48 = 2**48 - 1
-# PRP1, a property on perps market 4.
-PERPS_DETAIL = property_detail("PRP1", l2_market=PERPS_MARKET, market_price=101.5)
+# OPRA-PERP, perp 4.
+PERPS_DETAIL = market_detail("OPRA-PERP", market_index=4, l2=PERP_L2, market_price=101.5)
 
 NOW_MS = 1_800_000_000_000
 WRONG_CHAIN = "l2 chain id: not the engine's L2 chain"
@@ -75,8 +77,8 @@ def error_reply(status: int, message: str) -> httpx.Response:
 
 @pytest.fixture
 def perps_exchange(exchange):
-    """The exchange with PRP1 listed too."""
-    exchange.details["PRP1"] = PERPS_DETAIL
+    """The exchange with OPRA-PERP listed too."""
+    exchange.details["OPRA-PERP"] = PERPS_DETAIL
     return exchange
 
 
@@ -181,11 +183,43 @@ def test_reads_check_their_arguments_locally(exchange, trading_client, read):
     assert exchange.requests == []
 
 
-def test_market_of_a_perps_property():
-    assert market_of(PERPS_DETAIL, "PRP1") == (
-        421614, "0x" + "11" * 20, 4242, 4, 0, 3, "perps", "ACTIVE"
+def test_market_of_a_perp():
+    assert market_of(PERPS_DETAIL, "OPRA-PERP") == (
+        421614, "0x" + "11" * 20, 4242, 4, 0, 3, "PERP", "ACTIVE"
     )
-    assert market_of(property_detail(), "OPRA")[3:] == (2050, 6, 3, "spot", None)
+    assert market_of(market_detail(), "OPRA")[3:] == (2050, 6, 3, "SPOT", None)
+
+
+@pytest.mark.parametrize(
+    "l2, field",
+    [
+        ({**PERP_L2, "chainId": 0}, "chainId"),
+        ({**PERP_L2, "quoteAssetId": 4}, "quoteAssetId"),  # a perp's quote asset is USDC, 3
+        ({**PERP_L2, "quoteAssetId": "3"}, "quoteAssetId"),
+        ({k: v for k, v in PERP_L2.items() if k != "status"}, "status"),
+        ({**PERP_L2, "status": "HALTED"}, "status"),
+        ({**PERP_L2, "status": "active"}, "status"),
+        ({k: v for k, v in PERP_L2.items() if k != "quoteAssetId"}, "quoteAssetId"),
+    ],
+)
+def test_unusable_perp_market(exchange, trading_client, l2, field):
+    exchange.details["OPRA-PERP"] = market_detail("OPRA-PERP", market_index=4, l2=l2)
+    message = f"GET /trade/OPRA-PERP answered an unusable market.l2.{field}"
+    with pytest.raises(loaf.LoafServerError, match=re.escape(message)):
+        trading_client().orders.limit_buy("OPRA-PERP", 2, 101.5)
+    assert routes(exchange.requests) == ["GET /trade/OPRA-PERP"]
+
+
+def test_a_perps_l2_is_no_spot_l2_and_back(exchange, trading_client):
+    # The type decides what an order sends: a perp's l2 served for a spot market is unusable
+    # (no base asset), and a spot l2 served for a perp (no status) too.
+    exchange.details["OPRA"] = market_detail(l2=PERP_L2)
+    with pytest.raises(loaf.LoafServerError, match=re.escape("unusable market.l2.baseAssetId")):
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
+    exchange.details["OPRA-PERP"] = market_detail("OPRA-PERP", market_index=4, l2=MARKET_L2)
+    with pytest.raises(loaf.LoafServerError, match=re.escape("unusable market.l2.status")):
+        trading_client().orders.limit_buy("OPRA-PERP", 2, 101.5)
+    assert exchange.posts("/orders") == []
 
 
 # --------------------------------------------------------------------------- #
@@ -363,7 +397,7 @@ def test_an_amount_is_counted_in_the_collateral_served_not_an_assumed_one(
         dict(PERPS_COLLATERAL, extensionMultiplier=None),
     ],
     ids=[
-        "missing", "not-an-object", "no-tickSize", "assetId-2", "assetId-float", "symbol-empty",
+        "null", "not-an-object", "no-tickSize", "assetId-2", "assetId-float", "symbol-empty",
         "decimals-256", "decimals-text", "decimals-bool", "tickSize-0", "tickSize-number",
         "tickSize-leading-zero", "tickSize-2^128", "extension-2^56", "extension-missing",
     ],
@@ -385,7 +419,7 @@ def test_a_reply_without_a_usable_collateral_is_a_server_error(
 @pytest.mark.parametrize(
     "collateral",
     [None, {k: v for k, v in PERPS_COLLATERAL.items() if k != "tickSize"}],
-    ids=["missing", "no-tickSize"],
+    ids=["null", "no-tickSize"],
 )
 def test_an_exit_needs_no_collateral(exchange, trading_client, collateral):
     # An exit moves no amount: a reply without a usable collateral never blocks it, as nothing
@@ -642,7 +676,7 @@ def test_a_perps_order_signs_its_pool_and_reduce_only_bit(
     perps_exchange, trading_client, pool, reduce_only
 ):
     terms: dict[str, Any] = {} if pool is None else {"pool": pool}
-    trading_client().orders.limit_sell("PRP1", 2, 101.5, reduce_only=reduce_only, **terms)
+    trading_client().orders.limit_sell("OPRA-PERP", 2, 101.5, reduce_only=reduce_only, **terms)
     (body,) = perps_exchange.bodies("/orders")
     assert list(body) == PERPS_ORDER_KEYS
     assert (body["l2MarketIndex"], body["l2Pool"], body["l2ReduceOnly"]) == (
@@ -659,14 +693,14 @@ def test_a_perps_order_signs_its_pool_and_reduce_only_bit(
 
 
 def test_a_perps_market_order(perps_exchange, trading_client):
-    trading_client().orders.market_buy("PRP1", 3, pool=5)
+    trading_client().orders.market_buy("OPRA-PERP", 3, pool=5)
     (body,) = perps_exchange.bodies("/orders")
     assert (body["type"], body["l2Pool"], body["l2ReduceOnly"]) == ("MARKET", 5, False)
     verify_order(body)
 
 
 def test_a_perps_stop_signs_its_pool_and_reduce_only_bit(perps_exchange, trading_client):
-    trading_client().orders.stop_loss("PRP1", 2, 95, pool=1, reduce_only=True)
+    trading_client().orders.stop_loss("OPRA-PERP", 2, 95, pool=1, reduce_only=True)
     (body,) = perps_exchange.bodies("/orders/conditional")
     assert (body["l2Pool"], body["l2ReduceOnly"]) == (1, True)
     assert "l2BaseAssetId" not in body
@@ -675,7 +709,10 @@ def test_a_perps_stop_signs_its_pool_and_reduce_only_bit(perps_exchange, trading
 
 @pytest.mark.parametrize("terms", [{"pool": 0}, {"pool": 3}, {"reduce_only": True}])
 def test_a_spot_order_takes_no_pool_or_reduce_only(exchange, trading_client, terms):
-    message = "OPRA trades on a spot market: pool= and reduce_only= apply to perps markets only"
+    message = (
+        "OPRA is a spot market: pool= and reduce_only= apply to perps only (their tickers end in "
+        "-PERP)"
+    )
     with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
         trading_client().orders.limit_buy("OPRA", 10, 167.49, **terms)
     assert info.value.status_code == 0
@@ -698,8 +735,8 @@ def test_perps_terms_are_checked_before_anything_is_read(
 ):
     orders = trading_client().orders
     for place in (
-        lambda: orders.limit_buy("PRP1", 2, 101.5, **terms),
-        lambda: orders.take_profit("PRP1", 2, 110, **terms),
+        lambda: orders.limit_buy("OPRA-PERP", 2, 101.5, **terms),
+        lambda: orders.take_profit("OPRA-PERP", 2, 110, **terms),
     ):
         with pytest.raises(loaf.LoafValidationError, match=message) as info:
             place()
@@ -707,18 +744,18 @@ def test_perps_terms_are_checked_before_anything_is_read(
     assert perps_exchange.requests == []
 
 
-def test_an_expired_perps_market_takes_no_orders(exchange, trading_client):
-    exchange.details["PRP1"] = property_detail(
-        "PRP1", l2_market={**PERPS_MARKET, "status": "EXPIRED"}
+def test_an_expired_perp_takes_no_orders(exchange, trading_client):
+    exchange.details["OPRA-PERP"] = market_detail(
+        "OPRA-PERP", market_index=4, l2={**PERP_L2, "status": "EXPIRED"}
     )
     message = (
-        "PRP1's perps market (market 4) has expired and takes no orders: close a position in it "
-        "with perps.exit()"
+        "OPRA-PERP (perps market 4) has expired and takes no orders: close a position in it with "
+        "perps.exit()"
     )
     with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
-        trading_client().orders.limit_sell("PRP1", 2, 101.5, reduce_only=True)
+        trading_client().orders.limit_sell("OPRA-PERP", 2, 101.5, reduce_only=True)
     assert info.value.status_code == 0
-    assert routes(exchange.requests) == ["GET /trade/PRP1"]
+    assert routes(exchange.requests) == ["GET /trade/OPRA-PERP"]
 
 
 def check_legs_as_shared_types(body: dict) -> None:
@@ -755,9 +792,9 @@ def test_a_perps_orders_legs_are_reduce_only_on_its_pool_and_side_opposite(
 ):
     orders = trading_client().orders
     if side == "BUY":
-        res = orders.limit_buy("PRP1", 2, 101.5, pool=pool, tp_price=110, sl_price=95)
+        res = orders.limit_buy("OPRA-PERP", 2, 101.5, pool=pool, tp_price=110, sl_price=95)
     else:
-        res = orders.limit_sell("PRP1", 2, 101.5, pool=pool, tp_price=95, sl_price=110)
+        res = orders.limit_sell("OPRA-PERP", 2, 101.5, pool=pool, tp_price=95, sl_price=110)
     (body,) = perps_exchange.bodies("/orders")
     assert list(body) == PERPS_ORDER_KEYS + ["tp", "sl"]
     assert (body["l2Pool"], body["l2ReduceOnly"]) == (pool, False)
@@ -788,7 +825,7 @@ def test_a_perps_orders_legs_are_reduce_only_on_its_pool_and_side_opposite(
 
 def test_a_perps_market_sell_with_legs(perps_exchange, trading_client):
     trading_client().orders.market_sell(
-        "PRP1", 2, pool=1, tp_price=90, sl_price=115, leg_max_slippage_bps=500
+        "OPRA-PERP", 2, pool=1, tp_price=90, sl_price=115, leg_max_slippage_bps=500
     )
     (body,) = perps_exchange.bodies("/orders")
     check_legs_as_shared_types(body)
@@ -810,7 +847,7 @@ def test_a_perps_market_sell_with_legs(perps_exchange, trading_client):
 )
 def test_a_sells_leg_rules_are_mirrored(perps_exchange, trading_client, legs, message):
     with pytest.raises(loaf.LoafValidationError, match=message) as info:
-        trading_client().orders.limit_sell("PRP1", 2, 101.5, **legs)
+        trading_client().orders.limit_sell("OPRA-PERP", 2, 101.5, **legs)
     assert info.value.status_code == 0
     assert perps_exchange.requests == []
 
@@ -822,8 +859,8 @@ def test_a_reduce_only_order_takes_no_legs(perps_exchange, trading_client):
         "for them to close"
     )
     for place in (
-        lambda: orders.limit_sell("PRP1", 2, 101.5, reduce_only=True, tp_price=95),
-        lambda: orders.limit_buy("PRP1", 2, 101.5, pool=2, reduce_only=True, sl_price=95),
+        lambda: orders.limit_sell("OPRA-PERP", 2, 101.5, reduce_only=True, tp_price=95),
+        lambda: orders.limit_buy("OPRA-PERP", 2, 101.5, pool=2, reduce_only=True, sl_price=95),
     ):
         with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
             place()
@@ -836,9 +873,9 @@ def test_a_market_state_refusal_of_an_order(perps_exchange, trading_client, mess
     perps_exchange.queue("/orders", error_reply(403, message))
     orders = trading_client().orders
     with pytest.raises(cls) as info:
-        orders.limit_buy("PRP1", 2, 101.5)
+        orders.limit_buy("OPRA-PERP", 2, 101.5)
     assert type(info.value) is cls and info.value.state == state
     # Nothing was placed: the next order signs the same order number.
-    orders.limit_buy("PRP1", 2, 101.5, reduce_only=True)
+    orders.limit_buy("OPRA-PERP", 2, 101.5, reduce_only=True)
     first, second = perps_exchange.bodies("/orders")
     assert first["l2OrderIndex"] == second["l2OrderIndex"]

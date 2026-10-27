@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from loaf import LoafClient, LoafConfigError, LoafWebSocketClient, from_base_units
+from loaf._object import parse
 
 from conftest import secret_locals
 
@@ -96,14 +97,16 @@ def test_channel_helpers():
     ws.subscribe_chart("OPRA")
     ws.subscribe_mark_price("OPRA")
     ws.subscribe_volume("OPRA")
-    ws.subscribe_property_status("OPRA")
+    ws.subscribe_market_status("OPRA")
+    ws.subscribe_orderbook("H100-PERP")  # a perp's market ticker
     ws.subscribe_leaderboard()
     ws.subscribe_competition()
     ws.subscribe_portfolio()
     ws.subscribe_perps_markets()
     assert ws._channels == {
         "orderbook:OPRA", "trades:OPRA", "chart:OPRA", "markprice:OPRA", "volume:OPRA",
-        "property:OPRA", "leaderboard", "competition", "portfolio", "perps:markets",
+        "market:OPRA", "orderbook:H100-PERP", "leaderboard", "competition", "portfolio",
+        "perps:markets",
     }
 
 
@@ -129,12 +132,40 @@ def test_a_subscribe_as_the_loop_closes_is_left_to_the_next_connection(
     assert [str(w.message) for w in recwarn] == []
 
 
-def test_property_halt_dispatch():
+def test_market_halt_dispatch():
     ws = _client()
     seen = []
-    ws.on_property_halt(seen.append)
-    ws._dispatch(_frame(type="property_halt", propertyId=1, ticker="OPRA", isHalted=True))
-    assert seen[0].ticker == "OPRA" and seen[0].isHalted is True
+    ws.on_market_halt(seen.append)
+    ws._dispatch(_frame(type="market_halt", marketIndex=2050, ticker="OPRA", isHalted=True))
+    assert (seen[0].marketIndex, seen[0].ticker, seen[0].isHalted) == (2050, "OPRA", True)
+
+
+def test_mark_price_frames_match_holdings_by_market_index():
+    # Every markprice channel feeds on_mark_price and a frame names its market by index alone, so
+    # a frame is matched to the holding with that marketIndex, as the README shows. A holding with
+    # None has no spot market: nothing to subscribe, and no frame names it.
+    holdings = parse({"holdings": [
+        {"ticker": "OPRA", "marketIndex": 2050, "isIpoAllocation": False, "assetId": 6},
+        {"ticker": "MUS", "marketIndex": 2049, "isIpoAllocation": False, "assetId": 4},
+        {"ticker": "EFL", "marketIndex": None, "isIpoAllocation": True, "quantity": 5},
+    ]}).holdings
+    by_market = {h.marketIndex: h for h in holdings if h.marketIndex is not None}
+    ws = _client()
+    marks = {}
+
+    @ws.on_mark_price
+    def on_mark(msg):
+        held = by_market.get(msg.marketIndex)
+        if held is not None:
+            marks[held.ticker] = msg.price
+
+    for h in by_market.values():
+        ws.subscribe_mark_price(h.ticker)
+    assert ws._channels == {"markprice:OPRA", "markprice:MUS"}
+    ws._dispatch(_frame(type="mark_price", marketIndex=2049, price=50.5))
+    ws._dispatch(_frame(type="mark_price", marketIndex=2050, price=101.25))
+    ws._dispatch(_frame(type="mark_price", marketIndex=2051, price=7))  # a market none is held on
+    assert marks == {"MUS": 50.5, "OPRA": 101.25}
 
 
 def test_trade_new_dispatch():
@@ -144,7 +175,7 @@ def test_trade_new_dispatch():
     # A fill is final when it matches: its txHash is the trade's content hash from the start.
     tx_hash = "0x" + "3f" * 32
     ws._dispatch(_frame(type="trade_new", trade={
-        "tradeId": 1, "orderId": 991, "propertyId": 1, "ticker": "OPRA", "txHash": tx_hash,
+        "tradeId": 1, "orderId": 991, "marketIndex": 2050, "ticker": "OPRA", "txHash": tx_hash,
         "side": "BUY", "role": "TAKER", "quantity": 1, "price": 100, "executedAt": 0,
         "fee": 0.173, "proof": {"status": "PENDING"},
     }))
@@ -160,9 +191,9 @@ def test_order_queue_dispatch():
     ws.on_order_queue(seen.append)
     entry = {"orderId": 991, "side": "BUY", "price": 159.5, "quantity": 4,
              "quantityAhead": 12.5, "ordersAhead": 3}
-    ws._dispatch(_frame(type="order_queue", propertyId=1, orders=[entry]))
-    ws._dispatch(_frame(type="order_queue", propertyId=1, orders=[]))  # none rests there now
-    assert [(m.propertyId, m.orders) for m in seen] == [(1, [entry]), (1, [])]
+    ws._dispatch(_frame(type="order_queue", marketIndex=2050, orders=[entry]))
+    ws._dispatch(_frame(type="order_queue", marketIndex=2050, orders=[]))  # none rests there now
+    assert [(m.marketIndex, m.orders) for m in seen] == [(2050, [entry]), (2050, [])]
     assert (seen[0].orders[0].quantityAhead, seen[0].orders[0].ordersAhead) == (12.5, 3)
 
 
@@ -185,7 +216,7 @@ def test_a_liquidation_fill_reaches_on_liquidation_fill_not_on_trade():
     ws.on_liquidation_fill(fills.append)
     ws.on_trade(trades.append)
     fill = {
-        "perpsSeq": 990, "orderId": 77, "propertyId": 12, "ticker": "PRP1", "side": "BUY",
+        "perpsSeq": 990, "orderId": 77, "marketIndex": 4, "ticker": "MUS-PERP", "side": "BUY",
         "role": "MAKER", "quantity": 1.5, "price": 26.1, "fee": 0, "executedAt": 1_800_000_002,
     }
     ws._dispatch(_frame(type="liquidation_fill", fill=fill, timestamp=0))

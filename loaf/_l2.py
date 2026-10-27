@@ -1,5 +1,5 @@
-"""What an order is signed with: your trading key, the property's L2 market, your
-trading account and the order numbers reserved to it.
+"""What an order is signed with: your trading key, its market, your trading
+account and the order numbers reserved to it.
 
 Internal. :class:`~loaf.resources.orders.OrdersResource` keeps one
 :class:`L2State`; ``python -m loaf.secret_key`` shares :func:`market_of` and
@@ -24,7 +24,6 @@ from .constants import (
     L2_MAX_ORDER_LIFE_MS,
     L2_ORDER_INDEX_BLOCK,
     L2_ORDER_LIFE_MARGIN_MS,
-    PERPS_LAST,
     PERPS_QUOTE_ASSET_ID,
 )
 from .exceptions import (
@@ -33,6 +32,7 @@ from .exceptions import (
     LoafError,
     LoafNotFoundError,
     LoafServerError,
+    TradingHaltedError,
     _client_validation_error,
 )
 
@@ -51,7 +51,9 @@ _BAD_TRADING_KEY = (
 )
 _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 _PUBLIC_KEY_RE = re.compile(r"0x[0-9a-f]{80}")
-_TICKER_RE = re.compile(r"[A-Z0-9]{1,4}")
+# An asset's ticker, its spot market's too; a perp's market appends -PERP ('MUS', 'H100-PERP').
+_ASSET_TICKER_RE = re.compile(r"[A-Z0-9]{1,10}")
+_MARKET_TICKER_RE = re.compile(_ASSET_TICKER_RE.pattern + "(-PERP)?")
 # The journaledKey of an account whose trading an L1 key change disabled.
 _DISABLED_KEY = "0x" + "0" * 80
 
@@ -59,11 +61,12 @@ _MAX_48 = 2**48 - 1
 _MAX_ORDER_INDEX = 2**40 - 1
 _MAX_SAFE_INT = 2**53 - 1
 _KB_MODULUS = 2_130_706_433  # an L2 chain id is a KoalaBear element, below this prime
-# A spot market's index; a perps market's is 0 to PERPS_LAST.
-_SPOT_FIRST, _SPOT_LAST = 2_048, 4_094
-_PERPS_STATUSES = ("ACTIVE", "EXPIRED")
+# A perp's l2.status: K1's; an EXPIRED perp takes no more orders.
+_PERP_L2_STATUSES = ("ACTIVE", "EXPIRED")
 
 _RESERVED_TOO_SOON = "l2 order_index: the account's last reservation is less than 1 s old"
+# A 403 for a market that is the ticker's still (listed, its start time not reached yet).
+_NOT_STARTED = "Trading on this market has not started yet"
 
 # Refusals that show a cached market or account stale (matched in prefixed leg forms too).
 _CONTEXT_TEXTS = (
@@ -141,20 +144,21 @@ class TradingKey:
 
 
 class Market(NamedTuple):
-    """A property's ``l2Market``: the vault and market every order on it signs."""
+    """A market's ``marketIndex``, ``type`` and ``l2``: the vault and market every order on it
+    signs."""
 
     chain_id: int
     proxy_address: str
     l2_chain_id: int
     market_index: int
-    #: A spot market's base asset; 0 on a perps market, which has none (an order signs its pool).
+    #: A spot market's base asset; 0 on a perp, which has none (an order signs its pool).
     base_asset_id: int
     quote_asset_id: int
-    #: ``"spot"`` or ``"perps"``.
-    kind: str
-    #: A perps market's ``status``: ``"ACTIVE"``, or ``"EXPIRED"`` (it takes no more orders).
-    #: ``None`` on a spot market, which is served only while it is active.
-    status: str | None
+    #: ``"SPOT"`` or ``"PERP"``.
+    type: str
+    #: A perp's ``l2.status``: ``"ACTIVE"``, or ``"EXPIRED"`` (it takes no more orders).
+    #: ``None`` on a spot market, whose ``l2`` is served only while it is active.
+    l2_status: str | None
 
 
 class AccountState(NamedTuple):
@@ -181,40 +185,40 @@ class _Block:
 
 
 def market_of(detail: Any, ticker: str) -> Market:
-    """The market an order on ``ticker`` signs, from its ``GET /trade/{ticker}`` answer.
+    """The market an order on ``ticker`` signs, from its ``GET /trade/{ticker}`` answer:
+    its ``marketIndex`` and its ``l2``.
 
     Raises:
         LoafConfigError: the server does not run the exchange this SDK trades on.
-        LoafValidationError: the property has no L2 market right now (local).
-        LoafServerError: the answer has no property, or an unusable ``l2Market``.
+        LoafValidationError: the market has no L2 market right now (local).
+        LoafServerError: the answer is no JSON object (a web page), or an unusable market.
     """
-    prop = detail.get("property") if isinstance(detail, Mapping) else None
-    if not isinstance(prop, Mapping):
+    if not isinstance(detail, Mapping):  # the web app's page, an edge challenge
         raise LoafServerError(
-            f"GET /trade/{ticker} answered no property", status_code=200, body=detail
+            f"GET /trade/{ticker} answered no market", status_code=200, body=detail
         )
-    if "l2Market" not in prop:
+    market = detail.get("market")
+    if not isinstance(market, Mapping):  # an older server's answer, or another API's
         raise LoafConfigError(
-            f"GET /trade/{ticker} carries no l2Market: this server does not run the exchange this "
+            f"GET /trade/{ticker} answered no market: this server does not run the exchange this "
             f"SDK trades on (check {ENV_BASE_URL})."
         )
-    raw = prop["l2Market"]
-    if raw is None:
+    if "l2" in market and market["l2"] is None:
         raise _client_validation_error(
-            f"{ticker} has no L2 market right now (property.l2Market is null), so it cannot be "
-            "traded"
+            f"{ticker} has no L2 market right now (market.l2 is null), so it cannot be traded"
         )
-    field = _unusable_market_field(raw)
+    field = _unusable_market_field(market)
     if field is not None:
         raise LoafServerError(
-            f"GET /trade/{ticker} answered an unusable property.l2Market ({field})",
+            f"GET /trade/{ticker} answered an unusable market.{field}",
             status_code=200,
-            body=raw,
+            body=market,
         )
-    custody = (raw["chainId"], raw["proxyAddress"], raw["l2ChainId"], raw["marketIndex"])
-    if raw["kind"] == "perps":
-        return Market(*custody, 0, raw["quoteAssetId"], "perps", raw["status"])
-    return Market(*custody, raw["baseAssetId"], raw["quoteAssetId"], "spot", None)
+    l2 = market["l2"]
+    custody = (l2["chainId"], l2["proxyAddress"], l2["l2ChainId"], market["marketIndex"])
+    if market["type"] == "PERP":
+        return Market(*custody, 0, l2["quoteAssetId"], "PERP", l2["status"])
+    return Market(*custody, l2["baseAssetId"], l2["quoteAssetId"], "SPOT", None)
 
 
 def parse_keys(answer: Any) -> tuple[int, int | None, str | None]:
@@ -408,12 +412,24 @@ class L2State:
         error: LoafAPIError,
     ) -> None:
         """Forget what a refusal of an order on ``ticker`` shows stale: the order
-        started with ``account`` and took its indices from ``block``."""
+        started with ``account`` and took its indices from ``block`` (``None`` until
+        they are reserved: a refusal that comes with one answered the placement)."""
         # Texts count on refusals only: the 503s for an unreadable account or an unchecked
         # signature carry the l2 prefixes too, and show nothing stale.
         message = error.message if error.status_code < 500 else ""
         context = any(text in message for text in _CONTEXT_TEXTS)
-        if context:
+        # A placement names its market by the signed index alone: refused as no market (404) or as
+        # one that does not trade (403: delisted, say), it shows the ticker's market stale, since
+        # the ticker may name another market by now. A halt or a start not reached shows nothing.
+        market_refused = block is not None and (
+            error.status_code == 404
+            or (
+                error.status_code == 403
+                and not isinstance(error, TradingHaltedError)
+                and _NOT_STARTED not in message
+            )
+        )
+        if context or market_refused:
             self._markets.pop(ticker, None)
         with self._lock:
             if context and self._account == account:  # by value: a fresh, different read survives
@@ -471,33 +487,35 @@ def _whole(value: object, low: int, high: int) -> TypeGuard[int]:
     return _is_int(value) and low <= value <= high
 
 
-def _unusable_market_field(raw: Any) -> str | None:
-    """The first field of a ``property.l2Market`` no order can sign, in schema order: its
-    ``kind``, the custody, then a spot market's index and assets, or a perps market's
-    index, quote asset (USDC) and status. A perps market's other terms are not signed."""
-    if not isinstance(raw, Mapping):
-        return "l2Market"
-    kind = raw.get("kind")
-    if kind not in ("spot", "perps"):
-        return "kind"
-    proxy = raw.get("proxyAddress")
+def _unusable_market_field(market: Mapping[str, Any]) -> str | None:
+    """The first field of a ``market`` no order can sign, in schema order: its
+    ``marketIndex`` and ``type``, then its ``l2``'s: the custody, then a spot market's
+    assets, or a perp's quote asset (USDC) and status. A perp's other terms are not
+    signed."""
+    if not _whole(market.get("marketIndex"), 0, 4095):
+        return "marketIndex"
+    kind = market.get("type")
+    if kind not in ("SPOT", "PERP"):
+        return "type"
+    l2 = market.get("l2")
+    if not isinstance(l2, Mapping):
+        return "l2"
+    proxy = l2.get("proxyAddress")
     checks = [
-        ("chainId", _whole(raw.get("chainId"), 1, _MAX_SAFE_INT)),
+        ("chainId", _whole(l2.get("chainId"), 1, _MAX_SAFE_INT)),
         ("proxyAddress", isinstance(proxy, str) and _ADDRESS_RE.fullmatch(proxy) is not None),
-        ("l2ChainId", _whole(raw.get("l2ChainId"), 1, _KB_MODULUS - 1)),
+        ("l2ChainId", _whole(l2.get("l2ChainId"), 1, _KB_MODULUS - 1)),
     ]
-    quote = raw.get("quoteAssetId")
-    if kind == "perps":
+    quote = l2.get("quoteAssetId")
+    if kind == "PERP":
         checks += [
-            ("marketIndex", _whole(raw.get("marketIndex"), 0, PERPS_LAST)),
             ("quoteAssetId", _is_int(quote) and quote == PERPS_QUOTE_ASSET_ID),
-            ("status", raw.get("status") in _PERPS_STATUSES),
+            ("status", l2.get("status") in _PERP_L2_STATUSES),
         ]
     else:
-        base = raw.get("baseAssetId")
+        base = l2.get("baseAssetId")
         checks += [
-            ("marketIndex", _whole(raw.get("marketIndex"), _SPOT_FIRST, _SPOT_LAST)),
             ("baseAssetId", _whole(base, 1, 62)),
             ("quoteAssetId", _whole(quote, 1, 62) and quote != base),
         ]
-    return next((field for field, ok in checks if not ok), None)
+    return next((f"l2.{field}" for field, ok in checks if not ok), None)

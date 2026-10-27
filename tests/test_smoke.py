@@ -16,6 +16,7 @@ import sys
 import typing
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional, get_type_hints
 
 import httpx
 import pytest
@@ -78,15 +79,18 @@ def test_error_mapping():
     assert type(error_from_response(503, {"error": "down"})) is loaf.LoafServiceUnavailableError
 
     assert isinstance(
-        error_from_response(403, {"error": "Trading halted for this property"}),
+        error_from_response(403, {"error": "Trading halted for this market"}),
         loaf.TradingHaltedError,
     )
+    # The backend's own halt of a market is no market state of the engine's.
     assert not isinstance(
-        error_from_response(403, {"error": "Trading halted for this property"}),
+        error_from_response(403, {"error": "Trading halted for this market"}),
         loaf.MarketStateError,
     )
-    closed = error_from_response(403, {"error": "Trading is currently closed"})
-    assert type(closed) is loaf.LoafForbiddenError  # not a halt
+    delisted = error_from_response(
+        403, {"error": "This market has been delisted and is no longer available for trading"}
+    )
+    assert type(delisted) is loaf.LoafForbiddenError  # not a halt
     # The daily price band is a 400.
     band = error_from_response(
         400,
@@ -108,7 +112,7 @@ def test_error_mapping():
         assert type(halt) is loaf.TradingHaltedError and halt.status_code == 400
     # "halted" anywhere else in a 400 is an ordinary refusal.
     assert type(
-        error_from_response(400, {"error": "Order refused: the property was halted earlier"})
+        error_from_response(400, {"error": "Order refused: the market was halted earlier"})
     ) is loaf.LoafValidationError
     # A route that does not exist answers with an HTML page; keep just its message.
     missing = error_from_response(
@@ -139,7 +143,6 @@ def test_market_state_errors(message, cls, state):
 def test_errors_survive_pickle_and_copy():
     # A process pool pickles a worker's exception: signed_body must reach the parent.
     body = {
-        "ticker": "OPRA",
         "l2AccountIndex": 5,
         "l2OrderIndex": 4097,
         "l2ExpiryMs": 1_800_000_000_000,
@@ -231,13 +234,13 @@ def test_models_list_every_shape():
         if isinstance(value, type) and issubclass(value, dict)
         and value.__module__ == models.__name__
     }
-    # ... and L2Market, the union of a property's two kinds of market.
-    assert set(models.__all__) == shapes | {"L2Market"}
-    assert typing.get_args(models.L2Market) == (models.L2SpotMarket, models.L2PerpsMarket)
+    assert set(models.__all__) == shapes
     assert models.OrderQueueEntry.__required_keys__ == {
         "orderId", "side", "price", "quantity", "quantityAhead", "ordersAhead"
     }
     assert {"orderId", "role"} <= models.TradeHistoryItem.__optional_keys__
+    # A holding names its spot market as mark_price frames do; None: the asset has none.
+    assert get_type_hints(models.Holding)["marketIndex"] == Optional[int]
 
 
 # --------------------------------------------------------------------------- #
@@ -278,9 +281,9 @@ def test_public_endpoint_sends_no_auth():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["auth"] = request.headers.get("authorization")
-        return httpx.Response(200, json={"properties": []})
+        return httpx.Response(200, json={"markets": []})
 
-    make_client(handler).market.properties()
+    make_client(handler).market.list()
     assert seen["auth"] is None
 
 
@@ -318,11 +321,11 @@ def test_rate_limit_retry_then_success():
             return httpx.Response(
                 429, json={"error": "slow"}, headers={"RateLimit-Reset": "0"}
             )
-        return httpx.Response(200, json={"properties": []})
+        return httpx.Response(200, json={"markets": []})
 
     client = make_client(handler, max_retries=2)
-    res = client.market.properties()  # GET is idempotent -> 429 is retried
-    assert res["properties"] == []
+    res = client.market.list()  # GET is idempotent -> 429 is retried
+    assert res["markets"] == []
     assert calls["n"] == 2  # retried once
 
 
@@ -388,15 +391,15 @@ def test_a_liquidation_take_on_the_tape():
     # A perps tape row may be a liquidation take: isLiquidation true and, being no trade, no
     # txHash. It parses like a trade, and the model says so.
     trade = {
-        "tradeId": 41, "propertyId": 7, "txHash": "0x" + "ab" * 32, "aggressorSide": "BUY",
+        "tradeId": 41, "marketIndex": 4, "txHash": "0x" + "ab" * 32, "aggressorSide": "BUY",
         "price": 101.5, "quantity": 2, "timestamp": 1_700_000_000_000,
     }
     take = {
-        "tradeId": 42, "propertyId": 7, "aggressorSide": "SELL", "price": 99.25, "quantity": 1,
+        "tradeId": 42, "marketIndex": 4, "aggressorSide": "SELL", "price": 99.25, "quantity": 1,
         "timestamp": 1_700_000_000_500, "isLiquidation": True,
     }
     client = make_client(lambda request: httpx.Response(200, json={"trades": [trade, take]}))
-    first, second = client.market.trades("PRP1").trades
+    first, second = client.market.trades("MUS-PERP").trades
     assert first == trade and first.get("isLiquidation") is None
     assert second == take and second.isLiquidation is True and "txHash" not in second
     hints = typing.get_type_hints(models.TradeTick)
@@ -404,7 +407,7 @@ def test_a_liquidation_take_on_the_tape():
     assert {"isLiquidation", "txHash"} <= models.TradeTick.__optional_keys__
     # The maker side of a take is the user's liquidation fill: a fill, no trade.
     assert models.LiquidationFill.__required_keys__ == {
-        "perpsSeq", "orderId", "propertyId", "ticker", "side", "role", "quantity", "price", "fee",
+        "perpsSeq", "orderId", "marketIndex", "ticker", "side", "role", "quantity", "price", "fee",
         "executedAt",
     }
 
@@ -428,20 +431,21 @@ def test_trades_params_and_no_auth():
     ]
 
 
+# Refused before anything is sent: "" or "OPRA#" would fetch another route, and a control
+# character would raise an httpx error, not a LoafError.
+_MALFORMED_TICKERS = ("opra", "", "OPRA#", "../trade", "OPRA\n", "OPERAHOUSES", None)
+
+
 @pytest.mark.parametrize(
-    "call, path",
+    "call, route",
     [
-        (lambda c, t: c.market.property(t), "/api/trade/OPRA"),
-        (lambda c, t: c.market.candles(t, "1h"), "/api/trade/OPRA/candles"),
-        (lambda c, t: list(c.market.iter_candles(t, "1h")), "/api/trade/OPRA/candles"),
-        (lambda c, t: c.market.trades(t), "/api/trade/OPRA/trades"),
-        (lambda c, t: c.market.info_header(t), "/api/info/OPRA/header"),
-        (lambda c, t: c.market.info_overview(t), "/api/info/OPRA/overview"),
-        (lambda c, t: c.market.info_documents(t), "/api/info/OPRA/documents"),
-        (lambda c, t: c.offerings.get(t), "/api/offerings/OPRA"),
+        (lambda c, t: c.market.get(t), "/api/trade/{}"),
+        (lambda c, t: c.market.candles(t, "1h"), "/api/trade/{}/candles"),
+        (lambda c, t: list(c.market.iter_candles(t, "1h")), "/api/trade/{}/candles"),
+        (lambda c, t: c.market.trades(t), "/api/trade/{}/trades"),
     ],
 )
-def test_property_routes_take_only_a_ticker(call, path):
+def test_market_routes_take_only_a_market_ticker(call, route):
     sent = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -449,15 +453,44 @@ def test_property_routes_take_only_a_ticker(call, path):
         return httpx.Response(200, json={})
 
     client = make_client(handler)
-    call(client, "OPRA")
-    assert sent == [(path, None)]  # sent as given, and public
-    # Refused as orders refuse it, before anything is sent: "" or "OPRA#" would fetch another
-    # route, and a control character would raise an httpx error, not a LoafError.
-    for ticker in ("opra", "", "OPRA#", "../trade", "OPRA\n", None):
-        with pytest.raises(loaf.LoafValidationError) as info:
+    for ticker in ("OPRA", "OPERAHOUSE", "H100-PERP"):
+        call(client, ticker)
+    # Sent as given, and public.
+    assert sent == [(route.format(t), None) for t in ("OPRA", "OPERAHOUSE", "H100-PERP")]
+    # Refused as orders refuse it, before anything is sent.
+    for ticker in (*_MALFORMED_TICKERS, "-PERP", "OPRA-perp", "OPRA-SPOT"):
+        with pytest.raises(loaf.LoafValidationError, match="a market's ticker") as info:
             call(client, ticker)
         assert info.value.status_code == 0
-    assert len(sent) == 1
+    assert len(sent) == 3
+
+
+@pytest.mark.parametrize(
+    "call, route",
+    [
+        (lambda c, t: c.market.info_header(t), "/api/info/{}/header"),
+        (lambda c, t: c.market.info_overview(t), "/api/info/{}/overview"),
+        (lambda c, t: c.market.info_documents(t), "/api/info/{}/documents"),
+        (lambda c, t: c.offerings.get(t), "/api/offerings/{}"),
+    ],
+)
+def test_asset_routes_take_only_an_asset_ticker(call, route):
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, request.headers.get("authorization")))
+        return httpx.Response(200, json={})
+
+    client = make_client(handler)
+    for ticker in ("OPRA", "OPERAHOUSE"):
+        call(client, ticker)
+    assert sent == [(route.format(t), None) for t in ("OPRA", "OPERAHOUSE")]
+    # An asset has no -PERP: that is a market's ticker.
+    for ticker in (*_MALFORMED_TICKERS, "H100-PERP"):
+        with pytest.raises(loaf.LoafValidationError, match="an asset's ticker") as info:
+            call(client, ticker)
+        assert info.value.status_code == 0
+    assert len(sent) == 2
 
 
 def test_candles_busy_503_retried_then_raises():
@@ -591,12 +624,12 @@ def test_rate_limit_headers_recorded():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"properties": []},
+            json={"markets": []},
             headers={"RateLimit-Limit": "100", "RateLimit-Remaining": "97", "RateLimit-Reset": "873"},
         )
 
     client = make_client(handler)
-    client.market.properties()
+    client.market.list()
     assert client.last_rate_limit == {"limit": 100.0, "remaining": 97.0, "reset": 873.0}
 
 
@@ -694,10 +727,10 @@ def test_a_signed_body_passed_as_an_order_id_stays_out_of_the_refusal():
 
 
 @pytest.mark.parametrize(
-    "call", [lambda c: c.market.properties(), lambda c: c.orders.cancel(1)], ids=["GET", "POST"]
+    "call", [lambda c: c.market.list(), lambda c: c.orders.cancel(1)], ids=["GET", "POST"]
 )
 def test_a_2xx_that_is_not_json_is_a_server_error(call):
-    body = '{"properties": ['
+    body = '{"markets": ['
     client = make_client(
         lambda request: httpx.Response(
             200,
@@ -720,7 +753,7 @@ def test_an_undecodable_body_is_a_connection_error():
         )
 
     with pytest.raises(loaf.LoafConnectionError) as info:
-        make_client(handler, max_retries=1).market.properties()
+        make_client(handler, max_retries=1).market.list()
     assert isinstance(info.value.__cause__, httpx.DecodingError)
     assert len(sent) == 2  # a read is sent again
 

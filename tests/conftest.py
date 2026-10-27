@@ -31,19 +31,17 @@ L2_SECRET = KAT["keys"][0]["sk"]
 L2_PUBLIC_KEY = "0x" + KAT["keys"][0]["pk"]
 ACCOUNT_INDEX = 5
 EPOCH = 2
-# A property's l2Market as the exchange serves it: a spot market.
-MARKET = {
-    "kind": "spot",
+# OPRA's market index and its market.l2, as the exchange serves them.
+MARKET_INDEX = 2050
+MARKET_L2 = {
     "chainId": 421614,
     "proxyAddress": "0x" + "11" * 20,
     "l2ChainId": 4242,
-    "marketIndex": 2050,
     "baseAssetId": 6,
     "quoteAssetId": 3,
 }
-# A perps market, as a perps property's l2Market and GET /l2/perps/markets serve it.
+# Perp 4 (OPRA-PERP), as a row of GET /l2/perps/markets; its market.l2 is PERP_L2.
 PERPS_MARKET = {
-    "kind": "perps",
     "chainId": 421614,
     "proxyAddress": "0x" + "11" * 20,
     "l2ChainId": 4242,
@@ -62,7 +60,7 @@ PERPS_MARKET = {
     "minQuote": 0,
     "quoteLimit": 0,
 }
-# GET /l2/perps/positions: pool 0 holds a long in market 4, pool 2 a short in market 9.
+PERP_L2 = {k: v for k, v in PERPS_MARKET.items() if k != "marketIndex"}
 # The perps markets' collateral: USDC of 6 decimals, a tick of 10,000 base units (0.01 USDC), and
 # 100 extended units a tick.
 PERPS_COLLATERAL = {
@@ -72,7 +70,7 @@ PERPS_COLLATERAL = {
     "tickSize": "10000",
     "extensionMultiplier": "100",
 }
-# GET /l2/perps/markets/live: market 4 open, rated, in the engine's risk-only mode.
+# GET /l2/perps/markets/live: perp 4 open, rated, in the engine's risk-only mode.
 PERPS_LIVE = {
     "marketIndex": 4,
     "indexPrice": 2500,
@@ -113,7 +111,12 @@ PERPS_CLOSE = {
     "base": "18446744073709551615",
     "quote": 4_814_784,
     "fee": 2_407,
+    "quoteExtended": "48147840000000",
+    "feeExtended": "24070000000",
+    "adl": False,
 }
+# GET /l2/perps/positions: pool 0 holds a long in perp 4 and a reduce-only SELL resting there,
+# pool 2 a short in perp 9.
 PERPS_ACCOUNT = {
     "l2AccountIndex": ACCOUNT_INDEX,
     "pools": [
@@ -137,6 +140,16 @@ PERPS_ACCOUNT = {
                     "adlRank": 2,
                 }
             ],
+            "openOrders": [
+                {
+                    "orderId": 77,
+                    "market": 4,
+                    "side": "SELL",
+                    "quantityLeft": "20",
+                    "price": 104000,
+                    "reduceOnly": True,
+                }
+            ],
         },
         {
             "pool": 2,
@@ -158,10 +171,11 @@ PERPS_ACCOUNT = {
                     "adlRank": None,
                 }
             ],
+            "openOrders": [],
         },
     ],
 }
-# A perps market's state refusals: the exchange's 403 text, the error it raises, and its state.
+# A market's state refusals: the exchange's 403 text, the error it raises, and its state.
 MARKET_STATES = [
     ("Trading is halted on this market", loaf.MarketHaltedError, "MARKET_HALTED"),
     ("This market is outside its trading hours", loaf.MarketStateError, "MARKET_CLOSED"),
@@ -248,33 +262,45 @@ def l2_clock(_no_sleep: SimpleNamespace) -> SimpleNamespace:
     return _no_sleep
 
 
-def property_detail(
-    ticker: str = "OPRA", *, l2_market: Any = MARKET, market_price: float = 160
+_TYPES_L2 = object()
+
+
+def market_detail(
+    ticker: str = "OPRA",
+    *,
+    market_index: Any = MARKET_INDEX,
+    l2: Any = _TYPES_L2,
+    market_price: float = 160,
 ) -> dict:
     """A ``GET /trade/{ticker}`` body with the fields order placement reads.
 
-    ``l2_market=...`` leaves ``l2Market`` out, as a server that predates the L2
-    exchange does.
+    ``market_index=...`` or ``l2=...`` leaves that field out. ``l2`` defaults to its
+    type's: ``PERP_L2`` for a perp (its ticker ends in -PERP), else ``MARKET_L2``.
     """
-    prop: dict[str, Any] = {
+    perp = ticker.endswith("-PERP")
+    if l2 is _TYPES_L2:
+        l2 = PERP_L2 if perp else MARKET_L2
+    market: dict[str, Any] = {
+        "marketIndex": market_index,
         "ticker": ticker,
-        "tokenName": _NAMES.get(ticker, ticker),
+        "type": "PERP" if perp else "SPOT",
         "status": "LIVE",
         "isHalted": False,
+        "tradingStartsAt": None,
+        "l2": l2,
     }
-    if l2_market is not ...:
-        prop["l2Market"] = l2_market
-    listed = [{"ticker": ticker, "tokenName": prop["tokenName"], "marketPrice": market_price}]
-    if ticker != "MUS":  # another property ahead of it: the reference is found by its ticker
-        listed.insert(0, {"ticker": "MUS", "tokenName": "Musgrave", "marketPrice": 50})
-    return {"property": prop, "propertyList": listed}
+    market = {k: v for k, v in market.items() if v is not ...}
+    listed = [{"ticker": ticker, "name": _NAMES.get(ticker, ticker), "marketPrice": market_price}]
+    if ticker != "MUS":  # another market ahead of it: the reference is found by its ticker
+        listed.insert(0, {"ticker": "MUS", "name": "Musgrave", "marketPrice": 50})
+    return {"market": market, "marketList": listed}
 
 
 class FakeExchange:
     """The exchange's routes an order uses, in memory, for ``httpx.MockTransport``.
 
     * ``GET /trade`` lists ``details``; ``GET /trade/{ticker}`` serves
-      ``details[ticker]``, and an unknown ticker is a 404 ``Property not found``.
+      ``details[ticker]``, and an unknown ticker is a 404 ``Market not found``.
       Replace an entry to change what they serve.
     * ``GET /l2/keys`` serves ``keys``; ``None`` is the 404 of a user with no
       trading account.
@@ -283,7 +309,7 @@ class FakeExchange:
     * ``POST /orders`` and ``/orders/conditional`` place the order: 200 with a
       fresh ``orderId`` (and one per attached leg).
     * ``GET /l2/perps/markets`` lists ``perps_markets`` and ``perps_collateral``
-      (``None``: no collateral key), ``/markets/live`` ``perps_live`` and
+      (``None``: null, as when the exchange could not read it), ``/markets/live`` ``perps_live`` and
       ``/funding`` ``PERPS_FUNDING_TICK``; ``GET /l2/perps/positions`` serves
       ``perps_account`` and ``/closes`` ``PERPS_CLOSE`` (both 404 without a
       trading account). Those two and the two perps ops below answer 401
@@ -300,7 +326,7 @@ class FakeExchange:
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
-        self.details: dict[str, dict] = {"OPRA": property_detail()}
+        self.details: dict[str, dict] = {"OPRA": market_detail()}
         self.keys: dict[str, Any] | None = dict(KEYS)
         self.reserved_at_ms: int | None = None
         self._queues: dict[str, list[Any]] = {}
@@ -339,7 +365,7 @@ class FakeExchange:
         if route.startswith("GET /trade/"):
             detail = self.details.get(route[len("GET /trade/") :])
             if detail is None:
-                return httpx.Response(404, json={"error": "Property not found"})
+                return httpx.Response(404, json={"error": "Market not found"})
             return httpx.Response(200, json=detail)
         if route == "GET /l2/keys":
             if self.keys is None:
@@ -361,9 +387,7 @@ class FakeExchange:
                 },
             )
         if route == "GET /l2/perps/markets":
-            reply: dict[str, Any] = {"markets": self.perps_markets}
-            if self.perps_collateral is not None:
-                reply["collateral"] = self.perps_collateral
+            reply = {"markets": self.perps_markets, "collateral": self.perps_collateral}
             return httpx.Response(200, json=reply)
         if route == "GET /l2/perps/markets/live":
             return httpx.Response(200, json={"markets": self.perps_live})
@@ -416,12 +440,15 @@ class FakeExchange:
     def _listing(self) -> dict:
         rows = []
         for ticker, detail in self.details.items():
-            prop = detail["property"]
-            row = {"ticker": ticker, "status": prop["status"]}
-            if "l2Market" in prop:  # a server that predates the L2 exchange lists no hasL2Market
-                row["hasL2Market"] = prop["l2Market"] is not None
-            rows.append(row)
-        return {"properties": rows}
+            market = detail["market"]
+            rows.append({
+                "ticker": ticker,
+                "status": market["status"],
+                "isHalted": market["isHalted"],
+                "tradingStartsAt": market.get("tradingStartsAt"),
+                "hasL2Market": market.get("l2") is not None,
+            })
+        return {"markets": rows}
 
     def posts(self, path: str) -> list[bytes]:
         """The raw bodies POSTed to ``path`` (e.g. ``"/orders"``), in order."""

@@ -1,8 +1,13 @@
-"""Public market data: properties, candles, trades, info pages.
+"""Public market data: markets, candles, trades, asset info pages.
 
 None of these require authentication — they work with an anonymous client.
 All currency values are plain dollars and quantities plain tokens (see
 :mod:`loaf.money`).
+
+A market is one order book, spot or perp, named by its ticker: its asset's
+ticker, ``-PERP`` appended for a perp (``"MUS"``, ``"H100-PERP"``). The info
+pages describe an asset, named by the asset's ticker. Every call that takes a
+ticker refuses a malformed one (``"mus"``, say) before sending.
 """
 
 from __future__ import annotations
@@ -10,68 +15,88 @@ from __future__ import annotations
 from typing import Any, Iterator
 
 from ..exceptions import LoafError
-from .base import Resource, _check_ticker
+from .base import Resource, _check_asset_ticker, _check_market_ticker
 
 
 class MarketResource(Resource):
-    # -- Properties / trade ------------------------------------------------ #
+    # -- Markets ----------------------------------------------------------- #
 
-    def properties(self) -> Any:
-        """``GET /trade`` — every non-delisted property (PENDING and LIVE) with
-        market data + a 24h sparkline.
+    def list(self) -> Any:
+        """``GET /trade`` — every market that is not delisted (``PENDING`` and
+        ``LIVE``), each with its market data and a 24h sparkline.
 
-        A row is tradeable when ``status == "LIVE"`` and ``hasL2Market`` (halts
-        and trading hours still apply).
+        A row is tradeable when ``status == "LIVE"``, it is not ``isHalted``,
+        ``hasL2Market`` and its ``tradingStartsAt`` has passed: :meth:`get`'s
+        rule, read off the row.
 
-        Returns ``{"properties": [...]}``. Each item has ``propertyId``,
-        ``ticker`` (the identifier every other call takes), ``tokenName`` (the
-        display name), ``contractAddress``, ``propertyType``, ``marketPrice``,
-        ``dailyReferencePrice``, ``volume24h``, ``status``, ``hasL2Market``,
-        ``candlesticks`` (trailing-24h hourly OHLCV sparkline only — use
-        :meth:`candles` for real chart history), etc.
+        Returns ``{"markets": [...]}``. Each item has ``marketIndex``,
+        ``ticker`` (the market's, the identifier every market call takes),
+        ``type`` (``SPOT`` / ``PERP``), ``status``, ``isHalted``,
+        ``tradingStartsAt``, ``name`` (the asset's display name), ``kind``
+        (the asset's, :class:`~loaf.enums.AssetKind`), ``tokenAddress``,
+        ``marketPrice``, ``dailyReferencePrice``, ``volume24h``,
+        ``hasL2Market``, ``candlesticks`` (trailing-24h hourly OHLCV sparkline
+        only — use :meth:`candles` for real chart history), ``property`` (a
+        property's address, type, supply and yield; ``None`` for any other
+        kind), etc.
 
-        ``contractAddress`` is the property token's address. Orders do not sign
-        it, but the exchange refuses them while it is ``None`` (the token is not
-        deployed yet). ``marketPrice`` is ``0`` when the exchange has no
-        reference yet.
+        ``isHalted`` is the effective trading-halt flag when read, as
+        :meth:`get`'s ``market.isHalted``; ``market_halt`` frames carry each
+        change on the ``market:{ticker}`` channel
+        (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_market_status`).
+        ``tradingStartsAt`` is when the market's trading starts (unix seconds):
+        orders on it are refused before then (403 ``Trading on this market has
+        not started yet``); ``None``: no wait. ``tokenAddress`` is the asset's
+        token contract on the custody chain (``None`` without a token).
+        ``marketPrice`` is ``0`` when the exchange has no reference yet.
         """
         return self._client.get("/trade", auth=False)
 
-    def property(self, ticker: str) -> Any:
-        """``GET /trade/{ticker}`` — full detail for one property.
+    def get(self, ticker: str) -> Any:
+        """``GET /trade/{ticker}`` — full detail for one market.
 
-        Returns the ``property``, a ``propertyList`` selector, current
-        ``orderBook`` snapshot (``bids``/``asks`` price levels), ``recentTrades``,
-        ``volume24h``, ``dailyReferencePrice``, ``liquidity`` and market-hours
-        metadata. ``ticker`` is 1-4 uppercase letters or digits (``"OPRA"``,
-        not ``"opra"``); every REST call that takes one refuses anything else
-        before sending. Candle history is NOT included — fetch it from the
+        Returns the ``market``, its ``asset``, a ``marketList`` selector, the
+        current ``orderBook`` snapshot (``bids``/``asks`` price levels),
+        ``recentTrades``, ``volume24h``, ``dailyReferencePrice`` and
+        ``liquidity``. Candle history is NOT included — fetch it from the
         dedicated :meth:`candles` endpoint.
 
-        ``property.l2Market`` is the market every order on the property signs
-        (the SDK reads it for you), by its ``kind``: a spot market's ``{kind:
-        "spot", chainId, proxyAddress, l2ChainId, marketIndex, baseAssetId,
-        quoteAssetId}`` (:class:`~loaf.models.L2SpotMarket`), or a perps
-        market's, with its ``status`` and terms and no base asset
-        (:class:`~loaf.models.L2PerpsMarket`, as ``perps.markets()`` lists
-        it); or ``None``: the property cannot be traded now. ``property`` has
-        no ``marketPrice``: the reference MARKET orders are priced from is the
-        ``propertyList`` entry with the same ``ticker``.
+        ``market`` is ``{marketIndex, ticker, type, status, isHalted,
+        tradingStartsAt, l2}``.
+        ``market.l2`` is, by ``type``, a spot market's ``{chainId,
+        proxyAddress, l2ChainId, baseAssetId, quoteAssetId}``
+        (:class:`~loaf.models.MarketL2`), or a perp's, with its ``status`` and
+        terms and no base asset (:class:`~loaf.models.PerpMarketL2`, as
+        ``perps.markets()`` lists it): with ``marketIndex``, what every order
+        on the market signs (the SDK reads both for you), or ``None``: the
+        market cannot be traded now. ``asset`` is ``{ticker, name, kind,
+        assetId, tokenAddress, videoUrl, stakeholders, property}``:
+        ``assetId`` is its token's balances row (``None`` without one), and
+        ``property`` a property's own facts (``None`` for any other kind). A
+        spot market and the perp of one asset carry the same ``asset``. The
+        detail has no ``marketPrice``: the reference MARKET orders are priced
+        from is the ``marketList`` entry with the same ``ticker``.
+
+        The market trades while its ``status`` is ``LIVE``, it is not
+        ``isHalted``, its ``l2`` is not ``None`` and its ``tradingStartsAt``
+        (unix seconds) has passed (``None``: no wait): orders before then are
+        refused (403 ``Trading on this market has not started yet``). A perp
+        whose ``l2.status`` is ``EXPIRED`` takes no more orders.
 
         ``recentTrades`` holds the newest trades first (at most 20), each with a
         ``txHash``: the trade's content hash (``0x`` + 64 hex), not an on-chain
-        transaction (a perps market's liquidation take has ``isLiquidation:
-        True`` and no ``txHash``: :class:`~loaf.models.TradeTick`).
-        ``orderBook`` is ``None`` when the property is not LIVE or no fresh book
-        is known: treat ``None`` as unknown, not empty.
+        transaction (a perp's liquidation take has ``isLiquidation: True`` and
+        no ``txHash``: :class:`~loaf.models.TradeTick`). ``orderBook`` is
+        ``None`` when the market is not LIVE or no fresh book is known: treat
+        ``None`` as unknown, not empty.
 
-        ``property.isHalted`` is the effective trading-halt flag (this
-        property's own state OR'd with the platform-wide kill switch); it is
-        served here but NOT on the :meth:`properties` list. Seed from it, then
-        keep it live with the ``property:{ticker}`` WebSocket channel
-        (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_property_status`).
+        ``market.isHalted`` is the effective trading-halt flag (this market's
+        own state OR'd with the platform-wide kill switch), as a :meth:`list`
+        row's ``isHalted``. Seed from it, then keep it live with the
+        ``market:{ticker}`` WebSocket channel
+        (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_market_status`).
         """
-        _check_ticker(ticker)
+        _check_market_ticker(ticker)
         return self._client.get(f"/trade/{ticker}", auth=False)
 
     # -- Candles (chart history) -------------------------------------------- #
@@ -107,7 +132,7 @@ class MarketResource(Resource):
         ``Retry-After``) up to ``max_retries``, then raises
         :class:`~loaf.exceptions.LoafServiceUnavailableError`.
         """
-        _check_ticker(ticker)
+        _check_market_ticker(ticker)
         return self._client.get(
             f"/trade/{ticker}/candles",
             params={"resolution": str(resolution), "to": to, "countBack": count_back},
@@ -143,15 +168,15 @@ class MarketResource(Resource):
     # -- Trades (the tape's backfill) -------------------------------------- #
 
     def trades(self, ticker: str, *, after_trade_id: int = 0, limit: int = 100) -> Any:
-        """``GET /trade/{ticker}/trades`` — the property's trades after
+        """``GET /trade/{ticker}/trades`` — the market's trades after
         ``after_trade_id``, oldest first: what the ``trades:{ticker}`` channel
         pushed, to fill a gap in it.
 
         Returns ``{"trades": [...]}``: at most ``limit`` (1-1000) trades whose
         ``tradeId`` is above ``after_trade_id`` (0: from the first), each
-        ``{tradeId, propertyId, txHash, aggressorSide, price, quantity,
-        timestamp}`` as the channel pushes it (a perps market's liquidation
-        take has ``isLiquidation: True`` and no ``txHash``:
+        ``{tradeId, marketIndex, txHash, aggressorSide, price, quantity,
+        timestamp}`` as the channel pushes it (a perp's liquidation take has
+        ``isLiquidation: True`` and no ``txHash``:
         :class:`~loaf.models.TradeTick`). While a page comes back full,
         pass its last ``tradeId`` as ``after_trade_id`` for the next; stop at
         an empty or short page, or one whose last ``tradeId`` is not above the
@@ -162,26 +187,26 @@ class MarketResource(Resource):
         :meth:`~loaf.ws.client.LoafWebSocketClient.on_connect` fires, and merge
         them with the frames by ``tradeId``.
         """
-        _check_ticker(ticker)
+        _check_market_ticker(ticker)
         return self._client.get(
             f"/trade/{ticker}/trades",
             params={"afterTradeId": after_trade_id, "limit": limit},
             auth=False,
         )
 
-    # -- Info pages -------------------------------------------------------- #
+    # -- Info pages (by the asset's ticker) -------------------------------- #
 
     def info_header(self, ticker: str) -> Any:
         """``GET /info/{ticker}/header`` — address, hero image, bed/bath/car, offering valuation."""
-        _check_ticker(ticker)
+        _check_asset_ticker(ticker)
         return self._client.get(f"/info/{ticker}/header", auth=False)
 
     def info_overview(self, ticker: str) -> Any:
         """``GET /info/{ticker}/overview`` — description, media, metrics, amenities."""
-        _check_ticker(ticker)
+        _check_asset_ticker(ticker)
         return self._client.get(f"/info/{ticker}/overview", auth=False)
 
     def info_documents(self, ticker: str) -> Any:
         """``GET /info/{ticker}/documents`` — public document list (title + URL)."""
-        _check_ticker(ticker)
+        _check_asset_ticker(ticker)
         return self._client.get(f"/info/{ticker}/documents", auth=False)

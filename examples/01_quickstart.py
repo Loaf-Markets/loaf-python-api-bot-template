@@ -34,10 +34,10 @@ def main() -> None:
         )
         print(f"\nCash available     : {cash:,.2f}")
         print(f"Balances rows      : {len(balances)}")
-        print(f"Open positions     : {len(comp.get('positions') or [])}")
+        print(f"Holdings           : {len(comp.get('holdings') or [])}")
         print(f"Trading key        : {client.public_key or 'not set (orders disabled)'}")
         print(f"Max slippage       : {client.max_slippage_bps} bps (100 bps = 1%)")
-        print(f"Listed properties  : {len(client.market.properties().get('properties') or [])}")
+        print(f"Listed markets     : {len(client.market.list().get('markets') or [])}")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 A runnable starting point that:
   1. loads your credentials from the environment (or a .env file),
   2. verifies the connection and trading prerequisites,
-  3. prints your balances and positions,
+  3. prints your balances and holdings,
   4. opens the real-time feed (order book, halt status, competition round
      notices, and your private portfolio stream),
   5. runs a simple strategy loop you can replace with your own logic.
@@ -25,6 +25,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -43,9 +44,10 @@ try:
 except ImportError:
     pass
 
-# The property this template watches/trades: a ticker from
-# `loaf.market.properties()`, exactly as listed (uppercase), e.g. "OPRA". Leave it
-# empty to follow the first tradeable listed property.
+# The market this template watches/trades: a market's ticker from
+# `loaf.market.list()`, exactly as listed (uppercase), e.g. "OPRA". Leave it
+# empty to follow the first tradeable listed market (resolve_target says which
+# while none trades).
 TARGET_TICKER = ""
 
 
@@ -80,13 +82,19 @@ def cash_of(balances: Any) -> Decimal:
     )
 
 
+def trading_started(starts_at: int | None) -> bool:
+    """Whether a market's trading has started, from its ``tradingStartsAt`` (unix seconds;
+    ``None``: no wait). The exchange refuses its orders before then."""
+    return starts_at is None or starts_at <= time.time()
+
+
 # --------------------------------------------------------------------------- #
 # Preflight checks
 # --------------------------------------------------------------------------- #
 
 
 def preflight(client: LoafClient) -> None:
-    """Confirm credentials work and print balances/positions."""
+    """Confirm credentials work and print balances/holdings."""
     try:
         comp = client.portfolio.component()
     except loaf.LoafAuthError as exc:
@@ -94,23 +102,23 @@ def preflight(client: LoafClient) -> None:
 
     balances = comp.get("balances") or []
     print(f"  Cash: {cash_of(balances):,.2f} available")
-    positions = comp.get("positions") or []
-    if positions:
+    holdings = comp.get("holdings") or []
+    if holdings:
         rows = {b.assetId: b for b in balances}
-        print("  Positions:")
-        for p in positions:
-            if p.get("isIpoAllocation"):
-                held = f"{p.quantity:,.1f} (IPO allocation)"
-            elif p.get("assetId") in rows:  # an L2 holding: its amounts are its balances row
-                row = rows[p.assetId]
+        print("  Holdings:")
+        for h in holdings:
+            if h.get("isIpoAllocation"):
+                held = f"{h.quantity:,.1f} (IPO allocation)"
+            elif h.get("assetId") in rows:  # an L2 holding: its amounts are its balances row
+                row = rows[h.assetId]
                 total = loaf.from_base_units(row.total, row.decimals)
                 available = loaf.from_base_units(row.available, row.decimals)
                 held = f"{total:,.1f} ({available:,.1f} available)"
             else:  # no balances row: nothing held
                 held = "0.0"
-            avg = p.get("averageEntryPrice")
-            print(f"    {p.ticker}: {held} @ avg {'n/a' if avg is None else avg} "
-                  f"(mkt {p.marketPrice})")
+            avg = h.get("averageEntryPrice")
+            print(f"    {h.ticker}: {held} @ avg {'n/a' if avg is None else avg} "
+                  f"(mkt {h.marketPrice})")
     if client.public_key:
         bps = client.max_slippage_bps  # $LOAF_MAX_SLIPPAGE_BPS, default 200
         print(f"  Orders are signed by trading key {client.public_key}")
@@ -120,20 +128,24 @@ def preflight(client: LoafClient) -> None:
 
 
 def resolve_target(client: LoafClient) -> Any:
-    """Pick the property to follow: the configured one, else the first tradeable
-    one, else the first listed (or None)."""
-    listing = client.market.properties().get("properties") or []
+    """Pick the market to follow: the configured one, else the first tradeable
+    one, else the first LIVE one with an L2 market, whose halt or start the loop
+    waits out (while the platform-wide halt is on, every row reads halted), else
+    the first listed (or None)."""
+    listing = client.market.list().get("markets") or []
     if not listing:
-        print("No properties available on this environment.")
+        print("No markets available on this environment.")
         return None
     if TARGET_TICKER:
-        for prop in listing:
-            if prop.ticker == TARGET_TICKER:
-                return prop
-        print(f"Ticker {TARGET_TICKER!r} not found; falling back to the first tradeable one.")
-    # Tradeable: LIVE with an L2 market (halts and trading hours still apply).
+        for market in listing:
+            if market.ticker == TARGET_TICKER:
+                return market
+        print(f"Ticker {TARGET_TICKER!r} not found; picking one as with no TARGET_TICKER.")
+    # Tradeable: LIVE, not halted, with an L2 market, its trading started.
+    live = [m for m in listing if m.get("status") == "LIVE" and m.get("hasL2Market")]
     return next(
-        (p for p in listing if p.get("status") == "LIVE" and p.get("hasL2Market")), listing[0]
+        (m for m in live if not m.get("isHalted") and trading_started(m.get("tradingStartsAt"))),
+        live[0] if live else listing[0],
     )
 
 
@@ -159,12 +171,24 @@ class Strategy:
         self.mark_price: float | None = None
         self.last_trade: dict | None = None
         self.is_halted = False
-        # The book and the halt flag are read from REST on the next tick: at startup,
-        # and each time the feed goes live again (nothing is replayed).
+        # What no frame sends: the market's status, whether it has an L2 market (its
+        # `l2`), and its tradingStartsAt.
+        self.status: str | None = None
+        self.has_l2_market = False
+        self.trading_starts_at: int | None = None
+        # The book, the halt flag and those three are read from REST on the next tick: at
+        # startup and each time the feed goes live again (nothing is replayed). Until the
+        # market trades, a halt aside (a frame ends it), every tick reads them again.
         self.needs_seed = True
         # Which of them a frame has set since the feed went live: that read leaves those
         # alone, since the read can be older than the frame.
         self.from_feed: set[str] = set()
+        # The feed is live from on_connect until that connection ends (not yet at startup),
+        # and feed_changes counts each on_connect and ended attempt. A read takes the book
+        # only if the feed was live from its request until its answer is applied: one made
+        # otherwise can miss a change to the book that no frame brings.
+        self.feed_live = False
+        self.feed_changes = 0
 
     # -- WebSocket handlers (called on the WS thread) --------------------- #
 
@@ -189,16 +213,20 @@ class Strategy:
             self.best_bid = self.best_ask = None
             self.mark_price = None
             self.from_feed.clear()
+            self.feed_live = True
+            self.feed_changes += 1
             self.needs_seed = True
 
     def on_disconnect(self, msg) -> None:
         # Every ended connection attempt; the client reconnects with backoff. Forget
-        # the book and the mark so no order is priced off a dead feed: the book is
-        # re-seeded once the feed is live again, and with no mark the SDK reads the
-        # reference itself.
+        # the book and the mark so no order is priced off a dead feed: no read made
+        # before the feed is live again seeds the book, and with no mark the SDK reads
+        # the reference itself.
         with self._lock:
             self.best_bid = self.best_ask = None
             self.mark_price = None
+            self.feed_live = False
+            self.feed_changes += 1
         if msg.code is None:
             print(f"  feed: no connection ({msg.reason}); retrying")
         else:
@@ -209,7 +237,7 @@ class Strategy:
         print(f"  *** competition round {msg.roundNumber} {msg.status}")
 
     def on_halt(self, msg) -> None:
-        # `isHalted` is the effective state (this property's own flag OR a
+        # `isHalted` is the effective state (this market's own flag OR a
         # platform-wide halt), so it replaces the value seeded from REST.
         with self._lock:
             self.is_halted = msg.isHalted
@@ -253,37 +281,61 @@ class Strategy:
     # -- Decision loop (called on the main thread every few seconds) ------ #
 
     def seed(self) -> bool:
-        """Read the book and the halt flag, which the feed does not send on
-        subscribe, keeping what a frame has set since the feed went live. False
-        if the read failed: the next tick tries again."""
+        """Read the market's status, L2 market and trading start, which no frame
+        sends, and its halt flag and book, which the feed does not send on
+        subscribe. The read leaves alone what a frame has set since the feed went
+        live, and the book unless the feed was live from the request until the
+        answer is applied. False if the read failed: the next tick tries again."""
         with self._lock:
             self.needs_seed = False  # first: a reconnect during the read asks again
+            live_at_request, changes = self.feed_live, self.feed_changes
         try:
-            detail = self.client.market.property(self.ticker)
+            detail = self.client.market.get(self.ticker)
         except loaf.LoafError as exc:
             with self._lock:
                 self.needs_seed = True
             print(f"  could not read {self.ticker} ({exc}); trying again next tick")
             return False
         with self._lock:
+            self.status = detail.market.get("status")
+            self.has_l2_market = detail.market.get("l2") is not None
+            self.trading_starts_at = detail.market.get("tradingStartsAt")
             if "halt" not in self.from_feed:
-                self.is_halted = bool(detail.property.isHalted)
-            if "book" not in self.from_feed and detail.get("orderBook"):  # None: not known now
+                self.is_halted = bool(detail.market.isHalted)
+            # orderBook None: not known now.
+            live_throughout = live_at_request and changes == self.feed_changes
+            if live_throughout and "book" not in self.from_feed and detail.get("orderBook"):
                 self._set_book(detail.orderBook)
         return True
+
+    def _waiting(self) -> list[str]:  # under the lock
+        """Why the market does not trade, a halt aside: no frame announces a
+        listing, an L2 market or a trading start, so only a read shows these end."""
+        reasons: list[str] = []
+        if self.status != "LIVE":
+            reasons.append(str(self.status))  # PENDING: not listed yet; or DELISTED
+        if not self.has_l2_market:
+            reasons.append("NO L2 MARKET")  # market.l2 is None: the SDK refuses its orders
+        if not trading_started(self.trading_starts_at):
+            reasons.append("NOT STARTED")  # orders are refused (403) until its start
+        return reasons
 
     def on_tick(self) -> None:
         if self.needs_seed and not self.seed():
             return
         with self._lock:
             bid, ask, mark = self.best_bid, self.best_ask, self.mark_price
-            halted = self.is_halted
+            halted, waiting = self.is_halted, self._waiting()
+            if waiting:
+                self.needs_seed = True  # the next tick reads the market again
         spread = (ask - bid) if (bid is not None and ask is not None) else None
-        print(f"[{self.ticker}] bid={bid} ask={ask} spread={spread} mark={mark}"
-              f"{' [HALTED]' if halted else ''}")
+        flags = "".join(f" [{reason}]" for reason in (["HALTED"] if halted else []) + waiting)
+        print(f"[{self.ticker}] bid={bid} ask={ask} spread={spread} mark={mark}{flags}")
 
         if halted:
             return  # orders would be rejected with loaf.TradingHaltedError
+        if waiting:
+            return  # orders would be refused until the market trades
 
         # ----------------------------------------------------------------- #
         # YOUR STRATEGY GOES HERE. Examples (uncomment & adapt). on_tick runs
@@ -324,6 +376,9 @@ class Strategy:
         #
         # Wrap calls in try/except. Every loaf.LoafAPIError from a placement
         # means it was not placed: loaf.TradingHaltedError (halted), and the rest.
+        # A loaf.LoafForbiddenError about the market itself (delisted, not yet
+        # available, not started) means it stopped trading, which no frame
+        # announces: set self.needs_seed = True, and the next tick reads it again.
         # On loaf.LoafConfigError from a placement, stop and alert: e.g. your
         # trading key is no longer in force (set the new one, README §2,
         # restart, and re-arm your stops).
@@ -349,7 +404,7 @@ def main() -> None:
     if target is None:
         client.close()
         return
-    print(f"\nFollowing property {target.ticker} ({target.tokenName}, id {target.propertyId}).\n")
+    print(f"\nFollowing market {target.ticker} ({target.name}, index {target.marketIndex}).\n")
     strategy = Strategy(client, target.ticker)
 
     # Wire up the real-time feed.
@@ -358,7 +413,7 @@ def main() -> None:
     ws.on_mark_price(strategy.on_mark_price)
     ws.on_connect(strategy.on_feed_reset)     # live (again): re-seed on the next tick
     ws.on_disconnect(strategy.on_disconnect)  # every ended attempt: drop book and mark
-    ws.on_property_halt(strategy.on_halt)     # public: halt/resume for this property
+    ws.on_market_halt(strategy.on_halt)       # public: halt/resume for this market
     ws.on_round_update(strategy.on_round)     # public: competition round transitions
     ws.on_trades(strategy.on_trade_tick)
     ws.on_trade(strategy.on_my_fill)          # private: your fills
@@ -371,7 +426,7 @@ def main() -> None:
     ws.subscribe_orderbook(target.ticker)
     ws.subscribe_mark_price(target.ticker)
     ws.subscribe_trades(target.ticker)
-    ws.subscribe_property_status(target.ticker)
+    ws.subscribe_market_status(target.ticker)
     ws.subscribe_competition()
     ws.subscribe_portfolio()  # your private fills/balances stream (keyed by your API key)
 

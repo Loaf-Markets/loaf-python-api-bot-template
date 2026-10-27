@@ -110,8 +110,8 @@ L2_ORDER_INDEX_BLOCK = 64
 # Perps
 # --------------------------------------------------------------------------- #
 
-#: The highest perps market index: markets 0 to 254 are perps markets, 2048 to 4094 spot ones.
-PERPS_LAST = 254
+#: The highest perp's market index: markets 0 to 254 are perps, 2048 to 4094 spot markets.
+MAX_PERP_MARKET_INDEX = 254
 
 #: The highest margin pool: pool 0 is the cross pool, 1 to 7 are isolated pools.
 MAX_POOL = 7

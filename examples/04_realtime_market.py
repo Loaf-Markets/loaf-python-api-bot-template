@@ -20,11 +20,11 @@ except ImportError:
 def main() -> None:
     client = LoafClient()
 
-    properties = client.market.properties().get("properties") or []
-    if not properties:
-        raise SystemExit("No properties available.")
-    prop = properties[0]
-    print(f"Streaming {prop.ticker} (id {prop.propertyId}). Ctrl-C to stop.\n")
+    markets = client.market.list().get("markets") or []
+    if not markets:
+        raise SystemExit("No markets available.")
+    market = markets[0]
+    print(f"Streaming {market.ticker} (index {market.marketIndex}). Ctrl-C to stop.\n")
 
     ws = client.websocket()
 
@@ -49,14 +49,14 @@ def main() -> None:
     def on_mark(msg):
         print(f"MARK  {msg.price}")
 
-    @ws.on_property_halt
+    @ws.on_market_halt
     def on_halt(msg):
         print(f"HALT  {msg.ticker} -> {'HALTED' if msg.isHalted else 'RESUMED'}")
 
-    ws.subscribe_orderbook(prop.ticker)
-    ws.subscribe_trades(prop.ticker)
-    ws.subscribe_mark_price(prop.ticker)
-    ws.subscribe_property_status(prop.ticker)
+    ws.subscribe_orderbook(market.ticker)
+    ws.subscribe_trades(market.ticker)
+    ws.subscribe_mark_price(market.ticker)
+    ws.subscribe_market_status(market.ticker)
 
     ws.run_forever()  # blocking until Ctrl-C
 

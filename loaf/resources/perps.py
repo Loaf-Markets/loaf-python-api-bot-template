@@ -1,14 +1,16 @@
 """Perps: perps markets, your margin pools and positions, margin moves and exits.
 
-A perps market trades a perpetual future settled in USDC (its property's
-``l2Market`` has ``kind`` ``"perps"``). Its orders are placed like any other,
-with ``pool=`` and ``reduce_only=``
+A perp trades a perpetual future settled in USDC: its ticker is its asset's
+with ``-PERP`` appended, and its ``market.type`` is ``"PERP"``. Its orders are
+placed by its ticker like any other, with ``pool=`` and ``reduce_only=``
 (:class:`~loaf.resources.orders.OrdersResource`); this resource reads the
-markets and your positions, and moves your margin::
+perps and your positions, and moves your margin, naming a perp by its
+``marketIndex`` (0 to 254), as the exchange's perps API does::
 
+    index = loaf.market.get("MUS-PERP").market.marketIndex
     loaf.perps.add_margin(5_000, pool=0)           # 5,000 USDC: spot balance -> pool 0
-    loaf.orders.limit_buy("PRP1", quantity=2, price=101.5, pool=0)
-    loaf.perps.position(market=4, pool=0)
+    loaf.orders.limit_buy("MUS-PERP", quantity=2, price=101.5, pool=0)
+    loaf.perps.position(market=index, pool=0)
 
 **Pools.** Your perps margin is USDC held in pools: pool 0, the cross pool,
 and the isolated pools 1 to 7. Each holds at most 8 positions, one per market,
@@ -61,11 +63,11 @@ from ..constants import (
     DEFAULT_PERPS_OP_TTL_MS,
     ENV_API_KEY,
     ENV_SECRET_KEY,
+    MAX_PERP_MARKET_INDEX,
     MAX_PERPS_OP_TTL_MS,
     MAX_POOL,
     MIN_ORDER_TTL_MS,
     PERPS_HISTORY_MAX,
-    PERPS_LAST,
     PERPS_QUOTE_ASSET_ID,
     PERPS_SPOT_SIDE,
 )
@@ -123,12 +125,14 @@ class PerpsResource(Resource):
 
         Returns ``{"markets": [...], "collateral": {...}}``
         (:class:`~loaf.models.PerpsMarkets`); :meth:`collateral` reads the
-        second. Each row is the market as a property's ``l2Market`` serves it
-        (:class:`~loaf.models.L2PerpsMarket`): ``marketIndex`` (0 to 254),
-        ``status`` (``ACTIVE``, or ``EXPIRED``: it takes no orders and its
-        positions leave by exits), the custody (``chainId``, ``proxyAddress``,
-        ``l2ChainId``), ``quoteAssetId`` (3, USDC), and the terms its orders
-        are admitted against: ``takerFee`` / ``makerFee`` (per 1,000,000),
+        second (``None`` while the exchange cannot read it). Each row is a
+        perp's ``marketIndex`` (0 to 254) and its ``market.l2`` as
+        :meth:`~loaf.resources.market.MarketResource.get` serves it
+        (:class:`~loaf.models.L2PerpsMarket`): ``status`` (``ACTIVE``, or
+        ``EXPIRED``: it takes no orders and its positions leave by exits), the
+        custody (``chainId``, ``proxyAddress``, ``l2ChainId``), ``quoteAssetId``
+        (3, USDC), and the terms its orders are admitted against: ``takerFee`` /
+        ``makerFee`` (per 1,000,000),
         ``risk`` (the maintenance margin factor per 65,536; initial margin is
         twice it), ``band``, ``flags``, ``oiCap``, ``minBase``, ``minQuote``,
         ``quoteLimit``, ``sem`` and ``qem``.
@@ -148,13 +152,16 @@ class PerpsResource(Resource):
         decimal strings. Neither changes once the asset is registered.
 
         Raises:
-            LoafServerError: the reply has no usable collateral.
+            LoafServerError: the reply has no usable collateral (it serves
+                ``None`` while the exchange cannot read it from the chain: try
+                again in a moment).
         """
         return _collateral_of(self.markets()).row
 
     def market(self, market: int) -> Any:
-        """Perps market ``market``'s row of :meth:`markets`, or ``None`` when it is not listed."""
-        index = _ranged(market, "market", 0, PERPS_LAST, "a perps market index")
+        """Perp ``market``'s row of :meth:`markets` (by its ``marketIndex``), or ``None`` when it
+        is not listed."""
+        index = _ranged(market, "market", 0, MAX_PERP_MARKET_INDEX, "a perps market index")
         for row in _list_of(self.markets(), "markets"):
             if isinstance(row, Mapping) and row.get("marketIndex") == index:
                 return row
@@ -201,7 +208,7 @@ class PerpsResource(Resource):
     def market_live(self, market: int) -> Any:
         """Perps market ``market``'s row of :meth:`markets_live`
         (:class:`~loaf.models.PerpsMarketLive`), or ``None`` when it is not listed."""
-        index = _ranged(market, "market", 0, PERPS_LAST, "a perps market index")
+        index = _ranged(market, "market", 0, MAX_PERP_MARKET_INDEX, "a perps market index")
         for row in _list_of(self.markets_live(), "markets"):
             if isinstance(row, Mapping) and row.get("marketIndex") == index:
                 return row
@@ -222,7 +229,7 @@ class PerpsResource(Resource):
         signed, a decimal string), the index price and the tick's clock. For
         the next page, pass the last row's ``journalSeq`` as ``before``.
         """
-        index = _ranged(market, "market", 0, PERPS_LAST, "a perps market index")
+        index = _ranged(market, "market", 0, MAX_PERP_MARKET_INDEX, "a perps market index")
         return self._client.get(
             "/l2/perps/funding", params={"market": index, **_page(limit, before)}, auth=False
         )
@@ -234,8 +241,9 @@ class PerpsResource(Resource):
 
         Returns ``{l2AccountIndex, pools}`` (:class:`~loaf.models.PerpsAccount`):
         the pools that hold anything, ascending, each with its positions
-        ascending by market. Values are the engine's, as of its last commit,
-        each amount of 64 bits or more a decimal string:
+        ascending by market (a perp's ``marketIndex``) and its open orders.
+        Values are the engine's, as of its last commit, each amount of 64 bits
+        or more a decimal string:
 
         * a pool's ``collateral``, ``value`` (the collateral plus each
           position's signed notional less its funding owed) and a position's
@@ -257,9 +265,14 @@ class PerpsResource(Resource):
           above which (a short) the pool is liquidatable, every other term of
           the pool held, ``None`` when it has none; ``fundingIndex`` is the
           funding index it last settled at (32.32 fixed point);
-        * ``adlRank``, where served: the position's place in the
-          auto-deleveraging queue, 1 (deleveraged last) to 5 (first), ``None``
-          while it is unranked.
+        * ``adlRank``: the position's place in the auto-deleveraging queue,
+          1 (deleveraged last) to 5 (first), ``None`` while it is unranked;
+        * a pool's ``openOrders``: its open perps orders as the engine's
+          margin checks count them, ascending by ``orderId``, each ``{orderId,
+          market, side, quantityLeft, price, reduceOnly}``: ``quantityLeft``
+          in base units (a decimal string), ``price`` its signed limit price in
+          the market's price units (dollars x 1000). At most 200 across your
+          pools.
 
         Raises:
             LoafNotFoundError: you have no trading account yet.
@@ -280,7 +293,7 @@ class PerpsResource(Resource):
     def position(self, market: int, pool: int = 0) -> Any:
         """Your position in perps market ``market`` from margin pool ``pool``
         (:class:`~loaf.models.PerpsPosition`), or ``None`` when there is none."""
-        index = _ranged(market, "market", 0, PERPS_LAST, "a perps market index")
+        index = _ranged(market, "market", 0, MAX_PERP_MARKET_INDEX, "a perps market index")
         held = self.pool(pool)
         for row in _list_of(held, "positions") if held is not None else ():
             if isinstance(row, Mapping) and row.get("market") == index:
@@ -293,13 +306,21 @@ class PerpsResource(Resource):
 
         Returns ``{"closes": [...]}`` (:class:`~loaf.models.PerpsCloses`), each
         ``{journalSeq, atMs, kind, market, pool, side, baseAfter, price, base,
-        quote, fee}``: ``kind`` is ``LIQUIDATION``, ``DELEVERAGE``
-        (auto-deleveraging), ``EXIT`` or ``SETTLE`` (the engine closing the rest
-        of an expired market's position); ``side`` is the position's (``LONG``
-        or ``SHORT``) and ``baseAfter`` its signed base after the close, a
-        decimal string (``"0"``: closed; a close never flips it); ``price``,
-        ``base`` (a decimal string) and ``quote`` are the close's fill, ``fee``
-        yours, in the engine's units; ``atMs`` is its commit's clock.
+        quote, fee, quoteExtended, feeExtended, adl}``: ``kind`` is
+        ``LIQUIDATION``, ``DELEVERAGE`` (auto-deleveraging), ``EXIT`` or
+        ``SETTLE`` (the engine closing the rest of an expired market's
+        position); ``side`` is the position's (``LONG`` or ``SHORT``) and
+        ``baseAfter`` its signed base after the close, a decimal string
+        (``"0"``: closed; a close never flips it); ``price``, ``base`` (a
+        decimal string) and ``quote`` are the close's fill, ``fee`` yours, in
+        the engine's units (``quote`` and ``fee`` in the market's quote units,
+        10 x its ``qem`` extended units), and ``quoteExtended`` and
+        ``feeExtended`` the same two in the extended units of a pool's
+        collateral (:meth:`positions`), decimal strings; ``adl`` is ``True``
+        when your pool was a deleverage's counterparty, closed against the
+        deleveraged one (a ``DELEVERAGE`` with no fee); ``atMs`` is its
+        commit's clock. A deleverage between two of your pools is two closes
+        under one ``journalSeq``, told apart by ``adl``.
 
         Raises:
             LoafNotFoundError: you have no trading account yet.
@@ -440,7 +461,7 @@ class PerpsResource(Resource):
         usable collateral never blocks it.
         """
         key = self._credentials()
-        index = _ranged(market, "market", 0, PERPS_LAST, "a perps market index")
+        index = _ranged(market, "market", 0, MAX_PERP_MARKET_INDEX, "a perps market index")
         number = _pool(pool)
         ttl = _op_ttl(ttl_ms)
 

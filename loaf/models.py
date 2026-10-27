@@ -16,7 +16,7 @@ seconds, except ``expiryMs`` (unix milliseconds).
 
 from __future__ import annotations
 
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, Optional, TypedDict
 
 
 class PriceLevel(TypedDict):
@@ -25,7 +25,7 @@ class PriceLevel(TypedDict):
 
 
 class OrderBook(TypedDict, total=False):
-    propertyId: int
+    marketIndex: int
     bids: list[PriceLevel]
     asks: list[PriceLevel]
 
@@ -48,30 +48,27 @@ class CandleHistory(TypedDict, total=False):
     hasMore: bool  # at least one older candle exists before oldestTs
 
 
-class L2SpotMarket(TypedDict):
-    """``property.l2Market`` of ``GET /trade/{ticker}`` for a spot market: the L2
-    market every order on the property signs (the SDK reads it for you)."""
+class MarketL2(TypedDict):
+    """``market.l2`` of ``GET /trade/{ticker}`` for a spot market (``type`` ``"SPOT"``): with
+    the market's ``marketIndex``, what every order on the market signs, and its custody (the
+    SDK reads both for you)."""
 
-    kind: str  # "spot"
     chainId: int  # the chain the proxy is on, not what an order signs
     proxyAddress: str  # the ZkLoaf proxy
     l2ChainId: int
-    marketIndex: int  # 2048 to 4094
-    baseAssetId: int  # the property token's balances row
+    baseAssetId: int  # the asset token's balances row
     quoteAssetId: int  # the cash balances row
 
 
-class L2PerpsMarket(TypedDict):
-    """``property.l2Market`` for a perps market, and each row of
-    ``perps.markets()``: a perpetual future settled in USDC, with the terms its
-    orders are admitted against."""
+class PerpMarketL2(TypedDict):
+    """``market.l2`` of ``GET /trade/{ticker}`` for a perp (``type`` ``"PERP"``): a perpetual
+    future settled in USDC, its custody and the terms its orders are admitted against. It has
+    no base asset: an order signs its pool."""
 
-    kind: str  # "perps"
     chainId: int
     proxyAddress: str
     l2ChainId: int
-    marketIndex: int  # 0 to 254
-    quoteAssetId: int  # 3, USDC; a perps market has no base asset
+    quoteAssetId: int  # 3, USDC
     status: str  # "ACTIVE", or "EXPIRED": no more orders; positions leave by perps.exit()
     sem: int  # the market's size extension multiplier
     qem: str  # its quote extension multiplier, a decimal string (it can pass 2^53)
@@ -86,8 +83,10 @@ class L2PerpsMarket(TypedDict):
     quoteLimit: int  # the most quote of any order; 0: none
 
 
-#: ``property.l2Market``: a spot or a perps market, by ``kind``.
-L2Market = Union[L2SpotMarket, L2PerpsMarket]
+class L2PerpsMarket(PerpMarketL2):
+    """A row of ``perps.markets()``: a perp's ``marketIndex`` and its ``l2``."""
+
+    marketIndex: int  # 0 to 254
 
 
 class PerpsCollateral(TypedDict):
@@ -105,10 +104,10 @@ class PerpsMarkets(TypedDict):
     collateral their pools hold."""
 
     markets: list[L2PerpsMarket]
-    collateral: PerpsCollateral
+    collateral: Optional[PerpsCollateral]  # None when the exchange could not read it just now
 
 
-class PerpsPosition(TypedDict, total=False):
+class PerpsPosition(TypedDict):
     """One open position of a pool. Amounts are decimal strings in the engine's units."""
 
     market: int  # the perps market, 0 to 254
@@ -119,11 +118,22 @@ class PerpsPosition(TypedDict, total=False):
     fundingOwed: str  # extended USDC units: positive pays, negative receives
     notional: str  # |base| x index x qem, extended USDC units
     liquidationPrice: Optional[str]  # the index past which the pool is liquidatable, or None
-    adlRank: Optional[int]  # where served: 1 (deleveraged last) to 5 (first); None: unranked
+    adlRank: Optional[int]  # 1 (deleveraged last) to 5 (first); None: unranked
+
+
+class PerpsOpenOrder(TypedDict):
+    """One of a pool's open perps orders, as the engine's admission counts them."""
+
+    orderId: int
+    market: int  # the perp's market index
+    side: str  # OrderSide
+    quantityLeft: str  # what is left of it, base units (tokens x 10), a decimal string
+    price: int  # its signed limit price, dollars x 1000
+    reduceOnly: bool
 
 
 class PerpsPool(TypedDict):
-    """One margin pool of yours: its collateral and positions."""
+    """One margin pool of yours: its collateral, positions and open orders."""
 
     pool: int  # 0, the cross pool, or 1 to 7
     collateral: str  # signed, extended USDC units
@@ -132,6 +142,7 @@ class PerpsPool(TypedDict):
     liquidatable: Optional[bool]  # value < 0 or value x 65,536 < requirement
     initialMarginOk: Optional[bool]  # value x 65,536 >= 2 x requirement: collateral may leave
     positions: list[PerpsPosition]  # ascending by market, at most 8
+    openOrders: list[PerpsOpenOrder]  # ascending by orderId; at most 200 across your pools
 
 
 class PerpsAccount(TypedDict):
@@ -214,8 +225,11 @@ class PerpsClose(TypedDict):
     baseAfter: str  # its signed base after the close, a decimal string: "0" closed, never flipped
     price: int
     base: str  # the close's base units, a decimal string
-    quote: int
-    fee: int  # yours
+    quote: int  # in the market's quote units (10 x qem extended units)
+    fee: int  # yours, likewise
+    quoteExtended: str  # quote in extended USDC units, a decimal string
+    feeExtended: str  # fee in extended USDC units, a decimal string
+    adl: bool  # True: you were a deleverage's counterparty, closed against the deleveraged
 
 
 class PerpsCloses(TypedDict):
@@ -243,7 +257,7 @@ class TradeTick(TypedDict, total=False):
     ``tick.get("txHash")``."""
 
     tradeId: int
-    propertyId: int
+    marketIndex: int
     txHash: str  # a trade's content hash (0x + 64 hex), not an on-chain tx; absent on a take
     aggressorSide: str  # OrderSide of the taker (a take's: the liquidated side)
     price: float
@@ -291,8 +305,10 @@ class OrderHistoryItem(TypedDict, total=False):
     """
 
     id: int
-    propertyId: int
-    ticker: str  # "" on a conditional for a delisted/uncached property — key on propertyId
+    marketIndex: int  # the order's market: the index it signed
+    # The market's, a delisted one's too; "" only for a market no asset is bound to: key on
+    # marketIndex.
+    ticker: str
     side: str  # OrderSide
     type: str  # OrderType, or ConditionalOrderType — THIS is the discriminator
     timeInForce: str
@@ -348,8 +364,8 @@ class LiquidationFill(TypedDict):
 
     perpsSeq: int  # the liquidation's journal seq = its tape print's tradeId
     orderId: int  # your order it filled
-    propertyId: int
-    ticker: str
+    marketIndex: int
+    ticker: str  # the market's
     side: str  # OrderSide of your order
     role: str  # "MAKER"
     quantity: float
@@ -361,8 +377,8 @@ class LiquidationFill(TypedDict):
 class TradeHistoryItem(TypedDict, total=False):
     tradeId: int
     orderId: int  # this user's order the fill belongs to
-    propertyId: int
-    ticker: str
+    marketIndex: int
+    ticker: str  # the market's
     txHash: str  # the trade's content hash (0x + 64 hex), not an on-chain transaction
     side: str  # OrderSide, relative to this user
     role: str  # "MAKER" | "TAKER": the resting order is the MAKER, the aggressor's the TAKER
@@ -385,14 +401,17 @@ class L2AssetBalance(TypedDict):
     available: str  # total minus hold: what a new order can use
 
 
-class Position(TypedDict, total=False):
-    """A held property: facts only. An L2 holding's amounts are its ``balances`` row."""
+class Holding(TypedDict, total=False):
+    """A held asset's token: facts only. An L2 holding's amounts are its ``balances`` row."""
 
-    propertyId: int
-    ticker: str
-    tokenName: str  # display name
-    totalTokens: float  # the property's total token supply
+    ticker: str  # the asset's, its spot market's too
+    marketIndex: Optional[int]  # its spot market's, which mark_price frames name; None without one
+    name: str  # the asset's display name
+    kind: str  # AssetKind
+    totalTokens: Optional[float]  # a property's token supply; None for any other kind
     averageEntryPrice: Optional[float]  # None when the cost is unknown
+    # The mark when read: its spot market's for an L2 holding; an IPO allocation's unit price
+    # until it trades.
     marketPrice: float
     isIpoAllocation: bool
     assetId: int  # L2 holding only: its balances row
@@ -404,11 +423,14 @@ class Position(TypedDict, total=False):
 class PortfolioComponent(TypedDict, total=False):
     balances: list[L2AssetBalance]  # the whole L2 book; a missing row is 0
     lifetimeVolume: float  # dollars traded over the account's lifetime
-    positions: list[Position]
+    holdings: list[Holding]
     applicableFees: dict[str, int]  # {takerFeeBps, makerFeeBps}
     offeringOrders: list[dict[str, Any]]
     openOrders: list[OrderHistoryItem]  # booked orders + PENDING/ARMED conditionals, merged
     tradeHistory: list[TradeHistoryItem]
+    # Your newest liquidation fills, newest first: each a liquidation_fill frame's fill (no
+    # trade: tradeHistory never holds one).
+    liquidationFills: list[LiquidationFill]
     orderHistory: list[OrderHistoryItem]  # newest rows of both kinds, ANY status
     transfers: list[dict[str, Any]]  # newest first, keyed by journalSeq; `amount` in base units
 
@@ -465,7 +487,7 @@ class CompetitionRound(TypedDict, total=False):
     endsAt: Optional[int]  # likewise, re-stamped when it leaves ACTIVE
     participantBatchSize: int  # how many the queue admits into the round
     status: str  # CompetitionRoundStatus
-    newAssetProperty: Optional[dict[str, Any]]  # the round's headline asset (a GET /trade row)
+    newAssetMarket: Optional[dict[str, Any]]  # the round's new asset's market (a GET /trade row)
     prizePool: list[PrizePoolEntry]
     volumeMultiplierTiers: list[VolumeMultiplierTier]
     volumeExponent: float  # e in points = a * volume^e + b * pnl
@@ -509,12 +531,13 @@ __all__ = [
     "OrderBook",
     "Candle",
     "CandleHistory",
-    "L2SpotMarket",
+    "MarketL2",
+    "PerpMarketL2",
     "L2PerpsMarket",
-    "L2Market",
     "PerpsCollateral",
     "PerpsMarkets",
     "PerpsPosition",
+    "PerpsOpenOrder",
     "PerpsPool",
     "PerpsAccount",
     "PerpsFunding",
@@ -536,7 +559,7 @@ __all__ = [
     "TradeHistoryItem",
     "LiquidationFill",
     "L2AssetBalance",
-    "Position",
+    "Holding",
     "PortfolioComponent",
     "LeaderboardEntry",
     "PrizePoolEntry",

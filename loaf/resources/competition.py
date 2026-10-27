@@ -24,8 +24,8 @@ class CompetitionResource(Resource):
         fees. ``rounds`` is EVERY round in full, newest first (``None`` when
         none exist), each with ``roundNumber``, ``name``, ``rules``,
         ``startsAt``/``endsAt``, ``participantBatchSize`` (how many the queue
-        admits into the round), ``status``, ``newAssetProperty`` (the round's
-        headline asset: its trade-list row, or ``None``), ``prizePool``,
+        admits into the round), ``status``, ``newAssetMarket`` (the market of
+        the round's new asset: its trade-list row, or ``None``), ``prizePool``,
         ``volumeMultiplierTiers``, ``volumeExponent``, ``pnlMultiplier``,
         ``bottomCullPercent`` and ``winners``. See
         :class:`~loaf.models.CompetitionRound`.

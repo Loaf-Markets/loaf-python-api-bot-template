@@ -19,7 +19,7 @@ from loaf import LoafClient
 loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_SECRET_KEY (see §2)
 
 print(loaf.portfolio.component().balances)                 # your balances (base units)
-print(loaf.market.properties())                            # listed properties
+print(loaf.market.list())                                  # listed markets
 loaf.orders.limit_buy("MUS", quantity=10, price=167.49)    # signed locally with your trading key
 ```
 
@@ -57,7 +57,7 @@ Both come from the Loaf web app's **API** page (log in → **API**).
    read its own key's expiry, so note the date when you create it.
 2. **The trading key** needs trading enabled: deposit (your first deposit opens
    your trading account), then select **Enable trading** in the order panel on
-   a property's Trade page and wait until it is active. Then, under **Trading
+   a market's Trade page and wait until it is active. Then, under **Trading
    key** below your tokens, select **Show trading key**: your wallet signs
    once, and the page shows the key if it is the one in force (right after
    enabling or a reset, try again in a moment). Your account has one trading
@@ -131,15 +131,26 @@ the bot's environment (`LoafClient()` refuses to start while
 python bot.py
 ```
 
-`bot.py` verifies your credentials, prints balances/positions, opens the live
+`bot.py` verifies your credentials, prints balances/holdings, opens the live
 feed (order book, competition round notices and your private portfolio stream),
 and runs a 5-second strategy loop with clearly-marked `# YOUR STRATEGY GOES
 HERE` hooks. It only *observes* the market out of the box — drop your logic into
 `Strategy.on_tick`.
 
-It follows the property named by `TARGET_TICKER` at the top of the file — a
-ticker such as `OPRA` — or the first tradeable listed property when that is
-empty.
+It follows the market named by `TARGET_TICKER` at the top of the file — a
+market's ticker such as `OPRA` — or the first tradeable listed market when that
+is empty. While none trades it follows the first `LIVE` one with an L2 market,
+whose halt or start the loop waits out (while the platform-wide halt is on,
+every market reads halted), else the first listed one.
+
+Each tick runs the strategy only while the market trades: `LIVE`, with an L2
+market, not halted and past its `tradingStartsAt`. Otherwise the tick prints why
+(`[PENDING]`, `[HALTED]`, `[NOT STARTED]`, ...) and skips it. No frame announces
+a listing or a trading start, so until the market trades each tick reads it
+again (a halt aside: the feed announces its end). Once it trades, the gate uses
+the market as last read: a change only a read shows (unlisted, delisted, a later
+start) reaches it when an order is refused for it (set `needs_seed`, as
+`bot.py`'s strategy notes say) or when the feed reconnects.
 
 > **Copy it before you edit it.** `bot.py` is tracked by this repo and ships
 > alongside the SDK, so it changes when the SDK does. Strategy code written into
@@ -190,11 +201,11 @@ Create one `LoafClient` and reach everything through grouped resources:
 
 | Resource | What it covers |
 | --- | --- |
-| `loaf.market` | properties, property detail, candle history, trade backfill, info pages (all public) |
+| `loaf.market` | markets, market detail, candle history, trade backfill, asset info pages (all public) |
 | `loaf.offerings` | IPO offerings: list, detail |
 | `loaf.orders` | place (signed) / cancel / cancel-all orders, stop & take (conditional) orders |
 | `loaf.perps` | perps markets, your margin pools and positions, margin moves and exits (signed) |
-| `loaf.portfolio` | balances, positions, recent activity |
+| `loaf.portfolio` | balances, holdings, recent activity |
 | `loaf.history` | paginated order & trade history, cancelled & active orders |
 | `loaf.leaderboard` | competition leaderboard |
 | `loaf.competition` | competition rounds info, your queue position, payout details |
@@ -210,8 +221,8 @@ The trading-facing endpoints are wrapped (account management, KYC, referrals,
 and fiat ramps are not part of this SDK):
 
 ```
-market.properties()                   GET    /trade
-market.property(ticker)               GET    /trade/{ticker}
+market.list()                         GET    /trade
+market.get(ticker)                    GET    /trade/{ticker}
 market.candles(ticker, resolution)    GET    /trade/{ticker}/candles
 market.iter_candles(ticker, res)      (auto-paginate candle history)
 market.trades(ticker)                 GET    /trade/{ticker}/trades
@@ -264,7 +275,14 @@ orders the SDK also reads `GET /l2/keys` and reserves order numbers with
 `POST /l2/order-indices`, both with your API key. A perps allocate or exit is
 signed with your trading key too, and also carries your API key.
 
-Candle history is a dedicated, paginated endpoint (the property detail response
+A market (an order book, spot or perp) is named by its ticker: its asset's
+ticker, with `-PERP` appended for a perp (`MUS`, `H100-PERP`). `market.get`,
+`market.candles`, `market.trades`, orders and the WebSocket's market channels
+take a market's ticker; the info pages (`market.info_*`), offerings and your
+holdings name the asset by its own ticker (a spot market's ticker is its
+asset's).
+
+Candle history is a dedicated, paginated endpoint (the market detail response
 does not include it):
 
 ```python
@@ -280,8 +298,8 @@ older = loaf.market.candles("OPRA", "1h", to=h.oldestTs)  # page back while h.ha
 Placing an order is a single call:
 
 ```python
-# Orders are addressed by ticker. Pick a tradeable one from loaf.market.properties():
-# status "LIVE" and hasL2Market (halts and trading hours still apply).
+# Orders are addressed by the market's ticker. Pick a tradeable one from loaf.market.list():
+# status "LIVE", not isHalted, hasL2Market, and tradingStartsAt passed (None: no wait).
 
 # LIMIT order (price in dollars, <=2 dp; quantity in tokens, <=1 dp):
 res = loaf.orders.limit_buy("MUS", quantity=10, price=167.49)
@@ -331,7 +349,7 @@ stop means a second sell).
 - The reference read is one extra public request; it can lag the live market
   and may not yet show a trade you just made. For price-sensitive orders pass the
   `markprice:{ticker}` value you stream as `reference_price` (once the SDK has
-  read the property's market, that also saves the request).
+  read the market, that also saves the request).
 - If the exchange has no market price yet, the SDK refuses the order locally
   rather than sign it off zero.
 - A BUY holds **worst price × quantity × (1 + `L2_FEE_RATE_CAP` / 1,000,000)**
@@ -343,7 +361,7 @@ stop means a second sell).
 import math
 from loaf import L2_FEE_RATE_CAP, from_base_units, worst_price
 
-quote = loaf.market.property("MUS").property.l2Market.quoteAssetId   # the market's cash asset
+quote = loaf.market.get("MUS").market.l2.quoteAssetId   # the market's cash asset
 row = next((b for b in loaf.portfolio.component().balances if b.assetId == quote), None)
 cash = float(from_base_units(row.available, row.decimals)) if row else 0.0
 worst = worst_price(mark, "BUY", loaf.max_slippage_bps)  # what market_buy(..., reference_price=mark) signs
@@ -356,16 +374,19 @@ rejections rather than trying to avoid them:
 
 | Rejection | Rule |
 | --- | --- |
-| `LoafValidationError` (400) | **Minimum order value** — `price x quantity` must be at least $10, measured at the price you **sign** (a MARKET order's worst price). A SELL closing your *entire* available position is exempt, so dust can always be flattened. |
+| `LoafValidationError` (400) | **Minimum order value** — `price x quantity` must be at least $10, measured at the price you **sign** (a MARKET order's worst price). A SELL closing your *entire* available holding is exempt, so dust can always be flattened. |
 | `LoafValidationError` (400) | **Limit price deviation** — any order, MARKET included, whose signed price is too far from the market reference is refused. The ceiling is a deployment setting; keep your max slippage small. |
-| `LoafValidationError` (400) | **Daily price band** — a per-property band around the daily reference price, when enabled. The message carries the price, limit, reference and band width. |
+| `LoafValidationError` (400) | **Daily price band** — a per-market band around the daily reference price, when enabled. The message carries the price, limit, reference and band width. |
 | `LoafValidationError` (400) | **Balance and open-order caps** — `Insufficient available balance for this order`, or too many open orders (resting stops count too). |
 | `LoafValidationError` (400) | **Fee-rate cap** — `l2 fee: the signed fee-rate cap is below the account's fee rate`: your account's fee rate is above the cap every order signs. |
 
-Markets keep trading hours: outside them placement raises `LoafForbiddenError`
-(`Trading is currently closed`); cancels still work.
+Markets trade around the clock. A market that does not trade (before it is
+listed, before its trading starts at its `tradingStartsAt`, or once it is
+delisted) refuses placement with `LoafForbiddenError` (403), and an unknown one
+with `LoafNotFoundError` (404). After a 404, or a 403 for a market that is not
+listed, the SDK reads the ticker's market again for your next order.
 
-If trading is halted — platform-wide or for that property — order placement
+If trading is halted — platform-wide or for that market — order placement
 raises `TradingHaltedError` (403). A platform-wide halt blocks cancels too,
 except `orders.cancel_conditional()`, which the matching engine takes under any
 halt and stays available (see **Stop & take orders** below). `TradingHaltedError` also covers
@@ -379,20 +400,20 @@ it does not take now with `MarketStateError` (403), its `.state` the reason:
 reduce-only or stale-price market still takes an order that reduces a position.
 
 To see a halt coming instead of discovering it on a rejected order, subscribe to
-the property's status channel:
+the market's status channel:
 
 ```python
-ws.subscribe_property_status("MUS")
+ws.subscribe_market_status("MUS")
 
-@ws.on_property_halt
+@ws.on_market_halt
 def on_halt(msg):
     print(msg.ticker, "halted" if msg.isHalted else "resumed")
 ```
 
-`isHalted` is the **effective** state — the property's own flag OR'd with the
+`isHalted` is the **effective** state — the market's own flag OR'd with the
 platform-wide kill switch — so assign it straight over the `isHalted` you seeded
-from `market.property("MUS").property.isHalted`. Note a global halt lifting does
-not resume a property that is individually halted; the frame accounts for that.
+from `market.get("MUS").market.isHalted`. Note a global halt lifting does not
+resume a market that is individually halted; the frame accounts for that.
 
 ### Order life
 
@@ -514,7 +535,7 @@ Direction comes from the type **and** the side, not the type alone:
 
 **A 200 means the row is ARMED — not that it will ever book.** Your holding and
 cash are not checked until the row fires; a row that fires short of funds
-cancels your own resting orders on its property and side, and tries once more.
+cancels your own resting orders on its market and side, and tries once more.
 Every trigger-time failure (holding gone, cash gone, price band, limit deviation,
 minimum value *again*, engine rejection) raises nothing; it arrives as
 `status: "FAILED"` with a `rejectionReason` on your `portfolio` channel. A
@@ -579,22 +600,28 @@ Derive triggers with `round(mark * 0.95, 2)`: an unrounded float product carries
 
 ### Perps
 
-A property whose `l2Market` has `kind` `"perps"` trades a perpetual future
-settled in USDC: a BUY opens or grows a long (or shrinks a short), a SELL the
-other way round. Your margin is USDC held in **pools**: pool 0, the cross pool,
-and the isolated pools 1 to 7, each holding at most 8 positions margined by
-that pool's collateral alone. Fund a pool from your spot USDC, trade from it,
-and move what is left back:
+A perp (its ticker is its asset's with `-PERP` appended, its `market.type`
+`"PERP"`) trades a perpetual future settled in USDC: a BUY opens or grows a
+long (or shrinks a short), a SELL the other way round. Your margin is USDC held
+in **pools**: pool 0, the cross pool, and the isolated pools 1 to 7, each
+holding at most 8 positions margined by that pool's collateral alone. Fund a
+pool from your spot USDC, trade from it, and move what is left back:
 
 ```python
-loaf.perps.markets()                                  # every perps market, public
-loaf.perps.market_live(4)                             # tradingState, riskOnly, index, funding rate
+perp = loaf.market.get("MUS-PERP").market             # type "PERP", its marketIndex and l2 terms
+loaf.perps.markets()                                  # every perp's index and terms, public
+loaf.perps.market_live(perp.marketIndex)              # tradingState, riskOnly, index, funding rate
 loaf.perps.add_margin(5_000, pool=0)                  # 5,000 USDC: spot -> pool 0
-loaf.orders.limit_buy("PERP", quantity=2, price=101.5, pool=0)   # a long from pool 0
-loaf.orders.limit_sell("PERP", quantity=2, price=104, pool=0, reduce_only=True)
-loaf.perps.position(market=4, pool=0)                 # base, entryPrice, liquidationPrice, ...
+loaf.orders.limit_buy("MUS-PERP", quantity=2, price=101.5, pool=0)   # a long from pool 0
+loaf.orders.limit_sell("MUS-PERP", quantity=2, price=104, pool=0, reduce_only=True)
+loaf.perps.position(market=perp.marketIndex, pool=0)  # base, entryPrice, liquidationPrice, ...
 loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
 ```
+
+Orders name a perp by its ticker; the perps reads and ops name it by its
+`marketIndex` (0 to 254), as the exchange's perps API does, and so do their
+rows (`market`, `marketIndex`). `market.list()` rows and
+`market.get(ticker).market` carry both.
 
 - **Orders** take `pool=` (0 by default) and `reduce_only=True` (its fills
   may only shrink the pool's position), signed with the order; both are
@@ -602,7 +629,7 @@ loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
   perps BUY or SELL, never to a reduce-only order: each leg is a reduce-only
   order on the other side in the order's pool. A SELL's are mirrored:
   `tp_price < price < sl_price`, e.g.
-  `limit_sell("PERP", 2, 104, tp_price=95, sl_price=110)`.
+  `limit_sell("MUS-PERP", 2, 104, tp_price=95, sl_price=110)`.
 - **Allocates** (`add_margin`, `return_margin`, `allocate(amount, from_side=,
   to_side=)`, a side a pool or `loaf.PERPS_SPOT_SIDE`, 255, your spot balance)
   and **exits** (`exit(market, pool=)`: closes your position in an EXPIRED
@@ -628,7 +655,7 @@ loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
   (ticks x the collateral's `extensionMultiplier`), a position's `base` in an
   order's signed quantity units (tokens x 10, negative for a short), prices in
   the market's price units (its docstring has the rest).
-- **Market state.** A perps market can refuse orders for its own state (403,
+- **Market state.** A perp can refuse orders for its own state (403,
   `MarketStateError` with `.state`): halted, outside its trading hours,
   reduce-only, its price stale, or reduce-only while its latest price waits
   for review (`PriceHeldError`). In the last three a `reduce_only=True` order
@@ -695,7 +722,7 @@ ws = loaf.websocket()
 
 @ws.on_orderbook
 def on_book(msg):
-    print(msg.propertyId, msg.bids[0].price, msg.asks[0].price)
+    print(msg.marketIndex, msg.bids[0].price, msg.asks[0].price)
 
 @ws.on_trade            # YOUR fills (private portfolio channel)
 def on_fill(msg):
@@ -719,12 +746,12 @@ Channels:
 
 | Channel | Auth | Handler | Payload |
 | --- | --- | --- | --- |
-| `orderbook:{ticker}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (throttled); no initial frame — seed from `market.property(ticker).orderBook` |
+| `orderbook:{ticker}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (throttled); no initial frame — seed from `market.get(ticker).orderBook` |
 | `trades:{ticker}` | public | `on_trades` | every trade, in at most one frame every 100 ms holding every trade since the previous one, newest first; right after subscribing, the recent trades (up to 20) once, before `on_connect` — dedupe by `tradeId` |
 | `chart:{ticker}` | public | `on_candle` | OHLCV candle updates |
 | `markprice:{ticker}` | public | `on_mark_price` | canonical mark price (1s, on change) |
 | `volume:{ticker}` | public | `on_volume` | rolling-24h traded volume (replaces `volume24h`) |
-| `property:{ticker}` | public | `on_property_halt` | halt / resume status for that property |
+| `market:{ticker}` | public | `on_market_halt` | halt / resume status for that market |
 | `leaderboard` | public | `on_leaderboard` | competition leaderboard (top entries), on change |
 | `perps:markets` | public | `on_perps_markets_live` | every perps market's live state, as `perps.markets_live()` serves it, about once a second — replace what you hold |
 | `competition` | public | `on_round_update` | round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT); no initial frame — seed from `competition.info()` |
@@ -738,17 +765,17 @@ your API key authenticated as, so an anonymous connection is refused with an
 - `balances_update` carries your **whole** balance book after every change:
   replace yours with it, and treat a missing row as 0. Rows are `{assetId,
   symbol, decimals, isQuote, total, hold, available}`, the amounts in base
-  units (`loaf.from_base_units`); the `isQuote` rows are your cash, and a
-  property's row is its `property.l2Market.baseAssetId`.
+  units (`loaf.from_base_units`); the `isQuote` rows are your cash, and a spot
+  market's token row is its `market.l2.baseAssetId`.
 - Each fill arrives **once**, final when it matches. Each engine update's burst
   carries its `order_status` frames, then its `trade_new` frames, then
   `balances_update`; an update with more than 200 statuses or trades comes as
   several such bursts, `balances_update` in the last only. So match a fill to
   its order by `trade.orderId`, not by frame order; `trade.role` is
-  `MAKER` (that order rested) or `TAKER` (it aggressed). There is no position
-  frame: your holdings are balances rows. `trade.txHash` is the trade's content
-  hash, not an on-chain transaction; `trade.proof` is `{"status": "PENDING"}`, or
-  `None` with proofs off.
+  `MAKER` (that order rested) or `TAKER` (it aggressed). A fill pushes no
+  holding frame: your holdings are balances rows. `trade.txHash` is the
+  trade's content hash, not an on-chain transaction; `trade.proof` is
+  `{"status": "PENDING"}`, or `None` with proofs off.
 - `order_update` carries the whole committed order, with its `expiryMs`. For an
   order that trades immediately it can arrive after the fill frames and already
   show FILLED. Stop and take orders (TP/SL legs included) ride the same frame,
@@ -757,37 +784,63 @@ your API key authenticated as, so an anonymous connection is refused with an
 - `order_status` `CANCELLED` carries the cancelled remainder in
   `quantityLeft`. It also arrives for orders you never cancelled: the
   order's expiry (72 h before `expiryMs`), an epoch move (a Reset
-  trading key, or a cancel-all sent on chain), a closed market, a BUY that can
-  no longer fund a fill within its hold, your own order crossing a resting one
-  of yours (the resting one is cancelled), and a firing stop freeing funds by
-  cancelling your resting orders on its side.
-- `order_queue` places your resting orders in one property's book:
-  `{propertyId, orders}`, bids best first, then asks, each `{orderId, side,
+  trading key, or a cancel-all sent on chain), a delisted (or unlisted)
+  market, a BUY that can no longer fund a fill within its hold, your own order
+  crossing a resting one of yours (the resting one is cancelled), and a firing
+  stop freeing funds by cancelling your resting orders on its side.
+- `order_queue` places your resting orders in one market's book:
+  `{marketIndex, orders}`, bids best first, then asks, each `{orderId, side,
   price, quantity, quantityAhead, ordersAhead}` (`ordersAhead`: how many orders
   at its price are ahead of it in time priority; `quantityAhead`: their
-  unfilled tokens). It replaces what you hold for that property, and an empty
+  unfilled tokens). It replaces what you hold for that market, and an empty
   list means none of yours rests there. Each time a connection newly
   subscribes `portfolio` with your API key, as the client does on every
   connection (subscribing again while subscribed sends nothing), one arrives
-  for each property where you have resting orders (before or after
-  `on_connect` on a new connection), then one on every change; a property
+  for each market where you have resting orders (before or after
+  `on_connect` on a new connection), then one on every change; a market
   where none rests sends nothing, and no REST read serves queue places, so
   drop every list you hold in `on_disconnect` and, after you unsubscribe
   `portfolio`, at the `subscription_confirmed` that answers it (frames sent
   before it can still arrive; `ws.on("subscription_confirmed", handler)` gets
   it), not in `on_connect`. It can arrive before the order's `order_update`.
 - Delivery is at most once, so after a reconnect reconcile from
-  `loaf.portfolio.component()` / `loaf.history.trades()`. To value positions
-  live, combine your balances with the `markprice` channel (the server does not
-  push portfolio totals).
+  `loaf.portfolio.component()` / `loaf.history.trades()`.
+
+**Valuing holdings live.** The server does not push portfolio totals: combine
+your balances with the `markprice` channel. A `mark_price` frame is
+`{marketIndex, price}`, with no ticker, and every `markprice` channel you
+subscribe feeds the one `on_mark_price` handler, so match each frame to the
+holding with that `marketIndex`. A holding's `marketIndex` is its spot market's,
+whose ticker is the holding's; `None` means the asset has no spot market, so no
+mark streams for it. An L2 holding is read, not pushed: read the portfolio
+again when a token's balances row appears that no holding names (a first buy, a
+deposit, a graduated IPO).
+
+```python
+holdings = loaf.portfolio.component().holdings
+by_market = {h.marketIndex: h for h in holdings if h.marketIndex is not None}
+
+@ws.on_mark_price
+def on_mark(msg):                       # {marketIndex, price}, from every markprice channel
+    held = by_market.get(msg.marketIndex)
+    if held is not None:
+        print(held.ticker, "marked at", msg.price)
+
+for h in by_market.values():
+    ws.subscribe_mark_price(h.ticker)   # a holding's ticker is its spot market's
+```
 
 **Reconnects.** `on_connect` fires once the server has answered the auth and
 the subscriptions. Nothing is replayed across a reconnect, so flag a re-seed in
 `on_connect` and do the REST reads from your own thread: handlers run on the
 socket's thread, and a slow read there stalls it. A public read can be older
 than a frame received since `on_connect`, so keep the frame's value over the
-read's. `bot.py` does both. The private reads (`portfolio.component()` and the
-`history` reads) first wait, up to 2 s, until every change pushed before them
+read's. `bot.py` does both, and takes the book from a read only if the feed was
+live from the request until the answer is applied: a read made before the first
+`on_connect`, between an `on_disconnect` and the next `on_connect`, or in flight
+when the feed drops or comes back can miss a change that no frame brings. The
+private reads (`portfolio.component()` and the `history` reads) first wait, up
+to 2 s, until every change pushed before them
 is readable. The `order_queue` lists have no REST read: drop them in
 `on_disconnect` (and, after you unsubscribe `portfolio`, at the
 `subscription_confirmed` that answers it), and the next subscription (the
@@ -810,7 +863,7 @@ reconnected, it was overloaded and shed pushes, or the matching engine dropped
 some or restarted without a clean shutdown (a clean restart closes nothing). It
 closes every connection holding `portfolio` and, about 2 s after the last bus
 reconnect or engine-side loss, every one holding the `trades` channel of a
-property that traded since or whose recent trades the server had missed: each
+market that traded since or whose recent trades the server had missed: each
 at most once every 30 s, and a connection holding both only once. An API-key
 connection can also get `resync` so that its key is checked again.
 
@@ -914,7 +967,7 @@ Cancels are never retried. Tune with `LoafClient(max_retries=...)`.
 | File | Shows |
 | --- | --- |
 | `examples/01_quickstart.py` | confirm credentials, read balances + market |
-| `examples/02_market_data.py` | properties, order book, candle history (public) |
+| `examples/02_market_data.py` | markets, order book, candle history (public) |
 | `examples/03_place_order.py` | place → inspect → cancel a limit order (needs your trading key) |
 | `examples/04_realtime_market.py` | stream order book + trades + mark price + halts |
 | `examples/05_portfolio_stream.py` | stream your private portfolio events |
@@ -942,7 +995,7 @@ the `wallet` extra the trading-key helper's tests are skipped, and without
 - This SDK is the **trading-facing** surface. Account management, KYC, referrals
   (`/auth/*`), the featured-offering home feed (`/home`), fiat on/off-ramps
   (`/portfolio/onramp|offramp`), and the shareable image cards
-  (`/portfolio/position/{ticker}/pnl-card`, `/leaderboard/card`,
+  (`/portfolio/holding/{ticker}/pnl-card`, `/leaderboard/card`,
   `/competition/queue-position/card`) are **not** wrapped — do those in the
   Loaf web app. So are deposits, withdrawals, and enabling or resetting your
   trading key. (Moving USDC between your spot balance and your perps pools is

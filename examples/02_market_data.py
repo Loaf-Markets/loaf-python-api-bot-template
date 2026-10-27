@@ -19,18 +19,18 @@ def main() -> None:
     # Market data is public — anonymous client is fine.
     client = LoafClient()
 
-    properties = client.market.properties().get("properties") or []
-    print(f"{len(properties)} properties listed:\n")
-    for prop in properties[:10]:
-        print(f"  {prop.ticker:<6} {prop.tokenName:<20} "
-              f"price={prop.marketPrice}  24h vol={prop.volume24h}  status={prop.status}")
+    markets = client.market.list().get("markets") or []
+    print(f"{len(markets)} markets listed:\n")
+    for market in markets[:10]:
+        print(f"  {market.ticker:<10} {market.name:<20} "
+              f"price={market.marketPrice}  24h vol={market.volume24h}  status={market.status}")
 
-    if not properties:
+    if not markets:
         return
 
-    ticker = properties[0].ticker
+    ticker = markets[0].ticker
     print(f"\n--- detail for {ticker} ---")
-    detail = client.market.property(ticker)
+    detail = client.market.get(ticker)
     book = detail.get("orderBook")
     if book:
         best_bid = book.bids[0] if book.get("bids") else None

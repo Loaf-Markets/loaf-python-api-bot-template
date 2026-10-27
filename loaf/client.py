@@ -151,7 +151,7 @@ class LoafClient:
 
         with LoafClient(api_key="...") as loaf:
             print(loaf.portfolio.component().balances)
-            print(loaf.market.properties())
+            print(loaf.market.list())
 
     Args:
         api_key: The API key from the Loaf web app (API -> Generate API Token),
@@ -282,7 +282,7 @@ class LoafClient:
         from .resources.perps import PerpsResource
         from .resources.portfolio import PortfolioResource
 
-        #: Public market data: properties, candles, info pages.
+        #: Public market data: markets, candles, trades, info pages.
         self.market: MarketResource = MarketResource(self)
         #: Primary market (IPO offerings): list, detail.
         self.offerings: OfferingsResource = OfferingsResource(self)
@@ -290,7 +290,7 @@ class LoafClient:
         self.orders: OrdersResource = OrdersResource(self)
         #: Perps: markets, your pools and positions, margin moves and exits (signed like orders).
         self.perps: PerpsResource = PerpsResource(self)
-        #: Balances, positions, and recent activity.
+        #: Balances, holdings, and recent activity.
         self.portfolio: PortfolioResource = PortfolioResource(self)
         #: Paginated order & trade history.
         self.history: HistoryResource = HistoryResource(self)
