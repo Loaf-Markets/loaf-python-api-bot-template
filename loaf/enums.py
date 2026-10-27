@@ -41,8 +41,20 @@ class ConditionalOrderType(_StrEnum):
 
 
 class TimeInForce(_StrEnum):
-    #: Good-til-cancelled — the only value the exchange accepts; order rows carry it.
+    """An order's time in force (``time_in_force=``). Order rows carry ``GTC``, ``IOC`` or
+    ``FOK``: the exchange keeps a post-only order as ``GTC``, and a MARKET order sent as
+    ``GTC`` as ``IOC``."""
+
+    #: Good-til-cancelled: what does not fill at once rests on the book (a MARKET order never
+    #: rests: the exchange runs it as IOC).
     GTC = "GTC"
+    #: Immediate-or-cancel: what does not fill at once is cancelled; one that fills nothing is
+    #: refused.
+    IOC = "IOC"
+    #: Fill-or-kill: fills its whole quantity at once, or is refused and fills nothing.
+    FOK = "FOK"
+    #: A LIMIT order's alone: refused if it would trade at once, so it only ever rests.
+    POST_ONLY = "POST_ONLY"
 
 
 class OrderStatus(_StrEnum):

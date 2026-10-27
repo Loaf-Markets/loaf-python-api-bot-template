@@ -114,6 +114,15 @@ def test_error_mapping():
     assert type(
         error_from_response(400, {"error": "Order refused: the market was halted earlier"})
     ) is loaf.LoafValidationError
+    # A post-only order that would have traded at once: its own 400, on the whole text.
+    would_take = "Post-only order rejected: it would have traded with a resting order at once"
+    error = error_from_response(400, {"error": would_take})
+    assert type(error) is loaf.PostOnlyWouldTakeError and error.status_code == 400
+    assert isinstance(error, loaf.LoafValidationError)
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error)):
+        assert type(clone) is loaf.PostOnlyWouldTakeError and str(clone) == str(error)
+    assert type(error_from_response(400, {"error": would_take + "."})) is loaf.LoafValidationError
+    assert type(error_from_response(403, {"error": would_take})) is loaf.LoafForbiddenError
     # A route that does not exist answers with an HTML page; keep just its message.
     missing = error_from_response(
         404,
@@ -123,6 +132,11 @@ def test_error_mapping():
     )
     assert isinstance(missing, loaf.LoafNotFoundError)
     assert missing.message == "Cannot GET /trade"
+
+
+def test_time_in_force_is_shared_types_order_time_in_force():
+    # Shared-Types 2.0.90's ORDER_TIMES_IN_FORCE, in its order; GTD is no time in force.
+    assert [member.value for member in loaf.TimeInForce] == ["GTC", "IOC", "FOK", "POST_ONLY"]
 
 
 @pytest.mark.parametrize("message, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])

@@ -309,8 +309,10 @@ print(res.orderId, res.status, res.quantityLeft)   # e.g. 991 OPEN 10
 res = loaf.orders.market_buy("MUS", quantity=2)           # reference fetched; client's max slippage
 res = loaf.orders.market_sell("MUS", quantity=2,
                               reference_price=mark, max_slippage_bps=50)   # mark: your markprice; 0.5%
-if res.status in ("OPEN", "PARTIALLY_FILLED"):     # the unfilled rest is RESTING at the worst price
-    loaf.orders.cancel(res.orderId)
+print(res.status, res.quantityLeft)   # FILLED, or CANCELLED with the rest: a MARKET order never rests
+
+# Time in force (create / limit_buy / limit_sell): GTC (default), IOC, FOK or POST_ONLY.
+res = loaf.orders.limit_buy("MUS", quantity=10, price=150, time_in_force="POST_ONLY")   # makes, never takes
 
 loaf.orders.cancel_all()      # cancel every open order, stop and take (it sells nothing)
 ```
@@ -318,11 +320,22 @@ loaf.orders.cancel_all()      # cancel every open order, stop and take (it sells
 **A 200 is sent after the exchange commits the order, so its `status` is
 real.** `FILLED` means filled; `OPEN` / `PARTIALLY_FILLED` mean it is resting
 with `quantityLeft` tokens to go. `CANCELLED` on a new order means it stopped
-early: a BUY whose hold could not pay for its next fill, or a SELL stopped at
-K1's size bound (see **Money & units**). `attachedLegIds` are the conditional
+early: the unfilled rest of a MARKET or IOC order, a BUY whose hold could not
+pay for its next fill, or a SELL stopped at K1's size bound (see **Money &
+units**). `attachedLegIds` are the conditional
 ids of the TP/SL legs you attached, take-profit first (`[]` without legs). Later
 fills and cancels arrive on your private `portfolio` WebSocket channel (see
 below).
+
+**Time in force.** `time_in_force=` on `create`, `limit_buy` and `limit_sell`
+(`loaf.TimeInForce`): `GTC` (the default) rests what does not fill at once;
+`IOC` cancels it, and is refused (400 `Order rejected: no resting order could
+fill any of it`) when nothing fills; `FOK` fills the whole quantity at once or
+is refused (400 `Fill-or-kill order rejected: it could not be filled in full`);
+`POST_ONLY` (a LIMIT order's alone: the SDK refuses it on a MARKET order) is
+refused with `loaf.PostOnlyWouldTakeError` when it would trade at once, so it
+only ever makes. Order rows show a post-only order as `GTC`, and a MARKET order
+sent as `GTC` as `IOC`. Stops, takes and TP/SL legs book GTC orders.
 
 `duplicate: True` means this exact signed order had already landed (the
 exchange's own retry, an SDK re-send or a `resubmit`). Its legs then exist
@@ -344,8 +357,9 @@ stop means a second sell).
   Override it for one order with `max_slippage_bps=`. The same setting prices
   stops, take-profits and TP/SL legs (see **Stop & take orders**).
 - The exchange matches a MARKET order against resting orders at their prices,
-  never worse than the price you signed, and **anything left rests on the
-  book** until it fills, expires or you cancel it.
+  never worse than the price you signed, and **never rests it**: what it cannot
+  fill at once is cancelled (`CANCELLED`), and one that fills nothing is refused
+  (400 `Order rejected: no resting order could fill any of it`).
 - The reference read is one extra public request; it can lag the live market
   and may not yet show a trade you just made. For price-sensitive orders pass the
   `markprice:{ticker}` value you stream as `reference_price` (once the SDK has
@@ -566,8 +580,9 @@ at. A `tp_price` just above the reference can sit below your fill; the leg then
 arms already through its trigger and sells at once, no lower than its signed
 price. Leave the take-profit clear of the mark, or place it yourself once you
 see the fill. A leg's own price is first checked (deviation, band, minimum
-value) when it fires; if that fails the leg becomes FAILED. Cancelling a partly
-filled parent (for example a resting MARKET remainder) FAILs its legs.
+value) when it fires; if that fails the leg becomes FAILED. On a spot market a
+parent that ends partly filled (the cancelled rest of a MARKET or IOC order, or
+your cancel) FAILs its legs; a perp's legs arm on the parent's first fill.
 
 **Each stop or take holds one order number until it fires**, and one cancelled
 or expired unfired keeps counting against your account's allowance (see
@@ -914,6 +929,8 @@ except loaf.LoafAuthError:
     ...   # "Invalid credentials": your API key expired or was revoked — stop and alert
           # (create a new one, restart); otherwise the order's signature or key was
           # refused: the next order re-reads your account
+except loaf.PostOnlyWouldTakeError:
+    ...   # 400: a POST_ONLY order would have traded at once; nothing was placed
 except loaf.LoafValidationError as e:
     print(e.message, e.details)        # 400 (local ones have status_code 0)
 except loaf.LoafRateLimitError as e:

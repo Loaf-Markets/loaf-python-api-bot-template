@@ -17,6 +17,7 @@ Every error the API can return is mapped to a specific exception so a bot can
         │       ├── MarketHaltedError     403  the market is halted (a TradingHaltedError too)
         │       └── PriceHeldError        403  reduce-only while its latest price waits for review
         ├── LoafValidationError           400  validation or order-rule refusal (or local, status 0)
+        │   └── PostOnlyWouldTakeError    400  a POST_ONLY order would have traded at once
         ├── LoafNotFoundError             404
         ├── LoafConflictError             409  (e.g. a cancel that lost the race, a prize already claimed)
         ├── LoafRateLimitError            429  (carries .retry_after seconds)
@@ -310,6 +311,12 @@ class LoafValidationError(LoafAPIError):
     """
 
 
+class PostOnlyWouldTakeError(LoafValidationError):
+    """400 ``Post-only order rejected: it would have traded with a resting order at
+    once``: a ``POST_ONLY`` order crossed the book's best resting order of the other
+    side. Nothing was placed: re-price it behind the touch, or send it again."""
+
+
 class LoafNotFoundError(LoafAPIError):
     """404 — the resource does not exist."""
 
@@ -370,6 +377,12 @@ _MARKET_STATE_TEXTS: dict[str, tuple[type[MarketStateError], str]] = {
 }
 
 
+# The exchange's 400 text for a post-only order that would have traded at once (no code).
+_POST_ONLY_WOULD_TAKE = (
+    "Post-only order rejected: it would have traded with a resting order at once"
+)
+
+
 def _client_validation_error(message: str, details: list[str] | None = None) -> LoafValidationError:
     """Build a validation error for input rejected locally (no HTTP round-trip)."""
     return LoafValidationError(message, status_code=0, details=details)
@@ -419,6 +432,8 @@ def error_from_response(
     if status_code == 400:
         if message.startswith(_ENGINE_HALTS):
             return TradingHaltedError(message, **kwargs)
+        if message == _POST_ONLY_WOULD_TAKE:
+            return PostOnlyWouldTakeError(message, **kwargs)
         return LoafValidationError(message, **kwargs)
     if status_code == 404:
         return LoafNotFoundError(message, **kwargs)

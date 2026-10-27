@@ -47,10 +47,19 @@ private ``portfolio`` WebSocket channel.
 **MARKET orders** take no price. The SDK signs a worst price: the market
 reference moved against you by the max slippage (``max_slippage_bps=``, default
 ``client.max_slippage_bps``), rounded toward the reference to the cent. The
-engine matches it like a LIMIT at that price, and an unfilled remainder
-**rests** on the book until it fills, expires or you cancel it. A BUY holds
-worst price x quantity x (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` /
-1,000,000) of your cash.
+engine matches it up to that price and **never rests it**: what it cannot fill
+at once is cancelled, and one that fills nothing is refused. A BUY holds worst
+price x quantity x (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of
+your cash while it matches.
+
+**Time in force.** ``time_in_force=`` (:class:`~loaf.enums.TimeInForce`) on
+:meth:`OrdersResource.create`, :meth:`OrdersResource.limit_buy` and
+:meth:`OrdersResource.limit_sell`: ``GTC`` (the default) rests what does not
+fill at once; ``IOC`` cancels it, and is refused when it fills nothing; ``FOK``
+fills the whole quantity at once or is refused; ``POST_ONLY``, a LIMIT order's
+alone, is refused (:class:`~loaf.exceptions.PostOnlyWouldTakeError`) when it
+would trade at once, so it only ever rests. A stop or take, and a TP/SL leg,
+books a GTC order.
 
 **Perps.** A perp (its ticker ends in ``-PERP``; its ``market.type`` is
 ``"PERP"``) trades a perpetual future settled in USDC: a BUY opens or grows a
@@ -94,6 +103,11 @@ Server-side checks reject an order the SDK cannot pre-validate for you (all 400,
 * **Fee-rate cap** — ``l2 fee: the signed fee-rate cap is below the account's
   fee rate``: your account's fee rate is above
   :data:`~loaf.constants.L2_FEE_RATE_CAP`, which every order signs.
+* **Time in force** — an IOC or MARKET order that fills nothing (``Order
+  rejected: no resting order could fill any of it``), a FOK order that cannot
+  fill in full (``Fill-or-kill order rejected: it could not be filled in
+  full``), and a POST_ONLY order that would trade at once
+  (:class:`~loaf.exceptions.PostOnlyWouldTakeError`).
 
 A **conditional** (stop / take) order goes to ``POST /orders/conditional``
 instead. It rests server-side until the mark price reaches your trigger,
@@ -196,6 +210,7 @@ if TYPE_CHECKING:
     from ..client import LoafClient
 
 _LIMIT_CONDITIONALS = (ConditionalOrderType.STOP_LIMIT, ConditionalOrderType.TAKE_LIMIT)
+_TIMES_IN_FORCE = frozenset(member.value for member in TimeInForce)
 
 _SIGNED_BODY_STRS = ("l2SigS", "l2SigE")
 _SIGNED_BODY_INTS = ("l2OrderIndex", "l2AccountIndex", "l2ExpiryMs")
@@ -223,6 +238,7 @@ class OrdersResource(Resource):
         ttl_ms: int | None = None,
         pool: int | None = None,
         reduce_only: bool = False,
+        time_in_force: str = TimeInForce.GTC,
     ) -> Any:
         """``POST /orders`` — place a trading order, signed with your trading key.
 
@@ -269,6 +285,15 @@ class OrdersResource(Resource):
                 SELL at ``trigger x (1 - leg_max_slippage_bps/10,000)``, a
                 SELL's a LIMIT BUY at ``trigger x (1 + ...)``, so after a gap
                 past that price it rests instead of trading.
+            time_in_force: ``GTC`` (default), ``IOC``, ``FOK`` or ``POST_ONLY``
+                (:class:`~loaf.enums.TimeInForce`). ``GTC`` rests what does not
+                fill at once (a MARKET order never rests: the exchange runs it as
+                ``IOC``); ``IOC`` cancels it, and is refused (400) when it fills
+                nothing; ``FOK`` fills the whole quantity at once or is refused
+                (400) and fills nothing; ``POST_ONLY`` (LIMIT only: refused
+                locally on a MARKET order) is refused
+                (:class:`~loaf.exceptions.PostOnlyWouldTakeError`) when it would
+                trade at once. Order rows show a post-only order as ``GTC``.
             ttl_ms: how long the order may rest, in whole milliseconds, from
                 60,000 (one minute) to 3,968,658,432 (about 45.9 days); default
                 604,800,000 (7 days). The exchange then stops filling it and
@@ -306,6 +331,8 @@ class OrdersResource(Resource):
             MarketStateError: the market's own state does not take the order
                 now (``state``); :class:`~loaf.exceptions.PriceHeldError` while
                 its latest price waits for review.
+            PostOnlyWouldTakeError: a ``POST_ONLY`` order would have traded at
+                once (400); nothing was placed.
             LoafValidationError: refused locally (``status_code`` 0) or by the
                 exchange (400), including its ``l2 …`` texts.
             OrderOutcomeUnknownError: the order may or may not be live (or
@@ -327,10 +354,13 @@ class OrdersResource(Resource):
               ``tp_price < price < sl_price`` on a LIMIT SELL one.
             * The legs arrive on the ``portfolio`` channel as ``order_update``
               rows and show up in ``openOrders`` as ``PENDING`` conditionals.
-            * Legs arm only on a FULL fill of the parent. A parent that ends
-              CANCELLED after a partial fill FAILS its legs, and one with no
-              fill cancels them, so **cancelling a resting MARKET remainder
-              drops its TP/SL**.
+            * On a spot market legs arm only on a FULL fill of the parent. A
+              parent that ends CANCELLED after a partial fill (the unfilled rest
+              of a MARKET or IOC order, your cancel, its expiry) FAILS its legs,
+              and one with no fill cancels them. On a perp they arm on the
+              parent's first fill, at its quantity (reduce-only, they close no
+              more than the position); only a parent that fills nothing drops
+              them.
             * On a MARKET parent the server checks the triggers against its
               reference price, not your fill (400 ``Unable to determine market
               price for order`` when it has none).
@@ -343,6 +373,7 @@ class OrdersResource(Resource):
         otype = str(type)
         if otype not in (OrderType.LIMIT, OrderType.MARKET):
             raise _client_validation_error(f"Unknown order type {otype!r}")
+        tif = _time_in_force(time_in_force, otype)
         qty_d = validate_quantity(quantity)
         perps = _perps_terms(pool, reduce_only)
 
@@ -412,7 +443,7 @@ class OrdersResource(Resource):
                 order_price = _worst_price(reference_price, side, bps)
         ttl = _ttl(ttl_ms)
         return self._place(
-            key, ticker, side, otype, qty_d, order_price, ttl, perps, legs=legs
+            key, ticker, side, otype, qty_d, order_price, ttl, perps, legs=legs, time_in_force=tif
         )
 
     # -- Convenience wrappers --------------------------------------------- #
@@ -429,8 +460,10 @@ class OrdersResource(Resource):
         ttl_ms: int | None = None,
         pool: int | None = None,
         reduce_only: bool = False,
+        time_in_force: str = TimeInForce.GTC,
     ) -> Any:
-        """Place a LIMIT BUY, optionally with take-profit / stop-loss legs (see :meth:`create`)."""
+        """Place a LIMIT BUY, optionally with take-profit / stop-loss legs, ``GTC`` unless
+        ``time_in_force=`` says otherwise (see :meth:`create`)."""
         return self.create(
             ticker,
             OrderSide.BUY,
@@ -443,6 +476,7 @@ class OrdersResource(Resource):
             ttl_ms=ttl_ms,
             pool=pool,
             reduce_only=reduce_only,
+            time_in_force=time_in_force,
         )
 
     def limit_sell(
@@ -457,9 +491,10 @@ class OrdersResource(Resource):
         ttl_ms: int | None = None,
         pool: int | None = None,
         reduce_only: bool = False,
+        time_in_force: str = TimeInForce.GTC,
     ) -> Any:
-        """Place a LIMIT SELL, on a perp optionally with take-profit / stop-loss legs
-        (see :meth:`create`)."""
+        """Place a LIMIT SELL, on a perp optionally with take-profit / stop-loss legs, ``GTC``
+        unless ``time_in_force=`` says otherwise (see :meth:`create`)."""
         return self.create(
             ticker,
             OrderSide.SELL,
@@ -472,6 +507,7 @@ class OrdersResource(Resource):
             ttl_ms=ttl_ms,
             pool=pool,
             reduce_only=reduce_only,
+            time_in_force=time_in_force,
         )
 
     def market_buy(
@@ -492,8 +528,8 @@ class OrdersResource(Resource):
         ``reference_price x (1 + max_slippage_bps/10,000)``.
 
         You pass no price: by default the reference is the exchange's market
-        price and the max slippage is ``client.max_slippage_bps``. An unfilled
-        remainder rests at that price. See :meth:`create`.
+        price and the max slippage is ``client.max_slippage_bps``. It never
+        rests: what cannot fill at once is cancelled. See :meth:`create`.
         """
         return self.create(
             ticker,
@@ -528,9 +564,9 @@ class OrdersResource(Resource):
         ``reference_price x (1 - max_slippage_bps/10,000)``.
 
         You pass no price: by default the reference is the exchange's market
-        price and the max slippage is ``client.max_slippage_bps``. An unfilled
-        remainder rests at that price. TP/SL legs on a perp only. See
-        :meth:`create`.
+        price and the max slippage is ``client.max_slippage_bps``. It never
+        rests: what cannot fill at once is cancelled. TP/SL legs on a perp only.
+        See :meth:`create`.
         """
         return self.create(
             ticker,
@@ -960,14 +996,15 @@ class OrdersResource(Resource):
         perps: tuple[int | None, bool],
         trigger_d: Decimal | None = None,
         legs: Sequence[tuple[str, Decimal, Decimal]] = (),
+        time_in_force: str = TimeInForce.GTC.value,
     ) -> Any:
         """Read what the order signs, take its order numbers, sign it and send it.
 
         ``price`` is the order's price, or (a MARKET order without
         ``reference_price``) the function that derives it from the exchange's
         reference; ``perps`` its ``(pool, reduce_only)`` as passed;
-        ``trigger_d`` makes it a conditional; ``legs`` are its TP/SL legs as
-        ``("tp" | "sl", trigger, price)``.
+        ``trigger_d`` makes it a conditional (always GTC); ``legs`` are its
+        TP/SL legs as ``("tp" | "sl", trigger, price)``.
         """
         l2 = self._l2
         span = 1 + len(legs)
@@ -997,7 +1034,7 @@ class OrdersResource(Resource):
             if trigger_d is not None:  # a conditional: the order it books when the mark gets there
                 body["triggerPrice"] = float(trigger_d)
             body.update({
-                "timeInForce": TimeInForce.GTC.value,
+                "timeInForce": time_in_force,
                 "l2ChainId": market.l2_chain_id,
                 "l2AccountIndex": account.account_index,
                 "l2MarketIndex": market.market_index,
@@ -1048,6 +1085,18 @@ class OrdersResource(Resource):
             if block is not None:
                 l2.give_back(block, first, span)
             raise
+
+
+def _time_in_force(time_in_force: Any, otype: str) -> str:
+    """``time_in_force=`` checked against Shared-Types' ORDER_TIMES_IN_FORCE, POST_ONLY on a
+    LIMIT order alone (the exchange's own text for it)."""
+    if not isinstance(time_in_force, str) or time_in_force not in _TIMES_IN_FORCE:
+        raise _client_validation_error(
+            f"time_in_force must be GTC, IOC, FOK or POST_ONLY (got {time_in_force!r})"
+        )
+    if time_in_force == TimeInForce.POST_ONLY and otype != OrderType.LIMIT:
+        raise _client_validation_error("time_in_force: POST_ONLY requires a LIMIT order")
+    return TimeInForce(time_in_force).value
 
 
 def _perps_terms(pool: Any, reduce_only: Any) -> tuple[int | None, bool]:

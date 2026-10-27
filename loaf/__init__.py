@@ -61,6 +61,7 @@ from .exceptions import (
     MarketStateError,
     OrderOutcomeUnknownError,
     PerpsOutcomeUnknownError,
+    PostOnlyWouldTakeError,
     PriceHeldError,
     TradingHaltedError,
 )
@@ -118,6 +119,7 @@ __all__ = [
     "MarketHaltedError",
     "PriceHeldError",
     "LoafValidationError",
+    "PostOnlyWouldTakeError",
     "LoafNotFoundError",
     "LoafConflictError",
     "LoafRateLimitError",

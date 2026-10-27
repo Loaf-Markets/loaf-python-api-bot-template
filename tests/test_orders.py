@@ -965,6 +965,95 @@ def test_every_placement_takes_ttl(exchange, trading_client, l2_clock, place):
 
 
 # --------------------------------------------------------------------------- #
+# Time in force
+# --------------------------------------------------------------------------- #
+
+POST_ONLY_WOULD_TAKE = "Post-only order rejected: it would have traded with a resting order at once"
+
+
+@pytest.mark.parametrize("name", ["GTC", "IOC", "FOK", "POST_ONLY"])
+@pytest.mark.parametrize("member", [False, True], ids=["text", "member"])
+def test_a_limit_orders_time_in_force(exchange, trading_client, name, member):
+    time_in_force = loaf.TimeInForce[name] if member else name
+    orders = trading_client().orders
+    orders.limit_buy("OPRA", 10, 167.49, time_in_force=time_in_force)
+    orders.limit_sell("OPRA", 10, 170, time_in_force=time_in_force)
+    orders.create("OPRA", "BUY", 10, price=167.49, time_in_force=time_in_force)
+    bodies = exchange.bodies("/orders")
+    assert [body["timeInForce"] for body in bodies] == [name] * 3
+    for body in bodies:
+        assert list(body) == ORDER_KEYS
+        verify_order(body)
+    # A stop or take stays GTC: the order it books when it fires rests.
+    orders.stop_loss("OPRA", 2, 95)
+    assert exchange.bodies("/orders/conditional")[-1]["timeInForce"] == "GTC"
+
+
+@pytest.mark.parametrize("name", ["GTC", "IOC", "FOK"])
+@pytest.mark.parametrize("member", [False, True], ids=["text", "member"])
+def test_a_market_orders_time_in_force(exchange, trading_client, name, member):
+    time_in_force = loaf.TimeInForce[name] if member else name
+    trading_client().orders.create(
+        "OPRA", "BUY", 2, type="MARKET", reference_price=160, time_in_force=time_in_force
+    )
+    (body,) = exchange.bodies("/orders")
+    assert (body["type"], body["timeInForce"]) == ("MARKET", name)
+    verify_order(body)
+
+
+def test_an_order_is_gtc_by_default(exchange, trading_client):
+    orders = trading_client().orders
+    orders.limit_sell("OPRA", 10, 170)
+    orders.market_buy("OPRA", 2)  # the exchange runs a MARKET GTC as IOC: it never rests
+    orders.create("OPRA", "SELL", 2, type="MARKET", reference_price=160)
+    assert [body["timeInForce"] for body in exchange.bodies("/orders")] == ["GTC"] * 3
+
+
+@pytest.mark.parametrize("member", [False, True], ids=["text", "member"])
+def test_post_only_on_a_market_order_is_refused_locally(exchange, trading_client, member):
+    time_in_force = loaf.TimeInForce["POST_ONLY"] if member else "POST_ONLY"
+    with pytest.raises(loaf.LoafValidationError) as info:
+        trading_client().orders.create(
+            "OPRA", "BUY", 2, type="MARKET", reference_price=160, time_in_force=time_in_force
+        )
+    assert (info.value.status_code, info.value.message) == (
+        0,
+        "time_in_force: POST_ONLY requires a LIMIT order",
+    )
+    assert exchange.requests == []
+
+
+@pytest.mark.parametrize("time_in_force", ["GTD", "gtc", "ioc", "", "POST ONLY", None, 0, True])
+def test_an_unknown_time_in_force_is_refused_locally(exchange, trading_client, time_in_force):
+    orders = trading_client().orders
+    message = f"time_in_force must be GTC, IOC, FOK or POST_ONLY (got {time_in_force!r})"
+    for place in (
+        lambda: orders.limit_buy("OPRA", 10, 167.49, time_in_force=time_in_force),
+        lambda: orders.limit_sell("OPRA", 10, 170, time_in_force=time_in_force),
+        lambda: orders.create("OPRA", "BUY", 2, type="MARKET", time_in_force=time_in_force),
+    ):
+        with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
+            place()
+        assert info.value.status_code == 0
+    assert exchange.requests == []
+
+
+def test_a_post_only_order_that_would_take_is_its_own_error(exchange, trading_client):
+    orders = trading_client().orders
+    exchange.queue("/orders", error_reply(400, POST_ONLY_WOULD_TAKE))
+    with pytest.raises(loaf.PostOnlyWouldTakeError) as info:
+        orders.limit_buy("OPRA", 10, 167.49, time_in_force="POST_ONLY")
+    error = info.value
+    assert isinstance(error, loaf.LoafValidationError)
+    assert (error.status_code, error.message) == (400, POST_ONLY_WOULD_TAKE)
+    # Nothing was placed: the next order signs the same order number.
+    orders.limit_buy("OPRA", 10, 160, time_in_force="POST_ONLY")
+    refused, placed = exchange.bodies("/orders")
+    assert refused["l2OrderIndex"] == placed["l2OrderIndex"] == 4097
+    verify_order(placed)
+
+
+# --------------------------------------------------------------------------- #
 # MARKET orders
 # --------------------------------------------------------------------------- #
 
