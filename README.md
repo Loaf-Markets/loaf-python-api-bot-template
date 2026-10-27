@@ -367,8 +367,8 @@ Markets keep trading hours: outside them placement raises `LoafForbiddenError`
 
 If trading is halted — platform-wide or for that property — order placement
 raises `TradingHaltedError` (403). A platform-wide halt blocks cancels too,
-except `orders.cancel_conditional()`, which is database-only and stays
-available (see **Stop & take orders** below). `TradingHaltedError` also covers
+except `orders.cancel_conditional()`, which the matching engine takes under any
+halt and stays available (see **Stop & take orders** below). `TradingHaltedError` also covers
 the exchange engine's own halts (a 400): wait them out; cancels still work.
 
 The exchange engine also keeps each market's own state, and refuses an order

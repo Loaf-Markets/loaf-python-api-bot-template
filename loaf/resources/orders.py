@@ -837,20 +837,25 @@ class OrdersResource(Resource):
 
         Pass the CONDITIONAL row's own ``id``; a ``PLACED`` row is cancelled
         with :meth:`cancel` on its ``placedOrderId`` instead (:meth:`cancel_row`
-        picks). Each endpoint reads only its own table, so the wrong id is a 404
+        picks). Each endpoint reads only its own rows, so the wrong id is a 404
         like any unknown one. A terminal row raises
-        :class:`~loaf.exceptions.LoafValidationError` (400), NOT the
-        :class:`~loaf.exceptions.LoafConflictError` (409) :meth:`cancel` raises
-        for the same race — an idempotent cancel must catch both. A
-        ``status_code`` 0 :class:`~loaf.exceptions.LoafValidationError` does not
-        mean a terminal row: the ``order_id`` is not a whole number from 1, so
-        nothing was sent and the order may still be live.
+        :class:`~loaf.exceptions.LoafValidationError` (400); a row the engine
+        was already ending (firing or failing) as the cancel arrived raises
+        :class:`~loaf.exceptions.LoafConflictError` (409), as :meth:`cancel`
+        does for the same race — an idempotent cancel must catch both. A 503
+        (:class:`~loaf.exceptions.LoafServiceUnavailableError`) means the
+        engine did not answer; the row may still be live, and retrying is safe.
+        A ``status_code`` 0 :class:`~loaf.exceptions.LoafValidationError` does
+        not mean a terminal row: the ``order_id`` is not a whole number from 1,
+        so nothing was sent and the order may still be live.
 
-        This route is database-only, so unlike :meth:`cancel` and
-        :meth:`cancel_all` it still works under a platform-wide halt. That makes
-        it the only way to stop an ``ARMED`` row firing into the reopen:
-        triggering is level-based, so a row whose mark sat through its trigger
-        for the whole halt fires as soon as trading resumes.
+        The matching engine holds the row and cancels it, and never refuses the
+        cancel for the market's state, a pause or a halt; the backend's
+        platform-wide kill switch stops :meth:`cancel` and :meth:`cancel_all`
+        only. So it still works under a platform-wide halt, which makes it the
+        only way to stop an ``ARMED`` row firing into the reopen: triggering is
+        level-based, so a row whose mark sat through its trigger for the whole
+        halt fires as soon as trading resumes.
         """
         return self._client.post(
             "/orders/conditional/cancel", json={"orderId": _order_id(order_id)}

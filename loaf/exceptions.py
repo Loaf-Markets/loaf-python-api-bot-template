@@ -248,9 +248,9 @@ class TradingHaltedError(LoafForbiddenError):
     this property``. A platform-wide halt also blocks
     :meth:`~loaf.resources.orders.OrdersResource.cancel` and ``cancel_all`` (a
     single-property halt does not). The one exception is
-    :meth:`~loaf.resources.orders.OrdersResource.cancel_conditional`, which is
-    database-only and stays available — during a platform halt it is your only
-    way to pull a resting stop before the reopen.
+    :meth:`~loaf.resources.orders.OrdersResource.cancel_conditional`, which the
+    matching engine takes under any halt and stays available — during a
+    platform halt it is your only way to pull a resting stop before the reopen.
 
     Or 400 from the exchange's engine, whose own halts refuse orders but still
     admit cancels.
