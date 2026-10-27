@@ -699,6 +699,37 @@ def test_a_perps_market_order(perps_exchange, trading_client):
     verify_order(body)
 
 
+def test_a_perps_order_sends_its_time_in_force(perps_exchange, trading_client):
+    # A perps order takes time_in_force on a spot order's path: the same body key beside its
+    # signed pool byte, and the same local refusal of POST_ONLY on a MARKET order.
+    orders = trading_client().orders
+    orders.limit_sell("OPRA-PERP", 2, 101.5, pool=3, reduce_only=True, time_in_force="POST_ONLY")
+    orders.limit_buy("OPRA-PERP", 2, 101.5, time_in_force="IOC", tp_price=110, sl_price=95)
+    orders.create(
+        "OPRA-PERP", "SELL", 2, type="MARKET", reference_price=101.5, time_in_force="FOK", pool=1
+    )
+    post_only, ioc, fok = perps_exchange.bodies("/orders")
+    assert [body["timeInForce"] for body in (post_only, ioc, fok)] == ["POST_ONLY", "IOC", "FOK"]
+    assert [(b["type"], b["l2Pool"], b["l2ReduceOnly"]) for b in (post_only, ioc, fok)] == [
+        ("LIMIT", 3, True),
+        ("LIMIT", 0, False),
+        ("MARKET", 1, False),
+    ]
+    assert list(ioc) == PERPS_ORDER_KEYS + ["tp", "sl"]
+    for body in (post_only, ioc, fok):
+        verify_order(body)
+    for leg in ("tp", "sl"):
+        verify_order(ioc, leg)
+    sent = len(perps_exchange.requests)
+    with pytest.raises(loaf.LoafValidationError) as info:
+        orders.create("OPRA-PERP", "BUY", 2, type="MARKET", time_in_force="POST_ONLY", pool=1)
+    assert (info.value.status_code, info.value.message) == (
+        0,
+        "time_in_force: POST_ONLY requires a LIMIT order",
+    )
+    assert len(perps_exchange.requests) == sent
+
+
 def test_a_perps_stop_signs_its_pool_and_reduce_only_bit(perps_exchange, trading_client):
     trading_client().orders.stop_loss("OPRA-PERP", 2, 95, pool=1, reduce_only=True)
     (body,) = perps_exchange.bodies("/orders/conditional")
