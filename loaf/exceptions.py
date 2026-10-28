@@ -244,8 +244,9 @@ class TradingHaltedError(LoafForbiddenError):
     """Trading is halted: every new order is refused while it lasts, and nothing
     was placed.
 
-    403 ``Trading is currently halted`` (platform-wide) or ``Trading halted for
-    this market``. A platform-wide halt also blocks
+    403 ``Trading is currently halted`` (platform-wide) or ``Trading is halted
+    on this market`` (that market's halt, raised as :class:`MarketHaltedError`,
+    which is a ``TradingHaltedError`` too). A platform-wide halt also blocks
     :meth:`~loaf.resources.orders.OrdersResource.cancel` and ``cancel_all`` (a
     single-market halt does not). The one exception is
     :meth:`~loaf.resources.orders.OrdersResource.cancel_conditional`, which the

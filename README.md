@@ -401,7 +401,8 @@ with `LoafNotFoundError` (404). After a 404, or a 403 for a market that is not
 listed, the SDK reads the ticker's market again for your next order.
 
 If trading is halted — platform-wide or for that market — order placement
-raises `TradingHaltedError` (403). A platform-wide halt blocks cancels too,
+raises `TradingHaltedError` (403); a market's own halt raises its subclass
+`MarketHaltedError` (below). A platform-wide halt blocks cancels too,
 except `orders.cancel_conditional()`, which the matching engine takes under any
 halt and stays available (see **Stop & take orders** below). `TradingHaltedError` also covers
 the exchange engine's own halts (a 400): wait them out; cancels still work.

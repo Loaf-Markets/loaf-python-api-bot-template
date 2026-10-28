@@ -1860,7 +1860,7 @@ def test_market_refusal_rereads_the_market(exchange, trading_client, status, mes
 @pytest.mark.parametrize(
     "message, error",
     [
-        ("Trading halted for this market", loaf.TradingHaltedError),
+        ("Trading is halted on this market", loaf.MarketHaltedError),
         ("Trading is currently halted", loaf.TradingHaltedError),
         ("Trading on this market has not started yet", loaf.LoafForbiddenError),
     ],

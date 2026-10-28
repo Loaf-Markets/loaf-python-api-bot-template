@@ -78,15 +78,11 @@ def test_error_mapping():
     assert isinstance(error_from_response(429, {"error": "slow"}), loaf.LoafRateLimitError)
     assert type(error_from_response(503, {"error": "down"})) is loaf.LoafServiceUnavailableError
 
-    assert isinstance(
-        error_from_response(403, {"error": "Trading halted for this market"}),
-        loaf.TradingHaltedError,
-    )
-    # The backend's own halt of a market is no market state of the engine's.
-    assert not isinstance(
-        error_from_response(403, {"error": "Trading halted for this market"}),
-        loaf.MarketStateError,
-    )
+    # A market's halt reads the same from the backend's own check and from the engine's refusal: a
+    # MarketHaltedError, its state MARKET_HALTED, and a TradingHaltedError too.
+    halted = error_from_response(403, {"error": "Trading is halted on this market"})
+    assert type(halted) is loaf.MarketHaltedError and halted.state == "MARKET_HALTED"
+    assert isinstance(halted, loaf.TradingHaltedError)
     delisted = error_from_response(
         403, {"error": "This market has been delisted and is no longer available for trading"}
     )
