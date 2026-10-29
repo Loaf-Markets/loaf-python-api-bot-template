@@ -77,6 +77,7 @@ refuses a stack whose backstop holds one on `liq1`.
 | `E2E_PRICE_DECIMALS` / `E2E_SIZE_DECIMALS` | 3 / 1 | an index's decimals (dollars x 1000) and a size's (tokens x 10) |
 | `E2E_NOTIONAL` | 1500 | dollars per position |
 | `E2E_STEPS` | all | a comma list of steps (setup always runs), or `restore` alone (no setup) |
+| `E2E_KEEP_BACKSTOP` | unset | `1`: a step's restore leaves the backstop's knob (and the position it took) on the stack for the desk leg; `E2E_STEPS=restore` puts it back later |
 | `E2E_TAG` | e2e | the run's users' display-name prefix |
 | `E2E_WAIT_S` / `E2E_FINAL_WAIT_S` / `E2E_PROOF_WAIT_S` | 180 / 2400 / 5400 | a wait's deadline; an L1 execution's; the proofs' |
 

@@ -80,6 +80,10 @@ from loaf.secret_key import l2_key_typed_data
 STEPS = ("setup", "spot", "perps", "funding", "liquidation", "halt", "exit", "proof")
 #: The one-shot restore (E2E_STEPS=restore, alone): step_restore.
 RESTORE = "restore"
+#: E2E_KEEP_BACKSTOP=1: a step's restore leaves the backstop's knob where the step put it, so a position the backstop
+#: took in the step (liquidation's mode 1) stays on the stack for the desk leg that unwinds it (the P5 kit's phase
+#: desk); the one-shot restore puts the knob back later. Every other part of the restore runs.
+KEEP_BACKSTOP = (os.environ.get("E2E_KEEP_BACKSTOP") or "").strip() == "1"
 
 #: The run's users, in HD order from E2E_HD_BASE.
 USERS = ("A", "B", "C", "MM")
@@ -1061,7 +1065,9 @@ class Run:
             parts.append((f"market {m} OPEN", lambda m=m: self.reopen(m)))
         for m, home in sorted(touched.homes.items()):
             parts.append((f"market {m}'s index home at {home}", lambda m=m, home=home: self.walk(m, home)))
-        if touched.knob:
+        if touched.knob and KEEP_BACKSTOP:
+            log("  restore: the backstop's knob kept (E2E_KEEP_BACKSTOP=1): its position stays for the desk leg")
+        elif touched.knob:
             parts.append(("the backstop's knob at 0", lambda: self.backstop(0)))
         if not parts:
             return []
