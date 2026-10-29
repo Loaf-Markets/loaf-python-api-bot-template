@@ -211,8 +211,9 @@ def test_the_step_log_and_verdict(env, capsys):
     assert e2e.main(fns) == 1
     out = capsys.readouterr().out
     rcs = {line.split()[-2]: int(line.split()[-1]) for line in out.splitlines() if " ==== exit " in line}
-    assert rcs == {"setup": 0, "spot": 1, "perps": 3, "funding": 2, "liquidation": 0, "halt": 3, "exit": 0, "proof": 0}
-    assert "==== VERDICT FAIL setup=0 spot=1 perps=3 funding=2 liquidation=0 halt=3 exit=0 proof=0" in out
+    assert rcs == {"setup": 0, "spot": 1, "perps": 3, "mixed": 0, "funding": 2, "liquidation": 0, "halt": 3, "exit": 0,
+                   "proof": 0}
+    assert "==== VERDICT FAIL setup=0 spot=1 perps=3 mixed=0 funding=2 liquidation=0 halt=3 exit=0 proof=0" in out
     assert out.rstrip().endswith("==== DONE")
 
 
@@ -393,6 +394,142 @@ def test_the_spot_legs_orders_clear_the_backends_least_order_value(env, monkeypa
     [(quantity, bid)] = sent
     assert bid == run.cents(Decimal(ref) * Decimal("0.98"), False)
     assert quantity == size and quantity * bid >= 25 > (quantity - 1) * bid
+
+
+class FakeVenue:
+    """A spot book and a perps book: a GTC order rests, an IOC fills against one resting at its price (the whole of
+    it) or is refused NOT_FILLED; spot moves tokens and cents, perps moves base and nothing else. Books and
+    balances are the venue's; each user's client only names the user."""
+
+    def __init__(self, spot="EBS", perps="PERP", ext=1_000_000):
+        self.spot, self.perps_t, self.ext = spot, perps, ext
+        self.rest = {}  # (ticker, buy) -> [(price, qty, user)]
+        self.tokens, self.cents, self.base = {}, {}, {}  # user -> base units; user -> cents; (user, pool) -> base
+        self.pools = {}  # (user, pool) -> collateral
+        self.fills, self.seq, self.lock = {spot: 0, perps: 0}, 0, threading.Lock()
+
+    def client(self, name):
+        return FakeVenueClient(self, name)
+
+    def order(self, user, ticker, buy, qty, price, pool, tif):
+        qty, price = Decimal(str(qty)), Decimal(str(price))
+        with self.lock:
+            self.seq += 1
+            if tif != "IOC":
+                self.rest.setdefault((ticker, buy), []).append((price, qty, user))
+                return {"orderId": self.seq, "status": "OPEN", "quantityLeft": str(qty)}
+            book = self.rest.get((ticker, not buy), [])
+            hit = next((o for o in book if o[1] == qty and (o[0] <= price if buy else o[0] >= price)), None)
+            if hit is None:
+                raise LoafValidationError(e2e.NOT_FILLED, status_code=422)
+            book.remove(hit)
+            maker = hit[2]
+            if ticker == self.spot:
+                for u, sign in ((user, 1), (maker, -1)):
+                    self.tokens[u] = self.tokens.get(u, 0) + sign * (1 if buy else -1) * int(qty * 10**6)
+                    cost = int(qty * price * 100)
+                    self.cents[u] = self.cents.get(u, 0) - sign * (1 if buy else -1) * (cost + (cost // 200 if u == user else 0))
+            else:
+                for u, sign in ((user, 1), (maker, -1)):
+                    self.base[(u, pool)] = self.base.get((u, pool), 0) + sign * (1 if buy else -1) * int(qty * 10)
+            self.fills[ticker] += 1
+            return {"orderId": self.seq, "status": "FILLED", "quantityLeft": "0"}
+
+
+class FakeVenueClient:
+    def __init__(self, venue, name):
+        self.v, self.name = venue, name
+        self.orders = self.perps = self.portfolio = self.market = self
+
+    def limit_buy(self, t, q, p, *, pool=None, time_in_force="GTC", reduce_only=False):
+        return self.v.order(self.name, t, True, q, p, pool, time_in_force)
+
+    def limit_sell(self, t, q, p, *, pool=None, time_in_force="GTC", reduce_only=False):
+        return self.v.order(self.name, t, False, q, p, pool, time_in_force)
+
+    def cancel_all(self):
+        with self.v.lock:
+            for book in self.v.rest.values():
+                book[:] = [o for o in book if o[2] != self.name]
+
+    def allocate(self, amount, *, from_side, to_side):
+        pool, sign = (from_side, -1) if to_side == e2e.PERPS_SPOT_SIDE else (to_side, 1)
+        self.v.pools[(self.name, pool)] = self.v.pools.get((self.name, pool), 0) + sign * int(amount * 100) * self.v.ext
+        self.v.cents[self.name] = self.v.cents.get(self.name, 0) - sign * int(amount * 100)
+        return {"journalSeq": 1}
+
+    def positions(self):
+        pools = {p for (u, p) in list(self.v.pools) + list(self.v.base) if u == self.name}
+        return {"pools": [{"pool": p, "collateral": str(self.v.pools.get((self.name, p), 0)),
+                           "positions": [{"market": 0, "base": str(b)}] if (b := self.v.base.get((self.name, p), 0))
+                           else []} for p in sorted(pools)]}
+
+    def component(self):
+        return {"balances": [{"assetId": e2e.USDC_ASSET, "total": str(self.v.cents.get(self.name, 0) * 10_000),
+                              "available": "0"},
+                             {"assetId": 2, "total": str(self.v.tokens.get(self.name, 0)), "available": "0"}]}
+
+    def list(self):
+        return {"markets": [{"ticker": self.v.spot, "marketPrice": "10"}]}
+
+
+def mixed_run(venue, secs="0.4"):
+    cfg = dataclasses.replace(e2e.Config.read(), wait_s=2, mixed_s=float(secs))
+    run = e2e.Run(cfg, collateral={"decimals": 6, "tickSize": "10000", "extensionMultiplier": "1000000"})
+    run.spot, run.spot_l2 = venue.spot, {"quoteAssetId": e2e.USDC_ASSET, "baseAssetId": 2}
+    run.chain = types.SimpleNamespace(asset=lambda proxy, asset: {"decimals": 6})
+    run.anon = types.SimpleNamespace(perps=types.SimpleNamespace(
+        market_live=lambda m: {"tradingState": "OPEN", "indexPrice": "1500000"}))
+    run.perps, run.tickers = {0: {"minBase": "1"}}, {0: venue.perps_t}
+    run.users = {n: e2e.User(n, wallet=None, client=venue.client(n)) for n in e2e.USERS}
+    return run
+
+
+def test_the_mixed_step_fills_both_books_at_once_and_reconciles(env):
+    venue = FakeVenue()
+    run = mixed_run(venue)
+    e2e.step_mixed(run)
+    assert venue.fills["EBS"] > 0 and venue.fills["PERP"] > 0
+    assert not any(venue.rest.values()) and not any(venue.base.values())  # books empty, every position flat
+    # C bought and sold the same tokens: it paid the spread plus the taker's 0.5 % fee, within the step's 1 % bound
+    assert venue.tokens["C"] == 0 and venue.tokens["MM"] == 0 and venue.cents["C"] < 0 < venue.cents["MM"]
+    [note] = run.notes
+    assert note.startswith("mixed ") and "spot " in note and "perps " in note
+    assert "mixed" in e2e.STEPS and e2e.STEP_FNS["mixed"] is e2e.step_mixed
+    assert e2e.STEPS.index("mixed") == e2e.STEPS.index("perps") + 1
+
+
+def test_the_mixed_step_fails_on_a_stranger_fill_or_a_dead_side(env, monkeypatch):
+    venue = FakeVenue()
+    run = mixed_run(venue)
+    # a fee above the 1 % bound: the spot reconcile fails
+    taker_fee = venue.order
+
+    def pricey(user, ticker, buy, qty, price, pool, tif):
+        r = taker_fee(user, ticker, buy, qty, price, pool, tif)
+        if ticker == venue.spot and tif == "IOC":
+            venue.cents[user] -= int(Decimal(str(qty)) * Decimal(str(price)) * 100) // 20
+        return r
+    venue.order = pricey
+    with pytest.raises(e2e.Failed, match="plus fees"):
+        e2e.step_mixed(run)
+    # the perps side raising anything else: the step fails naming the side
+    venue = FakeVenue()
+    run = mixed_run(venue)
+    plain = venue.order
+
+    def refusing(user, ticker, buy, qty, price, pool, tif):
+        if ticker == venue.perps_t and tif == "IOC":
+            raise LoafValidationError("Order rejected: the market is REDUCE_ONLY", status_code=422)
+        return plain(user, ticker, buy, qty, price, pool, tif)
+    venue.order = refusing
+    with pytest.raises(e2e.Failed, match="the perps side stopped: LoafValidationError"):
+        e2e.step_mixed(run)
+    # no spot market: INCOMPLETE, as the spot step
+    run = mixed_run(FakeVenue())
+    run.spot = None
+    with pytest.raises(e2e.Incomplete):
+        e2e.step_mixed(run)
 
 
 def test_the_proof_step_pages_the_history_as_the_backend_allows(env):

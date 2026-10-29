@@ -76,6 +76,7 @@ refuses a stack whose backstop holds one on `liq1`.
 | `E2E_SPOT_PRICE` | 10 | the spot reference when the market has no price yet |
 | `E2E_PRICE_DECIMALS` / `E2E_SIZE_DECIMALS` | 3 / 1 | an index's decimals (dollars x 1000) and a size's (tokens x 10) |
 | `E2E_NOTIONAL` | 1500 | dollars per position |
+| `E2E_MIXED_SECS` | 30 | the mixed step's length: spot and perps IOC fills at once for that long |
 | `E2E_STEPS` | all | a comma list of steps (setup always runs), or `restore` alone (no setup) |
 | `E2E_KEEP_BACKSTOP` | unset | `1`: a step's restore leaves the backstop's knob (and the position it took) on the stack for the desk leg; `E2E_STEPS=restore` puts it back later |
 | `E2E_TAG` | e2e | the run's users' display-name prefix |
@@ -153,6 +154,14 @@ fee, and the fill is in C's history.
 - A's and B's positions read entry, entry quote, notional, funding owed, liquidation price (on the losing side of
   the entry) and adlRank; uPnL is logged; their pools are healthy; the market's live state reads the index, open
   interest (at least the run's size), funding index, next tick, period and trading state.
+
+**mixed** (spot and perps at once, `E2E_MIXED_SECS` long): in one thread C takes MM's spot ask and then its bid, one
+order each, over and over; in another B takes A's perps ask at the index + 0.1 % and then its bid at the index
+- 0.1 % (pool 0), over and over; no client is shared between the threads. An IOC refused NOT_FILLED (its quote not
+yet resting) is counted dry and the quote withdrawn; a partial fill or any other refusal fails the step. Both sides
+filled, dry takes fewer than fills; C's and MM's spot base moved by exactly the fills, C paid the net notional plus
+at most 1 % of the gross in fees; B long and A short by exactly the open perps fills; both flat again. The fill rates
+go in the verdict's notes, and the proof step then finds every one of these trades IN_BATCH.
 
 **funding** (markets `carry_pos` and `carry_neg`): A opens a long at the index from isolated pools 6 and 7 (no
 premium); two ticks that move each market carry the carry's sign; A's funding owed has it (positive pays) and MM's

@@ -50,6 +50,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -77,7 +78,7 @@ from loaf.exceptions import (
 )
 from loaf.secret_key import l2_key_typed_data
 
-STEPS = ("setup", "spot", "perps", "funding", "liquidation", "halt", "exit", "proof")
+STEPS = ("setup", "spot", "perps", "mixed", "funding", "liquidation", "halt", "exit", "proof")
 #: The one-shot restore (E2E_STEPS=restore, alone): step_restore.
 RESTORE = "restore"
 #: E2E_KEEP_BACKSTOP=1: a step's restore leaves the backstop's knob where the step put it, so a position the backstop
@@ -230,6 +231,7 @@ class Config:
     price_decimals: int
     size_decimals: int
     notional: Decimal
+    mixed_s: float
     backstop_dollars: Decimal
     wait_s: float
     final_wait_s: float
@@ -280,6 +282,7 @@ class Config:
             price_decimals=int(_env("E2E_PRICE_DECIMALS", "3")),
             size_decimals=int(_env("E2E_SIZE_DECIMALS", "1")),
             notional=Decimal(_env("E2E_NOTIONAL", "1500")),
+            mixed_s=float(_env("E2E_MIXED_SECS", "30")),
             backstop_dollars=Decimal(_env("E2E_BACKSTOP_DOLLARS", "50000")),
             wait_s=float(_env("E2E_WAIT_S", "180")),
             final_wait_s=float(_env("E2E_FINAL_WAIT_S", "2400")),
@@ -1532,6 +1535,127 @@ def step_perps(run: Run) -> None:
 # --------------------------------------------------------------------------------------------- #
 
 
+def step_mixed(run: Run) -> None:
+    """Spot and perps fills at the same time, for E2E_MIXED_SECS: C takes MM's spot quotes while B takes A's perps
+    quotes, each pair in a thread of its own (no client is shared between threads; every quote is one order and the
+    IOC that takes it), and both books reconcile exactly to the fills counted."""
+    if run.spot_failed:
+        raise Failed(run.spot_failed)
+    if not run.spot:
+        raise Incomplete("no spot market to trade beside perps: no LIVE spot market with an L2 is listed")
+    chain = run.chain
+    assert chain is not None
+    a, b, c, mm = (run.users[n] for n in USERS)
+    m, st = run.mkt("trade"), run.spot
+    t = run.ticker(m)
+    quote, base = int(run.spot_l2["quoteAssetId"]), int(run.spot_l2["baseAssetId"])
+    qscale, bscale = 10 ** chain.asset(run.proxy, quote)["decimals"], 10 ** chain.asset(run.proxy, base)["decimals"]
+    run.cancel_all()
+    for u in (a, b):
+        run.fund(u, 0, Decimal(10_000))
+        run.flat(u, m, 0)
+    live = run.live(m)
+    check(live.get("tradingState") == "OPEN", f"market {m} is OPEN: {live.get('tradingState')} {live.get('stateReason')}")
+    px, pq = run.dollars(int(live["indexPrice"])), run.qty(m)
+    punits = run.units(pq)
+    lo, hi = run.cents(px * Decimal("0.999"), False), run.cents(px * Decimal("1.001"), True)
+    row = next((r for r in c.c.market.list()["markets"] if r["ticker"] == st), {})
+    ref = Decimal(str(row.get("marketPrice") or 0)) or run.cfg.spot_price
+    bid, ask = run.cents(ref * Decimal("0.98"), False), run.cents(ref * Decimal("1.02"), True)
+    sq = spot_size(bid)
+    # MM holds the spot base and USDC; a quote that is not USDC was deposited to A and C only (setup), so then C
+    # only buys from MM's asks.
+    two_way = quote == USDC_ASSET
+    secs = run.cfg.mixed_s
+    log(f"  {secs:g} s of spot {st} (C takes MM's {sq} at ${ask}{f' and ${bid}' if two_way else ''}) beside perps"
+        f" {t} (B takes A's {pq} at ${hi} and ${lo}, pool 0)")
+    base_c0, quote_c0, base_mm0 = balance(c, base)[0], balance(c, quote)[0], balance(mm, base)[0]
+    tally = {"spot_buy": 0, "spot_sell": 0, "spot_dry": 0, "perps_buy": 0, "perps_sell": 0, "perps_dry": 0}
+    errors: dict[str, BaseException] = {}
+    deadline = time.monotonic() + secs
+
+    def take(maker: User, taker: User, ticker: str, qty: Decimal, price: Decimal, buy: bool, pool: int | None,
+             key: str) -> bool:
+        """One quote by ``maker`` and ``taker``'s IOC for exactly it. A NOT_FILLED (the quote not resting yet) is
+        counted dry and the quote withdrawn; anything else, and a partial fill, fail the step."""
+        post = maker.c.orders.limit_sell if buy else maker.c.orders.limit_buy
+        hit = taker.c.orders.limit_buy if buy else taker.c.orders.limit_sell
+        kw: dict[str, Any] = {} if pool is None else {"pool": pool}
+        r = post(ticker, float(qty), float(price), **kw)
+        if r.get("success") is False or int(r.get("orderId") or 0) <= 0:
+            raise Failed(f"{maker.name}'s {'ask' if buy else 'bid'} on {ticker} refused: {short(r)}")
+        try:
+            r = hit(ticker, float(qty), float(price), time_in_force="IOC", **kw)
+        except LoafValidationError as e:
+            if NOT_FILLED not in str(e):
+                raise
+            tally[f"{key}_dry"] += 1
+            maker.c.orders.cancel_all()
+            return False
+        if left(r) != 0:
+            raise Failed(f"{taker.name}'s IOC for {qty} on {ticker} left {left(r)}: a stranger on the book")
+        tally[f"{key}_{'buy' if buy else 'sell'}"] += 1
+        return True
+
+    def spot_loop() -> None:
+        while time.monotonic() < deadline:
+            take(mm, c, st, sq, ask, True, None, "spot")
+            if two_way:
+                take(mm, c, st, sq, bid, False, None, "spot")
+
+    def perps_loop() -> None:
+        while time.monotonic() < deadline:
+            if not take(a, b, t, pq, hi, True, 0, "perps"):
+                continue
+            for _ in range(5):
+                if take(a, b, t, pq, lo, False, 0, "perps"):
+                    break
+            else:
+                raise Failed("B's IOC sell found A's bid five times running not resting")
+
+    def guarded(name: str, fn: Callable[[], None]) -> None:
+        try:
+            fn()
+        except BaseException as e:  # noqa: BLE001 - re-raised in the main thread
+            errors[name] = e
+            log(f"  {name} stopped: {type(e).__name__}: {e}")
+
+    started = time.monotonic()
+    threads = [threading.Thread(target=guarded, args=(n, f), name=n, daemon=True)
+               for n, f in (("spot", spot_loop), ("perps", perps_loop))]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(secs + run.cfg.wait_s)
+    took = time.monotonic() - started
+    run.cancel_all()
+    spot_fills, perps_fills = tally["spot_buy"] + tally["spot_sell"], tally["perps_buy"] + tally["perps_sell"]
+    log(f"  {took:.1f} s: spot {spot_fills} fills ({spot_fills / took:.1f}/s, {tally['spot_dry']} dry), perps"
+        f" {perps_fills} fills ({perps_fills / took:.1f}/s, {tally['perps_dry']} dry)")
+    for name, e in errors.items():
+        raise Failed(f"the {name} side stopped: {type(e).__name__}: {e}") from e
+    check(not any(th.is_alive() for th in threads), "both sides returned")
+    check(spot_fills > 0 and perps_fills > 0, f"both books filled: spot {spot_fills}, perps {perps_fills}")
+    check(tally["spot_dry"] <= spot_fills and tally["perps_dry"] <= perps_fills, "dry takes are the minority")
+
+    # the spot book: C's and MM's tokens moved by exactly the fills, and C paid the net notional plus fees (at most
+    # 1 % of the gross notional, as the spot step asserts per fill)
+    net_base = (tally["spot_buy"] - tally["spot_sell"]) * int(sq * bscale)
+    run.until(f"C's spot base moved by {net_base}", lambda: balance(c, base)[0] - base_c0 == net_base)
+    run.until(f"MM's spot base moved by {-net_base}", lambda: balance(mm, base)[0] - base_mm0 == -net_base)
+    gross = int(sq * qscale * (tally["spot_buy"] * ask + tally["spot_sell"] * bid))
+    net = int(sq * qscale * (tally["spot_buy"] * ask - tally["spot_sell"] * bid))
+    paid = quote_c0 - balance(c, quote)[0]
+    check(net <= paid <= net + gross // 100, f"C paid the net notional {net} plus fees: {paid} (gross {gross})")
+    # the perps book: B long and A short by exactly the open fills, then both flat again
+    net_units = (tally["perps_buy"] - tally["perps_sell"]) * punits
+    run.wait_base(b, m, 0, net_units)
+    run.wait_base(a, m, 0, -net_units)
+    run.flat(b, m, 0)
+    run.flat(a, m, 0)
+    run.notes.append(f"mixed {took:.0f} s: spot {spot_fills / took:.1f} fills/s, perps {perps_fills / took:.1f} fills/s")
+
+
 def step_funding(run: Run) -> None:
     a, mm = run.users["A"], run.mm
     run.cancel_all()
@@ -1976,7 +2100,7 @@ def step_restore(run: Run) -> None:
 # --------------------------------------------------------------------------------------------- #
 
 STEP_FNS: dict[str, Callable[[Run], None]] = {
-    "setup": step_setup, "spot": step_spot, "perps": step_perps, "funding": step_funding,
+    "setup": step_setup, "spot": step_spot, "perps": step_perps, "mixed": step_mixed, "funding": step_funding,
     "liquidation": step_liquidation, "halt": step_halt, "exit": step_exit, "proof": step_proof,
     RESTORE: step_restore,
 }
