@@ -2,7 +2,7 @@
 
     python examples/04_realtime_market.py
 
-No API key required for public market channels.
+No trading key required for public market channels.
 """
 
 from __future__ import annotations

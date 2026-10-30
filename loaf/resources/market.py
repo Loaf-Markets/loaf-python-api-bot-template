@@ -1,13 +1,12 @@
-"""Public market data: markets, candles, trades, asset info pages.
+"""Public market data: markets, candles, trades.
 
 None of these require authentication — they work with an anonymous client.
 All currency values are plain dollars and quantities plain tokens (see
 :mod:`loaf.money`).
 
 A market is one order book, spot or perp, named by its ticker: its asset's
-ticker, ``-PERP`` appended for a perp (``"MUS"``, ``"H100-PERP"``). The info
-pages describe an asset, named by the asset's ticker. Every call that takes a
-ticker refuses a malformed one (``"mus"``, say) before sending.
+ticker, ``-PERP`` appended for a perp (``"MUS"``, ``"H100-PERP"``). Every call
+that takes a ticker refuses a malformed one (``"mus"``, say) before sending.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from __future__ import annotations
 from typing import Any, Iterator
 
 from ..exceptions import LoafError
-from .base import Resource, _check_asset_ticker, _check_market_ticker
+from .base import Resource, _check_market_ticker
 
 
 class MarketResource(Resource):
@@ -193,20 +192,3 @@ class MarketResource(Resource):
             params={"afterTradeId": after_trade_id, "limit": limit},
             auth=False,
         )
-
-    # -- Info pages (by the asset's ticker) -------------------------------- #
-
-    def info_header(self, ticker: str) -> Any:
-        """``GET /info/{ticker}/header`` — address, hero image, bed/bath/car, offering valuation."""
-        _check_asset_ticker(ticker)
-        return self._client.get(f"/info/{ticker}/header", auth=False)
-
-    def info_overview(self, ticker: str) -> Any:
-        """``GET /info/{ticker}/overview`` — description, media, metrics, amenities."""
-        _check_asset_ticker(ticker)
-        return self._client.get(f"/info/{ticker}/overview", auth=False)
-
-    def info_documents(self, ticker: str) -> Any:
-        """``GET /info/{ticker}/documents`` — public document list (title + URL)."""
-        _check_asset_ticker(ticker)
-        return self._client.get(f"/info/{ticker}/documents", auth=False)

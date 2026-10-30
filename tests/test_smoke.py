@@ -9,12 +9,8 @@ from __future__ import annotations
 import copy
 import itertools
 import json
-import os
 import pickle
-import subprocess
-import sys
 import typing
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, get_type_hints
 
@@ -28,15 +24,15 @@ from loaf.exceptions import error_from_response
 from loaf.money import bps_to_fraction, fraction_to_bps
 from loaf.ws.client import derive_ws_url
 
-from conftest import MARKET_STATES
+from conftest import MARKET_STATES, TRADING_KEY, verify_login
 
 BASE = "http://test/api"
 
 
-def make_client(handler, *, api_key: str | None = "testkey", **kwargs) -> LoafClient:
+def make_client(handler, *, trading_key: str | None = TRADING_KEY, **kwargs) -> LoafClient:
     transport = httpx.MockTransport(handler)
     http = httpx.Client(transport=transport, base_url=BASE)
-    return LoafClient(api_key=api_key, base_url=BASE, http_client=http, **kwargs)
+    return LoafClient(trading_key, base_url=BASE, http_client=http, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -259,31 +255,31 @@ def test_models_list_every_shape():
 
 
 def test_auth_header_and_config_error():
-    seen = {}
+    seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["auth"] = request.headers.get("authorization")
+        seen.append(request.headers.get("authorization"))
         return httpx.Response(200, json={"userId": 7})
 
-    client = make_client(handler)
-    client.portfolio.component()
-    assert seen["auth"] == "Bearer testkey"
+    # The Bearer is a login token the trading key signed for its account, on its chain; the key
+    # itself is never sent. Pasted with surrounding whitespace, it is read stripped.
+    for key in (TRADING_KEY, f" {TRADING_KEY}\n"):
+        make_client(handler, trading_key=key).portfolio.component()
+    for bearer in seen:
+        assert bearer is not None and bearer.startswith("Bearer loaf_lt_4242_5_")
+        assert verify_login(bearer[len("Bearer ") :])["l2AccountIndex"] == 5
+        assert TRADING_KEY[-80:] not in bearer
 
-    # A key read from a file or pasted with surrounding whitespace is sent stripped (httpx
-    # refuses a header value ending in a newline, quoting the whole token in the error).
-    padded = make_client(handler, api_key=" testkey\n")
-    assert padded.api_key == "testkey"
-    padded.portfolio.component()
-    assert seen["auth"] == "Bearer testkey"
-
-    # An anonymous client must refuse an authenticated call; a blank key counts as none.
+    # An anonymous client refuses an authenticated call, naming the variable; a blank key counts
+    # as none.
     for anon in (
         LoafClient(base_url=BASE, http_client=httpx.Client(base_url=BASE)),
-        LoafClient(api_key=" \n", base_url=BASE, http_client=httpx.Client(base_url=BASE)),
+        LoafClient(" \n", base_url=BASE, http_client=httpx.Client(base_url=BASE)),
     ):
-        assert anon.api_key is None
-        with pytest.raises(loaf.LoafConfigError):
+        assert anon.public_key is None
+        with pytest.raises(loaf.LoafConfigError, match=r"\$LOAF_TRADING_KEY"):
             anon.portfolio.component()
+    assert len(seen) == 2
 
 
 def test_public_endpoint_sends_no_auth():
@@ -475,34 +471,6 @@ def test_market_routes_take_only_a_market_ticker(call, route):
     assert len(sent) == 3
 
 
-@pytest.mark.parametrize(
-    "call, route",
-    [
-        (lambda c, t: c.market.info_header(t), "/api/info/{}/header"),
-        (lambda c, t: c.market.info_overview(t), "/api/info/{}/overview"),
-        (lambda c, t: c.market.info_documents(t), "/api/info/{}/documents"),
-        (lambda c, t: c.offerings.get(t), "/api/offerings/{}"),
-    ],
-)
-def test_asset_routes_take_only_an_asset_ticker(call, route):
-    sent = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        sent.append((request.url.path, request.headers.get("authorization")))
-        return httpx.Response(200, json={})
-
-    client = make_client(handler)
-    for ticker in ("OPRA", "OPERAHOUSE"):
-        call(client, ticker)
-    assert sent == [(route.format(t), None) for t in ("OPRA", "OPERAHOUSE")]
-    # An asset has no -PERP: that is a market's ticker.
-    for ticker in (*_MALFORMED_TICKERS, "H100-PERP"):
-        with pytest.raises(loaf.LoafValidationError, match="an asset's ticker") as info:
-            call(client, ticker)
-        assert info.value.status_code == 0
-    assert len(sent) == 2
-
-
 def test_candles_busy_503_retried_then_raises():
     calls = {"n": 0}
 
@@ -596,40 +564,6 @@ def test_a_candle_page_that_does_not_move_back_stops_paging():
     assert sent == [None, "100"]
 
 
-def test_competition_endpoints():
-    seen = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["auth"] = request.headers.get("authorization")
-        if request.content:
-            seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
-
-    client = make_client(handler)
-
-    client.competition.info()
-    assert seen["path"].endswith("/competition") and seen["auth"] is None
-
-    client.competition.queue_position()
-    assert seen["path"].endswith("/competition/queue-position")
-    assert seen["auth"] == "Bearer testkey"
-
-    client.competition.payout_details()
-    assert seen["path"].endswith("/competition/payout-details")
-    assert seen["auth"] == "Bearer testkey"
-
-    client.competition.submit_payout_details(email="win@example.com")
-    assert seen["path"].endswith("/competition/payout-details")
-    assert seen["body"] == {"email": "win@example.com"}  # None wallet dropped
-
-    # Exactly one destination is enforced locally.
-    with pytest.raises(loaf.LoafValidationError):
-        client.competition.submit_payout_details()
-    with pytest.raises(loaf.LoafValidationError):
-        client.competition.submit_payout_details(wallet_address="0xabc", email="a@b.c")
-
-
 def test_rate_limit_headers_recorded():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -697,7 +631,7 @@ def test_cancel_all_route_and_auth():
     assert make_client(handler).orders.cancel_all() == answer
     (request,) = sent  # exactly one request
     assert (request.method, request.url.path) == ("POST", "/api/orders/cancel-all")
-    assert request.headers.get("authorization") == "Bearer testkey"
+    verify_login(request.headers["authorization"][len("Bearer ") :])  # a login token
     assert request.content == b""  # no body
 
 
@@ -770,23 +704,3 @@ def test_an_undecodable_body_is_a_connection_error():
 
 def test_version():
     assert loaf.constants.USER_AGENT == f"loaf-python-sdk/{loaf.__version__}"
-
-
-def test_trading_needs_no_wallet_extra():
-    # eth-account and eth-utils are the `wallet` extra, for python -m loaf.secret_key alone: the SDK
-    # imports, signs and places orders without them. A fresh interpreter, where neither imports.
-    code = """
-import sys
-sys.modules["eth_account"] = sys.modules["eth_utils"] = None
-import httpx
-from conftest import BASE, L2_SECRET, FakeExchange
-from loaf import LoafClient
-exchange = FakeExchange()
-http = httpx.Client(transport=httpx.MockTransport(exchange.handler), base_url=BASE)
-client = LoafClient(api_key="testkey", secret_key=L2_SECRET, base_url=BASE, http_client=http)
-assert client.orders.limit_buy("OPRA", 1, 160).orderId == 1
-assert [name for name in sys.modules if name.startswith("eth_") and sys.modules[name]] == []
-"""
-    tests = Path(__file__).parent
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(tests.parent), str(tests)]))
-    subprocess.run([sys.executable, "-c", code], env=env, check=True)

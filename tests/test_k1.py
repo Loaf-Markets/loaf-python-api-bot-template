@@ -1,5 +1,5 @@
 """K1 signing, offline: K1's known answers, the order, allocate and exit checks
-the web app's signer makes, and the curve's own vectors.
+the web app's signer makes, the login message, and the curve's own vectors.
 
 ``k1-sign.json`` is K1's known-answer file, every line but its ``about`` text (K1's
 names internal documents): keys, signatures, orders, perps allocates and exits,
@@ -8,7 +8,10 @@ signature made by this SDK verifies there. Its withdraws, price reports and orde
 batches are messages this SDK does not build (it signs no withdrawal, report or
 batch): they ride along so the file stays K1's line for line, and the reports'
 signatures are checked like the allocates'. To take a new K1 file, copy it and put
-this file's ``about`` line back.
+this file's ``about`` line back. ``k1-login.json`` is the matching engine's for the
+login message (its ``crates/rules/kat/k1-login.json``, byte for byte), whose
+verifier the exchange checks each login token with: a login token this SDK signs
+is one the exchange takes.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from loaf.k1 import (
     allocate_message,
     exit_message,
     key_from_seed,
+    login_message,
     order_message,
     perps_base_field,
     public_key,
@@ -38,6 +42,8 @@ from loaf.k1 import (
 
 KAT_FILE = Path(__file__).with_name("k1-sign.json")
 KAT = json.loads(KAT_FILE.read_text())
+LOGIN_KAT_FILE = Path(__file__).with_name("k1-login.json")
+LOGIN_KAT = json.loads(LOGIN_KAT_FILE.read_text())
 
 # The group order n.
 N = 0x7FFFFFFD80000007_7FFFFFF100000016_7FFFFFE6CFB80639_E8885C39D724A09C_E80FD996948BFFE1
@@ -132,6 +138,17 @@ def op_fields(vector: dict[str, Any]) -> dict[str, Any]:
 ORDER0 = fields(KAT["orders"][0])
 ALLOCATE0 = op_fields(KAT["allocates"][0])
 EXIT0 = op_fields(KAT["exits"][0])
+# A login token's signed fields, wire keys in the engine's width order.
+LOGIN_KEYS = ("l2ChainId", "l2AccountIndex", "l2ExpiryMs")
+LOGIN_FIELDS = tuple(map(snake, LOGIN_KEYS))
+
+
+def login_fields(vector: dict[str, Any]) -> dict[str, Any]:
+    """A login vector's signed fields as login_message's keywords."""
+    return {snake(key): vector[key] for key in LOGIN_KEYS}
+
+
+LOGIN0 = login_fields(LOGIN_KAT["messages"][0])
 
 
 def refused(code: str, call: Any, *args: Any, **kwargs: Any) -> K1Error:
@@ -472,6 +489,133 @@ def test_an_ops_first_refusal_is_the_engines(call, op, out):
 def test_allocate_and_exit_fields_have_their_types(call, op, edit):
     with pytest.raises(TypeError, match=next(iter(edit))):
         call(**{**op, **edit})
+
+
+# --------------------------------------------------------------------------- #
+# The login message (a login token's), as the engine builds and checks it
+# --------------------------------------------------------------------------- #
+
+
+def test_login_kat_file_is_unchanged():
+    digest = hashlib.sha256(LOGIN_KAT_FILE.read_bytes()).hexdigest()
+    assert digest == "e0c16f47f93d69004c737ae377ea3f953c8d0358a07ecce262208a304b486cb7"
+
+
+@pytest.mark.parametrize(
+    "v", LOGIN_KAT["messages"], ids=["typical", "maxima", "zeros", "carry-account", "carry-expiry"]
+)
+def test_kat_login_messages(v):
+    # The sponge and the packing over the engine's elements, then the elements login_message
+    # lays out itself: the chain id, the tag, and each 48-bit field as its low and high 24 bits.
+    assert v["elements"][1] == LOGIN_KAT["tag"] == 14
+    assert k1._message_bytes(k1._kb_hash(v["elements"])).hex() == v["m"]
+    assert login_message(**login_fields(v)).hex() == v["m"]
+
+
+@pytest.mark.parametrize("v", LOGIN_KAT["signatures"], ids=lambda v: v["aux"][:2])
+def test_kat_login_signatures(v):
+    sk, pk = bytes.fromhex(v["sk"]), bytes.fromhex(v["pk"])
+    assert public_key(sk) == pk
+    m = login_message(**login_fields(v))
+    assert m.hex() == v["m"]
+    s, e = sign(sk, m, bytes.fromhex(v["aux"]))
+    assert (s.hex(), e.hex()) == (v["s"], v["e"])
+    verify(pk, m, s, e)
+
+
+@pytest.mark.parametrize("v", LOGIN_KAT["refusals"], ids=lambda v: v["case"])
+def test_kat_login_refusals(v):
+    # Each a whole check: the message rebuilt from the fields (a width refused before the
+    # signature), then the signature under the key, with the engine's reason.
+    with pytest.raises(K1Error) as info:
+        verify(
+            bytes.fromhex(v["pk"]),
+            login_message(**login_fields(v)),
+            bytes.fromhex(v["s"]),
+            bytes.fromhex(v["e"]),
+        )
+    assert str(info.value) == v["reason"]
+    assert info.value.code == ("Width" if v["reason"].startswith("l2 width:") else "Sig")
+
+
+def test_login_kat_refusals_cover_each_width_and_each_field_after_signing():
+    reasons = [v["reason"] for v in LOGIN_KAT["refusals"]]
+    widths = [f"l2 width: {field} out of range" for field in LOGIN_FIELDS]
+    assert reasons == widths + ["l2 signature: the Schnorr signature does not verify"] * 4
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"l2_chain_id": LOGIN0["l2_chain_id"] + 1},
+        {"l2_account_index": LOGIN0["l2_account_index"] + 1},
+        {"l2_account_index": LOGIN0["l2_account_index"] + 2**24},  # its high 24 bits only
+        {"l2_expiry_ms": LOGIN0["l2_expiry_ms"] + 1},
+        {"l2_expiry_ms": LOGIN0["l2_expiry_ms"] + 2**24},
+    ],
+    ids=["chain", "account-low", "account-high", "expiry-low", "expiry-high"],
+)
+def test_every_login_field_moves_the_message(edit):
+    assert login_message(**{**LOGIN0, **edit}).hex() != LOGIN_KAT["messages"][0]["m"]
+
+
+@pytest.mark.parametrize(
+    "field, high", [("l2_chain_id", 2130706432), ("l2_account_index", 2**48 - 1),
+                    ("l2_expiry_ms", 2**48 - 1)]
+)
+def test_login_field_widths(field, high):
+    # 0 is carried, the chain id's too, as an order's is.
+    for value in (0, high):
+        assert len(login_message(**{**LOGIN0, field: value})) == 32
+    for value in (-1, high + 1):
+        error = refused("Width", login_message, **{**LOGIN0, field: value})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+def test_the_first_login_refusal_is_the_engines():
+    # Every field out of range: each is named in turn, chain id first, as the ones before it are
+    # put right.
+    terms = {"l2_chain_id": 2130706433, "l2_account_index": 2**48, "l2_expiry_ms": 2**48}
+    for field in LOGIN_FIELDS:
+        assert str(refused("Width", login_message, **terms)) == f"l2 width: {field} out of range"
+        terms[field] = LOGIN0[field]
+    assert login_message(**terms).hex() == LOGIN_KAT["messages"][0]["m"]
+
+
+@pytest.mark.parametrize(
+    "edit", [{"l2_chain_id": True}, {"l2_account_index": 5.0}, {"l2_expiry_ms": "1800000000000"}]
+)
+def test_login_fields_have_their_json_types(edit):
+    with pytest.raises(TypeError, match=next(iter(edit))):
+        login_message(**{**LOGIN0, **edit})
+
+
+def test_a_login_message_is_never_an_order_message():
+    # The sponge's initial state holds the input's length, 6 for a login and 16 for every other
+    # message K1 signs: 6 elements hash otherwise than the same 6 padded to 16...
+    for v in LOGIN_KAT["messages"]:
+        assert k1._kb_hash(v["elements"]) != k1._kb_hash([*v["elements"], *[0] * 10])
+    # ...the tag in lane 1 is below an order's 149 and its low byte none of the withdraw's 13,
+    # the price report's 21, the allocate's 23, the exit's 25, the order's 149 or the batch
+    # root's 150...
+    assert LOGIN_KAT["tag"] < 149 and LOGIN_KAT["tag"] & 0xFF not in (13, 21, 23, 25, 149, 150)
+    # ...and no known login message is a known order's or signed message.
+    logins = {v["m"] for v in LOGIN_KAT["messages"]}
+    kinds = ("orders", "signatures", "withdraws", "reports", "allocates", "exits", "batches")
+    assert not logins & {v["m"] for kind in kinds for v in KAT[kind] if "m" in v}
+
+
+def test_the_sponge_overwrites_only_a_short_chunks_lanes():
+    # k1-sign's kb::hash spelled out over the permutation: the length in lane 8 of the initial
+    # state, each chunk of up to 8 overwriting that many of lanes 0..7 (the rest keep the state,
+    # never zeroed), the digest lanes 0..7, and one permutation for an empty input.
+    xs = [1_000_003 * i + 17 for i in range(10)]
+    state = k1._permute([*xs[:8], 10, 0, 0, 0, 0, 0, 0, 0], k1._KB16)
+    padded = [*xs[8:], 0, 0, 0, 0, 0, 0, *state[8:]]
+    state[:2] = xs[8:]
+    assert k1._kb_hash(xs) == k1._permute(state, k1._KB16)[:8]
+    assert k1._kb_hash(xs) != k1._permute(padded, k1._KB16)[:8]  # what zero padding would give
+    assert k1._kb_hash([]) == k1._permute([0] * 16, k1._KB16)[:8]
 
 
 # --------------------------------------------------------------------------- #

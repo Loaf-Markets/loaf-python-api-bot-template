@@ -19,6 +19,7 @@ import urllib.parse
 from decimal import Decimal
 from fractions import Fraction
 
+import httpx
 import pytest
 
 if os.environ.get("E2E_SDK"):
@@ -33,52 +34,46 @@ from eth_utils import keccak  # noqa: E402
 from loaf import k1  # noqa: E402
 from loaf.exceptions import LoafValidationError  # noqa: E402
 
-# K1's withdraw known answers (the engine's crates/k1-sign/kat/sign.json, "withdraws").
-WITHDRAW_KATS = [
-    {"l2ChainId": 1819238758, "l2AccountIndex": 5, "l2ApiKeyIndex": 0, "l2AssetId": 2, "l2Route": 1,
-     "amount": "123456789012", "l2Nonce": 3, "l2ExpiryMs": 1700000000,
-     "m": "51a51f0f69990732029b424bc44aab36ed347dd0b3192a1f1c7f0ba50b1f722d"},
-    {"l2ChainId": 2130706432, "l2AccountIndex": 281474976710655, "l2ApiKeyIndex": 255, "l2AssetId": 65535,
-     "l2Route": 255, "amount": "1152921504606846975", "l2Nonce": 281474976710655, "l2ExpiryMs": 281474976710655,
-     "m": "2044dd43f0085825b9889bd800d1683ed471559ec570220f638e4ce366566a13"},
-    {"l2ChainId": 0, "l2AccountIndex": 0, "l2ApiKeyIndex": 0, "l2AssetId": 0, "l2Route": 0, "amount": "0",
-     "l2Nonce": 0, "l2ExpiryMs": 0, "m": "7748f6661fc98f34abc32b8fa173a1291bc936fb7feaf113199f253877d7242a"},
+# The web app's L2Key typed data as viem signs it, by Hardhat's (and Anvil's) public test account #0, never a wallet
+# with funds, for the vault at L2_KEY_PROXY, and the trading key's secret and public key loaf.k1 derives from each
+# signature: the SDK's vectors from before the trading key (tests/test_secret_key.py at 1fb9d60). The last puts each
+# field near the top of its range, the key nonce at the web app's largest, 2^53 - 1.
+L2_KEY_WALLET = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+L2_KEY_PROXY = "0xedf6877B00000000000000000000000000000001"
+L2_KEY_VECTORS = [
+    {"chain_id": 421614, "l2_chain_id": 304, "account_index": 7, "key_nonce": 0,
+     "signature": "184ed5ae6ae095f3ed74b7e5eda9158ec7dcf0b9f0074d319855fc0703ef5b99"
+                  "2dea551529e51a5665900b5ef669e10a1c57093aba3b0a0fd1bccae3eb1493311b",
+     "secret": "018af9b2cf054f7d1c3f1892fd4d3e8c01f56eb2c0a01eeb29024e6bdfa5e2a32f05792cce720d48",
+     "public_key": "93fea21049464487d7e6c8902c85ccf41bc77bffc640a30076877f7f16252cc91587ac047535133c"},
+    {"chain_id": 421614, "l2_chain_id": 304, "account_index": 7, "key_nonce": 3,
+     "signature": "906106f46fdde97088405f9122df5e60b099f0da4a5903f1d92946055ced3f49"
+                  "1db4c7c1e8c6b0afc38eaeb587b8b5600b09c77d210969a794a2b6624ab4a0b21b",
+     "secret": "bb843ce009adf4fde928aecb50dfc88ed72c2b718c639510176e429abc993e91d9c8da3a99842e20",
+     "public_key": "28d6af1ed2dcddf1bdac2b72e4aabf5a016413d63bb13508352b3b944adf6ed6b46899e926c3d8a9"},
+    {"chain_id": 42161, "l2_chain_id": 4294967295, "account_index": 281474976710654, "key_nonce": 9007199254740991,
+     "signature": "b9132c02f5b20481deaec37c8356b5f7a5835d528acb2206cad097c36894f263"
+                  "6ea917e98dbc682e8bdf61167a1f037d08226e939307ff83e8788da7d24e61741c",
+     "secret": "1ef640bd6e47df6bc7ffcff59eb55fcdb042b55939b79862fa5e67f7642d2802343322096d6dc104",
+     "public_key": "a0515f41856892e44970c63117515ea23c0755e1c04d95ae52bcfbea6a52d632c133b5947c493319"},
 ]
 
-# A throwaway key for signing checks (the secp256k1 generator's scalar 1): no account anyone holds funds on.
-TEST_KEY = "0x" + "00" * 31 + "01"
 
-
-@pytest.mark.parametrize("v", WITHDRAW_KATS, ids=["typical", "max", "zero"])
-def test_the_withdraw_message_is_k1s(v):
-    m = e2e.withdraw_message(v["l2ChainId"], v["l2AccountIndex"], v["l2AssetId"], v["l2Route"], int(v["amount"]),
-                             v["l2Nonce"], v["l2ExpiryMs"], v["l2ApiKeyIndex"])
-    assert m.hex() == v["m"]
-
-
-def test_a_signed_withdrawal_verifies_under_its_key():
-    sk = k1.key_from_seed(keccak(b"e2e test seed"))
-    m = e2e.withdraw_message(31337, 7, e2e.USDC_ASSET, e2e.ROUTE_SPOT, 1_000, 2, 1_900_000_000_000)
-    s, e = k1.sign(sk, m, bytes(32))
-    assert len(s.hex()) == len(e.hex()) == 80
-    k1.verify(k1.public_key(sk), m, s, e)
-    with pytest.raises(k1.K1Error):
-        k1.verify(k1.public_key(sk), e2e.withdraw_message(31337, 7, 3, 1, 1_001, 2, 1_900_000_000_000), s, e)
-
-
-def test_change_pub_key_hashes_as_zkloaf_governance_does():
-    owner, proxy, pub = "0x" + "ab" * 20, "0x" + "11" * 20, bytes(range(40))
-    signable = encode_typed_data(full_message=e2e.change_pub_key_typed_data(owner, 31337, proxy, 5, pub, 0, 1_700_000_000))
-    domain = keccak(abi_encode(
-        ["bytes32", "bytes32", "bytes32", "uint256", "address"],
-        [keccak(text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-         keccak(text="ZkLoaf"), keccak(text="1"), 31337, proxy]))
-    typehash = keccak(text="ChangePubKey(address owner,uint48 accountIndex,uint8 apiKeyIndex,bytes pubKey,uint256 nonce,uint256 deadline)")
-    struct = keccak(abi_encode(["bytes32", "address", "uint48", "uint8", "bytes32", "uint256", "uint256"],
-                               [typehash, owner, 5, 0, keccak(pub), 0, 1_700_000_000]))
-    assert (signable.header, signable.body) == (domain, struct)
-    signed = Account.from_key(TEST_KEY).sign_message(signable)
-    assert Account.recover_message(signable, signature=signed.signature) == Account.from_key(TEST_KEY).address
+@pytest.mark.parametrize("v", L2_KEY_VECTORS, ids=lambda v: f"key-nonce-{v['key_nonce']}")
+def test_the_trading_key_derives_as_the_web_app_derives_it(v):
+    """The driver's copy of the web app's typed data signs as viem signed the web app's, for addresses in any case
+    (the driver passes the wallet checksummed and the vault lowercase), and seeds the same key."""
+    wallet = Account.from_key(L2_KEY_WALLET)
+    signatures = set()
+    for address in (wallet.address, wallet.address.lower()):
+        for proxy in (L2_KEY_PROXY, L2_KEY_PROXY.lower()):
+            typed = e2e.l2_key_typed_data(address, chain_id=v["chain_id"], proxy_address=proxy,
+                                          l2_chain_id=v["l2_chain_id"], account_index=v["account_index"],
+                                          key_nonce=v["key_nonce"])
+            signatures.add(bytes(wallet.sign_message(encode_typed_data(full_message=typed)).signature).hex())
+    assert signatures == {v["signature"]}
+    secret = k1.key_from_seed(keccak(bytes.fromhex(v["signature"])))
+    assert (secret.hex(), k1.public_key(secret).hex()) == (v["secret"], v["public_key"])
 
 
 def test_index_for_brings_the_pool_to_the_fraction():
@@ -99,12 +94,18 @@ def test_index_for_brings_the_pool_to_the_fraction():
         e2e.index_for({**pool, "value": str(r0 // 2)}, 1, p0, 2, 5)
 
 
-def test_provision_sql_carries_digests_and_quotes_labels():
-    sql = e2e.provision_sql([("e2e-A-o'brien", "0x" + "ab" * 20, "INVESTOR", "d" * 64)], 1_700_000_000)
-    assert "'e2e-A-o''brien'" in sql and "'" + "d" * 64 + "'" in sql
-    assert "1700086400" in sql and sql.startswith("BEGIN;") and sql.rstrip().endswith("COMMIT;")
-    assert sql.index("pg_get_serial_sequence") < sql.index("INSERT INTO users")
+def test_provision_sql_upserts_each_wallets_user_whatever_its_case_and_quotes_labels():
+    """The engine binds a deposit's account to the user whose lower(wallet_address) is the deposit's `to`, and
+    nothing when users in two cases hold it: the wallet goes in lowercase and every match ignores case, so a user
+    that holds the wallet checksummed is the one upserted, never doubled. No API key, no referral code."""
+    sql = e2e.provision_sql([("e2e-A-o'brien", "0x" + "AB" * 20, "INVESTOR")], 1_700_000_000)
+    assert "'e2e-A-o''brien'" in sql and "'0x" + "ab" * 20 + "'" in sql and "AB" * 20 not in sql
+    assert "1700000000" in sql and sql.startswith("BEGIN;") and sql.rstrip().endswith("COMMIT;")
+    assert sql.index("pg_get_serial_sequence('users', 'id')") < sql.index("INSERT INTO users")
     assert "EXCEPTION WHEN insufficient_privilege" in sql
+    assert "WHERE NOT EXISTS (SELECT 1 FROM users u WHERE lower(u.wallet_address) = e.wallet)" in sql
+    assert sql.count("lower(u.wallet_address) = e.wallet") == 3 and "u.wallet_address = e.wallet" not in sql
+    assert "api_keys" not in sql and "referral_codes" not in sql
 
 
 def test_the_operator_and_deleverage_sql():
@@ -167,17 +168,16 @@ def test_every_zkloaf_call_is_in_its_abi():
         "assetConfig(uint16)": ["(address,uint8,uint56,uint128,uint64,uint64)"],
         "getAccountIndexFromAddress(address)": ["uint48"],
         "changePubKeyNonce(address)": ["uint256"],
-        "getPendingBalance(address,uint16)": ["uint128"],
         "batchPointers()": ["uint64", "uint64", "uint64"],
         "deposit(address,uint16,uint8,uint256)": [],
-        "withdrawPendingBalance(address,uint16,uint128)": [],
+        "changePubKey(uint48,uint8,bytes)": [],
     }
     for s, out in used.items():
         assert have.get(s) == out, s
 
 
-def test_the_spot_side_and_buffer_are_the_sdks():
-    assert e2e.PERPS_SPOT_SIDE == 255 and e2e.BUFFER_MS == 72 * 3_600_000
+def test_the_spot_side_is_the_sdks():
+    assert e2e.PERPS_SPOT_SIDE == 255
 
 
 @pytest.fixture
@@ -276,8 +276,8 @@ def test_wait_for_retries_reads_and_times_out():
 
 
 def test_a_numeric_wait_ends_on_0_as_on_any_number():
-    """Every numeric wait (a pool's collateral, a deposit's total, L1's pending balance) ends once its number reaches
-    the goal, 0 included; a number short of the goal keeps it waiting to its deadline."""
+    """Every numeric wait (a pool's collateral, a deposit's total) ends once its number reaches the goal, 0
+    included; a number short of the goal keeps it waiting to its deadline."""
     reads = iter([5, 3] + [0] * 1_000)
     assert e2e.wait_for("x", e2e.value_once(lambda: next(reads), lambda v: v < 1), 1, 0.01) == (0,)
     with pytest.raises(e2e.Failed, match="no y within"):
@@ -355,6 +355,128 @@ def test_a_sweep_that_empties_the_pool_passes(env):
     assert (book.spot, book.pools) == (4_700 * 10**6, {0: 30_000})
     run.sweep(user, 0)
     assert (book.spot, book.pools, book.seq) == (5_000 * 10**6, {0: 0}, 2)
+
+
+def test_the_exit_step_allocates_out_and_says_why_it_makes_no_withdrawal(env, monkeypatch):
+    """POST /l2/withdrawals is Privy-only since the trading-key change and the driver has no Privy login: the exit
+    step moves A's flat pool 0 back to spot, uses no L1 (the run has no chain here) and notes, for the verdict, why
+    it makes no L2 withdrawal."""
+    cfg = dataclasses.replace(e2e.Config.read(), wait_s=1)
+    run = e2e.Run(cfg, collateral={"decimals": 6, "tickSize": "10000", "extensionMultiplier": "1000000"})
+    book = FakeBook(5_000 * 10**6)
+    run.users = {"A": e2e.User("A", wallet=None, client=book)}
+    monkeypatch.setattr(e2e.Run, "cancel_all", lambda self: None)
+    run.fund(run.users["A"], 0, Decimal(300))
+    e2e.step_exit(run)
+    assert (book.spot, book.pools) == (5_000 * 10**6, {0: 0})
+    assert run.notes == ["exit made no L2 withdrawal and no L1 claim: POST /l2/withdrawals is Privy-only since the "
+                         "trading-key change, and the driver has no Privy login"]
+
+
+MINT, APPROVE, DEPOSIT, CHANGE = ("mint(address,uint256)", "approve(address,uint256)",
+                                  "deposit(address,uint16,uint8,uint256)", "changePubKey(uint48,uint8,bytes)")
+
+
+class KeyStack:
+    """L1 and the backend for one user's account and key in setup: L1 assigns the address account 7 at its first
+    deposit and moves its key nonce at each changePubKey; the backend refuses the login token 401 until the engine
+    has journaled the key, ``lag`` reads after its change, then GET /l2/keys reads it, and l2_accounts binds the
+    account to user ``bound`` (None: to none). ``events`` is each L1 transaction and L2 read, in order."""
+
+    def __init__(self, account=e2e.NIL_ACCOUNT, nonce=0, journaled=None, lag=2, bound=41):
+        self.account, self.nonce, self.journaled, self.lag, self.bound = account, nonce, journaled, lag, bound
+        self.queued, self.waits, self.events = None, 0, []
+
+    def pg(self, sql):
+        assert sql == f"SELECT 'E2E', user_id FROM l2_accounts WHERE account_index = {self.account};"
+        return [] if self.bound is None else [[str(self.bound)]]
+
+    def account_index(self, proxy, owner):
+        return self.account
+
+    def key_nonce(self, proxy, owner):
+        return self.nonce
+
+    def balance_of(self, token, owner):
+        return 0
+
+    def allowance(self, token, owner, spender):
+        return 0
+
+    def send_unlocked(self, frm, to, sig, *args):
+        self.events.append(sig)
+
+    def send(self, account, to, sig, *args):
+        self.events.append(sig)
+        if sig == DEPOSIT:
+            assert self.account == e2e.NIL_ACCOUNT and args[1:] == (e2e.USDC_ASSET, e2e.ROUTE_SPOT, 100 * 10**6)
+            self.account = 7
+        elif sig == CHANGE:
+            assert args[:2] == (self.account, 0) and len(args[2]) == 40
+            self.nonce, self.queued, self.waits = self.nonce + 1, "0x" + args[2].hex(), self.lag
+
+    def handle(self, request):
+        assert request.url.path == "/api/l2/keys" and request.url.params["apiKeyIndex"] == "0"
+        assert request.headers["Authorization"].startswith(f"Bearer loaf_lt_304_{self.account}_")
+        if self.waits:
+            self.waits -= 1
+            if not self.waits:
+                self.journaled = self.queued
+            self.events.append("GET /l2/keys 401")
+            return httpx.Response(401, json={"error": "l2 key: no trading key is enabled for the account at this "
+                                                      "key index"})
+        self.events.append("GET /l2/keys 200")
+        return httpx.Response(200, json={"accountIndex": self.account, "epoch": 1, "journaledKey": self.journaled,
+                                         "pending": self.journaled != request.url.params["publicKey"],
+                                         "withdrawalNonce": 0})
+
+
+def test_the_setups_account_and_key_go_to_l1_before_any_l2_read(env, monkeypatch, capsys):
+    """A login token authenticates only once the engine has journaled the account (whose first deposit binds it to
+    the user) and its key 0, so nothing is read on L2 before both are on L1: a fresh address deposits, its wallet
+    changes its key, and the login is refused until the key is in force. The client is the SDK's on the web app's
+    trading key string, whose secret is the web app's (vector 0 is this wallet, vault and account at key nonce 0).
+    A re-run sends nothing and finds the key in force; so does one on a key changed four times (key nonce 3,
+    vector 1); one after a run that stopped between the first deposit and the key change sends the change only."""
+    monkeypatch.setattr(e2e.time, "sleep", lambda s: None)  # the in-force wait polls every 3 s
+    run = e2e.Run(e2e.Config.read(), proxy=L2_KEY_PROXY.lower(), l1_chain=421614, l2_chain=304,
+                  funder="0x" + "33" * 20, usdc={"id": e2e.USDC_ASSET, "token": "0x" + "22" * 20, "tick": 10_000,
+                                                 "cap": 0, "min": 1, "decimals": 6})
+    client, made = e2e.LoafClient, []
+
+    def setup(stack):
+        def on_stack(**kw):
+            made.append(kw["trading_key"])
+            transport = httpx.MockTransport(stack.handle)
+            return client(**kw, http_client=httpx.Client(base_url=kw["base_url"], transport=transport))
+
+        run.chain = stack
+        monkeypatch.setattr(e2e, "LoafClient", on_stack)
+        monkeypatch.setattr(e2e.Pg, "__call__", lambda pg, sql: stack.pg(sql))
+        user = e2e.User("A", Account.from_key(L2_KEY_WALLET), user_id=41)
+        e2e.open_account(run, user)
+        e2e.key_in_force(run, user, e2e.register_key(run, user))
+        return user
+
+    refused_then_in_force = ["GET /l2/keys 401", "GET /l2/keys 401", "GET /l2/keys 200"]
+    fresh = KeyStack()
+    a = setup(fresh)
+    assert fresh.events == [MINT, APPROVE, DEPOSIT, CHANGE] + refused_then_in_force
+    assert a.l2_account == 7 and a.k1_secret.hex() == L2_KEY_VECTORS[0]["secret"]
+    assert made == [f"loaf_tk_304_7_{a.k1_secret.hex()}"]
+    assert fresh.journaled == a.c.public_key == "0x" + L2_KEY_VECTORS[0]["public_key"]
+
+    again = KeyStack(account=7, nonce=1, journaled=fresh.journaled)
+    assert setup(again).k1_secret == a.k1_secret and again.events == ["GET /l2/keys 200"]
+    later = KeyStack(account=7, nonce=4, journaled="0x" + L2_KEY_VECTORS[1]["public_key"])
+    assert setup(later).k1_secret.hex() == L2_KEY_VECTORS[1]["secret"] and later.events == ["GET /l2/keys 200"]
+    stopped = KeyStack(account=7)
+    assert setup(stopped).k1_secret == a.k1_secret and stopped.events == [CHANGE] + refused_then_in_force
+    for other in (None, 40):
+        with pytest.raises(e2e.Failed, match="A's account 7 is bound to its user 41"):
+            setup(KeyStack(account=7, nonce=1, journaled=fresh.journaled, bound=other))
+    out = capsys.readouterr().out
+    assert "ok A's key in force" in out and a.k1_secret.hex() not in out and "loaf_lt_" not in out
 
 
 class SpotStop(Exception):

@@ -4,13 +4,13 @@ Every error the API can return is mapped to a specific exception so a bot can
 ``except`` precisely:
 
     LoafError                       (base — catch this to catch everything)
-    ├── LoafConfigError             misconfiguration (e.g. missing API key or trading key, a trading
-    │                               key not in force, a clock hours ahead)
+    ├── LoafConfigError             misconfiguration (e.g. no trading key or a malformed one, a
+    │                               market on another deployment's chain, a clock hours ahead)
     ├── LoafConnectionError         network failure / timeout / a body that failed to decompress
     ├── OrderOutcomeUnknownError    a signed order may be live; the SDK could not confirm it
     ├── PerpsOutcomeUnknownError    a signed perps allocate or exit may have been applied
     └── LoafAPIError                the server returned an HTTP error
-        ├── LoafAuthError                 401  bad/expired credentials, or an order's signature or key
+        ├── LoafAuthError                 401  a login token, or an order's signature or key, refused
         ├── LoafForbiddenError            403  generic forbidden
         │   ├── TradingHaltedError        403  "…halted…", or 400 from the exchange's engine
         │   └── MarketStateError          403  the market's state refuses the order (.state)
@@ -19,7 +19,7 @@ Every error the API can return is mapped to a specific exception so a bot can
         ├── LoafValidationError           400  validation or order-rule refusal (or local, status 0)
         │   └── PostOnlyWouldTakeError    400  a POST_ONLY order would have traded at once
         ├── LoafNotFoundError             404
-        ├── LoafConflictError             409  (e.g. a cancel that lost the race, a prize already claimed)
+        ├── LoafConflictError             409  (e.g. a cancel that lost the race)
         ├── LoafRateLimitError            429  (carries .retry_after seconds)
         └── LoafServerError               5xx  (503 -> LoafServiceUnavailableError)
             └── LoafServiceUnavailableError 503
@@ -51,23 +51,18 @@ def _rebuild_error(cls: type[LoafError], args: tuple) -> LoafError:
 
 
 class LoafConfigError(LoafError):
-    """The client is misconfigured: no API key for an authed request, a missing
-    or malformed API key or trading key, an invalid
+    """The client is misconfigured: no trading key (``$LOAF_TRADING_KEY``) for
+    an authenticated request or an order, a malformed trading key, an invalid
     ``LoafClient(max_slippage_bps=)`` / ``$LOAF_MAX_SLIPPAGE_BPS`` or
-    ``websocket(reconnect_delay=)``, or ``LOAF_WALLET_PRIVATE_KEY`` set in the
-    bot's environment.
+    ``websocket(reconnect_delay=)``, or a server that does not run the exchange.
 
     From an order placement (nothing was placed):
 
-    * your trading key is not the one in force on the market (it was reset in
-      the web app, or it belongs to another vault): get the key in force again
-      (README §2), restart, and cancel and re-arm every stop and take, because
-      those signed with the old key stay ARMED and FAIL when they fire;
-    * trading is not enabled on your account, or you have no trading account
-      yet: act in the web app (deposit first);
+    * the market is on another L2 chain than your trading key: the key is
+      another Loaf deployment's than ``$LOAF_API_BASE_URL``;
     * this machine's clock is hours ahead of the exchange's: synchronize it.
 
-    Act in the web app or fix the setup, then restart.
+    Fix the setup, then restart.
     """
 
 
@@ -153,8 +148,8 @@ class PerpsOutcomeUnknownError(LoafError):
 
     Attributes:
         signed_body: The exact body that was sent (its nonce, expiry and
-            signatures). It holds no key, but sending it needs none beyond
-            your API key: keep it out of logs and alerts (the message leaves
+            signatures). It holds no key, but sending it needs nothing beyond
+            a login token: keep it out of logs and alerts (the message leaves
             the signatures out).
         attempts: How many times the SDK tried to send it.
         last_error: The last attempt's error (also ``__cause__``).
@@ -183,7 +178,8 @@ class LoafAPIError(LoafError):
 
     Attributes:
         status_code: HTTP status code.
-        message: Human-readable error message (the API's ``error`` field).
+        message: Human-readable error message (the API's ``error`` field; a
+            refused login token's is followed by what it means).
         code: Machine-readable code when present.
         details: List of field-level messages on a 400 validation error.
         request_id: The ``X-Request-Id`` for support correlation, if any.
@@ -217,22 +213,36 @@ class LoafAPIError(LoafError):
 
 
 class LoafAuthError(LoafAPIError):
-    """401 — credentials, or an order's signature or key, were refused.
+    """401 — your trading key's login token, or an order's signature or key, was
+    refused.
 
-    ``Invalid credentials``: the API key is unknown, expired or deleted. Reads
-    and cancels raise it, and so do order placements, which read your trading
-    account and reserve order numbers with the API key: every request it
-    authenticates fails the same way until you create a new key in the web app
-    and restart. The WebSocket never raises it: while ``portfolio`` is
-    subscribed, it drops a connection whose key the server does not accept and
-    retries, reporting each attempt to ``on_disconnect``.
+    Reads, cancels, the account read and order-number reservation an order
+    placement makes, and perps allocates and exits (and their nonce read) are
+    authenticated by a login token your trading key signs.
+    A 401 to one is followed, in the message, by what it means (the server's
+    own text stays in :attr:`body`):
+
+    * your trading key is not the one in force on its account here: it was
+      reset in the web app, the account's key is not active yet, or the key is
+      another Loaf deployment's (``l2 signature: …``, ``l2 key: …``,
+      ``l2 account: …``, or ``l2 login: the token is for another exchange's L2
+      chain``). Every request fails the same way until you set the key in force
+      (README §2) and restart; after a reset, cancel and re-arm your stops and
+      takes, which FAIL when they fire;
+    * this machine's clock is off (``l2 login: the token has expired``, or
+      ``… expires more than 15 minutes ahead``): synchronize it, to within about
+      5 minutes of the exchange's.
+
+    The next request signs a fresh login token. The WebSocket never raises it:
+    while ``portfolio`` is subscribed, it drops a connection whose login token
+    the server does not accept and retries, reporting each attempt to
+    ``on_disconnect``.
 
     Otherwise, from an order placement, the exchange refused the order's
     signature or key — ``l2 signature: …`` (prefixed ``tp: `` / ``sl: `` for a
     leg), ``l2 key: …``, or ``l2 account: no trading account has this account
-    index``. Nothing was placed. The next order re-reads your trading account
-    and names the cause. After a key change, stops and takes signed before it
-    FAIL when they fire: re-arm them.
+    index``. Nothing was placed. The next order re-reads your trading account,
+    whose login token is refused, with the cause named, if the key changed.
     """
 
 
@@ -324,8 +334,7 @@ class LoafNotFoundError(LoafAPIError):
 
 class LoafConflictError(LoafAPIError):
     """409 — conflict (e.g. a cancel that lost the race to a fill, a stop /
-    take whose order number another order holds, payout details already
-    submitted)."""
+    take whose order number another order holds)."""
 
 
 class LoafRateLimitError(LoafAPIError):

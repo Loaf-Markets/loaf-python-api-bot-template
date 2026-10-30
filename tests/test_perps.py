@@ -12,6 +12,7 @@ import json
 import re
 import threading
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -24,7 +25,9 @@ from loaf.constants import DEFAULT_PERPS_OP_TTL_MS, MAX_PERPS_OP_TTL_MS, MIN_ORD
 
 from conftest import (
     ACCOUNT_INDEX,
+    BAD_SIGNATURE,
     KAT,
+    KEY_DISABLED,
     MARKET_L2,
     MARKET_STATES,
     NONCE_REFUSAL,
@@ -35,8 +38,12 @@ from conftest import (
     PERPS_LIVE,
     PERPS_MARKET,
     PERP_L2,
+    UNKNOWN_KEY,
+    freeze,
     market_detail,
     routes,
+    secret_locals,
+    verify_login,
     verify_op,
     verify_order,
 )
@@ -60,6 +67,16 @@ MAX_48 = 2**48 - 1
 PERPS_DETAIL = market_detail("OPRA-PERP", market_index=4, l2=PERP_L2, market_price=101.5)
 
 NOW_MS = 1_800_000_000_000
+# The login token's check, before the op reaches the engine: its account could not be read.
+ACCOUNT_UNREAD = (
+    "l2 account: the trading account could not be read; nothing was done, try again in a moment"
+)
+
+
+def _bearer(request: httpx.Request) -> str:
+    """The login token a request carries as its ``Authorization: Bearer``."""
+    return request.headers["authorization"][len("Bearer ") :]
+
 WRONG_CHAIN = "l2 chain id: not the engine's L2 chain"
 PAUSED = "Trading is paused. Your perps request was not submitted — please try again shortly."
 NOT_TAKEN = (
@@ -88,7 +105,7 @@ def perps_exchange(exchange):
 
 
 def test_markets_and_market(exchange, trading_client):
-    perps = trading_client(api_key=None).perps  # public: no API key needed
+    perps = trading_client().perps  # public: a client with a key sends it no token
     assert perps.markets() == {"markets": [PERPS_MARKET], "collateral": PERPS_COLLATERAL}
     assert perps.market(4) == PERPS_MARKET
     assert perps.market(5) is None
@@ -98,7 +115,7 @@ def test_markets_and_market(exchange, trading_client):
 
 
 def test_live_state_and_funding_ticks_are_public(exchange, trading_client):
-    perps = trading_client(api_key=None).perps
+    perps = trading_client().perps
     assert perps.markets_live() == {"markets": [PERPS_LIVE]}
     assert perps.market_live(4) == PERPS_LIVE
     assert perps.market_live(5) is None
@@ -118,11 +135,12 @@ def test_closes(exchange, trading_client):
     perps.closes(limit=1, before=990)
     gets = exchange.gets("/l2/perps/closes")
     assert [dict(r.url.params) for r in gets] == [{}, {"limit": "1", "before": "990"}]
-    assert {r.headers["authorization"] for r in gets} == {"Bearer testkey"}
-    with pytest.raises(loaf.LoafConfigError, match="API key"):
-        trading_client(api_key=None).perps.closes()
-    exchange.keys = None
-    with pytest.raises(loaf.LoafNotFoundError):
+    for request in gets:  # a login token the trading key signed for its account
+        assert verify_login(_bearer(request))["l2AccountIndex"] == ACCOUNT_INDEX
+    with pytest.raises(loaf.LoafConfigError, match="needs your trading key"):
+        trading_client(trading_key=None).perps.closes()
+    exchange.key_in_force = None
+    with pytest.raises(loaf.LoafAuthError, match=re.escape(UNKNOWN_KEY)):
         perps.closes()
 
 
@@ -143,15 +161,16 @@ def test_positions_pools_and_funding(exchange, trading_client):
     ]
     gets = exchange.gets("/l2/perps/positions")
     assert len(gets) == 9
-    assert {request.headers["authorization"] for request in gets} == {"Bearer testkey"}
+    for request in gets:
+        assert verify_login(_bearer(request))["l2AccountIndex"] == ACCOUNT_INDEX
 
 
-def test_positions_need_a_trading_account_and_an_api_key(exchange, trading_client):
-    with pytest.raises(loaf.LoafConfigError, match="API key"):
-        trading_client(api_key=None).perps.positions()
+def test_positions_need_the_trading_key_in_force(exchange, trading_client):
+    with pytest.raises(loaf.LoafConfigError, match="needs your trading key"):
+        trading_client(trading_key=None).perps.positions()
     assert exchange.requests == []
-    exchange.keys = None
-    with pytest.raises(loaf.LoafNotFoundError):
+    exchange.key_in_force = None
+    with pytest.raises(loaf.LoafAuthError, match=re.escape(UNKNOWN_KEY)):
         trading_client().perps.positions()
 
 
@@ -250,9 +269,11 @@ def test_add_margin(exchange, trading_client, l2_clock):
         "GET /l2/keys",
         "POST /l2/allocations",
     ]
+    assert "authorization" not in exchange.requests[0].headers  # the perps markets are public
     assert exchange.requests[1].url.params["apiKeyIndex"] == "0"
-    # Signed with the trading key, sent with the API key: the exchange checks the account is yours.
-    assert exchange.requests[2].headers["authorization"] == "Bearer testkey"
+    # Signed with the trading key, sent with a login token it signs: the exchange checks the
+    # account is yours.
+    assert verify_login(_bearer(exchange.requests[2]))["l2AccountIndex"] == ACCOUNT_INDEX
     assert exchange.keys["withdrawalNonce"] == 4
 
 
@@ -438,40 +459,42 @@ def test_an_exit_needs_no_collateral(exchange, trading_client, collateral):
     assert exchange.posts("/l2/allocations") == []
 
 
-def test_ops_need_both_keys(exchange, trading_client):
+def test_ops_need_the_trading_key(exchange, trading_client):
+    perps = trading_client(trading_key=None).perps
     with pytest.raises(loaf.LoafConfigError, match="needs your trading key"):
-        trading_client(secret_key=None).perps.add_margin(5)
-    with pytest.raises(loaf.LoafConfigError, match="needs your API key too"):
-        trading_client(api_key=None).perps.exit(4)
+        perps.add_margin(5)
+    with pytest.raises(loaf.LoafConfigError, match="needs your trading key"):
+        perps.exit(4)
     assert exchange.requests == []
 
 
-def test_an_op_needs_a_trading_account(exchange, trading_client):
-    exchange.keys = None
-    with pytest.raises(
-        loaf.LoafConfigError,
-        match=re.escape("You have no trading account yet: deposit in the Loaf web app first."),
-    ):
+@pytest.mark.parametrize(
+    "key_in_force, reason",
+    [("0x" + KAT["keys"][1]["pk"], BAD_SIGNATURE), (None, UNKNOWN_KEY), ("0x" + "0" * 80, KEY_DISABLED)],
+)
+def test_an_op_is_never_signed_while_the_trading_key_is_not_in_force(
+    exchange, trading_client, key_in_force, reason
+):
+    # Reset in the web app, never enabled, or disabled: the nonce read's login token is refused,
+    # before anything is signed.
+    exchange.key_in_force = key_in_force
+    with pytest.raises(loaf.LoafAuthError, match=re.escape(reason)) as info:
         trading_client().perps.add_margin(5)
+    assert "is not the trading key in force" in str(info.value)
     assert exchange.posts("/l2/allocations") == []
 
 
-def test_an_op_needs_trading_enabled(exchange, trading_client):
-    exchange.keys["journaledKey"] = None
-    with pytest.raises(
-        loaf.LoafConfigError,
-        match=re.escape(
-            "Trading is not enabled on your account (no trading key is in force): enable trading "
-            "on the Loaf web app's Trade page"
-        ),
-    ):
+def test_an_op_is_never_signed_with_another_deployments_key(exchange, trading_client):
+    exchange.perps_markets = [dict(PERPS_MARKET, l2ChainId=4243)]
+    with pytest.raises(loaf.LoafConfigError, match="is from another Loaf deployment"):
         trading_client().perps.exit(4)
-    assert exchange.posts("/l2/exits") == []
+    assert routes(exchange.requests) == ["GET /l2/perps/markets"]
 
 
-def test_an_op_is_never_signed_with_a_key_not_in_force(exchange, trading_client):
-    exchange.keys["journaledKey"] = "0x" + KAT["keys"][1]["pk"]
-    with pytest.raises(loaf.LoafConfigError, match="not the trading key in force"):
+@pytest.mark.parametrize("index", [6, None, "5", True, -1])
+def test_a_nonce_read_naming_another_account_is_a_server_error(exchange, trading_client, index):
+    exchange.keys["accountIndex"] = index
+    with pytest.raises(loaf.LoafServerError, match="/l2/keys answered an unusable accountIndex"):
         trading_client().perps.add_margin(5)
     assert exchange.posts("/l2/allocations") == []
 
@@ -509,8 +532,11 @@ def test_a_refused_chain_id_is_read_again(exchange, trading_client):
     exchange.queue("/l2/allocations", error_reply(400, WRONG_CHAIN))
     with pytest.raises(loaf.LoafValidationError, match="l2 chain id"):
         perps.add_margin(5)  # signed with the chain id read before
-    perps.add_margin(5)
-    assert [body["l2ChainId"] for body in exchange.bodies("/l2/allocations")] == [4242, 4242, 4343]
+    # Read again, the perps markets are on another chain than the trading key's (a key is one
+    # deployment's): nothing more is signed or sent.
+    with pytest.raises(loaf.LoafConfigError, match="is from another Loaf deployment"):
+        perps.add_margin(5)
+    assert [body["l2ChainId"] for body in exchange.bodies("/l2/allocations")] == [4242, 4242]
     assert len(exchange.gets("/l2/perps/markets")) == 2
 
 
@@ -581,7 +607,7 @@ def test_a_lost_answer_is_resent_and_answered_as_its_duplicate(
     assert exchange.keys["withdrawalNonce"] == 1  # applied once
 
 
-@pytest.mark.parametrize("message", [PAUSED, NOT_TAKEN])
+@pytest.mark.parametrize("message", [PAUSED, NOT_TAKEN, ACCOUNT_UNREAD])
 def test_a_503_that_applied_nothing_is_final(exchange, trading_client, message):
     perps = trading_client(max_retries=1).perps
     exchange.queue("/l2/allocations", error_reply(503, message), error_reply(503, message))
@@ -610,11 +636,13 @@ def test_an_unconfirmed_op_is_an_unknown_outcome_that_resubmit_settles(exchange,
     assert len(sent) == 2 and sent[0] == sent[1]
     assert json.dumps(error.signed_body, separators=(",", ":")).encode() == sent[0]
     # Neither attempt was applied: a resubmit applies it now, and a second one is its duplicate.
-    # A resubmit needs the API key alone.
-    resend = trading_client(secret_key=None).perps.resubmit
+    # A resubmit signs nothing new: a fresh client re-sends it with a login token alone.
+    reads = len(exchange.gets("/l2/keys"))
+    resend = trading_client().perps.resubmit
     assert resend(error.signed_body) == {"journalSeq": 1001, "duplicate": False}
     assert resend(error.signed_body) == {"journalSeq": 1001, "duplicate": True}
     assert exchange.posts("/l2/allocations")[2:] == sent
+    assert len(exchange.gets("/l2/keys")) == reads
 
 
 def test_a_refused_resubmit_is_still_unknown(exchange, trading_client):
@@ -910,3 +938,52 @@ def test_a_market_state_refusal_of_an_order(perps_exchange, trading_client, mess
     orders.limit_buy("OPRA-PERP", 2, 101.5, reduce_only=True)
     first, second = perps_exchange.bodies("/orders")
     assert first["l2OrderIndex"] == second["l2OrderIndex"]
+
+
+# --------------------------------------------------------------------------- #
+# An op's login token
+# --------------------------------------------------------------------------- #
+
+
+def _op_posts(exchange: Any) -> list[httpx.Request]:
+    return [r for r in exchange.requests if r.method == "POST" and r.url.path == "/api/l2/allocations"]
+
+
+def test_a_refused_op_login_token_is_forgotten_and_explained(exchange, trading_client):
+    # The op's own 401 (the backend's refusal of its signature or key), past the nonce read.
+    perps = trading_client().perps
+    exchange.queue("/l2/allocations", error_reply(401, BAD_SIGNATURE))
+    with pytest.raises(loaf.LoafAuthError, match=re.escape(BAD_SIGNATURE)) as info:
+        perps.add_margin(5)
+    assert "is not the trading key in force" in str(info.value)
+    (refused,) = _op_posts(exchange)  # a 401 is never re-sent
+    perps.add_margin(5)
+    assert _bearer(_op_posts(exchange)[1]) != _bearer(refused)  # signed afresh
+
+
+def test_an_ops_login_token_is_in_no_traceback_local(exchange, trading_client):
+    perps = trading_client().perps
+    exchange.queue("/l2/allocations", error_reply(401, BAD_SIGNATURE))
+    with pytest.raises(loaf.LoafAuthError) as refused:
+        perps.add_margin(5)
+    exchange.queue("/l2/allocations", *(httpx.ReadTimeout("slow") for _ in range(4)))
+    with pytest.raises(loaf.PerpsOutcomeUnknownError) as unknown:
+        perps.add_margin(5)
+    sent = [_bearer(r) for r in _op_posts(exchange)]
+    for error in (refused.value, unknown.value):
+        assert secret_locals(error, *sent) == []
+
+
+def test_each_attempt_of_an_op_carries_its_own_login_token(
+    exchange, trading_client, monkeypatch, l2_clock
+):
+    # A backoff can outlast the token's half-life: the re-send carries a fresh one.
+    now = freeze(l2_clock)
+    perps = trading_client().perps
+    monkeypatch.setattr(
+        "loaf.client.time", SimpleNamespace(sleep=lambda seconds: freeze(l2_clock, now + 300_000))
+    )
+    exchange.queue("/l2/allocations", httpx.ConnectError("unreachable"))
+    perps.add_margin(5)
+    first, second = (verify_login(_bearer(r))["l2ExpiryMs"] for r in _op_posts(exchange))
+    assert (first, second) == (now + 600_000, now + 300_000 + 600_000)

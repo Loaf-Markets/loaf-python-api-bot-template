@@ -2,7 +2,8 @@
 
 These capture the wire-level contract every client must honour: numeric
 precision limits, order limits and defaults, the timing rules of signed
-orders, and the perps markets' pools and the life of a signed allocate or exit.
+orders, the perps markets' pools and the life of a signed allocate or exit,
+and the trading key and its login tokens.
 """
 
 from __future__ import annotations
@@ -21,15 +22,10 @@ from ._version import __version__
 DEFAULT_BASE_URL = "https://api.loafmarkets.com/api"
 
 #: Environment variables the client reads when arguments are omitted.
-ENV_API_KEY = "LOAF_API_KEY"
-ENV_SECRET_KEY = "LOAF_SECRET_KEY"
+ENV_TRADING_KEY = "LOAF_TRADING_KEY"
 ENV_BASE_URL = "LOAF_API_BASE_URL"
 ENV_WS_URL = "LOAF_WS_URL"
 ENV_MAX_SLIPPAGE_BPS = "LOAF_MAX_SLIPPAGE_BPS"
-
-#: Your account wallet's private key: read only by ``python -m loaf.secret_key``, for one command.
-#: The client refuses to start while it is set.
-ENV_WALLET_PRIVATE_KEY = "LOAF_WALLET_PRIVATE_KEY"
 
 #: User-Agent sent on every request.
 USER_AGENT = f"loaf-python-sdk/{__version__}"
@@ -138,3 +134,22 @@ DEFAULT_PERPS_OP_TTL_MS = 600_000
 
 #: The longest ``ttl_ms=`` an allocate or exit accepts: one day.
 MAX_PERPS_OP_TTL_MS = 86_400_000
+
+# --------------------------------------------------------------------------- #
+# The trading key and its login tokens
+# --------------------------------------------------------------------------- #
+
+#: How a trading key starts: the one string the web app's Show trading key gives,
+#: ``loaf_tk_<l2ChainId>_<l2AccountIndex>_<secret key, 80 lowercase hex>``.
+TRADING_KEY_PREFIX = "loaf_tk_"
+
+#: How a login token starts: ``loaf_lt_<l2ChainId>_<l2AccountIndex>_<l2ExpiryMs>_<l2SigS><l2SigE>``,
+#: the Bearer of every authenticated request and the WebSocket's ``auth`` frame, signed with the
+#: trading key over its account, its chain and its expiry.
+L2_LOGIN_TOKEN_PREFIX = "loaf_lt_"
+
+#: How long a login token the SDK signs lives: 10 minutes. It signs a fresh one, for requests and
+#: the live WebSocket connection alike, once the one it holds is down to half of that, 5 minutes.
+#: The exchange takes one only before its expiry and at most 15 minutes ahead of its own clock (the
+#: longest life it takes), so this machine's clock may run up to about 5 minutes fast or 5 slow.
+L2_LOGIN_TOKEN_LIFE_MS = 600_000

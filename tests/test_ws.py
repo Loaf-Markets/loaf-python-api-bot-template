@@ -1,5 +1,5 @@
-"""Offline unit tests for the WebSocket client: the API keys and reconnect delays it refuses,
-channel helpers and frame dispatch.
+"""Offline unit tests for the WebSocket client: the reconnect delays it refuses, channel
+helpers, frame dispatch, and what a refused auth does to the login token.
 
 Frames are fed straight to the dispatcher; the connection lifecycle against a
 real server is covered by test_ws_lifecycle.py.
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,7 +18,7 @@ import pytest
 from loaf import LoafClient, LoafConfigError, LoafWebSocketClient, from_base_units
 from loaf._object import parse
 
-from conftest import secret_locals
+from conftest import TRADING_KEY
 
 
 def _client() -> LoafWebSocketClient:
@@ -26,52 +27,6 @@ def _client() -> LoafWebSocketClient:
 
 def _frame(**fields: Any) -> str:
     return json.dumps({**fields, "timestamp": 0})
-
-
-@pytest.mark.parametrize(
-    "api_key, refusal",
-    [
-        (" 0X" + "AB" * 32 + "\n", "looks like a wallet private key"),
-        # As a .env loader may keep it: quoted with a comment, the pasted line's own name, or
-        # exported without 0x on a second line after the API key.
-        ('"0x' + "ab" * 32 + '" # wallet', "looks like a wallet private key"),
-        ("PRIVATE_KEY=0x" + "ab" * 32, "looks like a wallet private key"),
-        ("cd" * 32 + "\n" + "ab" * 32, "stray character inside it"),
-        ("LOAF_SECRET_KEY=" + "ab" * 40, "looks like your trading key"),
-    ],
-    ids=["wallet key", "wallet key quoted", "wallet key line", "wallet key bare", "trading key"],
-)
-def test_a_wallet_or_trading_key_is_never_sent_as_the_api_key(api_key: str, refusal: str):
-    # Every auth frame carries the API key: either constructor refuses what LoafClient refuses,
-    # before anything is sent, and leaves the key in neither the error nor its frames.
-    loaf = LoafClient(api_key="cd" * 32)
-    for make in (
-        lambda: LoafWebSocketClient(ws_url="ws://test/ws", api_key=api_key),
-        lambda: loaf.websocket(api_key=api_key),
-    ):
-        with pytest.raises(LoafConfigError, match=refusal) as info:
-            make()
-        assert "ab" * 32 not in str(info.value).lower()
-        assert secret_locals(info.value, "ab" * 32) == []
-
-
-def test_whitespace_around_the_api_key_is_accepted():
-    # Sent as given: the server trims the key, as LoafClient strips its own.
-    key = " " + "cd" * 32 + "\n"
-    assert LoafWebSocketClient(ws_url="ws://test/ws", api_key=key).api_key == key
-    assert LoafClient(api_key="cd" * 32).websocket(api_key=key).api_key == key
-
-
-def test_a_key_passed_as_bytes_is_left_in_no_frame():
-    # A str pattern raises on bytes inside the check both clients share: no frame keeps the key.
-    key = b"0x" + b"ab" * 32
-    for make in (
-        lambda: LoafClient(api_key=key),  # type: ignore[arg-type]
-        lambda: LoafWebSocketClient(ws_url="ws://test/ws", api_key=key),  # type: ignore[arg-type]
-    ):
-        with pytest.raises(TypeError) as info:
-            make()
-        assert secret_locals(info.value, "ab" * 32) == []
 
 
 @pytest.mark.parametrize(
@@ -99,14 +54,11 @@ def test_channel_helpers():
     ws.subscribe_volume("OPRA")
     ws.subscribe_market_status("OPRA")
     ws.subscribe_orderbook("H100-PERP")  # a perp's market ticker
-    ws.subscribe_leaderboard()
-    ws.subscribe_competition()
     ws.subscribe_portfolio()
     ws.subscribe_perps_markets()
     assert ws._channels == {
         "orderbook:OPRA", "trades:OPRA", "chart:OPRA", "markprice:OPRA", "volume:OPRA",
-        "market:OPRA", "orderbook:H100-PERP", "leaderboard", "competition", "portfolio",
-        "perps:markets",
+        "market:OPRA", "orderbook:H100-PERP", "portfolio", "perps:markets",
     }
 
 
@@ -197,18 +149,6 @@ def test_order_queue_dispatch():
     assert (seen[0].orders[0].quantityAhead, seen[0].orders[0].ordersAhead) == (12.5, 3)
 
 
-def test_round_update_reaches_on_round_update():
-    ws = _client()
-    seen = []
-    ws.on_round_update(seen.append)
-    round_update = {
-        "type": "round_update", "roundNumber": 3, "status": "PREPARED",
-        "startsAt": 1_800_000_000, "endsAt": None, "arenaTicker": "MUS", "timestamp": 0,
-    }
-    ws._dispatch(json.dumps(round_update))
-    assert seen == [round_update]
-
-
 def test_a_liquidation_fill_reaches_on_liquidation_fill_not_on_trade():
     # A liquidation took from the user's resting perps order: a fill of it that is no trade.
     ws = _client()
@@ -257,12 +197,12 @@ def test_balances_update_keeps_base_unit_strings():
 def test_on_message_sees_every_frame():
     ws = _client()
     typed, every = [], []
-    ws.on_round_update(typed.append)
+    ws.on_market_halt(typed.append)
     ws.on_message(lambda m: every.append(m.type))
-    for message_type in ("connection", "round_update", "balances_update", "a_future_type"):
+    for message_type in ("connection", "market_halt", "balances_update", "a_future_type"):
         ws._dispatch(_frame(type=message_type))
     assert len(typed) == 1
-    assert every == ["connection", "round_update", "balances_update", "a_future_type"]
+    assert every == ["connection", "market_halt", "balances_update", "a_future_type"]
 
 
 def test_the_echo_of_the_ping_marks_the_connection_live():
@@ -270,7 +210,7 @@ def test_the_echo_of_the_ping_marks_the_connection_live():
     events = []
     ws.on_connect(lambda _: events.append("on_connect"))
     ws.on_message(lambda m: events.append(m.type))
-    ws._dispatch(_frame(type="subscription_confirmed", channels=["competition"]))
+    ws._dispatch(_frame(type="subscription_confirmed", channels=["orderbook:OPRA"]))
     ws._dispatch(_frame(type="echo", data={"type": "hello"}))
     assert not ws.wait_until_connected(timeout=0)
     ws._dispatch(_frame(type="echo", data={"type": "ping", "timestamp": 0}))
@@ -278,3 +218,64 @@ def test_the_echo_of_the_ping_marks_the_connection_live():
     assert ws.wait_until_connected(timeout=0)
     # Once per connection, and the echo itself still reaches the handlers.
     assert events == ["subscription_confirmed", "echo", "on_connect", "echo", "echo"]
+
+
+def test_a_refused_auth_drops_the_login_token_it_carried():
+    # The next auth frame, on this connection or the next, carries a fresh token: a refused one is
+    # never sent again. An accepted one is kept, and so is one signed since the refused one.
+    ws = LoafClient(TRADING_KEY).websocket()
+    tokens = ws._login_tokens
+    assert tokens is not None
+    ws._auth_token = sent = tokens.token()
+    ws._dispatch(_frame(type="auth_result", success=True))
+    assert tokens.token() == sent
+    ws._dispatch(_frame(type="auth_result", success=False))
+    fresh = tokens.token()
+    assert fresh != sent
+    ws._dispatch(_frame(type="auth_result", success=False))  # sent's again, fresh signed since
+    assert tokens.token() == fresh
+
+
+def test_an_anonymous_client_has_no_login_tokens():
+    assert LoafWebSocketClient(ws_url="ws://test/ws")._login_tokens is None
+    assert LoafClient().websocket()._login_tokens is None
+    assert LoafClient(TRADING_KEY).websocket()._login_tokens is not None
+
+
+class _Stop(BaseException):
+    """Ends a coroutine under test from inside a stand-in."""
+
+
+def test_a_refresh_that_wakes_early_sends_nothing_until_half_life(
+    monkeypatch: pytest.MonkeyPatch, l2_clock: SimpleNamespace
+):
+    # asyncio's clock is not the wall clock: a sleep can end a little before the token the
+    # connection holds is down to half its life. The connection keeps that token, waits out the
+    # rest, and only then sends a fresh one.
+    now_ms = [1_800_000_000_000]
+    l2_clock.time_ns = lambda: now_ms[0] * 1_000_000
+    ws = LoafClient(TRADING_KEY).websocket()
+    tokens = ws._login_tokens
+    assert tokens is not None
+    held, renew_in = tokens.token_and_renewal()
+    ws._auth_token = held
+    waits: list[float] = []
+    advances = [299_999, 1]  # ms: the first sleep ends a millisecond early
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        if not advances:
+            raise _Stop
+        now_ms[0] += advances.pop(0)
+
+    sent: list[str] = []
+
+    class Connection:
+        async def send(self, frame: str) -> None:
+            sent.append(json.loads(frame)["token"])
+
+    monkeypatch.setattr("loaf.ws.client.asyncio", SimpleNamespace(sleep=sleep))
+    with pytest.raises(_Stop):
+        asyncio.run(ws._keep_authenticated(Connection(), tokens, renew_in))
+    assert waits == [300.0, 0.001, 300.0]
+    assert len(sent) == 1 and sent[0] != held and ws._auth_token == sent[0]

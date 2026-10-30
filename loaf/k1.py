@@ -1,8 +1,9 @@
-"""K1 signing: the keys, order messages and Schnorr signatures of Loaf's L2.
+"""K1 signing: the keys, order and login messages and Schnorr signatures of Loaf's L2.
 
 A pure-Python port of K1's reference signer, the one implementation the engine
 verifies with and the web app signs with. It reproduces K1's known answers byte
-for byte (``tests/k1-sign.json``).
+for byte (``tests/k1-sign.json``), and the engine's for the login message
+(``tests/k1-login.json``).
 
 * :func:`key_from_seed` and :func:`public_key`: a 40-byte secret key from a
   32-byte seed, and its 40-byte public key, the point ``sk G`` of ECgFp5
@@ -15,6 +16,8 @@ for byte (``tests/k1-sign.json``).
   allocate (USDC moved between the spot balance and a margin pool, or between
   two pools) and a perps exit (the close of a position in an expired market)
   sign, likewise checked;
+* :func:`login_message`: the 32 bytes a login token signs, the same digest of
+  its 3 signed fields (the L2 chain, the account and the token's expiry);
 * :func:`sign` and :func:`verify`: the Schnorr pair ``(s, e)``, 40 bytes
   little-endian each.
 
@@ -35,7 +38,7 @@ from __future__ import annotations
 import hashlib
 from fractions import Fraction
 from functools import lru_cache
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
 from .exceptions import LoafError
 
@@ -212,6 +215,23 @@ def exit_message(
     return _exit_message(l2_chain_id, l2_account_index, pool, market, l2_nonce, l2_expiry_ms)
 
 
+def login_message(*, l2_chain_id: int, l2_account_index: int, l2_expiry_ms: int) -> bytes:
+    """The login message: the 32 bytes an account's api key 0, its trading key, signs
+    for a login token (``loaf_lt_…``), the Bearer that authenticates the account's
+    requests other than its signed orders.
+
+    The arguments are the token's three signed fields: the L2 chain id, the account's
+    index and the token's expiry (unix ms). A field the message cannot carry is refused
+    first, as the engine refuses it, in this order: ``Width`` with ``l2 width: <field>
+    out of range`` for a chain id not below the KoalaBear modulus (0 is carried, as an
+    order's is), then an account or an expiry wider than 48 bits.
+    """
+    _width("l2_chain_id", l2_chain_id, 0, _KB_P - 1)
+    _width("l2_account_index", l2_account_index, 0, _MAX_48)
+    _width("l2_expiry_ms", l2_expiry_ms, 0, _MAX_48)
+    return _login_message(l2_chain_id, l2_account_index, l2_expiry_ms)
+
+
 def sign(sk: bytes, message: bytes, aux: bytes) -> tuple[bytes, bytes]:
     """K1's Schnorr signature of a 32-byte message: ``(s, e)``, 40 bytes
     little-endian each (the body's ``l2SigS`` and ``l2SigE`` are their hex).
@@ -323,14 +343,15 @@ def _order_message(
     base_amount: int,
     expiry: int,
 ) -> bytes:
-    """The order message of fields in range, unchecked: its 16 elements' digest
-    (:func:`_digest`)."""
+    """The order message of fields in range, unchecked: the sponge digest of the
+    order's 16 elements (two absorbs) as the 32 bytes a key signs."""
     word = 149 + (is_ask << 16) + (base_asset << 17) + (quote_asset << 23)  # 149: a settle order
-    return _digest((
+    elements = (
         chain_id, word, market, price & _M24, price >> 24, fee_cap,
         account & _M24, account >> 24, index & _M24, index >> 24, epoch & _M24, epoch >> 24,
         base_amount & _M24, base_amount >> 24, expiry & _M24, expiry >> 24,
-    ))
+    )
+    return _message_bytes(_kb_hash(elements))
 
 
 def _allocate_message(
@@ -346,11 +367,11 @@ def _allocate_message(
     account (low 24, middle 24 bits); the sides; the amount (low 24, middle 24,
     the bits above 48); the nonce and the expiry (low 24, middle 24 bits each);
     three zeros."""
-    return _digest((
+    return _message_bytes(_kb_hash((
         chain_id, _ALLOCATE_TAG, account & _M24, account >> 24 & _M24, from_side, to_side,
         amount & _M24, amount >> 24 & _M24, amount >> 48,
         nonce & _M24, nonce >> 24 & _M24, expiry & _M24, expiry >> 24 & _M24, 0, 0, 0,
-    ))
+    )))
 
 
 def _exit_message(
@@ -359,19 +380,43 @@ def _exit_message(
     """The exit message of fields in range, unchecked: chain id; tag 25; the
     account (low 24, middle 24 bits); the pool; the market; the nonce and the
     expiry (low 24, middle 24 bits each); six zeros."""
-    return _digest((
+    return _message_bytes(_kb_hash((
         chain_id, _EXIT_TAG, account & _M24, account >> 24 & _M24, pool, market,
         nonce & _M24, nonce >> 24 & _M24, expiry & _M24, expiry >> 24 & _M24, 0, 0, 0, 0, 0, 0,
-    ))
+    )))
 
 
-def _digest(elements: tuple[int, ...]) -> bytes:
-    """A message's 16 KoalaBear elements to the 32 bytes signed: their sponge digest
-    m, sent as P_i = m[2i] + 2^31 m[2i+1], each 8 bytes little-endian."""
-    # Rate 8, the input length (16) in lane 8, each chunk overwriting lanes 0..7.
-    state = _permute([*elements[:8], 16, 0, 0, 0, 0, 0, 0, 0], _KB16)
-    state[:8] = elements[8:]
-    m = _permute(state, _KB16)
+def _login_message(chain_id: int, account: int, expiry: int) -> bytes:
+    """The login message of fields in range, unchecked: the sponge digest of its 6
+    elements (one absorb) as the 32 bytes a key signs. The sponge's initial state holds
+    the length, 6, where every other message K1 signs has 16, so no login message is
+    another message."""
+    # 14: a login, below the orders' 149, its low byte none of the withdraw's 13, the price
+    # report's 21, the allocate's 23, the exit's 25, the order's 149 or the batch root's 150 (the
+    # engine's crates/rules LOGIN_TAG).
+    elements = (chain_id, 14, account & _M24, account >> 24, expiry & _M24, expiry >> 24)
+    return _message_bytes(_kb_hash(elements))
+
+
+def _kb_hash(elements: Sequence[int]) -> list[int]:
+    """K1's sponge over KoalaBear (k1-sign ``kb::hash``): rate 8, the input's length in
+    lane 8 of the initial state; each chunk of up to 8 elements overwrites that many of
+    lanes 0..7, the rest keeping the state, then the state is permuted (once for an
+    empty input). The digest m is lanes 0..7."""
+    state = [0] * 16
+    state[8] = len(elements)
+    if not elements:
+        state = _permute(state, _KB16)
+    for start in range(0, len(elements), 8):
+        chunk = elements[start : start + 8]
+        state[: len(chunk)] = chunk
+        state = _permute(state, _KB16)
+    return state[:8]
+
+
+def _message_bytes(m: Sequence[int]) -> bytes:
+    """A digest m as the 32 bytes a key signs (k1-sign ``msg::message_bytes``):
+    P_i = m[2i] + 2^31 m[2i+1], each 8 bytes little-endian."""
     return (
         m[0] + (m[1] << 31)
         | (m[2] + (m[3] << 31)) << 64

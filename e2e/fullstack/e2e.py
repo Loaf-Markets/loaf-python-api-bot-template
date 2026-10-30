@@ -4,9 +4,10 @@ WebSocket and admin routes, with the devnet's L1 for the money that moves on cha
 
 Steps, in order (README.md has what each asserts):
 
-  setup        users A, B, C and the market maker MM (rows in the backend's database, an API key each), gas,
-               L1 deposits credited on L2, each user's trading key derived from its wallet and registered; the
-               role markets walked to E2E_HOME_INDEX
+  setup        users A, B, C and the market maker MM (rows in the backend's database), gas, each user's L2
+               account (opened by a first L1 deposit) and trading key (derived from its wallet, which registers
+               it on L1), every trading key's login, L1 deposits credited on L2; the role markets walked to
+               E2E_HOME_INDEX
   spot         a limit order rests and is cancelled, post-only rests and refuses to take, IOC, FOK, a crossing
                fill between two users
   perps        allocates into pool 0 and isolated pools; long and short by limit and market; post-only, IOC, FOK,
@@ -20,7 +21,8 @@ Steps, in order (README.md has what each asserts):
   halt         the admin halt refuses orders and the API key cannot resume it; the operator's reduce-only takes
                only reducing orders and its reopen opens again; an unreported price turns the market PRICE_STALE,
                which takes only reducing orders until the reports resume
-  exit         pool 0 closed and allocated out to spot, an L2 withdrawal, its L1 claim paid
+  exit         pool 0 closed and allocated out to spot; no L2 withdrawal (POST /l2/withdrawals is Privy-only
+               since the trading-key change, and the driver has no Privy login)
   proof        the run's trades in final batches, every batch through the run's last verified and executed on
                L1, settlesub's verified batch equal to L1's, no new settled refusal
 
@@ -34,18 +36,15 @@ is a passing step whose restore failed), 3 incomplete (a leg the run's configura
 step passed). A setup that does not pass skips every later step. The last lines are
 `==== VERDICT PASS|FAIL <step>=<rc> ...` and `==== DONE`; the exit status is 0 only when every step that ran passed.
 
-Configuration is the environment only (README.md: E2E_*). Nothing secret is written or printed: the API keys are
-minted for the run and kept in memory, the wallets derive from a seed file or a mnemonic, the trading keys from
-the wallets' signatures, and the admin key and the database DSNs are read from their files when a request needs
-them, never put in an argv.
+Configuration is the environment only (README.md: E2E_*). Nothing secret is written or printed: the wallets derive
+from a seed file or a mnemonic, the trading keys from the wallets' signatures and are kept in memory, and the
+admin key and the database DSNs are read from their files when a request needs them, never put in an argv.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import secrets
 import shlex
 import signal
 import subprocess
@@ -66,17 +65,15 @@ from eth_account.messages import encode_typed_data
 from eth_utils import keccak, to_checksum_address
 from loaf import k1
 from loaf.client import LoafClient
-from loaf.constants import PERPS_SPOT_SIDE
+from loaf.constants import PERPS_SPOT_SIDE, TRADING_KEY_PREFIX
 from loaf.exceptions import (
     LoafAPIError,
     LoafConnectionError,
-    LoafNotFoundError,
     LoafValidationError,
     MarketHaltedError,
     MarketStateError,
     PostOnlyWouldTakeError,
 )
-from loaf.secret_key import l2_key_typed_data
 
 STEPS = ("setup", "spot", "perps", "mixed", "funding", "liquidation", "halt", "exit", "proof")
 #: The one-shot restore (E2E_STEPS=restore, alone): step_restore.
@@ -88,16 +85,15 @@ KEEP_BACKSTOP = (os.environ.get("E2E_KEEP_BACKSTOP") or "").strip() == "1"
 
 #: The run's users, in HD order from E2E_HD_BASE.
 USERS = ("A", "B", "C", "MM")
-#: Each user's L2 USDC the setup tops up to (dollars); every run deposits at least MIN_DEPOSIT.
+#: Each user's L2 USDC the setup tops up to (dollars); every run deposits at least MIN_DEPOSIT, and so does the
+#: deposit that opens an address's L2 account (open_account).
 USDC_TARGET = {"A": Decimal(50_000), "B": Decimal(50_000), "C": Decimal(50_000), "MM": Decimal(200_000)}
 MIN_DEPOSIT = Decimal(100)
-#: The perps collateral, and a deposit's or withdrawal's route (TxTypes.RouteType: 0 perps, 1 spot).
+#: The perps collateral, and a deposit's route (TxTypes.RouteType: 0 perps, 1 spot).
 USDC_ASSET = 3
 ROUTE_SPOT = 1
 #: ZkLoaf's NIL_ACCOUNT_INDEX: an address that never deposited.
 NIL_ACCOUNT = 2**48 - 1
-#: The engine's BUFFER (l2-settle-schema L2_BUFFER_MS, 72 h): a signed withdrawal's expiry must clear it.
-BUFFER_MS = 259_200_000
 #: The backend's texts for the engine's order-term refusals (Loaf-Backend ordersService.ts).
 NOT_FILLED = "Order rejected: no resting order could fill any of it"
 FOK_NOT_FILLED = "Fill-or-kill order rejected: it could not be filled in full"
@@ -437,9 +433,6 @@ class Chain:
     def key_nonce(self, proxy: str, owner: str) -> int:
         return int(self.call(proxy, "changePubKeyNonce(address)", ["uint256"], owner)[0])
 
-    def pending_balance(self, proxy: str, owner: str, asset: int) -> int:
-        return int(self.call(proxy, "getPendingBalance(address,uint16)", ["uint128"], owner, asset)[0])
-
     def batch_pointers(self, proxy: str) -> tuple[int, int, int]:
         """(committed, verified, executed)."""
         c, v, e = self.call(proxy, "batchPointers()", ["uint64", "uint64", "uint64"])
@@ -447,8 +440,8 @@ class Chain:
 
 
 # --------------------------------------------------------------------------------------------- #
-# The backend's database through psql: the run's users and API keys, a market's control flags; the journal's
-# closes and settled's refusals
+# The backend's database through psql: the run's users, a market's control flags; the journal's closes and
+# settled's refusals
 # --------------------------------------------------------------------------------------------- #
 
 
@@ -456,46 +449,46 @@ def _lit(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-#: Moves each id sequence of the tables the provisioning inserts into past the table's largest id: a kit that
-#: inserted rows with explicit ids left the sequence behind them. Without the right to, it notes and goes on.
+#: Moves the users table's id sequence past its largest id: a kit that inserted rows with explicit ids left the
+#: sequence behind them. Without the right to, it notes and goes on.
 _SEQUENCES_SQL = """DO $$
-DECLARE t text; s text; top bigint;
+DECLARE s text; top bigint;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['users', 'referral_codes', 'api_keys'] LOOP
-    s := pg_get_serial_sequence(t, 'id');
-    CONTINUE WHEN s IS NULL;
-    EXECUTE format('SELECT GREATEST(COALESCE(max(id), 0), (SELECT last_value FROM %s)) FROM %I', s, t) INTO top;
+  s := pg_get_serial_sequence('users', 'id');
+  IF s IS NOT NULL THEN
+    EXECUTE format('SELECT GREATEST(COALESCE(max(id), 0), (SELECT last_value FROM %s)) FROM users', s) INTO top;
     PERFORM setval(s, GREATEST(top, 1));
-  END LOOP;
+  END IF;
 EXCEPTION WHEN insufficient_privilege THEN
-  RAISE NOTICE 'e2e: the id sequences stay as they are: %', SQLERRM;
+  RAISE NOTICE 'e2e: the users id sequence stays as it is: %', SQLERRM;
 END $$;"""
 
 
-def provision_sql(rows: Sequence[tuple[str, str, str, str]], now: int) -> str:
-    """Upserts each (label, wallet, user type, API key hash) as Loaf-Backend authenticates a key: the user, its
-    personal referral code (the key lookup INNER JOINs it) and an API key valid for a day (revoked_at is the
-    expiry). Prints ``E2E|label|user id`` for each."""
+def provision_sql(rows: Sequence[tuple[str, str, str]], now: int) -> str:
+    """Upserts each (label, wallet, user type) as the user its wallet's L2 account is bound to. The engine binds an
+    account to the user whose wallet a deposit to it names, when it journals the deposit, and nothing else binds it
+    for the driver (POST /l2/keys, which also binds, is Privy-only): the row must exist before the address's first
+    deposit (step_setup provisions first). It compares lower(wallet_address) with the deposit's `to` and binds
+    nothing when users in more than one case hold the wallet (loaf-matching-engine
+    src/db/sql/journal_bind_accounts.sql), so the wallet is written lowercase and a user that holds it in any case
+    is the one upserted (users_wallet_address_lower_idx), never doubled in another case. MARKET_MAKER exempts MM
+    from the backend's per-user rate limiter (Loaf-Backend userRateLimiter.ts). Prints ``E2E|label|user id`` for
+    each."""
     values = ",\n".join(
-        f"  ({_lit(label)}, {_lit(wallet)}, {_lit(kind)}::user_type_enum, {_lit(digest)}, "
-        f"{_lit('E2E' + secrets.token_hex(4).upper())})"
-        for label, wallet, kind, digest in rows
+        f"  ({_lit(label)}, {_lit(wallet.lower())}, {_lit(kind)}::user_type_enum)" for label, wallet, kind in rows
     )
     return f"""BEGIN;
 {_SEQUENCES_SQL}
-CREATE TEMP TABLE e2e_users (label text, wallet text, kind user_type_enum, digest text, ref text) ON COMMIT DROP;
+CREATE TEMP TABLE e2e_users (label text, wallet text, kind user_type_enum) ON COMMIT DROP;
 INSERT INTO e2e_users VALUES
 {values};
 INSERT INTO users (wallet_address, display_name, user_type, kyc_status, wholesale_status, created_at)
 SELECT e.wallet, e.label, e.kind, 'VERIFIED', 'VERIFIED', {now} FROM e2e_users e
+ WHERE NOT EXISTS (SELECT 1 FROM users u WHERE lower(u.wallet_address) = e.wallet)
 ON CONFLICT (wallet_address) DO NOTHING;
-UPDATE users u SET deleted_at = NULL FROM e2e_users e WHERE u.wallet_address = e.wallet AND u.deleted_at IS NOT NULL;
-INSERT INTO referral_codes (owner_user_id, is_personal, max_uses, code, created_at)
-SELECT u.id, true, -1, e.ref, {now} FROM e2e_users e JOIN users u ON u.wallet_address = e.wallet
- WHERE NOT EXISTS (SELECT 1 FROM referral_codes rc WHERE rc.owner_user_id = u.id AND rc.is_personal);
-INSERT INTO api_keys (user_id, token_hash, description, created_at, revoked_at)
-SELECT u.id, e.digest, 'e2e', {now}, {now + 86_400} FROM e2e_users e JOIN users u ON u.wallet_address = e.wallet;
-SELECT 'E2E', e.label, u.id FROM e2e_users e JOIN users u ON u.wallet_address = e.wallet ORDER BY e.label;
+UPDATE users u SET deleted_at = NULL FROM e2e_users e
+ WHERE lower(u.wallet_address) = e.wallet AND u.deleted_at IS NOT NULL;
+SELECT 'E2E', e.label, u.id FROM e2e_users e JOIN users u ON lower(u.wallet_address) = e.wallet ORDER BY e.label;
 COMMIT;
 """
 
@@ -618,50 +611,63 @@ class Prices:
 
 
 # --------------------------------------------------------------------------------------------- #
-# What the driver signs for the backend's routes the SDK does not serve (key change, withdrawal)
+# The trading key: what the wallet signs to derive it, as the web app derives it
 # --------------------------------------------------------------------------------------------- #
 
-
-def withdraw_message(chain_id: int, account: int, asset: int, route: int, amount: int, nonce: int, expiry: int,
-                     api_key: int = 0) -> bytes:
-    """K1's L2 withdraw message (k1-sign msg.rs WithdrawFields): the chain id; tag 13 with the api key above it;
-    the account (low and middle 24 bits); the asset; the route; the amount (low 24, middle 24, the bits above 48);
-    the nonce and the expiry (low and middle 24 bits each); three zeros. Hashed by the SDK's sponge, as its
-    allocate and exit messages are."""
-    m24 = (1 << 24) - 1
-    return k1._digest(
-        (
-            chain_id, 13 + (api_key << 8), account & m24, account >> 24 & m24, asset, route,
-            amount & m24, amount >> 24 & m24, amount >> 48,
-            nonce & m24, nonce >> 24 & m24, expiry & m24, expiry >> 24 & m24, 0, 0, 0,
-        )
-    )
+#: The warning the web app's ``L2Key`` typed data carries, byte for byte: the wallet signs it, so any other text
+#: derives another key. The web app is the source of truth (loafx-frontend shared/l2/keyMessage.ts L2_KEY_WARNING).
+L2_KEY_WARNING = (
+    "This signature is your Loaf L2 trading key. Anyone who holds it can trade for this account. "
+    "Sign it only in the Loaf app."
+)
 
 
-def change_pub_key_typed_data(owner: str, chain_id: int, proxy: str, account: int, pub_key: bytes, nonce: int,
-                              deadline: int) -> dict[str, Any]:
-    """ZkLoafGovernance's ChangePubKey (EIP-712, domain ZkLoaf/1 on the proxy), as POST /l2/keys relays it."""
+def l2_key_typed_data(
+    wallet: str,
+    *,
+    chain_id: int,
+    proxy_address: str,
+    l2_chain_id: int,
+    account_index: int,
+    key_nonce: int,
+) -> dict[str, Any]:
+    """The EIP-712 typed data whose signature by ``wallet`` seeds the trading key, byte for byte the web app's
+    (loafx-frontend shared/l2/keyMessage.ts L2_KEY_DOMAIN and L2_KEY_TYPES, apps/trade/src/l2/key.ts
+    l2KeyTypedData, the source of truth): domain ``Loaf L2 Key`` version 2 on ``chain_id`` (the vault's chain,
+    ``market.l2.chainId``) with no verifying contract, and an ``L2Key`` message binding the vault
+    (``proxy_address``, ``l2_chain_id``), the account, its api key 0, ``key_nonce`` (one per key change the
+    wallet made on the vault) and :data:`L2_KEY_WARNING`.
+
+    The seed is keccak256 of the 65-byte signature; addresses in any case sign the same.
+    """
     return {
         "types": {
             "EIP712Domain": [
                 {"name": "name", "type": "string"},
                 {"name": "version", "type": "string"},
                 {"name": "chainId", "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
             ],
-            "ChangePubKey": [
-                {"name": "owner", "type": "address"},
+            "L2Key": [
+                {"name": "wallet", "type": "address"},
+                {"name": "zkLoaf", "type": "address"},
+                {"name": "l2ChainId", "type": "uint64"},
                 {"name": "accountIndex", "type": "uint48"},
                 {"name": "apiKeyIndex", "type": "uint8"},
-                {"name": "pubKey", "type": "bytes"},
-                {"name": "nonce", "type": "uint256"},
-                {"name": "deadline", "type": "uint256"},
+                {"name": "keyNonce", "type": "uint64"},
+                {"name": "warning", "type": "string"},
             ],
         },
-        "primaryType": "ChangePubKey",
-        "domain": {"name": "ZkLoaf", "version": "1", "chainId": chain_id, "verifyingContract": to_checksum_address(proxy)},
-        "message": {"owner": to_checksum_address(owner), "accountIndex": account, "apiKeyIndex": 0, "pubKey": pub_key,
-                    "nonce": nonce, "deadline": deadline},
+        "primaryType": "L2Key",
+        "domain": {"name": "Loaf L2 Key", "version": "2", "chainId": chain_id},
+        "message": {
+            "wallet": wallet,
+            "zkLoaf": proxy_address,
+            "l2ChainId": l2_chain_id,
+            "accountIndex": account_index,
+            "apiKeyIndex": 0,
+            "keyNonce": key_nonce,
+            "warning": L2_KEY_WARNING,
+        },
     }
 
 
@@ -739,8 +745,9 @@ def wallet_of(cfg: Config, i: int, name: str) -> Any:
 class User:
     name: str
     wallet: Any = field(repr=False)
-    api_key: str = field(default="", repr=False)
-    trading_key: str = field(default="", repr=False)
+    #: The 40-byte secret of the account's K1 api key 0, derived from the wallet (register_key).
+    k1_secret: bytes = field(default=b"", repr=False)
+    #: The client on the user's trading key: it signs the orders and the login tokens of the authenticated reads.
     client: LoafClient | None = field(default=None, repr=False)
     l2_account: int = 0
     user_id: int = 0
@@ -754,16 +761,6 @@ class User:
     def c(self) -> LoafClient:
         assert self.client is not None
         return self.client
-
-
-def keys_state(user: User, pub_key: str | None = None) -> Mapping[str, Any] | None:
-    params: dict[str, Any] = {"apiKeyIndex": 0}
-    if pub_key:
-        params["publicKey"] = pub_key
-    try:
-        return user.c.get("/l2/keys", params=params)
-    except LoafNotFoundError:
-        return None
 
 
 def balance(user: User, asset: int) -> tuple[int, int]:
@@ -1223,21 +1220,33 @@ def step_setup(run: Run) -> None:
         if chain.eth(wallet.address) < 10**19:
             chain.set_gas(wallet.address, 100 * 10**18)
 
-    # The users and their API keys: the wallets' users, a fresh key each run.
-    tokens = {name: secrets.token_hex(32) for name in USERS}
+    # The users: the wallets' rows, before any deposit to them, whose journaling binds the account to its user
+    # (provision_sql).
     wanted = [
         (f"{cfg.tag}-{name}-{run.users[name].address[2:10]}", run.users[name].address,
-         "MARKET_MAKER" if name == "MM" else "INVESTOR", hashlib.sha256(tokens[name].encode()).hexdigest())
+         "MARKET_MAKER" if name == "MM" else "INVESTOR")
         for name in USERS
     ]
     got = {r[0]: r for r in cfg.pg(provision_sql(wanted, int(time.time())))}
     for (label, *_), name in zip(wanted, USERS, strict=True):
-        u = run.users[name]
-        check(label in got, f"user {name} provisioned with an API key")
-        u.user_id, u.api_key = int(got[label][1]), tokens.pop(name)
-        u.client = LoafClient(api_key=u.api_key, base_url=cfg.api, ws_url=cfg.ws, max_retries=2)
-        u.c.portfolio.component()
-    check(True, "every API key authenticates: " + ", ".join(f"{u.name}=user {u.user_id}" for u in run.users.values()))
+        check(label in got, f"user {name} provisioned")
+        run.users[name].user_id = int(got[label][1])
+
+    # Each user's L2 account and trading key, with nothing read on L2 until the key is in force: a login token
+    # authenticates only once the engine has journaled the account's first deposit (which binds it to the user) and
+    # its key 0, and L1 takes a key change only for an account it holds. Every key change is sent before the first
+    # wait, so the users' waits for the engine overlap; a re-run, every account and key in place, sends nothing and
+    # finds each key in force at once, and one after a run that stopped between an account's first deposit and its
+    # key change sends the change.
+    nonces: dict[str, int] = {}
+    for u in run.users.values():
+        open_account(run, u)
+        nonces[u.name] = register_key(run, u)
+    for u in run.users.values():
+        key_in_force(run, u, nonces[u.name])
+        u.trade_floor = newest_trade(u)
+    check(True, "every trading key logs in: "
+                + ", ".join(f"{u.name}=account {u.l2_account} (user {u.user_id})" for u in run.users.values()))
 
     # L1 deposits on the spot route, each credited on L2: USDC to everyone; the spot market's quote (when it is
     # not USDC) to A and C and its base to B and MM. A failed one fails the spot step, not the perps ones.
@@ -1254,13 +1263,6 @@ def step_setup(run: Run) -> None:
             run.spot_failed = f"the spot market {run.spot}'s deposits failed in setup: {e}"
             log(f"  {run.spot_failed}")
 
-    # Trading keys: derived as the web app derives them, registered through POST /l2/keys.
-    for u in run.users.values():
-        register_key(run, u)
-        u.client = LoafClient(api_key=u.api_key, base_url=cfg.api, ws_url=cfg.ws, secret_key=u.trading_key,
-                              max_retries=2)
-        u.trade_floor = newest_trade(u)
-
     # MM's private channel: its liquidation fills.
     ws = run.mm.c.websocket()
     ws.on_liquidation_fill(run.ws_fills.append)
@@ -1276,12 +1278,22 @@ def step_setup(run: Run) -> None:
 
 def deposit(run: Run, user: User, conf: Mapping[str, Any], target: Decimal) -> None:
     """``user`` tops its L2 balance of the asset up to ``target`` tokens (at least MIN_DEPOSIT) from its own
-    wallet on the spot route (the funder mints them first); its L2 book is credited with exactly that."""
+    wallet (l1_deposit); its L2 book is credited with exactly that."""
+    asset, scale = int(conf["id"]), 10 ** int(conf["decimals"])
+    total0, _ = balance(user, asset)
+    units = l1_deposit(run, user, conf, max(int(target * scale) - total0, int(MIN_DEPOSIT * scale)))
+    total = wait_for(f"{user.name}'s deposit of asset {asset} credited",
+                     value_once(lambda: balance(user, asset)[0], lambda t: t >= total0 + units), 2 * run.cfg.wait_s)[0]
+    check(total == total0 + units, f"{user.name}'s L2 asset {asset}: {total0} + {units} = {total}")
+
+
+def l1_deposit(run: Run, user: User, conf: Mapping[str, Any], units: int) -> int:
+    """``user`` deposits ``units`` base units of the asset (whole ticks, at most its cap) to its own account on the
+    spot route, from its own wallet (the funder mints them first): L1 only, nothing is read on L2. Returns the units
+    deposited."""
     chain = run.chain
     assert chain is not None
-    asset, token, tick, scale = int(conf["id"]), str(conf["token"]), int(conf["tick"]), 10 ** int(conf["decimals"])
-    total0, _ = balance(user, asset)
-    units = max(int(target * scale) - total0, int(MIN_DEPOSIT * scale))
+    asset, token, tick = int(conf["id"]), str(conf["token"]), int(conf["tick"])
     if conf["cap"]:
         units = min(units, int(conf["cap"]) * tick)
     units -= units % tick
@@ -1291,41 +1303,77 @@ def deposit(run: Run, user: User, conf: Mapping[str, Any], target: Decimal) -> N
     if chain.allowance(token, user.address, run.proxy) < units:
         chain.send(user.wallet, token, "approve(address,uint256)", run.proxy, 2**256 - 1)
     chain.send(user.wallet, run.proxy, "deposit(address,uint16,uint8,uint256)", user.address, asset, ROUTE_SPOT, units)
-    index = chain.account_index(run.proxy, user.address)
-    check(index != NIL_ACCOUNT, f"{user.name} holds L2 account {index} on L1")
-    user.l2_account = index
-    total = wait_for(f"{user.name}'s deposit of asset {asset} credited",
-                     value_once(lambda: balance(user, asset)[0], lambda t: t >= total0 + units), 2 * run.cfg.wait_s)[0]
-    check(total == total0 + units, f"{user.name}'s L2 asset {asset}: {total0} + {units} = {total}")
+    return units
 
 
-def register_key(run: Run, user: User) -> None:
-    """The key in force, derived from the wallet as the web app derives it (key nonce n - 1 for the vault's
-    nonce n). With none yet (n == 0) the key of nonce 0 is signed as ChangePubKey and sent through POST /l2/keys,
-    then awaited in the journal."""
+def open_account(run: Run, user: User) -> None:
+    """``user``'s L2 account, as L1 reads it (getAccountIndexFromAddress). L1 assigns an address its account at the
+    first deposit to it, so an address with none first deposits MIN_DEPOSIT of USDC (l1_deposit), with nothing read
+    on L2. The engine binds the account to the user when it journals that deposit (provision_sql), before the key
+    change key_in_force awaits (Loaf-Backend l2Journal.ts folds an account's key change only after its deposit), so
+    the setup's balance-checked deposits find it credited."""
     chain = run.chain
     assert chain is not None
-    state = keys_state(user)
-    check(state is not None and int(state["accountIndex"]) == user.l2_account,
-          f"{user.name}'s backend account is its L1 account {user.l2_account}")
+    index = chain.account_index(run.proxy, user.address)
+    if index == NIL_ACCOUNT:
+        l1_deposit(run, user, run.usdc, int(MIN_DEPOSIT * 10 ** int(run.usdc["decimals"])))
+        index = chain.account_index(run.proxy, user.address)
+    check(index != NIL_ACCOUNT, f"{user.name} holds L2 account {index} on L1")
+    user.l2_account = index
+
+
+def register_key(run: Run, user: User) -> int:
+    """``user``'s trading key, the key in force derived from the wallet as the web app derives it (key nonce n - 1
+    for the vault's nonce n: apps/trade/src/l2/key.ts inForceKeyNonce), and the user's client on it: the web app's
+    Show trading key, ``loaf_tk_<L2 chain>_<account>_<secret hex>`` (Shared-Types src/index.ts formatTradingKey).
+    With none yet (n == 0) the wallet sets its account's key 0 to the key of nonce 0 itself, ZkLoaf's
+    changePubKey(accountIndex, 0, pubKey) from the owner with no fee, as the P5 kit's traders do
+    (loaf-matching-engine tests/it/p5/chain.rs change_pub_key): POST /l2/keys, which relays the same change, is
+    Privy-only. Nothing is read on L2 (key_in_force awaits the key). Returns n."""
+    chain = run.chain
+    assert chain is not None
     n = chain.key_nonce(run.proxy, user.address)
     typed = l2_key_typed_data(user.wallet.address, chain_id=run.l1_chain, proxy_address=run.proxy,
                               l2_chain_id=run.l2_chain, account_index=user.l2_account, key_nonce=max(n - 1, 0))
-    sk = k1.key_from_seed(keccak(user.wallet.sign_message(encode_typed_data(full_message=typed)).signature))
-    pk = "0x" + k1.public_key(sk).hex()
+    user.k1_secret = k1.key_from_seed(keccak(user.wallet.sign_message(encode_typed_data(full_message=typed)).signature))
     if n == 0:
-        deadline = int(time.time()) + 600
-        signed = user.wallet.sign_message(encode_typed_data(full_message=change_pub_key_typed_data(
-            user.address, run.l1_chain, run.proxy, user.l2_account, bytes.fromhex(pk[2:]), 0, deadline)))
-        answer = user.c.post("/l2/keys", json={
-            "owner": user.address, "accountIndex": user.l2_account, "apiKeyIndex": 0, "pubKey": pk,
-            "deadline": deadline, "signature": "0x" + bytes(signed.signature).hex()})
-        check(answer.get("status") in ("SENT", "ALREADY_QUEUED"),
-              f"{user.name}'s key change {answer.get('status')} (tx {answer.get('txHash')})")
-    run.until(f"{user.name}'s key journaled", lambda: (lambda s: bool(s) and s.get("journaledKey") == pk
-                                                       and s.get("pending") is False)(keys_state(user, pk)), 600, 3.0)
-    check(chain.key_nonce(run.proxy, user.address) == max(n, 1), f"{user.name}'s key is the vault's (key nonce {max(n - 1, 0)})")
-    user.trading_key = sk.hex()
+        chain.send(user.wallet, run.proxy, "changePubKey(uint48,uint8,bytes)", user.l2_account, 0,
+                   k1.public_key(user.k1_secret))
+    user.client = LoafClient(
+        trading_key=f"{TRADING_KEY_PREFIX}{run.l2_chain}_{user.l2_account}_{user.k1_secret.hex()}",
+        base_url=run.cfg.api, ws_url=run.cfg.ws, max_retries=2)
+    return n
+
+
+def key_in_force(run: Run, user: User, nonce: int) -> None:
+    """Waits until ``user``'s trading key is in force. Until then the backend refuses its login token 401 (the
+    account bound to no user, or no key 0 journaled: Loaf-Backend l2LoginTokens.ts), which the wait retries, the SDK
+    signing a fresh token for each try; then GET /l2/keys reads the key journaled on the user's L1 account, not
+    pending. The account is bound to the user provision_sql upserted (l2_accounts, through which the login finds the
+    account's user, so GET /l2/keys can only name the token's own account), and L1's key nonce is still the one the
+    key was derived at (``nonce``, register_key's, or 1 after a first change)."""
+    chain = run.chain
+    assert chain is not None
+    pk = user.c.public_key
+
+    def journaled() -> Mapping[str, Any] | None:
+        state = user.c.get("/l2/keys", params={"apiKeyIndex": 0, "publicKey": pk})
+        return state if state.get("journaledKey") == pk and state.get("pending") is False else None
+
+    def bound() -> str:
+        rows = run.cfg.pg(f"SELECT 'E2E', user_id FROM l2_accounts WHERE account_index = {int(user.l2_account)};")
+        return f"user {rows[0][0]}" if rows else "no user"
+
+    try:
+        run.until(f"{user.name}'s key in force", journaled, 600, 3.0)
+    except Failed as e:
+        # An address whose first deposit the engine journaled before its users row existed is never bound (nothing
+        # else binds it for the driver: provision_sql), so its login is refused for good: the binding says which.
+        raise Failed(f"{e}; l2_accounts binds account {user.l2_account} to {bound()}") from e
+    check(bound() == f"user {user.user_id}",
+          f"{user.name}'s account {user.l2_account} is bound to its user {user.user_id}")
+    check(chain.key_nonce(run.proxy, user.address) == max(nonce, 1),
+          f"{user.name}'s key is the vault's (key nonce {max(nonce - 1, 0)})")
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -1963,13 +2011,14 @@ def step_halt(run: Run) -> None:
 
 
 # --------------------------------------------------------------------------------------------- #
-# 7. exit: allocate out, withdraw on L2, claim on L1
+# 7. exit: allocate out
 # --------------------------------------------------------------------------------------------- #
 
 
 def step_exit(run: Run) -> None:
-    chain = run.chain
-    assert chain is not None
+    """A's pool 0 closed and its whole ticks allocated out to spot. The driver no longer makes an L2 withdrawal:
+    POST /l2/withdrawals is Privy-only since the trading-key change (Loaf-Backend src/routes/l2.ts refuses a login
+    token there), and the driver has no Privy login. The run's verdict says so in a NOTE."""
     a = run.users["A"]
     run.cancel_all()
     for pos in (pool_of(a, 0) or {}).get("positions", []):
@@ -1977,41 +2026,8 @@ def step_exit(run: Run) -> None:
     check(not (pool_of(a, 0) or {}).get("positions"), "A's pool 0 holds no position")
     run.sweep(a, 0)
     check(collateral_of(a, 0) < int(run.collateral["extensionMultiplier"]), "pool 0's whole ticks are back in spot")
-
-    tick, scale = int(run.usdc["tick"]), 10 ** int(run.usdc["decimals"])
-    _, avail = balance(a, USDC_ASSET)
-    w = min(1_000 * scale // tick, avail // tick)
-    check(w > 0, f"A withdraws {w} ticks")
-    state = keys_state(a)
-    assert state is not None
-    nonce = int(state["withdrawalNonce"])
-    expiry = int(time.time() * 1000) + BUFFER_MS + 600_000
-    s, e = k1.sign(bytes.fromhex(a.trading_key),
-                   withdraw_message(run.l2_chain, a.l2_account, USDC_ASSET, ROUTE_SPOT, w, nonce, expiry), os.urandom(32))
-    total0, _ = balance(a, USDC_ASSET)
-    pend0 = chain.pending_balance(run.proxy, a.address, USDC_ASSET)
-    r = a.c.post("/l2/withdrawals", json={
-        "l2AccountIndex": a.l2_account, "l2ApiKeyIndex": 0, "l2AssetId": USDC_ASSET, "l2Route": ROUTE_SPOT,
-        "amount": str(w), "l2Nonce": nonce, "l2ExpiryMs": expiry, "l2ChainId": run.l2_chain,
-        "l2SigS": s.hex(), "l2SigE": e.hex()})
-    seq = int(r.get("journalSeq") or 0)
-    check(seq > 0 and r.get("duplicate") is False, f"A's L2 withdrawal of {w} ticks journaled at {seq}")
-    run.until(f"A's L2 USDC debited {w * tick}", lambda: total0 - balance(a, USDC_ASSET)[0] == w * tick)
-    pend = run.until(f"the withdrawal executed on L1 (A's pending balance {pend0} + {w})",
-                     value_once(lambda: chain.pending_balance(run.proxy, a.address, USDC_ASSET), lambda x: x >= pend0 + w),
-                     run.cfg.final_wait_s, 10.0)[0]
-    check(pend == pend0 + w, f"A's L1 pending balance is {pend}")
-    row = run.until("the withdrawal's transfer row CONFIRMED", lambda: next(
-        (x for x in a.c.portfolio.component().get("transfers", []) if int(x.get("journalSeq") or 0) == seq
-         and x.get("status") == "CONFIRMED"), None), run.cfg.wait_s, 5.0)
-    batch = row.get("batch") or {}
-    log(f"  transfer row: {short(row)}")
-    run.last_batch = max(run.last_batch, int(batch.get("batchNumber") or 0))
-    wallet0 = chain.balance_of(run.usdc["token"], a.address)
-    chain.send(a.wallet, run.proxy, "withdrawPendingBalance(address,uint16,uint128)", a.address, USDC_ASSET, pend)
-    paid = chain.balance_of(run.usdc["token"], a.address) - wallet0
-    check(paid == pend * tick and chain.pending_balance(run.proxy, a.address, USDC_ASSET) == 0,
-          f"the L1 claim paid A's wallet {paid} and left nothing pending")
+    run.notes.append("exit made no L2 withdrawal and no L1 claim: POST /l2/withdrawals is Privy-only since the "
+                     "trading-key change, and the driver has no Privy login")
 
 
 # --------------------------------------------------------------------------------------------- #

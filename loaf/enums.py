@@ -97,13 +97,6 @@ class AssetKind(_StrEnum):
     INDEX = "INDEX"
 
 
-class IpoStatus(_StrEnum):
-    PENDING = "PENDING"
-    LIVE = "LIVE"
-    CLOSED = "CLOSED"
-    CANCELLED = "CANCELLED"
-
-
 class CandleResolution(_StrEnum):
     """Bucket size for :meth:`loaf.resources.market.MarketResource.candles`."""
 
@@ -114,17 +107,6 @@ class CandleResolution(_StrEnum):
     FOUR_HOURS = "4h"
     ONE_DAY = "1d"
     ONE_WEEK = "1w"
-
-
-class CompetitionRoundStatus(_StrEnum):
-    """Lifecycle of a trading-competition round (leaderboard / competition info)."""
-
-    DRAFT = "DRAFT"
-    PENDING = "PENDING"
-    PREPARED = "PREPARED"
-    ACTIVE = "ACTIVE"
-    ENDING = "ENDING"
-    ENDED = "ENDED"
 
 
 class WSMessageType(_StrEnum):
@@ -145,9 +127,7 @@ class WSMessageType(_StrEnum):
     CANDLE_UPDATE = "candle_update"
     MARK_PRICE = "mark_price"
     VOLUME_UPDATE = "volume_update"
-    LEADERBOARD_UPDATE = "leaderboard_update"
     MARKET_HALT = "market_halt"
-    ROUND_UPDATE = "round_update"
     PERPS_MARKETS_LIVE = "perps_markets_live"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"

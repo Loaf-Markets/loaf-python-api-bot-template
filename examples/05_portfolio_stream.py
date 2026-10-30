@@ -1,10 +1,11 @@
-"""05 — Stream your PRIVATE portfolio events (requires an API key).
+"""05 — Stream your PRIVATE portfolio events (requires your trading key).
 
 Receives your balance book, order transitions and your fills in real time.
 
     python examples/05_portfolio_stream.py
 
-The channel carries no id — your API key tells the server whose events to send.
+The channel carries no id — the login token your trading key signs tells the
+server whose events to send.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ except ImportError:
 
 
 def main() -> None:
-    client = LoafClient()  # needs LOAF_API_KEY for the private channel
+    client = LoafClient()
+    if client.public_key is None:
+        raise SystemExit("Set LOAF_TRADING_KEY for your private channel (see README §2).")
 
     ws = client.websocket()
 

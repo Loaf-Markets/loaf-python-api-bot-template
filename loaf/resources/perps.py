@@ -22,10 +22,11 @@ market has expired, a position in it is closed by an exit
 (:meth:`PerpsResource.exit`).
 
 **Signing.** An allocate or an exit is signed on your machine with your
-trading key over the exchange's message, as an order is, and is sent with your
-API key too (the exchange checks the account is yours). Each spends your
-account's next nonce, one counter your withdrawals spend too: the SDK reads it
-(``GET /l2/keys``) for every op, and sends one op at a time per client. An op
+trading key over the exchange's message, as an order is, and is sent with a
+login token your trading key signs (the exchange checks the account is yours).
+Each spends your account's next nonce, one counter your withdrawals spend too:
+the SDK reads it (``GET /l2/keys``) for every op, and sends one op at a time
+per client. An op
 sent elsewhere (the web app, another process) between that read and the send
 makes the exchange refuse this one, ``l2 money: the nonce is not the api key's
 nonce …`` (422): send it again, and the SDK reads the new nonce.
@@ -61,8 +62,8 @@ from .._l2 import _KB_MODULUS, _is_int, _whole, read_signing_account
 from .._object import LoafObject
 from ..constants import (
     DEFAULT_PERPS_OP_TTL_MS,
-    ENV_API_KEY,
-    ENV_SECRET_KEY,
+    ENV_BASE_URL,
+    ENV_TRADING_KEY,
     MAX_PERP_MARKET_INDEX,
     MAX_PERPS_OP_TTL_MS,
     MAX_POOL,
@@ -275,7 +276,11 @@ class PerpsResource(Resource):
           pools.
 
         Raises:
-            LoafNotFoundError: you have no trading account yet.
+            LoafConfigError: no trading key.
+            LoafAuthError: the exchange refused the login token: your trading key
+                is not the one in force on its account (reset, not active yet, or
+                another deployment's), or this machine's clock is off, which the
+                message names.
             LoafServiceUnavailableError: the exchange has no perps book yet, or
                 could not read it; try again in a moment.
         """
@@ -323,7 +328,11 @@ class PerpsResource(Resource):
         under one ``journalSeq``, told apart by ``adl``.
 
         Raises:
-            LoafNotFoundError: you have no trading account yet.
+            LoafConfigError: no trading key.
+            LoafAuthError: the exchange refused the login token: your trading key
+                is not the one in force on its account (reset, not active yet, or
+                another deployment's), or this machine's clock is off, which the
+                message names.
         """
         return self._client.get("/l2/perps/closes", params=_page(limit, before))
 
@@ -384,9 +393,8 @@ class PerpsResource(Resource):
             (``duplicate``: a re-send of one applied before).
 
         Raises:
-            LoafConfigError: no trading key or API key; your trading key is not
-                the one in force; no trading account; trading not enabled; no
-                perps market listed yet.
+            LoafConfigError: no trading key; a trading key from another Loaf
+                deployment; no perps market listed yet.
             LoafServerError: the perps markets' reply has no usable
                 collateral, or chain id.
             LoafValidationError: refused locally (``status_code`` 0, nothing
@@ -395,7 +403,9 @@ class PerpsResource(Resource):
                 reason: more than your spot USDC available (your resting orders
                 hold some), a pool left below initial margin, a stale price,
                 the nonce, and the like. Nothing was applied.
-            LoafAuthError: your API key, or the op's signature or key.
+            LoafAuthError: the exchange refused the login token or the op's
+                signature: your trading key is not the one in force on its
+                account.
             PerpsOutcomeUnknownError: it may or may not have been applied;
                 :meth:`resubmit` it, never sign it afresh.
         """
@@ -425,7 +435,7 @@ class PerpsResource(Resource):
             )
 
         terms = {"fromSide": source, "toSide": target, "amount": str(ticks)}
-        return self._submit("/l2/allocations", "allocate", key, terms, ttl, message)
+        return self._submit("/l2/allocations", key, terms, ttl, message)
 
     def add_margin(
         self, amount: float | Decimal, *, pool: int = 0, ttl_ms: int | None = None
@@ -476,7 +486,7 @@ class PerpsResource(Resource):
             )
 
         terms = {"pool": number, "market": index}
-        return self._submit("/l2/exits", "exit", key, terms, ttl, message)
+        return self._submit("/l2/exits", key, terms, ttl, message)
 
     def resubmit(self, signed_body: Mapping[str, Any]) -> Any:
         """Re-send a signed allocate or exit exactly as it was (the ``signed_body``
@@ -488,7 +498,7 @@ class PerpsResource(Resource):
         earlier attempt may still be on its way. A 422 to a re-send made once
         its ``l2ExpiryMs`` has passed (allow a few minutes for clocks) settles
         it the other way: it was never applied, and never will be. Needs your
-        API key, not your trading key.
+        trading key, for the login token: it signs nothing new.
         """
         body = signed_body if isinstance(signed_body, Mapping) else {}
         kind = (
@@ -510,25 +520,18 @@ class PerpsResource(Resource):
     # -- Signing & sending --------------------------------------------------- #
 
     def _credentials(self) -> TradingKey:
-        """The trading key that signs, once both keys an op needs are set."""
+        """The trading key that signs the op and the login tokens that carry it."""
         key = self._client._l2_key
         if key is None:
             raise LoafConfigError(
-                f"Moving perps margin needs your trading key: set ${ENV_SECRET_KEY} (the web "
-                "app's Show trading key gives it; see the README) or pass secret_key=..."
-            )
-        if not self._client.api_key:
-            raise LoafConfigError(
-                "Moving perps margin needs your API key too: the SDK reads your account's nonce "
-                f"with it, and the exchange checks the account is yours. Pass api_key=... or set "
-                f"${ENV_API_KEY}."
+                f"Moving perps margin needs your trading key: set ${ENV_TRADING_KEY} to the web "
+                "app's Show trading key (README §2), or pass trading_key=..."
             )
         return key
 
     def _submit(
         self,
         path: str,
-        what: str,
         key: TradingKey,
         terms: dict[str, Any],
         ttl: int,
@@ -538,21 +541,23 @@ class PerpsResource(Resource):
         now + ``ttl`` and send it; one op at a time, so no two sign the same nonce."""
         with self._lock:
             chain_id = self._terms()[0]
-            account_index, nonce, journaled = read_signing_account(self._client)
-            if journaled != key.public_key:
+            if chain_id != key.l2_chain_id:
                 raise LoafConfigError(
-                    "LOAF_SECRET_KEY is not the trading key in force on your account: it was "
-                    "reset in the web app, or this key belongs to another vault. Set "
-                    "LOAF_SECRET_KEY to the key in force (the web app's Show trading key) and "
-                    "restart."
+                    f"The perps markets are on L2 chain {chain_id} and your trading key is for L2 "
+                    f"chain {key.l2_chain_id}: {ENV_TRADING_KEY} is from another Loaf deployment "
+                    f"than the one at {self._client.base_url} ({ENV_BASE_URL}). Set "
+                    f"{ENV_TRADING_KEY} to the trading key this deployment's web app shows "
+                    f"(README §2), or {ENV_BASE_URL} to the key's deployment."
                 )
+            account_index = key.l2_account_index
+            nonce = read_signing_account(self._client, account_index)
             expiry_ms = time.time_ns() // 1_000_000 + ttl
             try:
                 signed = message(chain_id, account_index, nonce, expiry_ms)
             except k1.K1Error as exc:
                 # The engine's own text, e.g. an account index past an op's width; nothing was sent.
                 raise _client_validation_error(str(exc)) from None
-            s, e = key.sign(signed, what)
+            s, e = key.sign(signed)
             body = {
                 "l2ChainId": chain_id,
                 "l2AccountIndex": account_index,

@@ -8,19 +8,20 @@ You name an order's market by its ticker (``"OPRA"``; a perp's ends in
 ``-PERP``); the order itself carries only the market index it signs.
 
 **Signing.** Every placement is signed on your machine with your trading key
-(``secret_key=`` / ``$LOAF_SECRET_KEY``) and authenticated by that
-signature alone: the API key is not sent with it. The API key is still needed,
-for cancels and for the account reads below.
+(``trading_key=`` / ``$LOAF_TRADING_KEY``) and authenticated by that
+signature alone: no login token is sent with it. Cancels and the account
+requests below are authenticated by a login token the trading key signs.
 
 **What the SDK reads for you.** An order signs its market (``market.marketIndex``
-and ``market.l2`` of ``GET /trade/{ticker}``), your trading account's index and
-epoch (``GET /l2/keys``), and an order number reserved to your account
-(``POST /l2/order-indices``), reserved in blocks that grow from what your first
-order needs to 64. All of it is cached in memory and refreshed when a refusal
-shows it stale (a placement refused as no market, or as one that is not listed,
-reads the ticker's market again). The order numbers of an order that was
+and ``market.l2`` of ``GET /trade/{ticker}``), your trading account's index (your
+trading key's) and its epoch (``GET /l2/keys``), and an order number reserved to
+your account (``POST /l2/order-indices``), reserved in blocks that grow from what
+your first order needs to 64. All of it is cached in memory and refreshed when a
+refusal shows it stale (a placement refused as no market, or as one that is not
+listed, reads the ticker's market again). The order numbers of an order that was
 definitely not placed are reused by later orders; a restart leaves the unused
-rest of a block unused.
+rest of a block unused. An order on a market of another L2 chain than your
+trading key's is refused before anything is signed.
 
 **Order life.** Every order expires. ``ttl_ms=`` sets how long it may rest
 (default 7 days, from one minute to about 45.9 days): the SDK signs the expiry
@@ -172,8 +173,8 @@ from .. import k1
 from .._l2 import AccountState, L2State, Market, TradingKey, _is_int, market_of
 from ..constants import (
     DEFAULT_ORDER_TTL_MS,
-    ENV_API_KEY,
-    ENV_SECRET_KEY,
+    ENV_BASE_URL,
+    ENV_TRADING_KEY,
     L2_BUFFER_MS,
     L2_FEE_RATE_CAP,
     MAX_ORDER_TTL_MS,
@@ -319,14 +320,15 @@ class OrdersResource(Resource):
             second stop means a second sell).
 
         Raises:
-            LoafConfigError: no trading key or API key; your trading key is not
-                the one in force; no trading account; trading not enabled; this
-                machine's clock hours ahead. Act in the web app or fix the
-                setup, then restart.
-            LoafAuthError: ``Invalid credentials``: your API key expired or was
-                revoked (cancels fail too): create a new one in the web app and
-                restart. Otherwise the exchange refused the order's signature or
-                key; the next order re-reads your account.
+            LoafConfigError: no trading key; a market on another L2 chain than
+                your trading key's (it is another deployment's); this machine's
+                clock hours ahead. Fix the setup, then restart.
+            LoafAuthError: the exchange refused the login token of your account
+                read or reservation: your trading key is not the one in force on
+                its account (reset, not active yet, or another deployment's),
+                which the message names, and cancels fail too: set the key in
+                force and restart. Otherwise the exchange refused the order's
+                signature or key; the next order re-reads your account.
             TradingHaltedError: trading is halted.
             MarketStateError: the market's own state does not take the order
                 now (``state``); :class:`~loaf.exceptions.PriceHeldError` while
@@ -813,13 +815,12 @@ class OrdersResource(Resource):
         the exchange refuses it (``l2 epoch: …``) and has cancelled any resting
         order of the old epoch.
 
-        Needs neither the trading key nor the API key. Once the order can no
-        longer rest (its ``l2ExpiryMs`` minus 72 hours has passed) nothing is
-        sent, since the exchange refuses it then: the
-        ``OrderOutcomeUnknownError`` has ``attempts`` 0 and the reason in
-        ``last_error``. Stop resubmitting it: find it in ``history.orders()`` by
-        its ``expiryMs``, and cancel any stop, take or TP/SL leg of it that is
-        still ``ARMED``.
+        Needs no trading key. Once the order can no longer rest (its
+        ``l2ExpiryMs`` minus 72 hours has passed) nothing is sent, since the
+        exchange refuses it then: the ``OrderOutcomeUnknownError`` has
+        ``attempts`` 0 and the reason in ``last_error``. Stop resubmitting it:
+        find it in ``history.orders()`` by its ``expiryMs``, and cancel any
+        stop, take or TP/SL leg of it that is still ``ARMED``.
         """
         body = signed_body if isinstance(signed_body, Mapping) else {}
         if not (
@@ -962,17 +963,12 @@ class OrdersResource(Resource):
     # -- Signing & sending ------------------------------------------------- #
 
     def _credentials(self) -> TradingKey:
-        """The trading key that signs, once both keys a placement needs are set."""
+        """The trading key that signs, once it is set."""
         key = self._client._l2_key
         if key is None:
             raise LoafConfigError(
-                f"Placing orders needs your trading key: set ${ENV_SECRET_KEY} (the web app's "
-                "Show trading key gives it; see the README) or pass secret_key=..."
-            )
-        if not self._client.api_key:
-            raise LoafConfigError(
-                "Placing orders needs your API key too: the SDK reads your trading account and "
-                f"reserves order numbers with it. Pass api_key=... or set ${ENV_API_KEY}."
+                f"Placing orders needs your trading key: set ${ENV_TRADING_KEY} to the web app's "
+                "Show trading key (README §2), or pass trading_key=..."
             )
         return key
 
@@ -1021,8 +1017,16 @@ class OrdersResource(Resource):
                 l2.remember(ticker, market)
                 if not isinstance(price, Decimal):
                     price = price(_reference_from(detail, ticker))
+            if market.l2_chain_id != key.l2_chain_id:
+                raise LoafConfigError(
+                    f"{ticker}'s market is on L2 chain {market.l2_chain_id} and your trading key "
+                    f"is for L2 chain {key.l2_chain_id}: {ENV_TRADING_KEY} is from another Loaf "
+                    f"deployment than the one at {self._client.base_url} ({ENV_BASE_URL}). Set "
+                    f"{ENV_TRADING_KEY} to the trading key this deployment's web app shows "
+                    f"(README §2), or {ENV_BASE_URL} to the key's deployment."
+                )
             market_keys, base_field, leg_field = _market_keys(market, ticker, side, perps, legs)
-            account = l2.account(key.public_key, ticker)
+            account = l2.account(key.l2_account_index)
             first, block, expiry_ms = l2.take(account, span, ttl)
 
             body: dict[str, Any] = {
