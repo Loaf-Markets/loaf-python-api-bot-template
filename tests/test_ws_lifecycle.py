@@ -1,24 +1,27 @@
 """Offline lifecycle tests for the WebSocket client against a real local server.
 
-``_Server`` answers like the exchange's: it greets, answers ``auth``, confirms
-subscriptions (refusing ``portfolio`` without an accepted auth, and following a
-new ``trades:`` one with its recent trades) and echoes any other frame, then
-runs the connection's scripted action. Backoff waits come from
-a stand-in for ``loaf.ws.client.random`` that returns 0, so nothing really
-sleeps. Also guards the bug where stop() raised "Event loop is closed" after a
-successful connection.
+``_Server`` answers like the exchange's: it greets, answers ``auth`` (checking
+its login token as the exchange does), confirms subscriptions (refusing
+``portfolio`` without an accepted auth, and following a new ``trades:`` one with
+its recent trades) and echoes any other frame, then runs the connection's
+scripted action. Backoff waits come from a stand-in for
+``loaf.ws.client.random`` that returns 0, so nothing really sleeps. Also guards
+the bug where stop() raised "Event loop is closed" after a successful
+connection.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
 import ssl
 import threading
+import time
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Collection
 
 import certifi
 import pytest
@@ -26,7 +29,13 @@ import websockets
 
 from loaf import LoafClient, LoafWebSocketClient
 
+from conftest import KAT, L2_PUBLIC_KEY, TRADING_KEY, login_refusal, verify_login
+
+# Another trading key (K1's second known-answer key): in force on the account once yours was reset.
+OTHER_KEY = "0x" + KAT["keys"][1]["pk"]
 Action = Callable[[Any], Awaitable[None]]
+# What the client reports when the server refuses its login token with portfolio subscribed.
+REFUSED = (1006, "the server did not accept the login token")
 
 
 async def _push_book(ws: Any) -> None:
@@ -40,6 +49,10 @@ async def _close_resync(ws: Any) -> None:
     await ws.close(1012, "resync")
 
 
+async def _close_expired(ws: Any) -> None:
+    await ws.close(4001, "expired")
+
+
 async def _go_away(ws: Any) -> None:
     await ws.close(1001, "going away")
 
@@ -51,21 +64,26 @@ async def _drop(ws: Any) -> None:
 class _Server:
     """A local Loaf-like WS server. ``actions`` run one per connection, in order,
     after the echo of the connection's first ping; later connections just idle.
-    It refuses the first ``refusals`` auth frames (``auth_result`` false), and
-    answers a new ``trades:`` subscription with ``recent_trades`` (when any)."""
+    It answers an auth frame true when the exchange would take its login token
+    (checked against ``key_in_force`` as the frame arrives: the test key, until a
+    test resets it), except the ``refused`` ones (counted from 1 across
+    connections), and answers a new ``trades:`` subscription with ``recent_trades``
+    (when any)."""
 
     def __init__(
         self,
         *actions: Action,
-        refusals: int = 0,
+        refused: Collection[int] = (),
         port: int = 0,
         recent_trades: list[dict[str, Any]] | None = None,
     ) -> None:
         self.actions = list(actions)
-        self.refusals = refusals
+        self.refused = refused
         self.port = port
         self.recent_trades = recent_trades or []
+        self.key_in_force = L2_PUBLIC_KEY  # the account's api key 0
         self.received: list[list[dict[str, Any]]] = []  # the client's frames, per connection
+        self.auth_at_ms: list[int] = []  # when each auth frame arrived, unix ms
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stop: asyncio.Event | None = None
@@ -110,9 +128,12 @@ class _Server:
                 frame = json.loads(raw)
                 frames.append(frame)
                 if frame["type"] == "auth":
-                    authed = self.refusals == 0
-                    if not authed:
-                        self.refusals -= 1
+                    now_ms = time.time_ns() // 1_000_000
+                    self.auth_at_ms.append(now_ms)
+                    authed = (
+                        len(self.auth_at_ms) not in self.refused
+                        and login_refusal(frame["token"], self.key_in_force, now_ms) is None
+                    )
                     await self._send(ws, type="auth_result", success=authed)
                 elif frame["type"] == "subscribe":
                     refused = [] if authed else [c for c in frame["channels"] if c == "portfolio"]
@@ -184,10 +205,10 @@ def _closed_port() -> int:
 
 
 def _client(
-    port: int, log: _Log, api_key: str | None = None, **kwargs: Any
+    port: int, log: _Log, trading_key: str | None = None, **kwargs: Any
 ) -> LoafWebSocketClient:
-    # Built as bot.py builds it: the API key and the URL come from the LoafClient.
-    ws = LoafClient(api_key=api_key, base_url=f"http://127.0.0.1:{port}/api").websocket(**kwargs)
+    # Built as bot.py builds it: the trading key and the URL come from the LoafClient.
+    ws = LoafClient(trading_key, base_url=f"http://127.0.0.1:{port}/api").websocket(**kwargs)
     ws.on_connect(lambda _: log.add("on_connect"))
     ws.on_disconnect(lambda m: log.add((m.code, m.reason)))
     return ws
@@ -196,7 +217,7 @@ def _client(
 def test_connect_subscribe_stop_is_clean():
     server = _Server(_push_book).start()
     log = _Log()
-    ws = _client(server.port, log, api_key="key", auto_reconnect=False)
+    ws = _client(server.port, log, TRADING_KEY, auto_reconnect=False)
     ws.on_message(lambda m: log.add(m.type))
     ws.subscribe_orderbook("OPRA")
     ws.start()
@@ -213,13 +234,16 @@ def test_connect_subscribe_stop_is_clean():
         "orderbook_update",
     ]
     assert [frame["type"] for frame in server.received[0]] == ["auth", "subscribe", "ping"]
-    assert server.received[0][0]["token"] == "key"  # the LoafClient's API key
+    # A login token the LoafClient's trading key signed for its account: the key is never sent.
+    token = server.received[0][0]["token"]
+    assert verify_login(token)["l2AccountIndex"] == 5 and TRADING_KEY[-80:] not in token
+    assert token not in repr(ws)
     # The loop thread has ended (stop() clears _thread only when it still had to wait for it).
     assert thread is not None and not thread.is_alive()
 
 
 def test_a_handler_that_raises_leaves_the_connection_up(caplog: pytest.LogCaptureFixture):
-    # A handler's exception is logged and swallowed: only the client's own refused-key error,
+    # A handler's exception is logged and swallowed: only the client's own refused-token error,
     # raised by _dispatch, ends an attempt.
     server = _Server(_push_book).start()
     log = _Log()
@@ -241,10 +265,17 @@ def test_a_handler_that_raises_leaves_the_connection_up(caplog: pytest.LogCaptur
     assert "RuntimeError: a handler bug" in caplog.text
 
 
-def test_a_1012_close_reconnects_and_resubscribes(ceilings: list[float]):
-    server = _Server(_close_resync).start()
+@pytest.mark.parametrize(
+    "close, code, reason",
+    [(_close_resync, 1012, "resync"), (_close_expired, 4001, "expired")],
+    ids=["resync", "expired"],
+)
+def test_a_server_close_reconnects_authenticates_and_resubscribes(
+    ceilings: list[float], close: Action, code: int, reason: str
+):
+    server = _Server(close).start()
     log = _Log()
-    ws = _client(server.port, log, api_key="key")
+    ws = _client(server.port, log, TRADING_KEY)
     ws.subscribe_portfolio()
     ws.start()
     try:
@@ -252,10 +283,12 @@ def test_a_1012_close_reconnects_and_resubscribes(ceilings: list[float]):
     finally:
         ws.stop()
         server.stop()
-    assert log.events == ["on_connect", (1012, "resync"), "on_connect"]
-    subscribes = [[f["channels"] for f in frames if f["type"] == "subscribe"]
-                  for frames in server.received]
-    assert subscribes == [[["portfolio"]], [["portfolio"]]]
+    assert log.events == ["on_connect", (code, reason), "on_connect"]
+    # Each connection authenticates first, then subscribes.
+    opening = [[(f["type"], f.get("channels")) for f in frames[:2]] for frames in server.received]
+    assert opening == [[("auth", None), ("subscribe", ["portfolio"])]] * 2
+    for frames in server.received:
+        verify_login(frames[0]["token"])
     assert ceilings == [1.0]
 
 
@@ -530,7 +563,7 @@ def test_stop_without_start_is_safe():
 def test_a_refused_subscription_reaches_on_error_before_on_connect():
     server = _Server().start()
     log = _Log()
-    ws = _client(server.port, log)  # no API key: portfolio is refused
+    ws = _client(server.port, log)  # no trading key: no auth frame, and portfolio is refused
     ws.on_error(lambda m: log.add(m.code))
     ws.subscribe_portfolio()
     ws.subscribe_orderbook("OPRA")
@@ -541,15 +574,16 @@ def test_a_refused_subscription_reaches_on_error_before_on_connect():
         ws.stop()
         server.stop()
     assert log.events == ["UNAUTHORIZED", "on_connect"]
+    assert [frame["type"] for frame in server.received[0]] == ["subscribe", "ping"]
 
 
-def test_a_refused_api_key_is_retried_while_portfolio_is_subscribed(ceilings: list[float]):
+def test_a_refused_login_token_is_retried_while_portfolio_is_subscribed(ceilings: list[float]):
     # A refused auth, even a transient one, leaves the socket anonymous: the client drops the
-    # connection, once handlers have had the refusal, and retries with backoff until the key is
-    # accepted.
-    server = _Server(refusals=3).start()
+    # connection, once handlers have had the refusal, and retries with backoff until a token is
+    # accepted, each attempt with a fresh one: a refused token is never sent again.
+    server = _Server(refused={1, 2, 3}).start()
     log = _Log()
-    ws = _client(server.port, log, api_key="key")
+    ws = _client(server.port, log, TRADING_KEY)
     ws.on("auth_result", lambda m: log.add(m.success))
     ws.subscribe_portfolio()
     ws.start()
@@ -558,19 +592,22 @@ def test_a_refused_api_key_is_retried_while_portfolio_is_subscribed(ceilings: li
     finally:
         ws.stop()
         server.stop()
-    refused = (1006, "the server did not accept the API key")
-    assert log.events == [False, refused, False, refused, False, refused, True, "on_connect"]
+    assert log.events == [False, REFUSED, False, REFUSED, False, REFUSED, True, "on_connect"]
     assert ceilings == [1.0, 2.0, 4.0]
     assert [frames[0]["type"] for frames in server.received] == ["auth"] * 4
+    tokens = [frames[0]["token"] for frames in server.received]
+    assert len(set(tokens)) == 4
 
 
-def test_a_refused_api_key_is_retried_once_portfolio_is_subscribed_later(ceilings: list[float]):
+def test_a_refused_login_token_is_retried_once_portfolio_is_subscribed_later(
+    ceilings: list[float]
+):
     # The server refuses portfolio on the anonymous socket the refusal left, however late it is
     # subscribed: the client drops that live connection at the refusal, once the subscribe has
     # gone out (here from a handler, on the socket's thread), and authenticates again.
-    server = _Server(refusals=1).start()
+    server = _Server(refused={1}).start()
     log = _Log()
-    ws = _client(server.port, log, api_key="key")
+    ws = _client(server.port, log, TRADING_KEY)
     ws.on_error(lambda m: log.add(m.code))
 
     def subscribe_late(_: Any) -> None:
@@ -585,8 +622,7 @@ def test_a_refused_api_key_is_retried_once_portfolio_is_subscribed_later(ceiling
     finally:
         ws.stop()
         server.stop()
-    refused = (1006, "the server did not accept the API key")
-    assert log.events == ["on_connect", "UNAUTHORIZED", refused, "on_connect"]
+    assert log.events == ["on_connect", "UNAUTHORIZED", REFUSED, "on_connect"]
     assert ceilings == [1.0]
     assert [[(f["type"], f.get("channels")) for f in frames] for frames in server.received] == [
         [("auth", None), ("subscribe", ["orderbook:OPRA"]), ("ping", None),
@@ -595,11 +631,11 @@ def test_a_refused_api_key_is_retried_once_portfolio_is_subscribed_later(ceiling
     ]
 
 
-def test_a_refused_api_key_is_retried_once_portfolio_is_subscribed_from_another_thread():
+def test_a_refused_login_token_is_retried_once_portfolio_is_subscribed_from_another_thread():
     # The same with portfolio subscribed from the bot's own thread, where the docs say to act.
-    server = _Server(refusals=1).start()
+    server = _Server(refused={1}).start()
     log = _Log()
-    ws = _client(server.port, log, api_key="key")
+    ws = _client(server.port, log, TRADING_KEY)
     ws.on_error(lambda m: log.add(m.code))
     ws.subscribe_orderbook("OPRA")
     ws.start()
@@ -610,15 +646,14 @@ def test_a_refused_api_key_is_retried_once_portfolio_is_subscribed_from_another_
     finally:
         ws.stop()
         server.stop()
-    refused = (1006, "the server did not accept the API key")
-    assert log.events == ["on_connect", "UNAUTHORIZED", refused, "on_connect"]
+    assert log.events == ["on_connect", "UNAUTHORIZED", REFUSED, "on_connect"]
 
 
-def test_a_refused_api_key_keeps_a_public_only_connection():
+def test_a_refused_login_token_keeps_a_public_only_connection():
     # Without portfolio nothing is lost: the server keeps the socket open for public channels.
-    server = _Server(refusals=1).start()
+    server = _Server(refused={1}).start()
     log = _Log()
-    ws = _client(server.port, log, api_key="key")
+    ws = _client(server.port, log, TRADING_KEY)
     ws.on("auth_result", lambda m: log.add(m.success))
     ws.subscribe_orderbook("OPRA")
     ws.start()
@@ -628,3 +663,126 @@ def test_a_refused_api_key_keeps_a_public_only_connection():
         ws.stop()
         server.stop()
     assert log.events == [False, "on_connect"]
+
+
+def test_the_connection_sends_a_fresh_login_token_at_each_half_life(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    # In band, on the one connection: each token the connection holds is replaced once half its
+    # life has passed, well before it expires, and portfolio stays subscribed throughout.
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr("loaf._l2.L2_LOGIN_TOKEN_LIFE_MS", 1_200)
+    server = _Server().start()
+    log = _Log()
+    ws = _client(server.port, log, TRADING_KEY)
+    ws.on("auth_result", lambda m: log.add(m.success))
+    ws.subscribe_portfolio()
+    ws.start()
+    try:
+        log.wait_for(lambda events: events.count(True) == 4)
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events == [True, "on_connect", True, True, True]
+    (frames,) = server.received
+    assert [f["type"] for f in frames] == ["auth", "subscribe", "ping", "auth", "auth", "auth"]
+    tokens = [f["token"] for f in frames if f["type"] == "auth"]
+    assert len(set(tokens)) == 4
+    expiries = [verify_login(token)["l2ExpiryMs"] for token in tokens]
+    for expiry, sent_at in zip(expiries, server.auth_at_ms[1:]):
+        assert expiry - 600 <= sent_at < expiry  # half its life gone, never all of it
+    assert not any(token in caplog.text for token in tokens)  # a credential: never logged
+
+
+def test_a_refused_fresh_login_token_ends_the_connection_and_signs_another(
+    monkeypatch: pytest.MonkeyPatch, ceilings: list[float]
+):
+    # The server refuses the token a live connection sent at half-life (it could not check it at
+    # that moment, say): with portfolio subscribed, the attempt ends there, and the next one sends
+    # a fresh token.
+    monkeypatch.setattr("loaf._l2.L2_LOGIN_TOKEN_LIFE_MS", 1_200)
+    server = _Server(refused={2}).start()
+    log = _Log()
+    ws = _client(server.port, log, TRADING_KEY)
+    ws.on("auth_result", lambda m: log.add(m.success))
+    ws.subscribe_portfolio()
+    ws.start()
+    try:
+        log.wait_for(lambda events: events.count("on_connect") == 2)
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events[:6] == [True, "on_connect", False, REFUSED, True, "on_connect"]
+    assert ceilings == [1.0]
+    first, second = server.received[:2]
+    tokens = [f["token"] for f in first if f["type"] == "auth"] + [second[0]["token"]]
+    assert len(tokens) == 3 and len(set(tokens)) == 3
+
+
+def test_after_a_key_reset_the_next_fresh_login_token_ends_the_private_stream(
+    monkeypatch: pytest.MonkeyPatch, ceilings: list[float]
+):
+    # The server checks the key in force only when a token arrives: after a reset in the web app
+    # the live connection streams on until it sends its next fresh token, which is refused, and
+    # with portfolio subscribed the client ends the attempt there. Every reconnect's token, signed
+    # by the same key, is refused too, each attempt waiting longer.
+    monkeypatch.setattr("loaf._l2.L2_LOGIN_TOKEN_LIFE_MS", 2_000)  # the reset lands before 1 s
+    server = _Server().start()
+    log = _Log()
+    ws = _client(server.port, log, TRADING_KEY)
+    ws.on("auth_result", lambda m: log.add(m.success))
+    ws.subscribe_portfolio()
+    ws.start()
+    try:
+        assert ws.wait_until_connected(timeout=5)
+        server.key_in_force = OTHER_KEY  # reset in the web app
+        log.wait_for(lambda events: events.count(REFUSED) == 3)
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events[:8] == [True, "on_connect", False, REFUSED, False, REFUSED, False, REFUSED]
+    assert ceilings[:3] == [1.0, 2.0, 4.0]
+    assert [f["type"] for f in server.received[0]] == ["auth", "subscribe", "ping", "auth"]
+    tokens = [f["token"] for frames in server.received[:3] for f in frames if f["type"] == "auth"]
+    assert len(set(tokens)) == 4
+    for token in tokens:
+        verify_login(token)  # each a good signature, by the key no longer in force
+
+
+@pytest.mark.parametrize(
+    "serve, events",
+    [
+        (lambda: _Server(_close_resync), ["on_connect", (1012, "resync"), "on_connect"]),
+        (lambda: _Server(_go_away), ["on_connect", (1001, "going away"), "on_connect"]),
+        (lambda: _Server(refused={1}), [REFUSED, "on_connect"]),
+    ],
+    ids=["resync", "going-away", "refused"],
+)
+def test_the_token_refresh_ends_with_its_connection(
+    serve: Callable[[], _Server], events: list[Any]
+):
+    # Each connection's refresh sleeps until the half-life of the client's one login token: it
+    # ends with its connection, however that ends. Left running, it wakes with the next
+    # connection's and, waking first, signs the fresh token and records it as sent: that
+    # connection then skips its refresh and is closed 4001 expired.
+    server = serve().start()
+    log = _Log()
+    ws = _client(server.port, log, TRADING_KEY)
+    ws.subscribe_portfolio()
+    ws.start()
+
+    async def refreshes() -> int:  # run on the client's loop: its refresh tasks still running
+        name = LoafWebSocketClient._keep_authenticated.__qualname__
+        return sum(
+            not task.done() and getattr(task.get_coro(), "__qualname__", None) == name
+            for task in asyncio.all_tasks()
+        )
+
+    try:
+        log.wait_for(lambda seen: seen == events)
+        assert ws._loop is not None
+        running = asyncio.run_coroutine_threadsafe(refreshes(), ws._loop).result(5)
+    finally:
+        ws.stop()
+        server.stop()
+    assert running == 1  # the live connection's alone

@@ -1,5 +1,5 @@
-"""Offline test of the bot template (bot.py): the market it follows, how it seeds from
-REST around the live feed, and when its strategy runs."""
+"""Offline test of the bot template (bot.py): the trading key it needs, the market it
+follows, how it seeds from REST around the live feed, and when its strategy runs."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import pytest
 
 from loaf import LoafObject, LoafServerError
 
-from conftest import MARKET_L2
+from conftest import L2_PUBLIC_KEY, MARKET_L2, TRADING_KEY
 
 # The fields of GET /trade/{ticker}'s market that let it trade, a halt aside: LIVE, with an L2
 # market, no start to wait for.
@@ -29,6 +29,21 @@ def _bot(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     bot = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bot)
     return bot
+
+
+def test_the_bot_needs_the_trading_key(monkeypatch: pytest.MonkeyPatch):
+    # Every private read and the portfolio channel take its login tokens: no key, no bot.
+    bot = _bot(monkeypatch)
+    with pytest.raises(SystemExit) as info:
+        bot.build_client()
+    assert str(info.value).startswith("No LOAF_TRADING_KEY set.")
+    assert "Show trading key" in str(info.value)
+    monkeypatch.setenv("LOAF_TRADING_KEY", "loaf_tk_4242_5_0x00")  # refused, and never echoed
+    with pytest.raises(SystemExit) as info:
+        bot.build_client()
+    assert "is not a trading key" in str(info.value) and "0x00" not in str(info.value)
+    monkeypatch.setenv("LOAF_TRADING_KEY", TRADING_KEY)
+    assert bot.build_client().public_key == L2_PUBLIC_KEY
 
 
 def test_seed_keeps_frames_newer_than_its_read(monkeypatch: pytest.MonkeyPatch):
@@ -274,3 +289,12 @@ def test_a_read_takes_the_book_only_if_the_feed_was_live_throughout(
         feed("C")
     # Live with no read in flight: the book is seeded.
     assert tick() == "[MUS] bid=100 ask=None spread=None mark=None"
+
+
+def test_a_liquidation_fill_is_reported_as_a_fill(monkeypatch: pytest.MonkeyPatch, capsys):
+    strategy = _bot(monkeypatch).Strategy(SimpleNamespace(), "MUS-PERP")
+    fill = {"perpsSeq": 990, "orderId": 77, "marketIndex": 4, "ticker": "MUS-PERP",
+            "side": "BUY", "quantity": 1.5, "price": 26.1}
+    strategy.on_my_liquidation_fill(LoafObject({"type": "liquidation_fill", "fill": fill}))
+    printed = capsys.readouterr().out
+    assert "FILLED by a liquidation: BUY 1.5 MUS-PERP @ 26.1 (order #77, seq 990)" in printed

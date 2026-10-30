@@ -41,8 +41,20 @@ class ConditionalOrderType(_StrEnum):
 
 
 class TimeInForce(_StrEnum):
-    #: Good-til-cancelled — the only value the exchange accepts; order rows carry it.
+    """An order's time in force (``time_in_force=``). Order rows carry ``GTC``, ``IOC`` or
+    ``FOK``: the exchange keeps a post-only order as ``GTC``, and a MARKET order sent as
+    ``GTC`` as ``IOC``."""
+
+    #: Good-til-cancelled: what does not fill at once rests on the book (a MARKET order never
+    #: rests: the exchange runs it as IOC).
     GTC = "GTC"
+    #: Immediate-or-cancel: what does not fill at once is cancelled; one that fills nothing is
+    #: refused.
+    IOC = "IOC"
+    #: Fill-or-kill: fills its whole quantity at once, or is refused and fills nothing.
+    FOK = "FOK"
+    #: A LIMIT order's alone: refused if it would trade at once, so it only ever rests.
+    POST_ONLY = "POST_ONLY"
 
 
 class OrderStatus(_StrEnum):
@@ -85,13 +97,6 @@ class AssetKind(_StrEnum):
     INDEX = "INDEX"
 
 
-class IpoStatus(_StrEnum):
-    PENDING = "PENDING"
-    LIVE = "LIVE"
-    CLOSED = "CLOSED"
-    CANCELLED = "CANCELLED"
-
-
 class CandleResolution(_StrEnum):
     """Bucket size for :meth:`loaf.resources.market.MarketResource.candles`."""
 
@@ -102,17 +107,6 @@ class CandleResolution(_StrEnum):
     FOUR_HOURS = "4h"
     ONE_DAY = "1d"
     ONE_WEEK = "1w"
-
-
-class CompetitionRoundStatus(_StrEnum):
-    """Lifecycle of a trading-competition round (leaderboard / competition info)."""
-
-    DRAFT = "DRAFT"
-    PENDING = "PENDING"
-    PREPARED = "PREPARED"
-    ACTIVE = "ACTIVE"
-    ENDING = "ENDING"
-    ENDED = "ENDED"
 
 
 class WSMessageType(_StrEnum):
@@ -133,14 +127,14 @@ class WSMessageType(_StrEnum):
     CANDLE_UPDATE = "candle_update"
     MARK_PRICE = "mark_price"
     VOLUME_UPDATE = "volume_update"
-    LEADERBOARD_UPDATE = "leaderboard_update"
     MARKET_HALT = "market_halt"
-    ROUND_UPDATE = "round_update"
+    PERPS_MARKETS_LIVE = "perps_markets_live"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"
     ORDER_STATUS = "order_status"
     ORDER_UPDATE = "order_update"
     TRADE_NEW = "trade_new"
+    LIQUIDATION_FILL = "liquidation_fill"
     ORDER_QUEUE = "order_queue"
     LIFETIME_VOLUME_UPDATE = "lifetime_volume_update"
 

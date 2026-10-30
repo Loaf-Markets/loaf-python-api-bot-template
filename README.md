@@ -16,7 +16,7 @@ portfolio, and places trades in a few lines.
 ```python
 from loaf import LoafClient
 
-loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_SECRET_KEY (see §2)
+loaf = LoafClient()   # reads $LOAF_TRADING_KEY (see §2)
 
 print(loaf.portfolio.component().balances)                 # your balances (base units)
 print(loaf.market.list())                                  # listed markets
@@ -35,95 +35,85 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .              # core
 pip install -e ".[dotenv]"    # + auto-load a .env file
 pip install -e ".[dev]"       # + pytest for the test suite
-pip install -e ".[wallet]"    # + eth-account, only for python -m loaf.secret_key (see §2)
 ```
 
 Requires Python 3.9+.
 
-## 2. Get your credentials
+## 2. Get your trading key
 
-The bot uses **two secrets**:
+The SDK needs **one secret**: your **trading key**, `LOAF_TRADING_KEY` in your
+`.env`. It is the one string the Loaf web app's **API** page shows (log in →
+**API**):
 
-| Secret | `.env` variable | What it does |
-| --- | --- | --- |
-| API key | `LOAF_API_KEY` | Sent as `Authorization: Bearer` on reads, cancels, the WebSocket and the account reads every order needs. 64 hex characters, no prefix. |
-| Trading key | `LOAF_SECRET_KEY` | Signs every order you place, on your machine. It is never sent. 80 hex characters, no prefix. |
+```
+loaf_tk_<l2ChainId>_<l2AccountIndex>_<80 hex characters>
+```
 
-Both come from the Loaf web app's **API** page (log in → **API**).
-
-1. **The API key**: select **Generate API Token**. It is shown **once**, so
-   copy it right away. It has an expiry; once it expires, or you revoke it,
-   every request it authenticates gets `401 Invalid credentials`. A bot cannot
-   read its own key's expiry, so note the date when you create it.
-2. **The trading key** needs trading enabled: deposit (your first deposit opens
-   your trading account), then select **Enable trading** in the order panel on
-   a market's Trade page and wait until it is active. Then, under **Trading
-   key** below your tokens, select **Show trading key**: your wallet signs
-   once, and the page shows the key if it is the one in force (right after
-   enabling or a reset, try again in a moment). Your account has one trading
-   key, shared by the web app and all your bots: it is the same at every
-   showing until you reset it, and the page does not save it.
+- **What it is.** The key your trading account signs its orders with (its K1
+  api key 0), with the account it belongs to and the L2 chain of the Loaf
+  deployment that showed it. Copy it whole: the SDK refuses anything else,
+  a bare 80-hex key included, with one message that never repeats what it was
+  given.
+- **How to get it.** Trading has to be enabled first: deposit (your first
+  deposit opens your trading account), then select **Enable trading** in the
+  order panel on a market's Trade page and wait until it is active. Then, on the
+  API page, under **Trading key**, select **Show trading key**: your wallet
+  signs once, and the page shows the key if it is the one in force (right after
+  enabling or a reset, try again in a moment). Your account has one trading
+  key, shared by the web app and all your bots: it is the same at every showing
+  until you reset it, and the page does not save it.
+- **What it does.** It signs every order you place, and every perps margin
+  move and exit, on your machine; the key itself is never sent. Everything
+  else the SDK does for you (reads, cancels, the account read and order-number
+  reservations an order needs, perps margin moves and exits and the nonce read
+  before each, and your private WebSocket channel) is authenticated by a
+  **login token** the SDK signs with it: a short-lived Bearer (`loaf_lt_…`)
+  for your account, which lives 10 minutes, and which the SDK signs afresh
+  once half of that has passed. The exchange takes one only before its expiry
+  and at most 15 minutes ahead of its own clock, so this machine's clock must
+  be within about 5 minutes of the exchange's: keep it synchronized (NTP).
+- **What it cannot do.** Whoever holds it can read your account and trade its
+  balance on its vault (the ledger the markets settle on) away, against orders
+  of their own: keep it, and the `.env` that holds it, as secret as your wallet
+  key. But it cannot move your wallet's funds: withdrawals, deposits and
+  everything else in the web app need a web-app login. **Reset trading key** in
+  the web app (in Account Settings) revokes it, for the web app and every bot
+  alike.
 
 ```bash
 cp .env.example .env
-chmod 600 .env   # only you can read it: it holds both secrets
+chmod 600 .env   # only you can read it: it holds your trading key
 # edit .env:
-#   LOAF_API_KEY=<API key: 64 hex characters, no prefix>
-#   LOAF_SECRET_KEY=<trading key: 80 hex characters, no prefix>
+#   LOAF_TRADING_KEY=<the loaf_tk_... string, whole>
 #   LOAF_API_BASE_URL=https://api.loafmarkets.com/api   # or http://localhost:8005/api for local dev
 #   LOAF_MAX_SLIPPAGE_BPS=200   # optional: max slippage in basis points (100 = 1%), see Placing orders
 ```
 
-The SDK reads environment variables; `bot.py`, the examples and
-`python -m loaf.secret_key` load `.env` into them when python-dotenv is installed
-(`pip install -e ".[dotenv]"`). Otherwise export the variables.
+The SDK reads environment variables; `bot.py` and the examples load `.env`
+into them when python-dotenv is installed (`pip install -e ".[dotenv]"`).
+Otherwise export the variables.
 
-### Your trading key
+Without `LOAF_TRADING_KEY` only the public market data works: every other call
+raises `LoafConfigError` naming it. `loaf.public_key` is your trading key's
+public key (`None` when no key is set): what `GET /l2/keys` names
+`journaledKey` while the key is in force.
 
-- **What it can do.** Trade the account's balance on its vault, the ledger the
-  markets settle on. Whoever holds it can trade that balance away, against
-  orders of their own: keep it, and the `.env` that holds it beside your API
-  key, as secret as your wallet key. It cannot move your wallet's funds: a
-  withdrawal it signs pays only the account's own wallet, and needs the API
-  key too.
-  **Reset trading key** in the web app (in Account Settings) revokes it, for the
-  web app and every bot alike.
-- **When it changes.** After a Reset trading key, get the new key once it is
-  active (until then the old one stays in force) and restart the bot with it.
-  Once the new key is active, a bot still on the old one may have its next order
-  refused with `l2 epoch: …` (`LoafValidationError`); after that its orders
-  raise `LoafConfigError` (the key is not in force). Also cancel and re-arm
-  every stop, take and TP/SL leg (see **Stop & take orders**): those signed with
-  the old key stay ARMED but FAIL when they fire.
-
-Without `LOAF_SECRET_KEY` everything works except placing orders.
-`loaf.public_key` is your trading key's public key (`None` when no key is
-set): what `GET /l2/keys` names `journaledKey` while the key is in force.
-
-### Deriving a trading key on your machine
-
-`python -m loaf.secret_key` derives the same key from your wallet's private
-key, without the web app. It needs an account whose wallet private key you
-hold, such as a wallet login or a dedicated bot account. It reads your trading
-account with `LOAF_API_KEY` (and `LOAF_API_BASE_URL`), so set those first, and
-run it from your bot's directory (it loads the `.env` found from the working
-directory up), on a trusted machine, once trading is enabled on the market:
-
-```bash
-pip install -e ".[wallet]"
-read -rs W && LOAF_WALLET_PRIVATE_KEY="$W" python -m loaf.secret_key; unset W
-```
-
-`read -rs` waits for you to paste your wallet's private key (not echoed) and
-press Enter. The wallet key goes to that one command only: a plain shell
-variable is not exported, so nothing started later in the shell inherits it,
-even if the command fails or `unset` is skipped. The helper prints one line,
-`LOAF_SECRET_KEY=<80 hex>`: paste it into your `.env`. After a Reset trading
-key it prints the old key until the new one is active.
-
-Never put the wallet key in `.env` (the helper refuses one that holds it) or in
-the bot's environment (`LoafClient()` refuses to start while
-`LOAF_WALLET_PRIVATE_KEY` is set).
+**When it changes.** After a Reset trading key, show the new key once it is
+active (until then the old one stays in force) and restart the bot with it.
+Once the new key is active, the old one's login tokens are refused: the bot's
+next request raises `LoafAuthError` saying its key is not the one in force. Its
+WebSocket connection keeps your private stream only until the server refuses
+the connection's next fresh login token, at most 5 minutes later, or, if none
+reaches the server, until its token expires (`4001 expired`), at most 10
+minutes later; with `portfolio` subscribed the client then reconnects, and
+every attempt is refused (see **Real-time WebSocket**). An order carries no
+login token, though, and is signed at the account epoch the SDK read before the
+reset, so the bot's next order may be refused with `l2 epoch: …`
+(`LoafValidationError`) or `l2 signature: …` (`LoafAuthError`, the exchange's
+text alone) instead; the order after it reads the account again and gets the
+explained `LoafAuthError`. Also cancel and re-arm every stop, take and TP/SL leg
+(see **Stop & take orders**): those signed with the old key stay ARMED but FAIL
+when they fire.
 
 ## 3. Run the bot template
 
@@ -131,9 +121,9 @@ the bot's environment (`LoafClient()` refuses to start while
 python bot.py
 ```
 
-`bot.py` verifies your credentials, prints balances/holdings, opens the live
-feed (order book, competition round notices and your private portfolio stream),
-and runs a 5-second strategy loop with clearly-marked `# YOUR STRATEGY GOES
+`bot.py` verifies your trading key, prints balances/holdings, opens the live
+feed (order book, halt status and your private portfolio stream), and runs a
+5-second strategy loop with clearly-marked `# YOUR STRATEGY GOES
 HERE` hooks. It only *observes* the market out of the box — drop your logic into
 `Strategy.on_tick`.
 
@@ -185,13 +175,15 @@ read from the working tree, so they stay accurate either way.
 To pin to a release rather than track `main`:
 
 ```bash
-git checkout v0.4.0
+git checkout v0.5.0
 ```
 
 Releases are tagged from `v0.3.0` onward. While the SDK is pre-1.0, a breaking
-change bumps the **minor** version — so `0.3.x` → `0.4.0` is the signal to
-re-read this README before upgrading. Expect that signal often while Loaf is on
-testnet; an old pin is the most common reason a bot stops matching these docs.
+change bumps the **minor** version — so `0.4.x` → `0.5.0` is the signal to
+re-read this README before upgrading (0.5.0 replaced the API key and the bare
+80-hex `LOAF_SECRET_KEY` with the one `LOAF_TRADING_KEY`, §2). Expect that
+signal often while Loaf is on testnet; an old pin is the most common reason a
+bot stops matching these docs.
 
 ---
 
@@ -201,13 +193,11 @@ Create one `LoafClient` and reach everything through grouped resources:
 
 | Resource | What it covers |
 | --- | --- |
-| `loaf.market` | markets, market detail, candle history, trade backfill, asset info pages (all public) |
-| `loaf.offerings` | IPO offerings: list, detail |
+| `loaf.market` | markets, market detail, candle history, trade backfill (all public) |
 | `loaf.orders` | place (signed) / cancel / cancel-all orders, stop & take (conditional) orders |
+| `loaf.perps` | perps markets, your margin pools and positions, margin moves and exits (signed) |
 | `loaf.portfolio` | balances, holdings, recent activity |
 | `loaf.history` | paginated order & trade history, cancelled & active orders |
-| `loaf.leaderboard` | competition leaderboard |
-| `loaf.competition` | competition rounds info, your queue position, payout details |
 
 Responses are `LoafObject`s — dicts that also allow attribute access, so
 `book.bids[0].price` and `book["bids"][0]["price"]` are equivalent. Unknown
@@ -217,7 +207,7 @@ typed descriptions of every documented shape.
 ### Endpoint coverage
 
 The trading-facing endpoints are wrapped (account management, KYC, referrals,
-and fiat ramps are not part of this SDK):
+competitions, IPO offerings and fiat ramps are not part of this SDK):
 
 ```
 market.list()                         GET    /trade
@@ -225,21 +215,28 @@ market.get(ticker)                    GET    /trade/{ticker}
 market.candles(ticker, resolution)    GET    /trade/{ticker}/candles
 market.iter_candles(ticker, res)      (auto-paginate candle history)
 market.trades(ticker)                 GET    /trade/{ticker}/trades
-market.info_header(ticker)            GET    /info/{ticker}/header
-market.info_overview(ticker)          GET    /info/{ticker}/overview
-market.info_documents(ticker)         GET    /info/{ticker}/documents
 
-offerings.list()                      GET    /offerings
-offerings.get(ticker)                 GET    /offerings/{ticker}
-
-orders.create(...) / limit_buy / ...  POST   /orders                (signed; no API key)
-orders.create_conditional(...)        POST   /orders/conditional    (signed; no API key)
-orders.stop_loss / take_profit(...)   POST   /orders/conditional    (signed; no API key)
+orders.create(...) / limit_buy / ...  POST   /orders                (signed; no login token)
+orders.create_conditional(...)        POST   /orders/conditional    (signed; no login token)
+orders.stop_loss / take_profit(...)   POST   /orders/conditional    (signed; no login token)
 orders.resubmit(signed_body)          POST   /orders or /orders/conditional (re-send unchanged)
 orders.cancel(order_id)               POST   /orders/cancel
 orders.cancel_conditional(order_id)   POST   /orders/conditional/cancel
 orders.cancel_row(order)              (routes a row to the right cancel)
 orders.cancel_all()                   POST   /orders/cancel-all
+
+perps.markets() / market(index)       GET    /l2/perps/markets
+perps.collateral()                    (its collateral: USDC's decimals and tick size)
+perps.markets_live() / market_live    GET    /l2/perps/markets/live (index, funding, trading state)
+perps.funding_ticks(market, limit=, before=)
+                                      GET    /l2/perps/funding      (applied funding ticks)
+perps.closes(limit=, before=)         GET    /l2/perps/closes       (liquidations, ADL, exits)
+perps.positions() / pool / position   GET    /l2/perps/positions
+perps.funding()                       (each position's funding, from /l2/perps/positions)
+perps.allocate / add_margin / return_margin
+                                      POST   /l2/allocations        (signed; with a login token)
+perps.exit(market, pool=)             POST   /l2/exits              (signed; with a login token)
+perps.resubmit(signed_body)           POST   /l2/allocations or /l2/exits (re-send unchanged)
 
 portfolio.component()                 GET    /portfolio/component
 
@@ -247,25 +244,21 @@ history.orders() / trades()           GET    /history/orders, /history/trades
 history.cancelled_orders()            GET    /history/orders/cancelled
 history.active_orders()               GET    /history/orders/active
 history.iter_orders() / iter_trades() (auto-paginate via cursor)
-
-leaderboard.get()                     GET    /leaderboard
-
-competition.info()                    GET    /competition
-competition.queue_position()          GET    /competition/queue-position
-competition.payout_details()          GET    /competition/payout-details
-competition.submit_payout_details()   POST   /competition/payout-details
 ```
 
-Placements are signed with your trading key and carry no API key. For your
-orders the SDK also reads `GET /l2/keys` and reserves order numbers with
-`POST /l2/order-indices`, both with your API key.
+Placements are signed with your trading key and carry no login token. Every
+other call above that is not public is authenticated by a login token your
+trading key signs, and so are the two requests the SDK makes for your orders:
+it reads your account's epoch with `GET /l2/keys` and reserves order numbers
+with `POST /l2/order-indices`. A perps allocate or exit is signed with your
+trading key too, and also carries a login token (the SDK reads its nonce with
+`GET /l2/keys` first).
 
 A market (an order book, spot or perp) is named by its ticker: its asset's
 ticker, with `-PERP` appended for a perp (`MUS`, `H100-PERP`). `market.get`,
 `market.candles`, `market.trades`, orders and the WebSocket's market channels
-take a market's ticker; the info pages (`market.info_*`), offerings and your
-holdings name the asset by its own ticker (a spot market's ticker is its
-asset's).
+take a market's ticker; your holdings name the asset by its own ticker (a spot
+market's ticker is its asset's).
 
 Candle history is a dedicated, paginated endpoint (the market detail response
 does not include it):
@@ -294,8 +287,10 @@ print(res.orderId, res.status, res.quantityLeft)   # e.g. 991 OPEN 10
 res = loaf.orders.market_buy("MUS", quantity=2)           # reference fetched; client's max slippage
 res = loaf.orders.market_sell("MUS", quantity=2,
                               reference_price=mark, max_slippage_bps=50)   # mark: your markprice; 0.5%
-if res.status in ("OPEN", "PARTIALLY_FILLED"):     # the unfilled rest is RESTING at the worst price
-    loaf.orders.cancel(res.orderId)
+print(res.status, res.quantityLeft)   # FILLED, or CANCELLED with the rest: a MARKET order never rests
+
+# Time in force (create / limit_buy / limit_sell): GTC (default), IOC, FOK or POST_ONLY.
+res = loaf.orders.limit_buy("MUS", quantity=10, price=150, time_in_force="POST_ONLY")   # makes, never takes
 
 loaf.orders.cancel_all()      # cancel every open order, stop and take (it sells nothing)
 ```
@@ -303,11 +298,22 @@ loaf.orders.cancel_all()      # cancel every open order, stop and take (it sells
 **A 200 is sent after the exchange commits the order, so its `status` is
 real.** `FILLED` means filled; `OPEN` / `PARTIALLY_FILLED` mean it is resting
 with `quantityLeft` tokens to go. `CANCELLED` on a new order means it stopped
-early: a BUY whose hold could not pay for its next fill, or a SELL stopped at
-K1's size bound (see **Money & units**). `attachedLegIds` are the conditional
+early: the unfilled rest of a MARKET or IOC order, a BUY whose hold could not
+pay for its next fill, or a SELL stopped at K1's size bound (see **Money &
+units**). `attachedLegIds` are the conditional
 ids of the TP/SL legs you attached, take-profit first (`[]` without legs). Later
 fills and cancels arrive on your private `portfolio` WebSocket channel (see
 below).
+
+**Time in force.** `time_in_force=` on `create`, `limit_buy` and `limit_sell`
+(`loaf.TimeInForce`): `GTC` (the default) rests what does not fill at once;
+`IOC` cancels it, and is refused (400 `Order rejected: no resting order could
+fill any of it`) when nothing fills; `FOK` fills the whole quantity at once or
+is refused (400 `Fill-or-kill order rejected: it could not be filled in full`);
+`POST_ONLY` (a LIMIT order's alone: the SDK refuses it on a MARKET order) is
+refused with `loaf.PostOnlyWouldTakeError` when it would trade at once, so it
+only ever makes. Order rows show a post-only order as `GTC`, and a MARKET order
+sent as `GTC` as `IOC`. Stops, takes and TP/SL legs book GTC orders.
 
 `duplicate: True` means this exact signed order had already landed (the
 exchange's own retry, an SDK re-send or a `resubmit`). Its legs then exist
@@ -329,8 +335,9 @@ stop means a second sell).
   Override it for one order with `max_slippage_bps=`. The same setting prices
   stops, take-profits and TP/SL legs (see **Stop & take orders**).
 - The exchange matches a MARKET order against resting orders at their prices,
-  never worse than the price you signed, and **anything left rests on the
-  book** until it fills, expires or you cancel it.
+  never worse than the price you signed, and **never rests it**: what it cannot
+  fill at once is cancelled (`CANCELLED`), and one that fills nothing is refused
+  (400 `Order rejected: no resting order could fill any of it`).
 - The reference read is one extra public request; it can lag the live market
   and may not yet show a trade you just made. For price-sensitive orders pass the
   `markprice:{ticker}` value you stream as `reference_price` (once the SDK has
@@ -372,10 +379,18 @@ with `LoafNotFoundError` (404). After a 404, or a 403 for a market that is not
 listed, the SDK reads the ticker's market again for your next order.
 
 If trading is halted — platform-wide or for that market — order placement
-raises `TradingHaltedError` (403). A platform-wide halt blocks cancels too,
-except `orders.cancel_conditional()`, which is database-only and stays
-available (see **Stop & take orders** below). `TradingHaltedError` also covers
+raises `TradingHaltedError` (403); a market's own halt raises its subclass
+`MarketHaltedError` (below). A platform-wide halt blocks cancels too,
+except `orders.cancel_conditional()`, which the matching engine takes under any
+halt and stays available (see **Stop & take orders** below). `TradingHaltedError` also covers
 the exchange engine's own halts (a 400): wait them out; cancels still work.
+
+The exchange engine also keeps each market's own state, and refuses an order
+it does not take now with `MarketStateError` (403), its `.state` the reason:
+`MARKET_HALTED` (`MarketHaltedError`, a `TradingHaltedError` too),
+`MARKET_CLOSED`, `REDUCE_ONLY`, or `PRICE_STALE`; and `PriceHeldError` (state
+`REDUCE_ONLY`) while a perps market's latest price waits for review. A
+reduce-only or stale-price market still takes an order that reduces a position.
 
 To see a halt coming instead of discovering it on a rejected order, subscribe to
 the market's status channel:
@@ -421,7 +436,10 @@ longest `ttl_ms`, weeks for the default and shorter.
 
 - The SDK signs every order on your machine with your trading key (K1, the
   exchange's signature scheme); the key itself is never sent. The request
-  carries that signature, not your API key.
+  carries that signature and no login token. The order signs your trading
+  key's account and the market's L2 chain: a market on another chain than the
+  key's (another deployment's key) is refused with `LoafConfigError` before
+  anything is signed.
 - The SDK re-sends the **exact** signed order on timeouts and server errors,
   after a short pause, so a re-send can never place it twice: the exchange
   admits one order per account and order number, and answers a repeat with
@@ -457,11 +475,13 @@ longest `ttl_ms`, weeks for the default and shorter.
   after only a few orders. So keep a bot running rather than restarting it
   often, and restart it after a crash with a growing delay. Many stops that never fire, or
   many processes on one account, add up too.
-- The client keeps the trading key only inside its signer and never logs it.
-  Prefer `$LOAF_SECRET_KEY` over `secret_key=`: an explicit argument can
-  show up in tools that capture call frames (crash reporters, debuggers), and
-  so can a Ctrl-C that lands while an order is being signed, so don't let a
-  crash reporter record local variables in a trading bot.
+- The client keeps the trading key only inside its signer and never logs it,
+  and the same goes for its login tokens, which are credentials too until they
+  expire: none is ever put in a log, an error or a `repr`. Prefer
+  `$LOAF_TRADING_KEY` over `trading_key=`: an explicit argument can show up in
+  tools that capture call frames (crash reporters, debuggers), and so can a
+  Ctrl-C that lands while an order is being signed, so don't let a crash
+  reporter record local variables in a trading bot.
 
 ```python
 from loaf import OrderOutcomeUnknownError
@@ -544,8 +564,9 @@ at. A `tp_price` just above the reference can sit below your fill; the leg then
 arms already through its trigger and sells at once, no lower than its signed
 price. Leave the take-profit clear of the mark, or place it yourself once you
 see the fill. A leg's own price is first checked (deviation, band, minimum
-value) when it fires; if that fails the leg becomes FAILED. Cancelling a partly
-filled parent (for example a resting MARKET remainder) FAILs its legs.
+value) when it fires; if that fails the leg becomes FAILED. On a spot market a
+parent that ends partly filled (the cancelled rest of a MARKET or IOC order, or
+your cancel) FAILs its legs; a perp's legs arm on the parent's first fill.
 
 **Each stop or take holds one order number until it fires**, and one cancelled
 or expired unfired keeps counting against your account's allowance (see
@@ -576,26 +597,72 @@ conditional does not carry. `loaf.history.active_orders()` and
 Derive triggers with `round(mark * 0.95, 2)`: an unrounded float product carries
 17 decimals and the SDK rejects it locally before the request goes out.
 
----
+### Perps
 
-## Competition rounds
-
-A round is normal trading scored over a window: it changes nothing about
-trading, your orders or your balances. Once the admission queue admits you,
-your trading (your bots' included) from the round's start, or your admission if
-later, until its end scores on the leaderboard by its volume and its PnL
-(deposits and withdrawals in the window are not PnL). Everyone else trades as
-usual. `loaf.competition.queue_position()` gives your place in the queue, or
-your `leaderboardPosition` and `leaderboardPoints` on the board being served,
-and the public `competition` channel announces each round transition:
+A perp (its ticker is its asset's with `-PERP` appended, its `market.type`
+`"PERP"`) trades a perpetual future settled in USDC: a BUY opens or grows a
+long (or shrinks a short), a SELL the other way round. Your margin is USDC held
+in **pools**: pool 0, the cross pool, and the isolated pools 1 to 7, each
+holding at most 8 positions margined by that pool's collateral alone. Fund a
+pool from your spot USDC, trade from it, and move what is left back:
 
 ```python
-ws.subscribe_competition()
-
-@ws.on_round_update
-def on_round(msg):
-    print(msg.roundNumber, msg.status)
+perp = loaf.market.get("MUS-PERP").market             # type "PERP", its marketIndex and l2 terms
+loaf.perps.markets()                                  # every perp's index and terms, public
+loaf.perps.market_live(perp.marketIndex)              # tradingState, riskOnly, index, funding rate
+loaf.perps.add_margin(5_000, pool=0)                  # 5,000 USDC: spot -> pool 0
+loaf.orders.limit_buy("MUS-PERP", quantity=2, price=101.5, pool=0)   # a long from pool 0
+loaf.orders.limit_sell("MUS-PERP", quantity=2, price=104, pool=0, reduce_only=True)
+loaf.perps.position(market=perp.marketIndex, pool=0)  # base, entryPrice, liquidationPrice, ...
+loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
 ```
+
+Orders name a perp by its ticker; the perps reads and ops name it by its
+`marketIndex` (0 to 254), as the exchange's perps API does, and so do their
+rows (`market`, `marketIndex`). `market.list()` rows and
+`market.get(ticker).market` carry both.
+
+- **Orders** take `pool=` (0 by default) and `reduce_only=True` (its fills
+  may only shrink the pool's position), signed with the order; both are
+  refused on a spot market. TP/SL legs (`tp_price=`, `sl_price=`) attach to a
+  perps BUY or SELL, never to a reduce-only order: each leg is a reduce-only
+  order on the other side in the order's pool. A SELL's are mirrored:
+  `tp_price < price < sl_price`, e.g.
+  `limit_sell("MUS-PERP", 2, 104, tp_price=95, sl_price=110)`.
+- **Allocates** (`add_margin`, `return_margin`, `allocate(amount, from_side=,
+  to_side=)`, a side a pool or `loaf.PERPS_SPOT_SIDE`, 255, your spot balance)
+  and **exits** (`exit(market, pool=)`: closes your position in an EXPIRED
+  market, which takes no orders) are signed with your trading key and sent
+  with a login token it signs. Each spends your account's next nonce, the
+  counter your withdrawals spend too; the SDK reads it for every op. One
+  applied elsewhere between that read and the send makes the exchange refuse
+  this one (422, `l2 money: the nonce is not the api key's nonce …`): send it
+  again. An op is valid for `ttl_ms` (default 10 minutes).
+- **Retries** work as for orders: timeouts and 5xx re-send the same signed
+  body, which the exchange applies once at most (`duplicate: True` on a repeat
+  of an applied one). Any error but `PerpsOutcomeUnknownError` means it was
+  not applied; on that one, `loaf.perps.resubmit(e.signed_body)`, never a
+  fresh op for the same intent.
+- **Units.** An allocate's `amount` is in USDC. The exchange moves whole
+  ticks of it, so the SDK counts the amount in the collateral that
+  `GET /l2/perps/markets` serves (`perps.collateral()`: ticks = amount x
+  10^`decimals` / `tickSize`). It refuses an amount that is not a whole number
+  of ticks, and a reply without a usable collateral: it never assumes one.
+  An exit moves no amount, so it never needs the collateral.
+  The reads are the engine's units: `positions()` serves amounts as decimal
+  strings, collateral, value, funding owed and notional in extended units
+  (ticks x the collateral's `extensionMultiplier`), a position's `base` in an
+  order's signed quantity units (tokens x 10, negative for a short), prices in
+  the market's price units (its docstring has the rest).
+- **Market state.** A perp can refuse orders for its own state (403,
+  `MarketStateError` with `.state`): halted, outside its trading hours,
+  reduce-only, its price stale, or reduce-only while its latest price waits
+  for review (`PriceHeldError`). In the last three a `reduce_only=True` order
+  is still taken. `perps.markets_live()` (and the `perps:markets` channel)
+  serves each market's state as the engine decides it, before you send:
+  `tradingState`, `stateReason`, `halted`, `heldPrice`, and `riskOnly` (the
+  engine's risk-only mode: only an order that reduces is taken, and no
+  withdrawal, whatever `tradingState` says), all as of `asOfMs`.
 
 ---
 
@@ -615,6 +682,9 @@ quantities in **tokens** — for what you send and the market data you receive:
   token's base units (`"1500000"` is 1.5 of a 6-decimal token). Turn one into an
   exact `Decimal` of tokens with `loaf.from_base_units(row.available, row.decimals)`.
 - A trade's `fee` is in dollars, to 0.001.
+- **Perps** amounts are the exchange engine's units (see **Perps**): an
+  allocate's `amount` in USDC ticks, and `perps.positions()` values as decimal
+  strings.
 - `*Bps` fields are raw basis points (`30` = 0.30%); use `loaf.bps_to_fraction`.
 - `*Percent` / `*Percentage` fields are already percentages (`5.2` = 5.2%).
 
@@ -660,14 +730,18 @@ Channels:
 | `markprice:{ticker}` | public | `on_mark_price` | canonical mark price (1s, on change) |
 | `volume:{ticker}` | public | `on_volume` | rolling-24h traded volume (replaces `volume24h`) |
 | `market:{ticker}` | public | `on_market_halt` | halt / resume status for that market |
-| `leaderboard` | public | `on_leaderboard` | competition leaderboard (top entries), on change |
-| `competition` | public | `on_round_update` | round transitions (PREPARED, ACTIVE, ENDING, ENDED, DRAFT); no initial frame — seed from `competition.info()` |
-| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_order_queue`, `on_lifetime_volume` | your account deltas, and your resting orders' places in their books |
+| `perps:markets` | public | `on_perps_markets_live` | every perps market's live state, as `perps.markets_live()` serves it, about once a second — replace what you hold |
+| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_liquidation_fill`, `on_order_queue`, `on_lifetime_volume` | your account deltas, and your resting orders' places in their books; a liquidation's take from your resting perps order is a fill but no trade: `on_liquidation_fill`, not `on_trade` |
 
-The private channel carries no id: the server resolves it from the account
-your API key authenticated as, so an anonymous connection is refused with an
-`error` frame. It is a **delta stream** — you receive `balances_update`,
-`order_status`, `order_update`, etc. as separate frames:
+A client with a trading key authenticates each connection with a login token
+the key signs (the `auth` frame, never the URL), and sends a fresh one on the
+live connection each time the one it holds passes half its life (5 of its 10
+minutes), so the connection stays authenticated for as long as it lasts while
+the key stays in force. The private channel carries no id: the server resolves
+it from the account the login token authenticated, so an anonymous connection
+(no trading key) is refused with an `error` frame. It is a **delta stream** —
+you receive `balances_update`, `order_status`, `order_update`, etc. as separate
+frames:
 
 - `balances_update` carries your **whole** balance book after every change:
   replace yours with it, and treat a missing row as 0. Rows are `{assetId,
@@ -700,8 +774,8 @@ your API key authenticated as, so an anonymous connection is refused with an
   price, quantity, quantityAhead, ordersAhead}` (`ordersAhead`: how many orders
   at its price are ahead of it in time priority; `quantityAhead`: their
   unfilled tokens). It replaces what you hold for that market, and an empty
-  list means none of yours rests there. Each time a connection newly
-  subscribes `portfolio` with your API key, as the client does on every
+  list means none of yours rests there. Each time a connection your trading
+  key authenticated newly subscribes `portfolio`, as the client does on every
   connection (subscribing again while subscribed sends nothing), one arrives
   for each market where you have resting orders (before or after
   `on_connect` on a new connection), then one on every change; a market
@@ -754,16 +828,23 @@ is readable. The `order_queue` lists have no REST read: drop them in
 client makes one on every connection while you stay subscribed) sends them
 again. `on_disconnect` gets `{code, reason}` after every ended attempt: 1012
 with reason `resync` (pushes may have been lost, below) means re-seed once
-`on_connect` fires again; 4001 with reason `revoked` or `expired` means the API
-key was revoked or has expired and will not authenticate again: create a new
+`on_connect` fires again; 4001 with reason `expired` means the connection's
+login token expired before a fresh one reached the server (the machine slept,
+or a handler held the socket's thread), and the next connection signs a fresh
 one; `code` `None` means no connection was made (`reason` says why); several
-without an `on_connect` between them mean the feed is down. The
-client keeps retrying, waiting a random time below a ceiling that doubles up to
-30 s. With `portfolio` subscribed, a connection whose API
-key the server does not accept is dropped and retried, with the reason
-`the server did not accept the API key`. The server also answers so when it
-cannot check the key at that moment, and a later attempt then gets through; if
-it keeps repeating, the key has expired or been revoked.
+without an `on_connect` between them mean the feed is down. The client keeps
+retrying, waiting a random time below a ceiling that doubles up to 30 s. With
+`portfolio` subscribed, a connection whose login token the server does not
+accept is dropped and retried with a fresh one, with the reason `the server
+did not accept the login token`. The server also answers so when it cannot
+check the token at that moment, and a later attempt then gets through; if it
+keeps repeating, your trading key is not the one in force, and REST calls
+raise `LoafAuthError` saying why. The server checks the key only when a token
+arrives: after a Reset trading key, a live connection keeps your private
+stream until the server refuses its next fresh token, at most 5 minutes later,
+or, if none reaches it, until its token expires (`4001 expired`), at most 10
+minutes later, and every connection after that is refused (§2, **When it
+changes**).
 
 The server sends `resync` after a loss on its side: its message bus
 reconnected, it was overloaded and shed pushes, or the matching engine dropped
@@ -771,8 +852,7 @@ some or restarted without a clean shutdown (a clean restart closes nothing). It
 closes every connection holding `portfolio` and, about 2 s after the last bus
 reconnect or engine-side loss, every one holding the `trades` channel of a
 market that traded since or whose recent trades the server had missed: each
-at most once every 30 s, and a connection holding both only once. An API-key
-connection can also get `resync` so that its key is checked again.
+at most once every 30 s, and a connection holding both only once.
 
 **The tape across a reconnect.** A `trades` subscription brings only the
 recent trades, up to 20. For the trades missed while the feed was down, page
@@ -811,13 +891,19 @@ except loaf.OrderOutcomeUnknownError as e:
     ...   # may be live or filled: resubmit(e.signed_body) if still wanted, else check history.orders()
 except loaf.TradingHaltedError:
     ...   # halted — back off and retry later
+except loaf.MarketStateError as e:
+    ...   # 403: the market's own state (e.state) — reduce-only, price stale or held
+          # (PriceHeldError), closed: back off, or send only reduce_only=True orders
 except loaf.LoafConfigError:
-    ...   # e.g. your trading key is no longer in force — stop and alert: set the
-          # key in force (§2), restart, and re-arm your stops
+    ...   # a setup to fix (the message says what): e.g. a market on another deployment's
+          # L2 chain than your trading key's — stop and alert
 except loaf.LoafAuthError:
-    ...   # "Invalid credentials": your API key expired or was revoked — stop and alert
-          # (create a new one, restart); otherwise the order's signature or key was
-          # refused: the next order re-reads your account
+    ...   # your trading key's login token was refused, and the message says why: the
+          # key is not the one in force (reset, not active yet, another deployment's) or
+          # the clock is off — stop and alert (set the key in force, §2, restart, re-arm
+          # your stops); or the order's signature or key: the next order re-reads your account
+except loaf.PostOnlyWouldTakeError:
+    ...   # 400: a POST_ONLY order would have traded at once; nothing was placed
 except loaf.LoafValidationError as e:
     print(e.message, e.details)        # 400 (local ones have status_code 0)
 except loaf.LoafRateLimitError as e:
@@ -830,33 +916,45 @@ except loaf.LoafAPIError as e:
 timeout), or one arrived whose compressed body could not be decompressed; from
 an order placement it means the order never reached the exchange, because
 anything that might have landed raises `OrderOutcomeUnknownError` instead.
-`LoafConfigError` means a missing or invalid key (placing orders needs
-`LOAF_SECRET_KEY` and `LOAF_API_KEY`), `LOAF_WALLET_PRIVATE_KEY` left in the
-bot's environment, or an invalid client-wide max slippage
-(`LOAF_MAX_SLIPPAGE_BPS` / `LoafClient(max_slippage_bps=)`). From a placement
-it means a setup to fix before retrying: your trading key is not the one in
-force, trading is not enabled, you have no trading account yet, or this
-machine's clock is hours ahead; the message says what to do. A
-bad per-order `max_slippage_bps=` / `leg_max_slippage_bps=` / `ttl_ms=` is a
+`LoafConfigError` means a missing or malformed trading key (every
+authenticated call and every order needs `LOAF_TRADING_KEY`), or an invalid
+client-wide max slippage (`LOAF_MAX_SLIPPAGE_BPS` /
+`LoafClient(max_slippage_bps=)`). From a placement it means a setup to fix
+before retrying: the market is on another L2 chain than your trading key (the
+key is another deployment's), or this machine's clock is hours ahead; the
+message says what to do. `LoafAuthError` from a read, a cancel or a placement's
+account requests means the server refused your trading key's login token: the
+key is not the one in force on its account (reset, not active yet, another
+deployment's) or this machine's clock is off by more than about 5 minutes,
+which the message names after the server's own text (kept in `e.body`); the
+next request signs a fresh token, but nothing changes until you fix the cause.
+A bad per-order `max_slippage_bps=` / `leg_max_slippage_bps=` / `ttl_ms=` is a
 local `LoafValidationError` (status_code 0).
+
+A perps allocate or exit raises the same errors, with
+`PerpsOutcomeUnknownError` in place of `OrderOutcomeUnknownError` (re-send it
+with `loaf.perps.resubmit(e.signed_body)`); its refusals by the exchange's
+rules (above your available spot USDC, a pool left under initial margin, the
+nonce) are plain `LoafAPIError`s with status 422, and applied nothing.
 
 ## Rate limits & retries
 
 The backend rate limits requests per IP and sends standard `RateLimit-*`
 headers (snapshot at `loaf.last_rate_limit`). Order placements, cancels,
-order-number reservations, portfolio reads and competition queue/payout calls
-are additionally limited **per account** (a placement counts for the account
-it is signed for), so rotating IPs doesn't raise the ceiling. Reads are retried
-automatically on 429, 503 and network errors, with backoff that honours a
-positive `RateLimit-Reset` / `Retry-After` (one of 0 or less backs off
-exponentially, as with none); the reads a placement makes before it signs
-raise a 429 at once instead, since a late order is stale. Order placements are
-re-sent unchanged on network errors and server errors after a short jittered
-pause, not the rate-limit headers (see **Signing & retries**), but never on a
-429 — a rate-limited order raises `LoafRateLimitError` so you can decide
-whether to re-issue it at a fresh price. (A rate-limited `resubmit` raises
-`OrderOutcomeUnknownError` instead, since the first attempt may be live.)
-Cancels are never retried. Tune with `LoafClient(max_retries=...)`.
+order-number reservations and portfolio reads are additionally limited **per
+account** (a placement counts for the account it is signed for), so rotating
+IPs doesn't raise the ceiling. Reads are retried automatically on 429, 503 and
+network errors, with backoff that honours a positive `RateLimit-Reset` /
+`Retry-After` (one of 0 or less backs off exponentially, as with none), each
+attempt with a login token that has more than half its life left; the reads a
+placement makes before it signs raise a 429 at once instead, since a late order
+is stale. Order placements are re-sent unchanged on network errors and server
+errors after a short jittered pause, not the rate-limit headers (see **Signing
+& retries**), but never on a 429 — a rate-limited order raises
+`LoafRateLimitError` so you can decide whether to re-issue it at a fresh price.
+(A rate-limited `resubmit` raises `OrderOutcomeUnknownError` instead, since the
+first attempt may be live.) Cancels are never retried. Tune with
+`LoafClient(max_retries=...)`.
 
 ---
 
@@ -875,32 +973,33 @@ Cancels are never retried. Tune with `LoafClient(max_retries=...)`.
 ## Tests
 
 ```bash
-pip install -e ".[dev,wallet,dotenv]"
+pip install -e ".[dev,dotenv]"
 pytest
 ```
 
 The suite runs fully offline against an in-memory mock transport and a local
-WebSocket server (no live server, no real key). It covers K1 signing (checked
-against the exchange's known answers), the web app's trading-key derivation
-vectors, the order flow, order-number reservations, stop & take orders, retries,
-input validation, pagination, error mapping, and the WebSocket client. Without
-the `wallet` extra the trading-key helper's tests are skipped, and without
-`dotenv` its `.env` tests are.
+WebSocket server (no live server, no real key). It covers K1 signing and the
+login message (checked against the exchange's known answers), the trading key
+and its login tokens (an in-memory exchange checks each one as the real one
+does), the order flow, order-number reservations, stop & take orders, perps
+orders, reads, margin moves and exits, retries, input validation, pagination,
+error mapping, and the WebSocket client.
 
 ## Notes / intentionally excluded
 
 - This SDK is the **trading-facing** surface. Account management, KYC, referrals
-  (`/auth/*`), the featured-offering home feed (`/home`), fiat on/off-ramps
-  (`/portfolio/onramp|offramp`), and the shareable image cards
-  (`/portfolio/holding/{ticker}/pnl-card`, `/leaderboard/card`,
-  `/competition/queue-position/card`) are **not** wrapped — do those in the
-  Loaf web app. So are deposits, withdrawals, and enabling or resetting your
-  trading key.
-- Create your API key in the web app. Nothing else is needed for the private
-  WebSocket channel — the API key identifies the account it streams.
-- IPO subscriptions are not wrapped: each purchase is signed by your account
-  wallet, which neither the API key nor the trading key can do. Subscribe in
-  the web app.
+  (`/auth/*`), competitions and the leaderboard, IPO offerings and
+  subscriptions, the featured-offering home feed (`/home`), fiat on/off-ramps
+  (`/portfolio/onramp|offramp`), and the shareable image cards are **not**
+  wrapped, and neither are deposits, withdrawals, or enabling or resetting your
+  trading key (moving USDC between your spot balance and your perps pools is
+  wrapped: `loaf.perps`). Their public reads need no credential:
+  `loaf.get("/leaderboard", auth=False)` works, as do `/competition`,
+  `/offerings` and `/home`. The rest need a web-app login, so do them in the
+  Loaf web app: a login token works on the trading routes only, and the others
+  refuse it (401).
+- Your trading key is the one credential: its login tokens authenticate the
+  private WebSocket channel too, and identify the account it streams.
 - The default base URL is the **production API** (`https://api.loafmarkets.com/api`).
   While Loaf is on testnet, set `LOAF_API_BASE_URL` to the testnet API you were
   given. For local dev, set it to your dev server (e.g.

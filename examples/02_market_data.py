@@ -1,4 +1,4 @@
-"""02 — Public market data (no API key needed).
+"""02 — Public market data (no trading key needed).
 
     python examples/02_market_data.py
 """

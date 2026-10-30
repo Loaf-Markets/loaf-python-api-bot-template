@@ -2,17 +2,16 @@
 """Loaf trading bot — template.
 
 A runnable starting point that:
-  1. loads your credentials from the environment (or a .env file),
+  1. loads your trading key from the environment (or a .env file),
   2. verifies the connection and trading prerequisites,
   3. prints your balances and holdings,
-  4. opens the real-time feed (order book, halt status, competition round
-     notices, and your private portfolio stream),
+  4. opens the real-time feed (order book, halt status, and your private
+     portfolio stream),
   5. runs a simple strategy loop you can replace with your own logic.
 
 Run it:
     cp .env.example .env
-    chmod 600 .env                # only you can read it; then set LOAF_API_KEY, and
-                                  # LOAF_SECRET_KEY to place orders (README §2)
+    chmod 600 .env                # only you can read it; then set LOAF_TRADING_KEY (README §2)
     pip install -e ".[dotenv]"    # the dotenv extra loads .env; or export the variables yourself
     python bot.py
 
@@ -53,25 +52,22 @@ TARGET_TICKER = ""
 
 def build_client() -> LoafClient:
     """Create a client from the environment, with friendly errors."""
-    api_key = os.environ.get("LOAF_API_KEY")
-    if not api_key:
+    if not os.environ.get("LOAF_TRADING_KEY", "").strip():
         sys.exit(
-            "No LOAF_API_KEY set.\n"
-            "  1. Create an API key in the Loaf web app (API -> Generate API Token).\n"
-            "  2. cp .env.example .env && chmod 600 .env  and put it in LOAF_API_KEY.\n"
-            "  3. To place orders, also put your trading key in LOAF_SECRET_KEY: the\n"
-            "     API page's Show trading key gives it (README §2).\n"
+            "No LOAF_TRADING_KEY set.\n"
+            "  1. In the Loaf web app, open the API page and select Show trading key\n"
+            "     (deposit and enable trading on a market's Trade page first).\n"
+            "  2. cp .env.example .env && chmod 600 .env  and put it in LOAF_TRADING_KEY:\n"
+            "     the one loaf_tk_... string, whole (README §2).\n"
             "  .env is read only when python-dotenv is installed\n"
-            "  (pip install -e \".[dotenv]\"); otherwise export the variables.\n"
+            "  (pip install -e \".[dotenv]\"); otherwise export the variable.\n"
         )
-    # The trading key is read from $LOAF_SECRET_KEY, and base_url / ws_url
+    # The trading key is read from $LOAF_TRADING_KEY, and base_url / ws_url
     # from $LOAF_API_BASE_URL / $LOAF_WS_URL, if set.
     try:
-        return LoafClient(api_key=api_key)
+        return LoafClient()
     except loaf.LoafConfigError as exc:
-        # A malformed key or LOAF_MAX_SLIPPAGE_BPS, or LOAF_WALLET_PRIVATE_KEY left in the
-        # environment.
-        sys.exit(str(exc))
+        sys.exit(str(exc))  # a malformed trading key or LOAF_MAX_SLIPPAGE_BPS
 
 
 def cash_of(balances: Any) -> Decimal:
@@ -98,7 +94,7 @@ def preflight(client: LoafClient) -> None:
     try:
         comp = client.portfolio.component()
     except loaf.LoafAuthError as exc:
-        sys.exit(f"Authentication failed — check your API key. ({exc.message})")
+        sys.exit(f"Your trading key was refused: {exc.message}")
 
     balances = comp.get("balances") or []
     print(f"  Cash: {cash_of(balances):,.2f} available")
@@ -119,12 +115,9 @@ def preflight(client: LoafClient) -> None:
             avg = h.get("averageEntryPrice")
             print(f"    {h.ticker}: {held} @ avg {'n/a' if avg is None else avg} "
                   f"(mkt {h.marketPrice})")
-    if client.public_key:
-        bps = client.max_slippage_bps  # $LOAF_MAX_SLIPPAGE_BPS, default 200
-        print(f"  Orders are signed by trading key {client.public_key}")
-        print(f"  Max slippage: {bps} bps ({bps / 100:g}%) for MARKET orders, stops and TP/SL legs")
-    else:
-        print("  No LOAF_SECRET_KEY: watching only (placing orders needs it).")
+    bps = client.max_slippage_bps  # $LOAF_MAX_SLIPPAGE_BPS, default 200
+    print(f"  Orders are signed by trading key {client.public_key}")
+    print(f"  Max slippage: {bps} bps ({bps / 100:g}%) for MARKET orders, stops and TP/SL legs")
 
 
 def resolve_target(client: LoafClient) -> Any:
@@ -232,10 +225,6 @@ class Strategy:
         else:
             print(f"  feed closed: {msg.code} {msg.reason}; reconnecting")
 
-    def on_round(self, msg) -> None:
-        # Only report it: a round changes nothing about trading.
-        print(f"  *** competition round {msg.roundNumber} {msg.status}")
-
     def on_halt(self, msg) -> None:
         # `isHalted` is the effective state (this market's own flag OR a
         # platform-wide halt), so it replaces the value seeded from REST.
@@ -255,6 +244,13 @@ class Strategy:
         t = msg.trade
         print(f"  *** FILLED: {t.side} {t.quantity} {t.ticker} @ {t.price} "
               f"(fee {t.fee}) #{t.tradeId}")
+
+    def on_my_liquidation_fill(self, msg) -> None:
+        # A liquidation took from one of YOUR resting perps orders: a fill of it,
+        # but no trade (no tradeId or txHash; perpsSeq names it).
+        f = msg.fill
+        print(f"  *** FILLED by a liquidation: {f.side} {f.quantity} {f.ticker} @ {f.price} "
+              f"(order #{f.orderId}, seq {f.perpsSeq})")
 
     def on_my_order(self, msg) -> None:
         # `order_status` is the transition only (FILLED / CANCELLED / ...).
@@ -372,9 +368,9 @@ class Strategy:
         # A loaf.LoafForbiddenError about the market itself (delisted, not yet
         # available, not started) means it stopped trading, which no frame
         # announces: set self.needs_seed = True, and the next tick reads it again.
-        # On loaf.LoafConfigError from a placement, stop and alert: e.g. your
-        # trading key is no longer in force (set the new one, README §2,
-        # restart, and re-arm your stops).
+        # On loaf.LoafConfigError or loaf.LoafAuthError from a placement, stop and
+        # alert: e.g. your trading key is no longer in force (the message says;
+        # set the new one, README §2, restart, and re-arm your stops).
         # On loaf.OrderOutcomeUnknownError the order may be live or already
         # filled. If you still want it, resubmit(e.signed_body) (the same order
         # if it landed, placed now if not); otherwise look for it in
@@ -407,9 +403,9 @@ def main() -> None:
     ws.on_connect(strategy.on_feed_reset)     # live (again): re-seed on the next tick
     ws.on_disconnect(strategy.on_disconnect)  # every ended attempt: drop book and mark
     ws.on_market_halt(strategy.on_halt)       # public: halt/resume for this market
-    ws.on_round_update(strategy.on_round)     # public: competition round transitions
     ws.on_trades(strategy.on_trade_tick)
     ws.on_trade(strategy.on_my_fill)          # private: your fills
+    ws.on_liquidation_fill(strategy.on_my_liquidation_fill)  # private: liquidation fills
     ws.on_order_update(strategy.on_my_order_accepted)  # private: your new orders
     ws.on_order_status(strategy.on_my_order)  # private: your order transitions
     ws.on_balances(strategy.on_balances)      # private: your balance changes
@@ -419,8 +415,7 @@ def main() -> None:
     ws.subscribe_mark_price(target.ticker)
     ws.subscribe_trades(target.ticker)
     ws.subscribe_market_status(target.ticker)
-    ws.subscribe_competition()
-    ws.subscribe_portfolio()  # your private fills/balances stream (keyed by your API key)
+    ws.subscribe_portfolio()  # your private fills/balances stream (your trading key's account)
 
     ws.start()  # background thread
     if ws.wait_until_connected(timeout=10):

@@ -4,7 +4,7 @@ Quick start::
 
     from loaf import LoafClient
 
-    loaf = LoafClient()   # reads $LOAF_API_KEY and $LOAF_SECRET_KEY
+    loaf = LoafClient()   # reads $LOAF_TRADING_KEY
     print(loaf.portfolio.component().balances)
     print(loaf.market.list())
     loaf.orders.limit_buy("MUS", quantity=10, price=167.49)   # signed with your trading key
@@ -22,17 +22,17 @@ from .constants import (
     DEFAULT_MAX_SLIPPAGE_BPS,
     L2_BUFFER_MS,
     L2_FEE_RATE_CAP,
+    MAX_POOL,
     MAX_PRICE_DECIMALS,
     MAX_QUANTITY_DECIMALS,
+    PERPS_SPOT_SIDE,
 )
 from .enums import (
     CONDITIONAL_ORDER_TYPES,
     AssetKind,
     CandleResolution,
-    CompetitionRoundStatus,
     ConditionalOrderStatus,
     ConditionalOrderType,
-    IpoStatus,
     MarketStatus,
     MarketType,
     OrderSide,
@@ -55,7 +55,12 @@ from .exceptions import (
     LoafServerError,
     LoafServiceUnavailableError,
     LoafValidationError,
+    MarketHaltedError,
+    MarketStateError,
     OrderOutcomeUnknownError,
+    PerpsOutcomeUnknownError,
+    PostOnlyWouldTakeError,
+    PriceHeldError,
     TradingHaltedError,
 )
 from .money import bps_to_fraction, fraction_to_bps, from_base_units, worst_price
@@ -72,8 +77,10 @@ __all__ = [
     "DEFAULT_MAX_SLIPPAGE_BPS",
     "L2_BUFFER_MS",
     "L2_FEE_RATE_CAP",
+    "MAX_POOL",
     "MAX_PRICE_DECIMALS",
     "MAX_QUANTITY_DECIMALS",
+    "PERPS_SPOT_SIDE",
     # enums
     "OrderSide",
     "OrderType",
@@ -84,9 +91,7 @@ __all__ = [
     "MarketType",
     "MarketStatus",
     "AssetKind",
-    "IpoStatus",
     "CandleResolution",
-    "CompetitionRoundStatus",
     "WSMessageType",
     # order-row helpers
     "CONDITIONAL_ORDER_TYPES",
@@ -101,11 +106,16 @@ __all__ = [
     "LoafConfigError",
     "LoafConnectionError",
     "OrderOutcomeUnknownError",
+    "PerpsOutcomeUnknownError",
     "LoafAPIError",
     "LoafAuthError",
     "LoafForbiddenError",
     "TradingHaltedError",
+    "MarketStateError",
+    "MarketHaltedError",
+    "PriceHeldError",
     "LoafValidationError",
+    "PostOnlyWouldTakeError",
     "LoafNotFoundError",
     "LoafConflictError",
     "LoafRateLimitError",

@@ -1,8 +1,8 @@
 """Order placement against an in-memory exchange: the signed L2 bodies, what the
-SDK reads for them (the market, your trading account, order numbers), MARKET
-pricing, TP/SL legs, conditionals, the order life, retries, resubmit, what a
-refusal invalidates, the order numbers a definite refusal gives back, and the
-trading key's handling.
+SDK reads for them (the market, your trading account, order numbers) and how
+they must match the trading key, MARKET pricing, TP/SL legs, conditionals, the
+order life, retries, resubmit, what a refusal invalidates, and the order numbers
+a definite refusal gives back.
 
 Signatures are checked with ``conftest.verify_order``, which rebuilds the signed
 terms from the posted JSON as the exchange reads it.
@@ -10,9 +10,7 @@ terms from the posted JSON as the exchange reads it.
 
 from __future__ import annotations
 
-import copy
 import json
-import pickle
 import re
 import threading
 import time
@@ -25,13 +23,7 @@ import pytest
 
 import loaf
 from loaf import LoafClient, OrderOutcomeUnknownError, k1
-from loaf._l2 import (
-    AccountState,
-    L2State,
-    TradingKey,
-    market_of,
-    read_account,
-)
+from loaf._l2 import AccountState, L2State, market_of
 from loaf.constants import (
     DEFAULT_ORDER_TTL_MS,
     L2_BUFFER_MS,
@@ -41,18 +33,24 @@ from loaf.constants import (
 from loaf.exceptions import error_from_response
 
 from conftest import (
+    ACCOUNT_INDEX,
+    BAD_SIGNATURE,
     BASE,
     KAT,
+    KEY_DISABLED,
     KEYS,
     L2_PUBLIC_KEY,
     L2_SECRET,
     MARKET_INDEX,
     MARKET_L2,
-    NO_ACCOUNT,
+    TRADING_KEY,
+    UNKNOWN_KEY,
     FakeExchange,
+    freeze,
     market_detail,
     routes,
     secret_locals,
+    verify_login,
     verify_order,
 )
 
@@ -101,14 +99,11 @@ INDEX_TOO_OLD = (
 RESERVED_TOO_SOON = "l2 order_index: the account's last reservation is less than 1 s old"
 STALE_EPOCH = "l2 epoch: not the account's current settle epoch"
 WRONG_CHAIN = "l2 chain id: not the engine's L2 chain"
-BAD_SIGNATURE = "l2 signature: the Schnorr signature does not verify"
 K1_BOUND = "l2 k1 bound: quantity x price / 10 is not below 2^48 (K1's 48-bit fill quote)"
 CLOSED = "Cannot send a request, as the client has been closed."
 
-# Another account's trading key (K1's second known-answer key).
+# Another trading key (K1's second known-answer key): in force on the account once yours was reset.
 OTHER_KEY = "0x" + KAT["keys"][1]["pk"]
-# K1's group order n: 40 bytes little-endian, not a secret key.
-N = 0x7FFFFFFD80000007_7FFFFFF100000016_7FFFFFE6CFB80639_E8885C39D724A09C_E80FD996948BFFE1
 
 HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
@@ -153,17 +148,10 @@ def unsigned(body: dict) -> dict:
     return {k: v for k, v in body.items() if k not in ("l2ExpiryMs", "l2SigS", "l2SigE")}
 
 
-def freeze(l2_clock: SimpleNamespace, at_ms: int | None = None) -> int:
-    """Stop the SDK's order clock at ``at_ms`` (default: now), in unix ms; returns it."""
-    now_ms = time.time_ns() // 1_000_000 if at_ms is None else at_ms
-    l2_clock.time_ns = lambda: now_ms * 1_000_000
-    return now_ms
-
-
 def pool(client: LoafClient) -> tuple[L2State, AccountState]:
     """The client's L2 state with the account read, as a first placement on OPRA leaves it."""
     l2 = client.orders._l2
-    return l2, l2.account(L2_PUBLIC_KEY, "OPRA")
+    return l2, l2.account(ACCOUNT_INDEX)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,7 +174,7 @@ def test_limit_body_signed_no_bearer(exchange, trading_client):
         **CONTEXT,
     }
     assert all(re.fullmatch("[0-9a-f]{80}", body[k]) for k in ("l2SigS", "l2SigE"))
-    # The signature authenticates a placement: the API key is set but not sent.
+    # The signature authenticates a placement: no login token is sent with it.
     assert "authorization" not in request.headers
     assert request.headers["content-type"] == "application/json"
     verify_order(body)
@@ -216,10 +204,12 @@ def test_context_reads(exchange, trading_client):
     ]
     detail, keys, reserve, _ = exchange.requests
     assert "authorization" not in detail.headers  # a public read
-    # The account: apiKeyIndex only (the SDK compares the key in force with its own).
-    assert keys.headers["authorization"] == "Bearer testkey"
+    # The account's epoch and its order numbers, both authenticated by one login token the
+    # trading key signed for its account: the account is the token's, so only apiKeyIndex is sent.
     assert keys.url.params.multi_items() == [("apiKeyIndex", "0")]
-    assert reserve.headers["authorization"] == "Bearer testkey"
+    bearer = keys.headers["authorization"]
+    assert reserve.headers["authorization"] == bearer
+    assert verify_login(bearer[len("Bearer ") :])["l2AccountIndex"] == ACCOUNT_INDEX
     assert json.loads(reserve.content) == {"count": 1}
 
     # The market and the account are kept; the next order only needs order numbers.
@@ -356,6 +346,21 @@ def test_unusable_market(exchange, trading_client, market_index, l2, field):
     assert routes(exchange.requests) == ["GET /trade/OPRA"]
 
 
+@pytest.mark.parametrize("kind", [..., None, "FUTURE", "spot", "perp"])
+def test_unusable_market_type(exchange, trading_client, kind):
+    # The type decides what the l2 holds and what an order sends: never guessed.
+    detail = market_detail()
+    if kind is ...:
+        del detail["market"]["type"]
+    else:
+        detail["market"]["type"] = kind
+    exchange.details["OPRA"] = detail
+    message = "GET /trade/OPRA answered an unusable market.type"
+    with pytest.raises(loaf.LoafServerError, match=re.escape(message)):
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
+    assert routes(exchange.requests) == ["GET /trade/OPRA"]
+
+
 @pytest.mark.parametrize("market_index", [0, 254, 2048, 4094, 4095])
 def test_any_12_bit_market_index_is_signed(exchange, trading_client, market_index):
     # 0 is a market (a perp's), never "none". The SDK checks only K1's 12 bits; the exchange
@@ -371,64 +376,81 @@ def test_any_12_bit_market_index_is_signed(exchange, trading_client, market_inde
 # Account refusals: nothing kept, reserved or posted
 # --------------------------------------------------------------------------- #
 
-NOT_ENABLED = (
-    "Trading is not enabled on your account on OPRA's market (no trading key is in force): open "
-    "OPRA on the Loaf web app's Trade page, enable trading there and wait for it to take effect, "
-    "then set LOAF_SECRET_KEY to the key in force: the web app's Show trading key (README §2)."
-)
-NOT_IN_FORCE = "LOAF_SECRET_KEY is not the trading key in force on OPRA's market"
-
 
 @pytest.mark.parametrize(
-    "keys, error, message",
+    "keys, field",
     [
-        (
-            None,
-            loaf.LoafConfigError,
-            "You have no trading account on OPRA's market yet: deposit in the Loaf web app first.",
-        ),
-        ({"journaledKey": None}, loaf.LoafConfigError, NOT_ENABLED),
-        ({"epoch": None}, loaf.LoafConfigError, NOT_ENABLED),
-        ({"journaledKey": "0x" + "0" * 80}, loaf.LoafConfigError, NOT_ENABLED),  # disabled on L1
-        ({"journaledKey": OTHER_KEY}, loaf.LoafConfigError, NOT_IN_FORCE),
-        ({"journaledKey": OTHER_KEY, "pending": True}, loaf.LoafConfigError, NOT_IN_FORCE),
-        ({"accountIndex": -1}, loaf.LoafServerError, "unusable accountIndex"),
-        ({"accountIndex": 2**48}, loaf.LoafServerError, "unusable accountIndex"),
-        ({"accountIndex": True}, loaf.LoafServerError, "unusable accountIndex"),
-        ({"accountIndex": None}, loaf.LoafServerError, "unusable accountIndex"),
-        ({"epoch": "2"}, loaf.LoafServerError, "unusable epoch"),
-        ({"epoch": 2**48}, loaf.LoafServerError, "unusable epoch"),
-        ({"journaledKey": L2_PUBLIC_KEY[:-1]}, loaf.LoafServerError, "unusable journaledKey"),
-        (
-            {"journaledKey": "0x" + L2_PUBLIC_KEY[2:].upper()},
-            loaf.LoafServerError,
-            "unusable journaledKey",
-        ),
+        ({"accountIndex": 6}, "accountIndex"),  # not your trading key's account
+        ({"accountIndex": -1}, "accountIndex"),
+        ({"accountIndex": True}, "accountIndex"),
+        ({"accountIndex": "5"}, "accountIndex"),
+        ({"accountIndex": None}, "accountIndex"),
+        ({"epoch": None}, "epoch"),  # the key in force signed the token: it has an epoch
+        ({"epoch": "2"}, "epoch"),
+        ({"epoch": 2**48}, "epoch"),
+        ({"epoch": True}, "epoch"),
     ],
 )
-def test_account_refusals(exchange, trading_client, keys, error, message):
-    exchange.keys = None if keys is None else {**KEYS, **keys}
+def test_unusable_account(exchange, trading_client, keys, field):
+    exchange.keys = {**KEYS, **keys}
     orders = trading_client().orders
     for _ in range(2):  # nothing is kept: the next order reads the account again
-        with pytest.raises(error, match=re.escape(message)) as info:
+        with pytest.raises(loaf.LoafServerError) as info:
             orders.limit_buy("OPRA", 10, 167.49)
-        assert type(info.value) is error
-    # The market is kept, so the second order reads the account alone.
+        assert info.value.message == f"GET /l2/keys answered an unusable {field}"
+    # The market is kept, so the second order reads the account alone; nothing is reserved.
     assert routes(exchange.requests) == ["GET /trade/OPRA", "GET /l2/keys", "GET /l2/keys"]
 
 
-def test_key_not_in_force_names_the_remedy(exchange, trading_client):
-    exchange.keys = {**KEYS, "journaledKey": OTHER_KEY}
-    with pytest.raises(loaf.LoafConfigError) as info:
-        trading_client().orders.limit_buy("OPRA", 10, 167.49)
-    assert "the web app's Show trading key" in str(info.value)
-    assert "re-arm your stops and takes" in str(info.value)
-
-
-def test_pending_is_not_read(exchange, trading_client):
-    # The SDK compares the key in force itself: "pending" decides nothing.
-    exchange.keys = {**KEYS, "pending": True}
+def test_the_journaled_key_and_pending_are_not_read(exchange, trading_client):
+    # The login token is checked against the key in force: GET /l2/keys is read for the epoch.
+    exchange.keys = {**KEYS, "journaledKey": OTHER_KEY, "pending": True}
     assert trading_client().orders.limit_buy("OPRA", 10, 167.49).orderId == 1
+
+
+@pytest.mark.parametrize(
+    "key_in_force, reason",
+    [(OTHER_KEY, BAD_SIGNATURE), (None, UNKNOWN_KEY), ("0x" + "0" * 80, KEY_DISABLED)],
+    ids=["reset", "none", "disabled"],
+)
+def test_a_trading_key_not_in_force_is_refused_with_what_to_do(
+    exchange, trading_client, key_in_force, reason
+):
+    # Reset in the web app (another key in force), no key in force yet, or disabled on L1: the
+    # account read's login token is refused, and nothing is reserved or placed.
+    exchange.key_in_force = key_in_force
+    orders = trading_client().orders
+    for _ in range(2):
+        with pytest.raises(loaf.LoafAuthError) as info:
+            orders.limit_buy("OPRA", 10, 167.49)
+        assert info.value.message.startswith(reason + " — LOAF_TRADING_KEY is not the trading key")
+        assert info.value.body == {"error": reason}
+    # The refusal shows the key stale, not the market: the market is read once.
+    assert routes(exchange.requests) == ["GET /trade/OPRA", "GET /l2/keys", "GET /l2/keys"]
+    # Each refusal drops its token: the next request signs a fresh one.
+    first, second = (r.headers["authorization"] for r in exchange.gets("/l2/keys"))
+    assert first != second
+    exchange.key_in_force = L2_PUBLIC_KEY
+    assert orders.limit_buy("OPRA", 10, 167.49).orderId == 1
+
+
+def test_a_market_on_another_chain_is_refused_before_anything_is_signed(
+    exchange, trading_client
+):
+    # The trading key is another deployment's: its account and its chain are not this one's.
+    exchange.details["OPRA"] = market_detail(l2={**MARKET_L2, "l2ChainId": 4243})
+    orders = trading_client().orders
+    for _ in range(2):
+        with pytest.raises(loaf.LoafConfigError) as info:
+            orders.limit_buy("OPRA", 10, 167.49)
+        assert str(info.value) == (
+            "OPRA's market is on L2 chain 4243 and your trading key is for L2 chain 4242: "
+            "LOAF_TRADING_KEY is from another Loaf deployment than the one at http://test/api "
+            "(LOAF_API_BASE_URL). Set LOAF_TRADING_KEY to the trading key this deployment's web "
+            "app shows (README §2), or LOAF_API_BASE_URL to the key's deployment."
+        )
+    # The market is kept, read once; no login token is signed or sent.
+    assert routes(exchange.requests) == ["GET /trade/OPRA"]
 
 
 def test_other_keys_404_propagates(exchange, trading_client):
@@ -446,26 +468,6 @@ def test_other_keys_404_propagates(exchange, trading_client):
         "POST /l2/order-indices",
         "POST /orders",
     ]
-
-
-def test_read_account(exchange, trading_client):
-    client = trading_client()
-    assert read_account(client, "OPRA") == (5, 2, L2_PUBLIC_KEY)
-    # The caller compares the key in force with its own.
-    exchange.keys = {**KEYS, "journaledKey": OTHER_KEY}
-    assert read_account(client, "OPRA") == (5, 2, OTHER_KEY)
-    for keys, error, message in (
-        (None, loaf.LoafConfigError, "You have no trading account on OPRA's market yet"),
-        ({**KEYS, "epoch": None}, loaf.LoafConfigError, NOT_ENABLED),
-        ({**KEYS, "journaledKey": "0x" + "0" * 80}, loaf.LoafConfigError, NOT_ENABLED),
-        ({**KEYS, "accountIndex": True}, loaf.LoafServerError, "unusable accountIndex"),
-    ):
-        exchange.keys = keys
-        with pytest.raises(error, match=re.escape(message)):
-            read_account(client, "OPRA")
-    assert [r.url.params.multi_items() for r in exchange.gets("/l2/keys")] == [
-        [("apiKeyIndex", "0")]
-    ] * 6
 
 
 # --------------------------------------------------------------------------- #
@@ -498,7 +500,7 @@ def test_reservation_too_soon_twice_raises(exchange, trading_client, l2_clock):
     "answer, reads",
     [
         ({"accountIndex": True}, []),
-        ({"accountIndex": 6}, ["GET /l2/keys"]),  # another account's range
+        ({"accountIndex": 6}, []),  # another account's range
         ({"firstIndex": 0}, []),
         ({"count": 0}, []),
         ({"firstIndex": 2**40 - 1, "count": 2}, []),  # its last index does not fit 40 bits
@@ -521,22 +523,8 @@ def test_unusable_reservation(exchange, trading_client, answer, reads):
     assert exchange.posts("/orders") == []
     sent = len(exchange.requests)
     orders.limit_buy("OPRA", 10, 167.49)
-    # The account is kept, unless the range was another account's: then it is read again.
+    # The account is kept: its index is the trading key's.
     assert routes(exchange.requests[sent:]) == reads + ["POST /l2/order-indices", "POST /orders"]
-
-
-def test_another_accounts_range_drops_the_account_and_its_block(exchange, trading_client):
-    l2, account = pool(trading_client())
-    l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 1
-    l2.take(account, 1, DEFAULT_ORDER_TTL_MS)  # reserves 2: one number left
-    exchange.keys = {**KEYS, "accountIndex": 6}  # now account 6, with the same key in force
-    with pytest.raises(loaf.LoafServerError, match="no order can be signed in"):
-        l2.take(account, 3, DEFAULT_ORDER_TTL_MS)  # needs 3: the reservation names account 6
-    fresh = l2.account(L2_PUBLIC_KEY, "OPRA")
-    assert fresh == AccountState(6, 2) and len(exchange.gets("/l2/keys")) == 2
-    # Account 5's last number is never signed for account 6: a new block.
-    assert l2.take(fresh, 1, DEFAULT_ORDER_TTL_MS)[0] == 4104
-    assert counts(exchange) == [1, 2, 4, 4]
 
 
 @pytest.mark.parametrize(
@@ -629,7 +617,6 @@ def test_clock_hours_ahead(exchange, trading_client, l2_clock):
             loaf.LoafServiceUnavailableError,
         ),
         (404, "Not found", loaf.LoafNotFoundError),
-        (404, NO_ACCOUNT, loaf.LoafNotFoundError),
     ],
 )
 def test_other_reservation_refusals_propagate(
@@ -647,15 +634,15 @@ def test_expiry_read_after_the_reservation(exchange, l2_clock):
     now = freeze(l2_clock)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/l2/order-indices":  # the reservation takes ten minutes
-            freeze(l2_clock, now + 600_000)
+        if request.url.path == "/api/l2/order-indices":  # the reservation takes a minute
+            freeze(l2_clock, now + 60_000)
         return exchange.handler(request)
 
     http = httpx.Client(transport=httpx.MockTransport(handler), base_url=BASE)
-    client = LoafClient(api_key="testkey", secret_key=L2_SECRET, base_url=BASE, http_client=http)
+    client = LoafClient(TRADING_KEY, base_url=BASE, http_client=http)
     client.orders.limit_buy("OPRA", 10, 167.49)
     (body,) = exchange.bodies("/orders")
-    assert body["l2ExpiryMs"] == now + 600_000 + L2_BUFFER_MS + DEFAULT_ORDER_TTL_MS
+    assert body["l2ExpiryMs"] == now + 60_000 + L2_BUFFER_MS + DEFAULT_ORDER_TTL_MS
 
 
 # --------------------------------------------------------------------------- #
@@ -755,13 +742,24 @@ def test_leg_rules(exchange, trading_client, legs, message):
 
 def test_leg_rules_side_and_market_parent(exchange, trading_client):
     orders = trading_client().orders
-    with pytest.raises(loaf.LoafValidationError, match="only be attached to a BUY"):
-        orders.create("OPRA", "SELL", 1, price=100, sl_price=90)
-    with pytest.raises(TypeError):
-        orders.limit_sell("OPRA", 1, 100, sl_price=90)  # legs protect a BUY only
     with pytest.raises(loaf.LoafValidationError, match="tp_price must be above sl_price"):
         orders.market_buy("OPRA", 1, tp_price=90, sl_price=95)
     assert exchange.requests == []
+    # Spot has no short to protect: a SELL's legs are refused once its market is read (a perps
+    # SELL takes them).
+    message = (
+        "OPRA is a spot market: take-profit and stop-loss can only be attached to a BUY order "
+        "there (spot has no short to protect)"
+    )
+    for place in (
+        lambda: orders.create("OPRA", "SELL", 1, price=100, tp_price=90),
+        lambda: orders.limit_sell("OPRA", 1, 100, tp_price=90, sl_price=110),
+        lambda: orders.market_sell("OPRA", 1, reference_price=100, sl_price=110),
+    ):
+        with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
+            place()
+        assert info.value.status_code == 0
+    assert routes(exchange.requests) == ["GET /trade/OPRA"]  # read once, then remembered
 
     # On a MARKET parent the exchange checks the triggers against its own reference. The legs
     # keep the client's max slippage (2% here) whatever the entry's max_slippage_bps is.
@@ -936,6 +934,95 @@ def test_every_placement_takes_ttl(exchange, trading_client, l2_clock, place):
     assert exchange.requests == []
     place(orders, HOUR_MS)
     assert json.loads(exchange.requests[-1].content)["l2ExpiryMs"] == now + L2_BUFFER_MS + HOUR_MS
+
+
+# --------------------------------------------------------------------------- #
+# Time in force
+# --------------------------------------------------------------------------- #
+
+POST_ONLY_WOULD_TAKE = "Post-only order rejected: it would have traded with a resting order at once"
+
+
+@pytest.mark.parametrize("name", ["GTC", "IOC", "FOK", "POST_ONLY"])
+@pytest.mark.parametrize("member", [False, True], ids=["text", "member"])
+def test_a_limit_orders_time_in_force(exchange, trading_client, name, member):
+    time_in_force = loaf.TimeInForce[name] if member else name
+    orders = trading_client().orders
+    orders.limit_buy("OPRA", 10, 167.49, time_in_force=time_in_force)
+    orders.limit_sell("OPRA", 10, 170, time_in_force=time_in_force)
+    orders.create("OPRA", "BUY", 10, price=167.49, time_in_force=time_in_force)
+    bodies = exchange.bodies("/orders")
+    assert [body["timeInForce"] for body in bodies] == [name] * 3
+    for body in bodies:
+        assert list(body) == ORDER_KEYS
+        verify_order(body)
+    # A stop or take stays GTC: the order it books when it fires rests.
+    orders.stop_loss("OPRA", 2, 95)
+    assert exchange.bodies("/orders/conditional")[-1]["timeInForce"] == "GTC"
+
+
+@pytest.mark.parametrize("name", ["GTC", "IOC", "FOK"])
+@pytest.mark.parametrize("member", [False, True], ids=["text", "member"])
+def test_a_market_orders_time_in_force(exchange, trading_client, name, member):
+    time_in_force = loaf.TimeInForce[name] if member else name
+    trading_client().orders.create(
+        "OPRA", "BUY", 2, type="MARKET", reference_price=160, time_in_force=time_in_force
+    )
+    (body,) = exchange.bodies("/orders")
+    assert (body["type"], body["timeInForce"]) == ("MARKET", name)
+    verify_order(body)
+
+
+def test_an_order_is_gtc_by_default(exchange, trading_client):
+    orders = trading_client().orders
+    orders.limit_sell("OPRA", 10, 170)
+    orders.market_buy("OPRA", 2)  # the exchange runs a MARKET GTC as IOC: it never rests
+    orders.create("OPRA", "SELL", 2, type="MARKET", reference_price=160)
+    assert [body["timeInForce"] for body in exchange.bodies("/orders")] == ["GTC"] * 3
+
+
+@pytest.mark.parametrize("member", [False, True], ids=["text", "member"])
+def test_post_only_on_a_market_order_is_refused_locally(exchange, trading_client, member):
+    time_in_force = loaf.TimeInForce["POST_ONLY"] if member else "POST_ONLY"
+    with pytest.raises(loaf.LoafValidationError) as info:
+        trading_client().orders.create(
+            "OPRA", "BUY", 2, type="MARKET", reference_price=160, time_in_force=time_in_force
+        )
+    assert (info.value.status_code, info.value.message) == (
+        0,
+        "time_in_force: POST_ONLY requires a LIMIT order",
+    )
+    assert exchange.requests == []
+
+
+@pytest.mark.parametrize("time_in_force", ["GTD", "gtc", "ioc", "", "POST ONLY", None, 0, True])
+def test_an_unknown_time_in_force_is_refused_locally(exchange, trading_client, time_in_force):
+    orders = trading_client().orders
+    message = f"time_in_force must be GTC, IOC, FOK or POST_ONLY (got {time_in_force!r})"
+    for place in (
+        lambda: orders.limit_buy("OPRA", 10, 167.49, time_in_force=time_in_force),
+        lambda: orders.limit_sell("OPRA", 10, 170, time_in_force=time_in_force),
+        lambda: orders.create("OPRA", "BUY", 2, type="MARKET", time_in_force=time_in_force),
+    ):
+        with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
+            place()
+        assert info.value.status_code == 0
+    assert exchange.requests == []
+
+
+def test_a_post_only_order_that_would_take_is_its_own_error(exchange, trading_client):
+    orders = trading_client().orders
+    exchange.queue("/orders", error_reply(400, POST_ONLY_WOULD_TAKE))
+    with pytest.raises(loaf.PostOnlyWouldTakeError) as info:
+        orders.limit_buy("OPRA", 10, 167.49, time_in_force="POST_ONLY")
+    error = info.value
+    assert isinstance(error, loaf.LoafValidationError)
+    assert (error.status_code, error.message) == (400, POST_ONLY_WOULD_TAKE)
+    # Nothing was placed: the next order signs the same order number.
+    orders.limit_buy("OPRA", 10, 160, time_in_force="POST_ONLY")
+    refused, placed = exchange.bodies("/orders")
+    assert refused["l2OrderIndex"] == placed["l2OrderIndex"] == 4097
+    verify_order(placed)
 
 
 # --------------------------------------------------------------------------- #
@@ -1212,22 +1299,22 @@ def test_client_max_slippage_read_per_order(exchange, trading_client):
 # --------------------------------------------------------------------------- #
 
 
-def test_placing_needs_both_keys(exchange, trading_client):
-    keyless = trading_client(secret_key=None)
+def test_placing_and_cancelling_need_the_trading_key(exchange, trading_client):
+    keyless = trading_client(trading_key=None)
     assert keyless.public_key is None
     for place in (
         lambda orders: orders.limit_buy("OPRA", 10, 167.49),
         lambda orders: orders.stop_loss("OPRA", 5, 90),
     ):
-        with pytest.raises(loaf.LoafConfigError, match="LOAF_SECRET_KEY") as info:
+        with pytest.raises(loaf.LoafConfigError) as info:
             place(keyless.orders)
-        assert "the web app's Show trading key gives it" in str(info.value)
-    # The API key reads the account and reserves order numbers (and cancels).
-    readless = trading_client(api_key=None)
-    with pytest.raises(loaf.LoafConfigError, match="LOAF_API_KEY"):
-        readless.orders.limit_buy("OPRA", 10, 167.49)
-    with pytest.raises(loaf.LoafConfigError):
-        readless.orders.cancel(1)
+        assert str(info.value) == (
+            "Placing orders needs your trading key: set $LOAF_TRADING_KEY to the web app's Show "
+            "trading key (README §2), or pass trading_key=..."
+        )
+    # Its login token authenticates a cancel.
+    with pytest.raises(loaf.LoafConfigError, match=r"\$LOAF_TRADING_KEY"):
+        keyless.orders.cancel(1)
     assert exchange.requests == []
 
 
@@ -1509,7 +1596,7 @@ def test_placement_timeout_ignores_injected_clients_timeout(exchange):
         base_url=BASE,
         timeout=httpx.Timeout(120.0, connect=20.0),
     )
-    client = LoafClient(api_key="testkey", base_url=BASE, secret_key=L2_SECRET, http_client=http)
+    client = LoafClient(TRADING_KEY, base_url=BASE, http_client=http)
     client.orders.limit_buy("OPRA", 10, 167.49)
     *reads, post = exchange.requests
     for read in reads:
@@ -1661,7 +1748,7 @@ def test_response_hook_raising_on_a_5xx_is_unknown(exchange):
         base_url=BASE,
         event_hooks={"response": [lambda response: response.raise_for_status()]},
     )
-    client = LoafClient(api_key="testkey", secret_key=L2_SECRET, base_url=BASE, http_client=http)
+    client = LoafClient(TRADING_KEY, base_url=BASE, http_client=http)
     exchange.queue("/orders", error_reply(503, NOT_CONFIRMED))
     with pytest.raises(OrderOutcomeUnknownError) as info:
         client.orders.limit_buy("OPRA", 10, 167.49)
@@ -1715,6 +1802,20 @@ def test_context_refusal_rereads_market_and_account(
     assert indices(exchange) == [4097, 4098, 4098]
 
 
+def test_a_refused_reservation_rereads_the_account_alone(exchange, trading_client):
+    # The reservation's login token is refused (the key was reset since the account read): the
+    # account is read again, but the market is kept, since the reservation never names it.
+    orders = trading_client().orders
+    exchange.queue("/l2/order-indices", error_reply(401, BAD_SIGNATURE))
+    with pytest.raises(loaf.LoafAuthError):
+        orders.limit_buy("OPRA", 10, 167.49)
+    sent = len(exchange.requests)
+    orders.limit_buy("OPRA", 10, 167.49)
+    assert routes(exchange.requests[sent:]) == [
+        "GET /l2/keys", "POST /l2/order-indices", "POST /orders"
+    ]
+
+
 @pytest.mark.parametrize(
     "status, message, error",
     [
@@ -1745,7 +1846,7 @@ def test_market_refusal_rereads_the_market(exchange, trading_client, status, mes
 @pytest.mark.parametrize(
     "message, error",
     [
-        ("Trading halted for this market", loaf.TradingHaltedError),
+        ("Trading is halted on this market", loaf.MarketHaltedError),
         ("Trading is currently halted", loaf.TradingHaltedError),
         ("Trading on this market has not started yet", loaf.LoafForbiddenError),
     ],
@@ -1805,14 +1906,15 @@ def test_unknown_outcome_still_invalidates(exchange, trading_client, message, re
 def test_refusal_of_an_older_account_keeps_a_fresh_read(exchange, trading_client):
     l2, account = pool(trading_client())
     l2.remember("OPRA", market_of(market_detail(), "OPRA"))
+    _, block, _ = l2.take(account, 1, DEFAULT_ORDER_TTL_MS)
     epoch_refusal = error_from_response(400, {"error": STALE_EPOCH})
     # An order signed with the account as it was before another thread read it again.
-    l2.after_refusal("OPRA", account._replace(epoch=1), None, epoch_refusal)
+    l2.after_refusal("OPRA", account._replace(epoch=1), block, epoch_refusal)
     assert l2.market("OPRA") is None  # the market is dropped whatever it was
-    assert l2.account(L2_PUBLIC_KEY, "OPRA") == account
+    assert l2.account(ACCOUNT_INDEX) == account
     assert len(exchange.gets("/l2/keys")) == 1  # the fresh read is kept
-    l2.after_refusal("OPRA", account, None, epoch_refusal)
-    l2.account(L2_PUBLIC_KEY, "OPRA")
+    l2.after_refusal("OPRA", account, block, epoch_refusal)
+    l2.account(ACCOUNT_INDEX)
     assert len(exchange.gets("/l2/keys")) == 2  # dropped: read again
 
 
@@ -1955,8 +2057,8 @@ def test_resubmit(exchange, trading_client):
     with pytest.raises(OrderOutcomeUnknownError) as stop:
         trading_client(max_retries=0).orders.stop_loss("OPRA", 5, 90)
 
-    # The body carries its own signature: neither key is needed to re-send it.
-    bare = trading_client(api_key=None, secret_key=None)
+    # The body carries its own signature: no trading key is needed to re-send it.
+    bare = trading_client(trading_key=None)
     sent = len(exchange.requests)
     exchange.queue("/orders", duplicate_reply())
     assert bare.orders.resubmit(order.value.signed_body).duplicate is True
@@ -2002,6 +2104,7 @@ def test_resubmit_only_while_the_order_can_rest(exchange, trading_client, l2_clo
     assert info.value.__cause__ is refusal
     until = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(rests_until // 1000))
     assert f"could rest only until {until}" in refusal.message
+    assert "(its l2ExpiryMs minus 72 hours)" in refusal.message  # L2_BUFFER_MS
     assert f"expiryMs {body['l2ExpiryMs']}" in refusal.message
     # Nothing expires a stop, a take or a leg: one that landed must be cancelled.
     assert "stays ARMED" in refusal.message
@@ -2045,152 +2148,14 @@ def test_resubmit_failure_stays_unknown(exchange, trading_client, replies, reaso
 
 
 # --------------------------------------------------------------------------- #
-# The trading key
+# Signing with the trading key
 # --------------------------------------------------------------------------- #
 
 
-def test_trading_key_from_argument_or_environment(monkeypatch):
-    for secret in (L2_SECRET, L2_SECRET.upper()):
-        assert LoafClient(base_url=BASE, secret_key=secret).public_key == L2_PUBLIC_KEY
-
-    monkeypatch.setenv("LOAF_SECRET_KEY", f"  {L2_SECRET}\n")
-    with LoafClient(api_key="testkey", base_url=BASE) as client:
-        assert client.public_key == L2_PUBLIC_KEY
-        assert repr(client) == (
-            f"<LoafClient base_url='{BASE}' authenticated public_key={L2_PUBLIC_KEY} "
-            f"v{loaf.__version__}>"
-        )
-
-    monkeypatch.setenv("LOAF_SECRET_KEY", "  ")  # blank counts as unset
-    with LoafClient(base_url=BASE) as client:
-        assert client.public_key is None
-        assert repr(client) == f"<LoafClient base_url='{BASE}' anonymous v{loaf.__version__}>"
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [
-        L2_SECRET[:-1],  # 79 hex
-        L2_SECRET + "0",  # 81 hex
-        "0x" + L2_SECRET,  # 0x + 80 hex is the shape of a public key
-        L2_SECRET[:-1] + "g",
-        "0" * 80,
-        N.to_bytes(40, "little").hex(),  # the group order itself
-        "ab" * 32,  # an API key
-    ],
-)
-def test_bad_trading_key_refused(monkeypatch, bad):
-    def refused(make: Any) -> loaf.LoafConfigError:
-        with pytest.raises(loaf.LoafConfigError, match="is not a trading key") as info:
-            make()
-        assert "the 80 hex characters the web app's Show trading key gives" in str(info.value)
-        assert bad not in str(info.value)
-        assert info.value.__cause__ is None and info.value.__context__ is None
-        return info.value
-
-    refused(lambda: LoafClient(base_url=BASE, secret_key=bad))
-    monkeypatch.setenv("LOAF_SECRET_KEY", bad)
-    refused(lambda: LoafClient(base_url=BASE))
-
-
-def test_trading_key_cannot_be_pickled_or_copied():
-    key = TradingKey(L2_SECRET)
-    assert repr(key) == f"TradingKey(public_key={L2_PUBLIC_KEY!r})"
-    # Serializers that would otherwise read the slots (jsonpickle) ask __getstate__ too.
-    for leak in (pickle.dumps, copy.copy, copy.deepcopy, TradingKey.__getstate__):
-        with pytest.raises(TypeError, match="holds a secret key"):
-            leak(key)
-
-
-def test_trading_key_not_in_traceback_locals(monkeypatch):
-    # Crash reporters and debuggers record every traceback frame's locals.
-    later: list[tuple[type[BaseException], dict[str, Any]]] = [
-        (ValueError, {"max_retries": "x"}),
-    ]
-    monkeypatch.setenv("LOAF_SECRET_KEY", L2_SECRET.upper())
-    for failure, kwargs in later:
-        with pytest.raises(failure) as info:
-            LoafClient(base_url=BASE, **kwargs)
-        assert secret_locals(info.value, L2_SECRET) == []
-    monkeypatch.delenv("LOAF_SECRET_KEY")
-
-    # Nor an explicit argument, whichever step of the constructor fails.
-    earlier: list[tuple[type[BaseException], dict[str, Any]]] = [
-        (loaf.LoafConfigError, {"api_key": "0x" + "ab" * 32}),
-        (loaf.LoafConfigError, {"max_slippage_bps": -1}),
-    ]
-    for failure, kwargs in earlier + later:
-        with pytest.raises(failure) as info:
-            LoafClient(base_url=BASE, secret_key=L2_SECRET, **kwargs)
-        assert secret_locals(info.value, L2_SECRET) == []
-
-    # Nearly the key itself, refused: one hex digit short, or 80 hex that are no scalar below
-    # K1's group order (its last byte is the most significant).
-    for near_miss, kept in (
-        (L2_SECRET[:-1], L2_SECRET[:-1]),
-        (L2_SECRET[:-2] + "ff", L2_SECRET[:-2]),
-    ):
-        monkeypatch.setenv("LOAF_SECRET_KEY", near_miss)
-        with pytest.raises(loaf.LoafConfigError) as info:
-            LoafClient(base_url=BASE)
-        assert secret_locals(info.value, kept) == []
-    monkeypatch.delenv("LOAF_SECRET_KEY")
-
-    # The key as bytes (a secret file read in binary mode) is no trading key either.
-    for raw in (L2_SECRET.encode(), bytearray(L2_SECRET.encode())):
-        with pytest.raises(loaf.LoafConfigError, match="is not a trading key") as info:
-            LoafClient(base_url=BASE, secret_key=raw)  # type: ignore[arg-type]
-        assert info.value.__context__ is None
-        assert secret_locals(info.value, L2_SECRET) == []
-
-
-def test_interrupted_key_setup_leaves_no_trace(monkeypatch):
-    # A Ctrl-C while the first client computes its public key, when K1 builds its table.
-    def interrupted() -> Any:
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(k1, "_generator_table", interrupted)
-    with pytest.raises(KeyboardInterrupt) as info:
-        LoafClient(base_url=BASE, secret_key=L2_SECRET)
-    assert secret_locals(info.value, L2_SECRET) == []
-
-
-def test_half_built_objects_still_repr():
-    # Crash reporters repr every local of a failed constructor's frame.
-    def selves(exc: BaseException) -> list[Any]:
-        found = []
-        tb = exc.__traceback__
-        while tb is not None:
-            if tb.tb_frame.f_code.co_name == "__init__":
-                found.append(tb.tb_frame.f_locals["self"])
-            tb = tb.tb_next
-        return found
-
-    with pytest.raises(ValueError) as failed:
-        LoafClient(
-            base_url=BASE, secret_key=L2_SECRET, max_retries="x"  # type: ignore[arg-type]
-        )
-    (client,) = selves(failed.value)
-    assert repr(client) == (
-        f"<LoafClient base_url='{BASE}' anonymous public_key={L2_PUBLIC_KEY} v{loaf.__version__}>"
-    )
-    with pytest.raises(loaf.LoafConfigError) as refused:
-        LoafClient(base_url=BASE, secret_key="0" * 80)
-    client, key = selves(refused.value)
-    assert repr(client) == f"<LoafClient base_url=None anonymous v{loaf.__version__}>"
-    assert repr(key) == "TradingKey(public_key=None)"
-    with pytest.raises(loaf.LoafConfigError) as refused:
-        loaf.LoafWebSocketClient(ws_url="ws://test/ws", api_key="0x" + "ab" * 32)
-    (ws,) = selves(refused.value)
-    assert repr(ws) == "<LoafWebSocketClient None idle channels=0>"
-    with pytest.raises(loaf.LoafConfigError) as refused:
-        loaf.LoafWebSocketClient(ws_url="ws://test/ws", reconnect_delay=0)
-    (ws,) = selves(refused.value)
-    assert repr(ws) == "<LoafWebSocketClient 'ws://test/ws' idle channels=0>"
-
-
 def test_signing_failure_leaves_no_trace(exchange, trading_client, monkeypatch):
-    orders = trading_client().orders
+    client = trading_client()
+    orders = client.orders
+    pool(client)  # the account, read with a login token signed before the failure below
     with monkeypatch.context() as m:
         # k1.sign itself refuses (31 random bytes), with the secret scalar in its frame.
         m.setattr("loaf._l2.os", SimpleNamespace(urandom=lambda n: bytes(n - 1)))
@@ -2199,8 +2164,8 @@ def test_signing_failure_leaves_no_trace(exchange, trading_client, monkeypatch):
     error = info.value
     assert type(error) is loaf.LoafError
     assert str(error) == (
-        "Signing the order failed (K1Error: l2 signer: the random bytes must be 32 bytes); "
-        "nothing was sent."
+        "Signing with your trading key failed (K1Error: l2 signer: the random bytes must be 32 "
+        "bytes); nothing was sent."
     )
     # Neither a chained error nor the traceback reaches k1.sign's frame.
     assert error.__cause__ is None and error.__context__ is None
@@ -2213,102 +2178,6 @@ def test_signing_failure_leaves_no_trace(exchange, trading_client, monkeypatch):
     assert exchange.posts("/orders") == []
     orders.limit_buy("OPRA", 10, 100, tp_price=120, sl_price=90)
     assert numbers(exchange.bodies("/orders")[-1]) == [4097, 4098, 4099]  # given back
-
-
-def test_wallet_key_shaped_api_key_refused():
-    wallet = "0x" + "ab" * 32
-    for swapped in (
-        wallet,
-        f" {wallet}",
-        f"{wallet}\n",
-        "0X" + "AB" * 32,
-        # As a .env loader may keep it: quoted, with a comment, the pasted line's own name, or
-        # on a second line.
-        f'"{wallet}"',
-        f"'{wallet}'",
-        f"{wallet} # wallet",
-        f"PRIVATE_KEY={wallet}",
-        f"{'cd' * 32}\n{wallet}",
-    ):
-        with pytest.raises(loaf.LoafConfigError, match="looks like a wallet private key") as info:
-            LoafClient(api_key=swapped)
-        assert "ab" * 32 not in str(info.value).lower()
-        # Nor left in the constructor's frame, where crash reporters look.
-        assert secret_locals(info.value, "ab" * 32) == []
-        tb = info.value.__traceback__
-        while tb is not None and tb.tb_frame.f_code.co_name != "__init__":
-            tb = tb.tb_next
-        assert tb is not None and getattr(tb.tb_frame.f_locals["self"], "api_key", None) is None
-
-
-@pytest.mark.parametrize(
-    "misplaced",
-    [
-        L2_SECRET,
-        L2_SECRET.upper(),
-        f" {L2_SECRET}\n",
-        f"LOAF_SECRET_KEY={L2_SECRET}",  # the helper's whole line
-        f"0x{L2_SECRET}",  # 0x-prefixed: it holds a wallet key's shape too, but is 80 hex
-    ],
-)
-def test_trading_key_shaped_api_key_refused(monkeypatch, misplaced):
-    # The API key is sent with every read: the trading key must never go out as one.
-    def refused(make: Any) -> None:
-        with pytest.raises(loaf.LoafConfigError, match="looks like your trading key") as info:
-            make()
-        assert L2_SECRET not in str(info.value).lower()
-        assert secret_locals(info.value, L2_SECRET) == []
-        tb = info.value.__traceback__
-        while tb is not None and tb.tb_frame.f_code.co_name != "__init__":
-            tb = tb.tb_next
-        assert tb is not None and getattr(tb.tb_frame.f_locals["self"], "api_key", None) is None
-
-    refused(lambda: LoafClient(base_url=BASE, api_key=misplaced))
-    monkeypatch.setenv("LOAF_API_KEY", misplaced)
-    refused(lambda: LoafClient(base_url=BASE))
-    monkeypatch.setenv("LOAF_SECRET_KEY", L2_SECRET)  # pasted into both
-    refused(lambda: LoafClient(base_url=BASE))
-
-
-@pytest.mark.parametrize(
-    "stray",
-    [
-        # A .env value written over two lines: a wallet key exported without 0x, or a note, on
-        # the second, or a trading key wrapped over both.
-        f"{'cd' * 32}\n{'ab' * 32}",
-        f"{'cd' * 32}\r\n{'ab' * 32}",
-        f"{'cd' * 32}\n# expires 2027-04-01",
-        f"{L2_SECRET[:40]}\n{L2_SECRET[40:]}",
-        f"{'cd' * 32} {'ab' * 32}",  # or on one line
-        f"\u201c{'cd' * 32}\u201d",  # typographic quotes, which no .env loader removes
-    ],
-    ids=["wallet key", "wallet key crlf", "note", "trading key", "space", "typographic quotes"],
-)
-def test_api_key_with_a_stray_character_refused(monkeypatch, stray):
-    # httpx would quote the whole value in its error, and the WebSocket send it in every auth frame.
-    parts = ("cd" * 32, "ab" * 32, L2_SECRET[:40], L2_SECRET[40:])
-
-    def refused(make: Any) -> None:
-        with pytest.raises(loaf.LoafConfigError, match="stray character inside it") as info:
-            make()
-        assert not any(part in str(info.value).lower() for part in parts)
-        assert secret_locals(info.value, *parts) == []
-
-    refused(lambda: LoafClient(base_url=BASE, api_key=stray))
-    monkeypatch.setenv("LOAF_API_KEY", stray)
-    refused(lambda: LoafClient(base_url=BASE))
-
-
-def test_wallet_key_in_the_environment_refused(monkeypatch):
-    wallet = "0x" + "cd" * 32
-    monkeypatch.setenv("LOAF_WALLET_PRIVATE_KEY", wallet)
-    with pytest.raises(loaf.LoafConfigError, match="LOAF_WALLET_PRIVATE_KEY is set") as info:
-        LoafClient(base_url=BASE, secret_key=L2_SECRET)
-    assert "cd" * 32 not in str(info.value)
-    assert ".env" in str(info.value)  # where a bot's environment usually gets it from
-    monkeypatch.setenv("LOAF_WALLET_PRIVATE_KEY", " \n")  # blank counts as unset
-    with LoafClient(base_url=BASE) as client:
-        assert client.public_key is None
 
 
 # --------------------------------------------------------------------------- #

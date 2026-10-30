@@ -1,8 +1,9 @@
 """Protocol constants for the Loaf API.
 
 These capture the wire-level contract every client must honour: numeric
-precision limits, order limits and defaults, and the timing rules of signed
-orders.
+precision limits, order limits and defaults, the timing rules of signed
+orders, the perps markets' pools and the life of a signed allocate or exit,
+and the trading key and its login tokens.
 """
 
 from __future__ import annotations
@@ -21,15 +22,10 @@ from ._version import __version__
 DEFAULT_BASE_URL = "https://api.loafmarkets.com/api"
 
 #: Environment variables the client reads when arguments are omitted.
-ENV_API_KEY = "LOAF_API_KEY"
-ENV_SECRET_KEY = "LOAF_SECRET_KEY"
+ENV_TRADING_KEY = "LOAF_TRADING_KEY"
 ENV_BASE_URL = "LOAF_API_BASE_URL"
 ENV_WS_URL = "LOAF_WS_URL"
 ENV_MAX_SLIPPAGE_BPS = "LOAF_MAX_SLIPPAGE_BPS"
-
-#: Your account wallet's private key: read only by ``python -m loaf.secret_key``, for one command.
-#: The client refuses to start while it is set.
-ENV_WALLET_PRIVATE_KEY = "LOAF_WALLET_PRIVATE_KEY"
 
 #: User-Agent sent on every request.
 USER_AGENT = f"loaf-python-sdk/{__version__}"
@@ -105,3 +101,55 @@ MAX_ORDER_TTL_MS = L2_MAX_ORDER_LIFE_MS - 2 * L2_ORDER_LIFE_MARGIN_MS - L2_BUFFE
 #: order needs up to this, doubling each time, so a process that stops after a few orders leaves
 #: few of them unused.
 L2_ORDER_INDEX_BLOCK = 64
+
+# --------------------------------------------------------------------------- #
+# Perps
+# --------------------------------------------------------------------------- #
+
+#: The highest perp's market index: markets 0 to 254 are perps, 2048 to 4094 spot markets.
+MAX_PERP_MARKET_INDEX = 254
+
+#: The highest margin pool: pool 0 is the cross pool, 1 to 7 are isolated pools.
+MAX_POOL = 7
+
+#: An allocate's side for your spot USDC balance, beside the pools 0 to 7.
+PERPS_SPOT_SIDE = 255
+
+#: The most rows one page of a perps history read (funding ticks, closes) holds.
+PERPS_HISTORY_MAX = 200
+
+#: The quote asset of every perps market: USDC.
+PERPS_QUOTE_ASSET_ID = 3
+
+#: A perps market's ``flags``: its cross pool (0) may trade it.
+PERPS_FLAG_CROSS = 1
+
+#: A perps market's ``flags``: it is reduce-only, and no order may add to a position.
+PERPS_FLAG_REDUCE_ONLY = 2
+
+#: How long a signed allocate or exit stays valid when ``ttl_ms=`` is omitted: 10 minutes. The
+#: exchange applies it only before its ``l2ExpiryMs`` (now + this), so an outcome left unknown
+#: is settled once that has passed.
+DEFAULT_PERPS_OP_TTL_MS = 600_000
+
+#: The longest ``ttl_ms=`` an allocate or exit accepts: one day.
+MAX_PERPS_OP_TTL_MS = 86_400_000
+
+# --------------------------------------------------------------------------- #
+# The trading key and its login tokens
+# --------------------------------------------------------------------------- #
+
+#: How a trading key starts: the one string the web app's Show trading key gives,
+#: ``loaf_tk_<l2ChainId>_<l2AccountIndex>_<secret key, 80 lowercase hex>``.
+TRADING_KEY_PREFIX = "loaf_tk_"
+
+#: How a login token starts: ``loaf_lt_<l2ChainId>_<l2AccountIndex>_<l2ExpiryMs>_<l2SigS><l2SigE>``,
+#: the Bearer of every authenticated request and the WebSocket's ``auth`` frame, signed with the
+#: trading key over its account, its chain and its expiry.
+L2_LOGIN_TOKEN_PREFIX = "loaf_lt_"
+
+#: How long a login token the SDK signs lives: 10 minutes. It signs a fresh one, for requests and
+#: the live WebSocket connection alike, once the one it holds is down to half of that, 5 minutes.
+#: The exchange takes one only before its expiry and at most 15 minutes ahead of its own clock (the
+#: longest life it takes), so this machine's clock may run up to about 5 minutes fast or 5 slow.
+L2_LOGIN_TOKEN_LIFE_MS = 600_000

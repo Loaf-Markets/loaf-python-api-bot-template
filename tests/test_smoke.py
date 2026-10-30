@@ -9,11 +9,8 @@ from __future__ import annotations
 import copy
 import itertools
 import json
-import os
 import pickle
-import subprocess
-import sys
-from pathlib import Path
+import typing
 from types import SimpleNamespace
 from typing import Optional, get_type_hints
 
@@ -27,13 +24,15 @@ from loaf.exceptions import error_from_response
 from loaf.money import bps_to_fraction, fraction_to_bps
 from loaf.ws.client import derive_ws_url
 
+from conftest import MARKET_STATES, TRADING_KEY, verify_login
+
 BASE = "http://test/api"
 
 
-def make_client(handler, *, api_key: str | None = "testkey", **kwargs) -> LoafClient:
+def make_client(handler, *, trading_key: str | None = TRADING_KEY, **kwargs) -> LoafClient:
     transport = httpx.MockTransport(handler)
     http = httpx.Client(transport=transport, base_url=BASE)
-    return LoafClient(api_key=api_key, base_url=BASE, http_client=http, **kwargs)
+    return LoafClient(trading_key, base_url=BASE, http_client=http, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -75,10 +74,11 @@ def test_error_mapping():
     assert isinstance(error_from_response(429, {"error": "slow"}), loaf.LoafRateLimitError)
     assert type(error_from_response(503, {"error": "down"})) is loaf.LoafServiceUnavailableError
 
-    assert isinstance(
-        error_from_response(403, {"error": "Trading halted for this market"}),
-        loaf.TradingHaltedError,
-    )
+    # A market's halt reads the same from the backend's own check and from the engine's refusal: a
+    # MarketHaltedError, its state MARKET_HALTED, and a TradingHaltedError too.
+    halted = error_from_response(403, {"error": "Trading is halted on this market"})
+    assert type(halted) is loaf.MarketHaltedError and halted.state == "MARKET_HALTED"
+    assert isinstance(halted, loaf.TradingHaltedError)
     delisted = error_from_response(
         403, {"error": "This market has been delisted and is no longer available for trading"}
     )
@@ -106,6 +106,15 @@ def test_error_mapping():
     assert type(
         error_from_response(400, {"error": "Order refused: the market was halted earlier"})
     ) is loaf.LoafValidationError
+    # A post-only order that would have traded at once: its own 400, on the whole text.
+    would_take = "Post-only order rejected: it would have traded with a resting order at once"
+    error = error_from_response(400, {"error": would_take})
+    assert type(error) is loaf.PostOnlyWouldTakeError and error.status_code == 400
+    assert isinstance(error, loaf.LoafValidationError)
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error)):
+        assert type(clone) is loaf.PostOnlyWouldTakeError and str(clone) == str(error)
+    assert type(error_from_response(400, {"error": would_take + "."})) is loaf.LoafValidationError
+    assert type(error_from_response(403, {"error": would_take})) is loaf.LoafForbiddenError
     # A route that does not exist answers with an HTML page; keep just its message.
     missing = error_from_response(
         404,
@@ -115,6 +124,26 @@ def test_error_mapping():
     )
     assert isinstance(missing, loaf.LoafNotFoundError)
     assert missing.message == "Cannot GET /trade"
+
+
+def test_time_in_force_is_shared_types_order_time_in_force():
+    # Shared-Types 2.0.90's ORDER_TIMES_IN_FORCE, in its order; GTD is no time in force.
+    assert [member.value for member in loaf.TimeInForce] == ["GTC", "IOC", "FOK", "POST_ONLY"]
+
+
+@pytest.mark.parametrize("message, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])
+def test_market_state_errors(message, cls, state):
+    error = error_from_response(403, {"error": message})
+    assert type(error) is cls and (error.state, error.status_code) == (state, 403)
+    assert isinstance(error, loaf.LoafForbiddenError)
+    # Code that backs off on halts catches the market's own halt too.
+    assert isinstance(error, loaf.TradingHaltedError) is (state == "MARKET_HALTED")
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
+        assert type(clone) is cls and (clone.state, clone.status_code) == (state, 403)
+        assert str(clone) == str(error)
+    # Only the whole text, and only as a 403.
+    assert not isinstance(error_from_response(403, {"error": message + "."}), loaf.MarketStateError)
+    assert not isinstance(error_from_response(400, {"error": message}), loaf.MarketStateError)
 
 
 def test_errors_survive_pickle_and_copy():
@@ -156,6 +185,45 @@ def test_errors_survive_pickle_and_copy():
     assert str(clone) == str(limited)
 
 
+def test_perps_outcome_unknown_survives_pickle_and_copy():
+    allocate = {
+        "l2ChainId": 4242,
+        "l2AccountIndex": 5,
+        "fromSide": 255,
+        "toSide": 0,
+        "amount": "5000000",
+        "l2Nonce": 3,
+        "l2ExpiryMs": 1_800_000_000_000,
+        "l2SigS": "ab" * 40,
+        "l2SigE": "cd" * 40,
+    }
+    error = loaf.PerpsOutcomeUnknownError(
+        signed_body=allocate, attempts=4, last_error=error_from_response(502, {"error": "x"})
+    )
+    assert str(error) == (
+        "Could not confirm whether the allocate of account 5 at nonce 3 was applied after 4 "
+        "attempt(s) (last error: HTTP 502: x). It may have been applied. Never sign it afresh: "
+        "re-send it unchanged with perps.resubmit(error.signed_body), whose 202 settles it "
+        "(duplicate: applied before; otherwise applied now). Once its l2ExpiryMs 1800000000000 "
+        "has passed, a 422 to a resubmit means it was never applied."
+    )
+    assert "ab" * 40 not in str(error)  # the signatures stay out of the message
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
+        assert type(clone) is loaf.PerpsOutcomeUnknownError
+        assert (clone.signed_body, clone.attempts) == (allocate, 4)
+        assert str(clone) == str(error)
+        assert type(clone.last_error) is loaf.LoafServerError
+    # Neither a connection error nor an order's unknown outcome.
+    assert not isinstance(error, (loaf.LoafConnectionError, loaf.OrderOutcomeUnknownError))
+    exit_body = {
+        k: v for k, v in allocate.items() if k not in ("fromSide", "toSide", "amount")
+    } | {"pool": 2, "market": 9}
+    unknown = loaf.PerpsOutcomeUnknownError(
+        signed_body=exit_body, attempts=1, last_error=error_from_response(502, {"error": "x"})
+    )
+    assert str(unknown).startswith("Could not confirm whether the exit of account 5 at nonce 3")
+
+
 def test_is_conditional_order():
     # `type` is the discriminator: `status` is not (CANCELLED belongs to both spaces).
     for t in ("STOP_LIMIT", "STOP_MARKET", "TAKE_LIMIT", "TAKE_MARKET"):
@@ -187,31 +255,31 @@ def test_models_list_every_shape():
 
 
 def test_auth_header_and_config_error():
-    seen = {}
+    seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["auth"] = request.headers.get("authorization")
+        seen.append(request.headers.get("authorization"))
         return httpx.Response(200, json={"userId": 7})
 
-    client = make_client(handler)
-    client.portfolio.component()
-    assert seen["auth"] == "Bearer testkey"
+    # The Bearer is a login token the trading key signed for its account, on its chain; the key
+    # itself is never sent. Pasted with surrounding whitespace, it is read stripped.
+    for key in (TRADING_KEY, f" {TRADING_KEY}\n"):
+        make_client(handler, trading_key=key).portfolio.component()
+    for bearer in seen:
+        assert bearer is not None and bearer.startswith("Bearer loaf_lt_4242_5_")
+        assert verify_login(bearer[len("Bearer ") :])["l2AccountIndex"] == 5
+        assert TRADING_KEY[-80:] not in bearer
 
-    # A key read from a file or pasted with surrounding whitespace is sent stripped (httpx
-    # refuses a header value ending in a newline, quoting the whole token in the error).
-    padded = make_client(handler, api_key=" testkey\n")
-    assert padded.api_key == "testkey"
-    padded.portfolio.component()
-    assert seen["auth"] == "Bearer testkey"
-
-    # An anonymous client must refuse an authenticated call; a blank key counts as none.
+    # An anonymous client refuses an authenticated call, naming the variable; a blank key counts
+    # as none.
     for anon in (
         LoafClient(base_url=BASE, http_client=httpx.Client(base_url=BASE)),
-        LoafClient(api_key=" \n", base_url=BASE, http_client=httpx.Client(base_url=BASE)),
+        LoafClient(" \n", base_url=BASE, http_client=httpx.Client(base_url=BASE)),
     ):
-        assert anon.api_key is None
-        with pytest.raises(loaf.LoafConfigError):
+        assert anon.public_key is None
+        with pytest.raises(loaf.LoafConfigError, match=r"\$LOAF_TRADING_KEY"):
             anon.portfolio.component()
+    assert len(seen) == 2
 
 
 def test_public_endpoint_sends_no_auth():
@@ -325,6 +393,31 @@ def test_candles_params_and_no_auth():
     assert seen["params"] == {"resolution": "1d", "to": "1700000000"}
 
 
+def test_a_liquidation_take_on_the_tape():
+    # A perps tape row may be a liquidation take: isLiquidation true and, being no trade, no
+    # txHash. It parses like a trade, and the model says so.
+    trade = {
+        "tradeId": 41, "marketIndex": 4, "txHash": "0x" + "ab" * 32, "aggressorSide": "BUY",
+        "price": 101.5, "quantity": 2, "timestamp": 1_700_000_000_000,
+    }
+    take = {
+        "tradeId": 42, "marketIndex": 4, "aggressorSide": "SELL", "price": 99.25, "quantity": 1,
+        "timestamp": 1_700_000_000_500, "isLiquidation": True,
+    }
+    client = make_client(lambda request: httpx.Response(200, json={"trades": [trade, take]}))
+    first, second = client.market.trades("MUS-PERP").trades
+    assert first == trade and first.get("isLiquidation") is None
+    assert second == take and second.isLiquidation is True and "txHash" not in second
+    hints = typing.get_type_hints(models.TradeTick)
+    assert hints["isLiquidation"] is bool and hints["txHash"] is str
+    assert {"isLiquidation", "txHash"} <= models.TradeTick.__optional_keys__
+    # The maker side of a take is the user's liquidation fill: a fill, no trade.
+    assert models.LiquidationFill.__required_keys__ == {
+        "perpsSeq", "orderId", "marketIndex", "ticker", "side", "role", "quantity", "price", "fee",
+        "executedAt",
+    }
+
+
 def test_trades_params_and_no_auth():
     sent = []
     tape = [{"tradeId": 41, "price": 160.5}, {"tradeId": 44, "price": 161}]  # oldest first
@@ -376,34 +469,6 @@ def test_market_routes_take_only_a_market_ticker(call, route):
             call(client, ticker)
         assert info.value.status_code == 0
     assert len(sent) == 3
-
-
-@pytest.mark.parametrize(
-    "call, route",
-    [
-        (lambda c, t: c.market.info_header(t), "/api/info/{}/header"),
-        (lambda c, t: c.market.info_overview(t), "/api/info/{}/overview"),
-        (lambda c, t: c.market.info_documents(t), "/api/info/{}/documents"),
-        (lambda c, t: c.offerings.get(t), "/api/offerings/{}"),
-    ],
-)
-def test_asset_routes_take_only_an_asset_ticker(call, route):
-    sent = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        sent.append((request.url.path, request.headers.get("authorization")))
-        return httpx.Response(200, json={})
-
-    client = make_client(handler)
-    for ticker in ("OPRA", "OPERAHOUSE"):
-        call(client, ticker)
-    assert sent == [(route.format(t), None) for t in ("OPRA", "OPERAHOUSE")]
-    # An asset has no -PERP: that is a market's ticker.
-    for ticker in (*_MALFORMED_TICKERS, "H100-PERP"):
-        with pytest.raises(loaf.LoafValidationError, match="an asset's ticker") as info:
-            call(client, ticker)
-        assert info.value.status_code == 0
-    assert len(sent) == 2
 
 
 def test_candles_busy_503_retried_then_raises():
@@ -499,40 +564,6 @@ def test_a_candle_page_that_does_not_move_back_stops_paging():
     assert sent == [None, "100"]
 
 
-def test_competition_endpoints():
-    seen = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["auth"] = request.headers.get("authorization")
-        if request.content:
-            seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
-
-    client = make_client(handler)
-
-    client.competition.info()
-    assert seen["path"].endswith("/competition") and seen["auth"] is None
-
-    client.competition.queue_position()
-    assert seen["path"].endswith("/competition/queue-position")
-    assert seen["auth"] == "Bearer testkey"
-
-    client.competition.payout_details()
-    assert seen["path"].endswith("/competition/payout-details")
-    assert seen["auth"] == "Bearer testkey"
-
-    client.competition.submit_payout_details(email="win@example.com")
-    assert seen["path"].endswith("/competition/payout-details")
-    assert seen["body"] == {"email": "win@example.com"}  # None wallet dropped
-
-    # Exactly one destination is enforced locally.
-    with pytest.raises(loaf.LoafValidationError):
-        client.competition.submit_payout_details()
-    with pytest.raises(loaf.LoafValidationError):
-        client.competition.submit_payout_details(wallet_address="0xabc", email="a@b.c")
-
-
 def test_rate_limit_headers_recorded():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -600,7 +631,7 @@ def test_cancel_all_route_and_auth():
     assert make_client(handler).orders.cancel_all() == answer
     (request,) = sent  # exactly one request
     assert (request.method, request.url.path) == ("POST", "/api/orders/cancel-all")
-    assert request.headers.get("authorization") == "Bearer testkey"
+    verify_login(request.headers["authorization"][len("Bearer ") :])  # a login token
     assert request.content == b""  # no body
 
 
@@ -673,23 +704,3 @@ def test_an_undecodable_body_is_a_connection_error():
 
 def test_version():
     assert loaf.constants.USER_AGENT == f"loaf-python-sdk/{loaf.__version__}"
-
-
-def test_trading_needs_no_wallet_extra():
-    # eth-account and eth-utils are the `wallet` extra, for python -m loaf.secret_key alone: the SDK
-    # imports, signs and places orders without them. A fresh interpreter, where neither imports.
-    code = """
-import sys
-sys.modules["eth_account"] = sys.modules["eth_utils"] = None
-import httpx
-from conftest import BASE, L2_SECRET, FakeExchange
-from loaf import LoafClient
-exchange = FakeExchange()
-http = httpx.Client(transport=httpx.MockTransport(exchange.handler), base_url=BASE)
-client = LoafClient(api_key="testkey", secret_key=L2_SECRET, base_url=BASE, http_client=http)
-assert client.orders.limit_buy("OPRA", 1, 160).orderId == 1
-assert [name for name in sys.modules if name.startswith("eth_") and sys.modules[name]] == []
-"""
-    tests = Path(__file__).parent
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(tests.parent), str(tests)]))
-    subprocess.run([sys.executable, "-c", code], env=env, check=True)

@@ -3,8 +3,8 @@
 This DOES place a real conditional order, triggered far from the market so it
 never fires. Review it before running against a live account.
 
-It needs both keys: LOAF_SECRET_KEY signs the order, and LOAF_API_KEY reads
-your trading account, reads the row back and cancels it.
+It needs your trading key (LOAF_TRADING_KEY): it signs the order, and the
+login tokens that read your trading account, read the row back and cancel it.
 
     python examples/06_stop_and_take.py
 """
@@ -27,12 +27,7 @@ except ImportError:
 def main() -> None:
     client = LoafClient()
     if client.public_key is None:
-        raise SystemExit("Set LOAF_SECRET_KEY to place orders (see README §2).")
-    if not client.api_key:
-        raise SystemExit(
-            "Set LOAF_API_KEY too, to read your trading account and cancel the order "
-            "(see README §2)."
-        )
+        raise SystemExit("Set LOAF_TRADING_KEY to place orders (see README §2).")
 
     # Pick a market you can trade now: LIVE, not halted, with an L2 market, its trading
     # started (tradingStartsAt None or passed). A halt since this read still refuses the

@@ -1,10 +1,11 @@
-"""05 — Stream your PRIVATE portfolio events (requires an API key).
+"""05 — Stream your PRIVATE portfolio events (requires your trading key).
 
 Receives your balance book, order transitions and your fills in real time.
 
     python examples/05_portfolio_stream.py
 
-The channel carries no id — your API key tells the server whose events to send.
+The channel carries no id — the login token your trading key signs tells the
+server whose events to send.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ except ImportError:
 
 
 def main() -> None:
-    client = LoafClient()  # needs LOAF_API_KEY for the private channel
+    client = LoafClient()
+    if client.public_key is None:
+        raise SystemExit("Set LOAF_TRADING_KEY for your private channel (see README §2).")
 
     ws = client.websocket()
 
@@ -43,6 +46,10 @@ def main() -> None:
     ws.on_trade(lambda m: print(f"FILL {m.trade.side} {m.trade.quantity} "
                                 f"{m.trade.ticker} @ {m.trade.price} "
                                 f"fee={m.trade.fee} #{m.trade.tradeId} {m.trade.txHash[:10]}"))
+    # A liquidation's take from your resting perps order: a fill, but no trade.
+    ws.on_liquidation_fill(lambda m: print(f"LIQUIDATION FILL {m.fill.side} {m.fill.quantity} "
+                                           f"{m.fill.ticker} @ {m.fill.price} "
+                                           f"order #{m.fill.orderId} seq {m.fill.perpsSeq}"))
     # Every ended connection attempt (code None: no connection was made); it reconnects.
     ws.on_disconnect(lambda m: print(f"DISCONNECTED code={m.code} reason={m.reason!r}"))
     ws.on_error(lambda m: print(f"ERROR {m.get('message')}"))
