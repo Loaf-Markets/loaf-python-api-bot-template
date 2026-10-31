@@ -80,7 +80,7 @@ refuses a stack whose backstop holds one on `liq1`.
 | `E2E_STEPS` | all | a comma list of steps (setup always runs), or `restore` alone (no setup) |
 | `E2E_KEEP_BACKSTOP` | unset | `1`: a step's restore leaves the backstop's knob (and the position it took) on the stack for the desk leg; `E2E_STEPS=restore` puts it back later |
 | `E2E_TAG` | e2e | the run's users' display-name prefix |
-| `E2E_WAIT_S` / `E2E_FINAL_WAIT_S` / `E2E_PROOF_WAIT_S` | 180 / 2400 / 5400 | a wait's deadline; an L1 execution's; the proofs' |
+| `E2E_WAIT_S` / `E2E_FINAL_WAIT_S` / `E2E_PROOF_WAIT_S` | 180 / 2400 / 5400 | a wait's deadline; a wait on the mark or a funding tick; the proofs' |
 
 ### The price pump's control
 
@@ -118,8 +118,9 @@ route and its Privy auth are not exercised.
 ## What each step asserts
 
 **setup**
-- every role's market is listed ACTIVE with a ticker; the collateral is asset 3 (USDC); spot and perps share one
-  vault and L2 chain; the RPC serves that chain; ZkLoaf has code; L1's USDC tick and extension are the backend's;
+- every role's market is listed ACTIVE with a ticker; spot and perps share one vault and L2 chain; the RPC serves
+  that chain; ZkLoaf has code; the collateral is asset 3 (USDC), read with the first login, and L1's USDC tick and
+  extension are the backend's;
 - with `E2E_HOME_INDEX`, every role market's index walks there (a market left unreported is reported again);
 - A, B, C (INVESTOR) and MM (MARKET_MAKER, which the backend's per-user rate limiter exempts) are upserted (the users
   id sequence moved past the largest id first) before any deposit to them: the engine binds an address's L2 account
@@ -142,7 +143,7 @@ route and its Privy auth are not exercised.
 - each user deposits on L1 (spot route): mint, approve, `deposit`; the backend's L2 balance rises by exactly the
   deposit (USDC to all; the spot market's base to B and MM, its quote to A and C when it is not USDC); each run
   deposits at least 100 and tops up to the targets;
-- MM's WebSocket connects on its portfolio channel; settled's refusal count is read.
+- each user's WebSocket connects on its portfolio channel, every frame kept; settled's refusal count is read.
 
 **spot**: every order is a whole number of tokens, sized so the least of them, the bid, is worth 2.5 times the
 backend's least order value (10 USDL; under it an order is refused). A limit bid rests whole, holds cash, and its
@@ -150,7 +151,7 @@ cancel releases exactly its hold; MM's post-only ask rests and
 A's post-only bid at it is refused POST_ONLY_WOULD_TAKE; an IOC with nothing to cross and a FOK for twice the
 resting size are refused with the backend's texts; an IOC for twice the ask fills its size and rests nothing; a FOK
 for the ask fills whole; C's bid takes B's ask: the tokens move from B to C, C pays the notional plus at most 1 %
-fee, and the fill is in C's history.
+fee, and the fill is in C's history. C's fill pushes its holding_update with its average entry.
 
 **perps** (market `trade`)
 - allocates: into pool 0 and isolated pool 1 and back out of pool 1; the spot USDC moves by exactly the ticks, and a
@@ -163,10 +164,15 @@ fee, and the fill is in C's history.
 - a reduce-only sell of half A's long fills; a reduce-only buy in a flat pool opens nothing (with MM's ask resting at
   its price);
 - a buy with TP/SL legs from pool 3: two legs, both ARMED once the parent fills; the index walks above the
-  take-profit, the leg fires and closes the long into MM's bid;
-- A's and B's positions read entry, entry quote, notional, funding owed, liquidation price (on the losing side of
-  the entry) and adlRank; uPnL is logged; their pools are healthy; the market's live state reads the index, open
-  interest (at least the run's size), funding index, next tick, period and trading state.
+  take-profit: the mark lags it, within 5 %, and when it gets there the leg fires and closes the long into MM's bid;
+- A's fills read source, direction and closed PnL (the pool 1 close exactly (bid - ask) x size), its push carries
+  the long, and its open order its pool;
+- A's and B's positions read ticker, qem, risk, band, entry, entry quote, notional, funding owed and liquidation
+  price (on the losing side of the entry), no ADL rank and no pool orders; uPnL is logged; their pools are healthy;
+  the market's live state reads the index, the mark, open interest (at least the run's size), funding index, next
+  tick, period and trading state;
+- A saves its leverage on the market by its ticker (2, or the market's most when lower): the answer, the summary's
+  `perpsLeverage` and a `perps_leverage_update` pushed after the save read it.
 
 **mixed** (spot and perps at once, `E2E_MIXED_SECS` long): in one thread C takes MM's spot ask and then its bid, one
 order each, over and over; in another B takes A's perps ask at the index + 0.1 % and then its bid at the index
@@ -176,29 +182,34 @@ filled, dry takes fewer than fills; C's and MM's spot base moved by exactly the 
 at most 1 % of the gross in fees; B long and A short by exactly the open perps fills; both flat again. The fill rates
 go in the verdict's notes, and the proof step then finds every one of these trades IN_BATCH.
 
-**funding** (markets `carry_pos` and `carry_neg`): A opens a long at the index from isolated pools 6 and 7 (no
-premium); two ticks that move each market carry the carry's sign; A's funding owed has it (positive pays) and MM's
-short the other; each pool's value is exactly collateral + notional - funding owed; the close at the index, away
-from a tick, leaves the collateral at the pool's value less the close's fee (within a cent a token): the funding
-was realised.
+**funding** (markets `carry_pos` and `carry_neg`): A opens a long at the index from isolated pools 6 and 7 (its own
+quotes at the index add no impact premium); two payments of A's that moved money carry the carry's sign, in
+`history.funding()` and on its `funding_payment` frames; A's funding owed has it (positive pays) and MM's short the
+other; each pool's value is exactly collateral + notional - funding owed; the close at the index, away from a tick,
+leaves the collateral at the pool's value with the gap from the mark to the close's price realised, less the close's
+fee (within a cent a token): the funding was realised.
 
 **liquidation** (C's longs from isolated pools with their initial margin plus 10 %, opened against MM's ask at the
 index, with no bid left on the book)
 - first, the backstop holds no position on `liq1` (the read model's `l2_perps_positions`, account 1): a long it took
   in an earlier run's mode 1 would ride this run's deleverage walk with its free collateral at 0 and take its pool 0
   under initial margin, so the step runs once per stack;
-- deleverage (market `liq1`, the backstop's free collateral at 0): the index walks C's pool 1 to -1/5 of its
-  maintenance (below 0; K1 deleverages no pool above 0); C's closes are DELEVERAGEs only, not adl, the newest
-  leaving 0, and the pool holds nothing; in the journal each names its counter, whose own close (adl) is under the
-  same journalSeq; when MM is the counter, MM's closes read it (DELEVERAGE, adl);
+- C's closes are its `history.trades()` rows whose `source` closes a position and whose `role` is TAKER (its pool
+  the one closed), told apart by `tradeId`, the journal seq; each victim's margin is checked at the mark, so its
+  long opens once the mark is within 25 bp of the index, and the walked index brings the pool to its fraction once
+  the mark follows it there;
+- deleverage (market `liq1`, the backstop's free collateral at 0): the mark brings C's pool 1 to -1/5 of its
+  maintenance (below 0; K1 deleverages no pool above 0); C's closes are DELEVERAGEs only and the pool holds nothing;
+  in the journal (`l2_perps_fills`) each names its counter, whose own fill (maker) is under the same journal seq;
+  when MM is the counter, MM's history reads it (DELEVERAGE, MAKER, its pool);
 - mode 1 (market `liq1`, the backstop funded with `E2E_BACKSTOP_DOLLARS` once the backstop's guard finds no other
-  pool waiting for it): the index walks C's pool 2 to 2/5 of its maintenance; C's close is a LIQUIDATION of the whole
-  long, not an ADL, and no order of MM's filled it;
-- mode 0 (market `liq0`, as the P5 kit's mode0_leg): the index walks C's pool 4 to 17/20 of its maintenance and
+  pool waiting for it): the mark brings C's pool 2 to 2/5 of its maintenance; C's close is a BACKSTOP_LIQUIDATION of
+  the whole long, and no order of MM's filled it (no trade_new of MM's under its tradeId);
+- mode 0 (market `liq0`, as the P5 kit's mode0_leg): the mark brings C's pool 4 to 17/20 of its maintenance and
   nothing is liquidated without a bid; MM bids just under the index and far asks run batches; C's close is a
-  LIQUIDATION of the whole long; MM's portfolio holds the liquidation fill (its bid, MAKER, no fee, no tradeId, no
-  txHash, perpsSeq == the close's journalSeq), its WebSocket got the `liquidation_fill` frame, and the market's tape
-  prints the take as isLiquidation with tradeId == perpsSeq and no txHash;
+  LIQUIDATION of the whole long; MM's portfolio holds its row of the take (LIQUIDATION, MAKER, its bid, no fee, no
+  txHash, tradeId == the close's tradeId), its WebSocket got the take's `trade_new` frame, and the market's tape
+  prints the take as isLiquidation with that tradeId and no txHash;
 - the step's restore walks each market home and puts the backstop's free collateral back to 0.
 
 **halt** (market `halt`, reopened first if an earlier run left it otherwise): A long from pool 5 against B's short;
@@ -234,6 +245,11 @@ mapping of the phase, its refusals, and its driver lock (a second driver refused
 through the run and free after it); the backstop's guard on a fake status (another waiting pool named, the victim
 and the book's tier passed, the debts and the engine's gauge without a list); every numeric wait ending on 0 as on
 any number (a sweep that empties a pool); the spot leg's order size against the backend's least order value; the
-proof step's history pages within the backend's largest; each step's restore (a failing step's markets reopened
-and walked home and the knob put at 0, with and without `E2E_HOME_INDEX`; a restore that fails named, a passing
-step then an error; a stop's restore) and the one-shot restore (alone, no setup). `E2E_SDK` names an SDK tree when the venv has none installed.
+proof step's history pages within the backend's largest, and its wait for trades alone (a fill that is no trade has
+no proof); a user's closes (TAKER rows of a close source on the market and pool, past a tradeId) and funding
+payments; the private channel's frames kept per user and a push's position read; a live state read again until the
+backend has one, and the wait for the mark to follow the index; a saved leverage read back from its answer, the
+summary and a push sent after it; the deleverage SQL on `l2_perps_fills`; each step's
+restore (a failing step's markets reopened and walked home and the knob put at 0, with and without
+`E2E_HOME_INDEX`; a restore that fails named, a passing step then an error; a stop's restore) and the one-shot
+restore (alone, no setup). `E2E_SDK` names an SDK tree when the venv has none installed.

@@ -129,14 +129,21 @@ class WSMessageType(_StrEnum):
     VOLUME_UPDATE = "volume_update"
     MARKET_HALT = "market_halt"
     PERPS_MARKETS_LIVE = "perps_markets_live"
+    MARKET_TERMS_UPDATE = "market_terms_update"
     # private portfolio deltas
     BALANCES_UPDATE = "balances_update"
     ORDER_STATUS = "order_status"
     ORDER_UPDATE = "order_update"
     TRADE_NEW = "trade_new"
-    LIQUIDATION_FILL = "liquidation_fill"
     ORDER_QUEUE = "order_queue"
     LIFETIME_VOLUME_UPDATE = "lifetime_volume_update"
+    PERPS_ACCOUNT_UPDATE = "perps_account_update"
+    FUNDING_PAYMENT = "funding_payment"
+    HOLDING_UPDATE = "holding_update"
+    TRANSFER_UPDATE = "transfer_update"
+    FEES_UPDATE = "fees_update"
+    L2_KEYS_UPDATE = "l2_keys_update"
+    PERPS_LEVERAGE_UPDATE = "perps_leverage_update"
 
 
 #: The four ``type`` values that mark an order row as a conditional (stop / take).

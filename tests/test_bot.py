@@ -291,10 +291,10 @@ def test_a_read_takes_the_book_only_if_the_feed_was_live_throughout(
     assert tick() == "[MUS] bid=100 ask=None spread=None mark=None"
 
 
-def test_a_liquidation_fill_is_reported_as_a_fill(monkeypatch: pytest.MonkeyPatch, capsys):
+def test_a_liquidation_row_is_reported_as_a_fill(monkeypatch: pytest.MonkeyPatch, capsys):
     strategy = _bot(monkeypatch).Strategy(SimpleNamespace(), "MUS-PERP")
-    fill = {"perpsSeq": 990, "orderId": 77, "marketIndex": 4, "ticker": "MUS-PERP",
-            "side": "BUY", "quantity": 1.5, "price": 26.1}
-    strategy.on_my_liquidation_fill(LoafObject({"type": "liquidation_fill", "fill": fill}))
+    trade = {"tradeId": 990, "orderId": 77, "source": "LIQUIDATION", "side": "BUY",
+             "quantity": 1.5, "ticker": "MUS-PERP", "price": 26.1, "fee": 0}
+    strategy.on_my_fill(LoafObject({"type": "trade_new", "trade": trade}))
     printed = capsys.readouterr().out
-    assert "FILLED by a liquidation: BUY 1.5 MUS-PERP @ 26.1 (order #77, seq 990)" in printed
+    assert "FILLED (LIQUIDATION): BUY 1.5 MUS-PERP @ 26.1 (fee 0, order #77) #990" in printed

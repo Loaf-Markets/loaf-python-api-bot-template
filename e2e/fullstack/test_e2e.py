@@ -114,7 +114,10 @@ def test_the_operator_and_deleverage_sql():
         "SELECT 'E2E', market_index, is_halted, is_reduce_only FROM markets WHERE market_index = 3;\n")
     assert "is_reduce_only = false" in e2e.market_flags_sql(3, False)
     sql = e2e.deleverage_sql([7, 12])
-    assert "kind = 65 AND journal_seq IN (7, 12)" in sql and "counter_account, counter_pool" in sql
+    # Each row names its side (maker: the counter's own) and the other row of its journal seq as its counter.
+    assert sql.startswith("SELECT 'E2E', f.journal_seq, f.maker, f.account_index, f.pool, c.account_index, c.pool ")
+    assert "FROM l2_perps_fills f JOIN l2_perps_fills c ON c.journal_seq = f.journal_seq AND c.maker <> f.maker" in sql
+    assert "f.kind = 65 AND f.journal_seq IN (7, 12)" in sql and "l2_perps_closes" not in sql
 
 
 class FakeChain(e2e.Chain):
@@ -316,7 +319,7 @@ class FakeBook:
         return {"pools": [{"pool": p, "collateral": str(c), "positions": [{"market": 0}] if p in self.held else []}
                           for p, c in sorted(self.pools.items())]}
 
-    def component(self):
+    def summary(self):
         return {"balances": [{"assetId": e2e.USDC_ASSET, "total": str(self.spot), "available": str(self.spot)}]}
 
 
@@ -493,7 +496,7 @@ class FakeSpotClient:
     def list(self):
         return {"markets": [{"ticker": "EBS"}]}
 
-    def component(self):
+    def summary(self):
         return {"balances": [{"assetId": e2e.USDC_ASSET, "total": str(10**12), "available": str(10**12)}]}
 
     def limit_buy(self, ticker, quantity, price, **_):
@@ -586,7 +589,7 @@ class FakeVenueClient:
                            "positions": [{"market": 0, "base": str(b)}] if (b := self.v.base.get((self.name, p), 0))
                            else []} for p in sorted(pools)]}
 
-    def component(self):
+    def summary(self):
         return {"balances": [{"assetId": e2e.USDC_ASSET, "total": str(self.v.cents.get(self.name, 0) * 10_000),
                               "available": "0"},
                              {"assetId": 2, "total": str(self.v.tokens.get(self.name, 0)), "available": "0"}]}
@@ -600,8 +603,8 @@ def mixed_run(venue, secs="0.4"):
     run = e2e.Run(cfg, collateral={"decimals": 6, "tickSize": "10000", "extensionMultiplier": "1000000"})
     run.spot, run.spot_l2 = venue.spot, {"quoteAssetId": e2e.USDC_ASSET, "baseAssetId": 2}
     run.chain = types.SimpleNamespace(asset=lambda proxy, asset: {"decimals": 6})
-    run.anon = types.SimpleNamespace(perps=types.SimpleNamespace(
-        market_live=lambda m: {"tradingState": "OPEN", "indexPrice": "1500000"}))
+    run.anon = types.SimpleNamespace(market=types.SimpleNamespace(get=lambda t: {"market": {"live": {
+        "tradingState": "OPEN", "indexPrice": "1500000", "markPrice": "1500000"}}}))
     run.perps, run.tickers = {0: {"minBase": "1"}}, {0: venue.perps_t}
     run.users = {n: e2e.User(n, wallet=None, client=venue.client(n)) for n in e2e.USERS}
     return run
@@ -674,6 +677,175 @@ def test_the_proof_step_pages_the_history_as_the_backend_allows(env):
     with pytest.raises(e2e.Failed, match="every trade of the run is IN_BATCH and final"):
         e2e.step_proof(run)
     assert len(pages) == len(e2e.USERS) and max(pages) <= 100
+
+
+def test_the_proof_step_waits_for_the_runs_trades_alone(env, monkeypatch):
+    """A perps fill that is no trade (a liquidation's, say) has no proof: the step waits for every trade of the run
+    past the user's floor, and for nothing else."""
+    monkeypatch.setattr(e2e.time, "sleep", lambda s: None)
+    rows = [
+        {"tradeId": 9, "source": "LIQUIDATION", "proof": None},
+        {"tradeId": 8, "source": "TRADE", "proof": {"status": "IN_BATCH", "final": True, "batchNumber": 4}},
+        {"tradeId": 5, "source": "TRADE", "proof": {"status": "PENDING"}},  # at the floor: before the run
+    ]
+    history = types.SimpleNamespace(iter_trades=lambda *, page_size: iter(rows))
+    run = e2e.Run(dataclasses.replace(e2e.Config.read(), proof_wait_s=0.05), start_pointers=(3, 3, 3))
+    run.users = {"A": e2e.User("A", wallet=None, client=types.SimpleNamespace(history=history), trade_floor=5)}
+    run.chain = types.SimpleNamespace(batch_pointers=lambda proxy: (4, 4, 4))
+    e2e.step_proof(run)
+    assert run.last_batch == 4
+    rows.insert(1, {"tradeId": 8, "source": "TRADE", "proof": {"status": "PENDING"}})  # a trade still waits
+    with pytest.raises(e2e.Failed, match=r"1 not final, the first: \[\('A', 8, 'PENDING'\)\]"):
+        e2e.step_proof(run)
+
+
+def test_a_users_closes_are_the_rows_that_closed_its_pool():
+    """closes_of keeps a user's rows that closed its pool (TAKER) by a close source, on the market and pool, past
+    ``after``: a deleverage's counter side (MAKER), a trade, another market's, another pool's and an older one are
+    not; last_close is the newest row's tradeId."""
+    rows = [
+        {"tradeId": 50, "source": "DELEVERAGE", "role": "TAKER", "marketIndex": 6, "pool": 1},
+        {"tradeId": 49, "source": "DELEVERAGE", "role": "MAKER", "marketIndex": 6, "pool": 1},
+        {"tradeId": 48, "source": "TRADE", "role": "TAKER", "marketIndex": 6, "pool": 1},
+        {"tradeId": 47, "source": "BACKSTOP_LIQUIDATION", "role": "TAKER", "marketIndex": 6, "pool": 2},
+        {"tradeId": 46, "source": "LIQUIDATION", "role": "TAKER", "marketIndex": 2, "pool": 1},
+        {"tradeId": 45, "source": "LIQUIDATION", "role": "TAKER", "marketIndex": 6, "pool": 1},
+        {"tradeId": 40, "source": "EXIT", "role": "TAKER", "marketIndex": 6, "pool": 1},
+    ]
+    history = types.SimpleNamespace(trades=lambda *, page_size: {"trades": rows})
+    user = e2e.User("C", wallet=None, client=types.SimpleNamespace(history=history))
+    assert [r["tradeId"] for r in e2e.closes_of(user, 6, 1, 40)] == [50, 45]
+    assert [r["tradeId"] for r in e2e.closes_of(user, 6, 2, 0)] == [47]
+    assert e2e.close_of(user, 6, 1, 40)["tradeId"] == 50 and e2e.close_of(user, 6, 1, 50) is None
+    assert e2e.last_close(user) == 50
+    rows.clear()
+    assert e2e.last_close(user) == 0
+
+
+def test_payments_of_keeps_a_pools_moves_on_a_market_past_after():
+    rows = [
+        {"journalSeq": 31, "marketIndex": 8, "pool": 6, "payment": "0"},
+        {"journalSeq": 30, "marketIndex": 8, "pool": 6, "payment": "-12"},
+        {"journalSeq": 29, "marketIndex": 9, "pool": 6, "payment": "3"},
+        {"journalSeq": 28, "marketIndex": 8, "pool": 5, "payment": "4"},
+        {"journalSeq": 20, "marketIndex": 8, "pool": 6, "payment": "4"},
+    ]
+    history = types.SimpleNamespace(funding=lambda *, page_size: {"funding": rows})
+    user = e2e.User("A", wallet=None, client=types.SimpleNamespace(history=history))
+    assert [x["journalSeq"] for x in e2e.payments_of(user, 8, 6, 20)] == [30]
+    assert [x["journalSeq"] for x in e2e.payments_of(user, 8, 6, 0)] == [30, 20]
+
+
+def test_the_private_channel_keeps_every_frame(env):
+    """listen keeps each frame of a user's portfolio channel; Run.sent picks a kind's, oldest first, and
+    pushed_base reads a perps_account_update's position."""
+    calls = []
+
+    class Socket:
+        def on_message(self, fn):
+            calls.append("on_message")
+            self.fn = fn
+
+        def subscribe_portfolio(self):
+            calls.append("subscribe_portfolio")
+
+        def start(self):
+            calls.append("start")
+
+        def wait_until_connected(self, timeout):
+            calls.append(timeout)
+            return True
+
+    socket = Socket()
+    user = e2e.User("MM", wallet=None, client=types.SimpleNamespace(websocket=lambda: socket))
+    run = e2e.Run(e2e.Config.read())
+    e2e.listen(run, user)
+    assert calls == ["on_message", "subscribe_portfolio", "start", 30] and run.sockets == [socket]
+    push = {"type": "perps_account_update", "perps": {"l2AccountIndex": 5, "pools": [
+        {"pool": 0, "positions": [{"market": 4, "base": "-20"}, {"market": 6, "base": "15"}]},
+        {"pool": 3, "positions": [{"market": 6, "base": "7"}]}]}}
+    for frame in (push, {"type": "trade_new", "trade": {"tradeId": 1}}, {"type": "echo"}, push):
+        socket.fn(frame)
+    assert run.sent(user, "perps_account_update") == [push, push]
+    assert run.sent(user, "trade_new") == [{"type": "trade_new", "trade": {"tradeId": 1}}]
+    assert (e2e.pushed_base(push, 6, 0), e2e.pushed_base(push, 4, 0), e2e.pushed_base(push, 6, 3)) == (15, -20, 7)
+    assert e2e.pushed_base(push, 4, 3) == 0 and e2e.pushed_base(push, 6, 1) == 0
+
+
+def test_a_live_state_the_backend_has_not_read_is_read_again(env, monkeypatch):
+    """market.get serves a perp's live None until the backend has read one: Run.live reads it again, and fails
+    naming the market once its wait is over. The tickers are the listing's perps."""
+    monkeypatch.setattr(e2e.time, "sleep", lambda s: None)
+    tickers = e2e.perp_tickers([{"marketIndex": 6, "ticker": "H100-PERP", "type": "PERP"},
+                                {"marketIndex": 2050, "ticker": "MUS", "type": "SPOT"}])
+    assert tickers == {6: "H100-PERP"}
+    answers = iter([None, None, {"indexPrice": 1_500_000, "markPrice": 1_503_000}])
+    sent = []
+
+    def get(ticker):
+        sent.append(ticker)
+        return {"market": {"live": next(answers)}}
+
+    run = e2e.Run(dataclasses.replace(e2e.Config.read(), wait_s=5), tickers=tickers)
+    run.anon = types.SimpleNamespace(market=types.SimpleNamespace(get=get))
+    assert run.live(6) == {"indexPrice": 1_500_000, "markPrice": 1_503_000} and sent == ["H100-PERP"] * 3
+    run.cfg = dataclasses.replace(run.cfg, wait_s=0.05)
+    run.anon = types.SimpleNamespace(market=types.SimpleNamespace(get=lambda t: {"market": {"live": None}}))
+    with pytest.raises(e2e.Failed, match="no market 6's live state within"):
+        run.live(6)
+
+
+def test_mark_near_waits_for_the_mark_to_follow_the_index(env, monkeypatch):
+    """The mark lags a walked index: mark_near ends once it is within 25 bp (inclusive), and fails past
+    E2E_FINAL_WAIT_S while it stays off."""
+    monkeypatch.setattr(e2e.time, "sleep", lambda s: None)
+    marks = iter([1_440_000, 1_490_000, 1_496_250])  # off the index 1,500,000 by 4 %, 66.7 bp, then 25 bp
+    run = e2e.Run(dataclasses.replace(e2e.Config.read(), wait_s=1, final_wait_s=5), tickers={2: "MUS-PERP"})
+    run.anon = types.SimpleNamespace(market=types.SimpleNamespace(
+        get=lambda t: {"market": {"live": {"indexPrice": 1_500_000, "markPrice": next(marks)}}}))
+    run.mark_near(2)
+    assert next(marks, None) is None
+    run.cfg = dataclasses.replace(run.cfg, final_wait_s=0.05)
+    run.anon = types.SimpleNamespace(market=types.SimpleNamespace(
+        get=lambda t: {"market": {"live": {"indexPrice": 1_500_000, "markPrice": 1_496_249}}}))
+    with pytest.raises(e2e.Failed, match="no market 2's mark within 25 bp of its index within"):
+        run.mark_near(2)
+    assert run.mark(2) == 1_496_249
+
+
+def test_a_saved_leverage_is_read_back_from_its_answer_the_summary_and_a_push(env, monkeypatch):
+    """save_leverage saves 2, or the market's most (65536 // (2 x risk)) when lower, by the market's ticker: its
+    answer, the summary and a perps_leverage_update sent after it read it; a push from before the save does not."""
+    monkeypatch.setattr(e2e.time, "sleep", lambda s: None)
+    saved, frames, sent = {}, [], []
+
+    class Portfolio:
+        push = True
+
+        def set_perps_leverage(self, market, leverage):
+            sent.append((market, leverage))
+            saved[6] = leverage
+            if self.push:
+                frames.append({"type": "perps_leverage_update", "marketIndex": 6, "leverage": leverage})
+            return {"marketIndex": 6, "leverage": leverage}
+
+        def summary(self):
+            return {"perpsLeverage": [{"marketIndex": m, "leverage": v} for m, v in saved.items()]}
+
+    portfolio = Portfolio()
+    run = e2e.Run(dataclasses.replace(e2e.Config.read(), wait_s=0.05), tickers={6: "H100-PERP"},
+                  perps={6: {"risk": 3277}}, frames={"A": frames})
+    user = e2e.User("A", wallet=None, client=types.SimpleNamespace(portfolio=portfolio))
+    e2e.save_leverage(run, user, 6)
+    run.perps[6] = {"risk": 32_768}  # its most is 1
+    e2e.save_leverage(run, user, 6)
+    assert sent == [("H100-PERP", 2), ("H100-PERP", 1)] and saved == {6: 1}
+    portfolio.push = False  # the last push matches, but it came before this save
+    with pytest.raises(e2e.Failed, match="no A's perps_leverage_update for market 6 within"):
+        e2e.save_leverage(run, user, 6)
+    portfolio.summary = lambda: {"perpsLeverage": []}
+    with pytest.raises(e2e.Failed, match="no A's summary reading its leverage on market 6 within"):
+        e2e.save_leverage(run, user, 6)
 
 
 SECRET = "s3cr3t-p@ss/word"
@@ -880,8 +1052,8 @@ class FakeStack:
         self.pump, self.states, self.start, self.flags = pump, dict(states or {}), dict(start or {}), {}
         stack = self
         monkeypatch.setattr(e2e.Run, "index", lambda run, m: stack.index(m))
-        monkeypatch.setattr(e2e.Run, "live",
-                            lambda run, m: {"indexPrice": stack.index(m), "tradingState": stack.state(m)})
+        monkeypatch.setattr(e2e.Run, "live", lambda run, m: {
+            "indexPrice": stack.index(m), "markPrice": stack.index(m), "tradingState": stack.state(m)})
         monkeypatch.setattr(e2e.Run, "admin", lambda run, path, body: stack.admin(path, body))
         monkeypatch.setattr(e2e.Pg, "__call__", lambda pg, sql: stack.pg(sql))
 
@@ -996,7 +1168,8 @@ def test_the_one_shot_restore_runs_alone_and_puts_every_role_market_back(env, tm
     """E2E_STEPS=restore: no setup; every role market reopened if it is not OPEN and walked home, the knob at 0."""
     pump = FakePump(tmp_path)
     stack = FakeStack(monkeypatch, pump, states={3: "HALTED"}, start={2: 1_432_808, 3: 1_480_000})
-    monkeypatch.setattr(e2e, "LoafClient", lambda **kw: object())
+    monkeypatch.setattr(e2e, "LoafClient",
+                        lambda **kw: types.SimpleNamespace(market=types.SimpleNamespace(list=lambda: {"markets": []})))
     for var, value in (("E2E_STEPS", "restore"), ("E2E_WAIT_S", "5"), ("E2E_OPERATOR", "sql"),
                        ("E2E_HOME_INDEX", "1500000"), ("E2E_PRICE_CONTROL", str(pump.control)),
                        ("E2E_PRICE_STATUS", str(pump.status))):

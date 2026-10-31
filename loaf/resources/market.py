@@ -54,19 +54,21 @@ class MarketResource(Resource):
     def get(self, ticker: str) -> Any:
         """``GET /trade/{ticker}`` — full detail for one market.
 
-        Returns the ``market``, its ``asset``, a ``marketList`` selector, the
-        current ``orderBook`` snapshot (``bids``/``asks`` price levels),
+        Returns the ``market``, its ``asset``, a ``marketList`` selector (each
+        row's ``marketIndex``, ``ticker``, ``type``, and a perp's ``risk``,
+        ``None`` on spot: it maps a market index to its ticker), the current
+        ``orderBook`` snapshot (``bids``/``asks`` price levels),
         ``recentTrades``, ``volume24h``, ``dailyReferencePrice`` and
         ``liquidity``. Candle history is NOT included — fetch it from the
         dedicated :meth:`candles` endpoint.
 
         ``market`` is ``{marketIndex, ticker, type, status, isHalted,
-        tradingStartsAt, l2}``.
+        tradingStartsAt, l2}``, and a perp's ``live``.
         ``market.l2`` is, by ``type``, a spot market's ``{chainId,
         proxyAddress, l2ChainId, baseAssetId, quoteAssetId}``
         (:class:`~loaf.models.MarketL2`), or a perp's, with its ``status`` and
-        terms and no base asset (:class:`~loaf.models.PerpMarketL2`, as
-        ``perps.markets()`` lists it): with ``marketIndex``, what every order
+        terms and no base asset (:class:`~loaf.models.PerpMarketL2`): with
+        ``marketIndex``, what every order
         on the market signs (the SDK reads both for you), or ``None``: the
         market cannot be traded now. ``asset`` is ``{ticker, name, kind,
         assetId, tokenAddress, videoUrl, stakeholders, property}``:
@@ -81,6 +83,48 @@ class MarketResource(Resource):
         (unix seconds) has passed (``None``: no wait): orders before then are
         refused (403 ``Trading on this market has not started yet``). A perp
         whose ``l2.status`` is ``EXPIRED`` takes no more orders.
+
+        ``market.live``, a perp's alone, is its live state
+        (:class:`~loaf.models.PerpsMarketLive`), the engine's, except that the
+        exchange reads an EXPIRED perp's ``tradingState`` as ``HALTED`` and its
+        ``stateReason`` as ``MARKET_CLOSED``; ``None`` until the exchange has
+        read it (a stalled engine never delays this read: it serves its last
+        answer, so bound the age by ``asOfMs``):
+
+        * ``status`` — ``ACTIVE``, or ``EXPIRED``: it takes no orders, and its
+          positions leave by exits;
+        * ``tradingState`` — ``OPEN``, ``REDUCE_ONLY``, ``PRICE_STALE`` or
+          ``HALTED``, least to most restrictive — and ``stateReason``, why it
+          refuses an order that adds risk (``None`` while it admits one); both
+          ``None`` when the engine holds no book of the market;
+        * ``halted``, the engine's trading pause (every new order refused),
+          and ``riskOnly``, its risk-only mode: whatever ``tradingState`` says,
+          every order that adds risk, and every withdrawal, is answered
+          unavailable, so an ``OPEN`` market admits only an order that reduces;
+        * ``asOfMs``, the engine clock those four are as of: bound their age
+          by it;
+        * ``markPrice``, what your positions are valued at, margin is checked
+          at and stops and takes fire on (within 5 % of the index; 0 before
+          the first report), and ``indexPrice``, the oracle's accepted index
+          (0 before the first report), as of ``observedAtMs``, both in the
+          market's price units (dollars x 1000); ``openInterest`` (base units,
+          K1's two-sided sum: longs plus shorts, so one side's is half)
+          and ``fundingIndex`` (F: a position owes base x (F - its
+          ``fundingIndex``), signed), decimal strings;
+        * ``tickAtMs`` and ``nextTickAtMs``, the last funding tick and when the
+          next is due (0: none, an expired or unpriced market), and
+          ``fundingPeriodMs``, the period ``fundingRateCbp`` (centi-bp of the
+          index: funding is paid on the index) is per; it and
+          ``premiumSampleBp`` (bp) are what a tick would apply now, ``None``
+          when the market is not rated;
+        * ``heldPrice``, ``{price, observedAtMs}``: the newest price report,
+          held for an operator's answer, while no order that can add to a
+          position is admitted; ``None`` when there is none.
+
+        The ``perps:markets`` channel pushes every perp's row about once a
+        second (:meth:`~loaf.ws.client.LoafWebSocketClient.on_perps_markets_live`),
+        and its terms when they change
+        (:meth:`~loaf.ws.client.LoafWebSocketClient.on_market_terms`).
 
         ``recentTrades`` holds the newest trades first (at most 20), each with a
         ``txHash``: the trade's content hash (``0x`` + 64 hex), not an on-chain

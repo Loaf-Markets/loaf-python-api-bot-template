@@ -128,13 +128,13 @@ def test_trade_new_dispatch():
     tx_hash = "0x" + "3f" * 32
     ws._dispatch(_frame(type="trade_new", trade={
         "tradeId": 1, "orderId": 991, "marketIndex": 2050, "ticker": "OPRA", "txHash": tx_hash,
-        "side": "BUY", "role": "TAKER", "quantity": 1, "price": 100, "executedAt": 0,
-        "fee": 0.173, "proof": {"status": "PENDING"},
+        "side": "BUY", "role": "TAKER", "pool": None, "quantity": 1, "price": 100,
+        "executedAt": 0, "fee": 0.173, "closedPnl": None, "source": "TRADE", "direction": "BUY",
     }))
     trade = seen[0].trade
     assert (trade.tradeId, trade.txHash, trade.fee) == (1, tx_hash, 0.173)
     assert (trade.orderId, trade.role) == (991, "TAKER")  # the user's own order, which aggressed
-    assert trade.proof == {"status": "PENDING"}
+    assert (trade.source, trade.direction, trade.pool) == ("TRADE", "BUY", None)
 
 
 def test_order_queue_dispatch():
@@ -149,28 +149,52 @@ def test_order_queue_dispatch():
     assert (seen[0].orders[0].quantityAhead, seen[0].orders[0].ordersAhead) == (12.5, 3)
 
 
-def test_a_liquidation_fill_reaches_on_liquidation_fill_not_on_trade():
-    # A liquidation took from the user's resting perps order: a fill of it that is no trade.
+def test_a_liquidation_row_reaches_on_trade():
+    # A liquidation took from the user's resting perps order: a fill, source LIQUIDATION, that is
+    # no trade; its tradeId is the liquidation's journal seq.
     ws = _client()
-    fills, trades = [], []
-    ws.on_liquidation_fill(fills.append)
-    ws.on_trade(trades.append)
-    fill = {
-        "perpsSeq": 990, "orderId": 77, "marketIndex": 4, "ticker": "MUS-PERP", "side": "BUY",
-        "role": "MAKER", "quantity": 1.5, "price": 26.1, "fee": 0, "executedAt": 1_800_000_002,
+    seen = []
+    ws.on_trade(seen.append)
+    trade = {
+        "tradeId": 990, "orderId": 77, "marketIndex": 4, "ticker": "MUS-PERP", "txHash": None,
+        "side": "BUY", "role": "MAKER", "pool": 0, "quantity": 1.5, "price": 26.1, "fee": 0,
+        "closedPnl": None, "source": "LIQUIDATION", "direction": "OPEN_LONG",
+        "executedAt": 1_800_000_002,
     }
-    ws._dispatch(_frame(type="liquidation_fill", fill=fill, timestamp=0))
-    assert trades == []
-    (frame,) = fills
-    assert frame.fill == fill
-    assert (frame.fill.orderId, frame.fill.perpsSeq, frame.fill.role) == (77, 990, "MAKER")
+    ws._dispatch(_frame(type="trade_new", trade=trade))
+    (frame,) = seen
+    assert frame.trade == trade and frame.trade.txHash is None
+
+
+@pytest.mark.parametrize(
+    "register, fields",
+    [
+        ("on_perps_account", {"type": "perps_account_update", "perps": {"l2AccountIndex": 5, "pools": []}}),
+        ("on_funding_payment", {"type": "funding_payment", "funding": {"journalSeq": 7, "payment": "-12"}}),
+        ("on_holding", {"type": "holding_update", "holding": {"ticker": "MUS", "averageEntryPrice": 12.5}}),
+        ("on_transfer", {"type": "transfer_update", "transfer": {"journalSeq": 9}}),
+        ("on_fees", {"type": "fees_update", "applicableFees": {"takerFeeBps": 30, "makerFeeBps": 10}}),
+        ("on_l2_keys", {"type": "l2_keys_update", "apiKeyIndices": [0]}),
+        ("on_perps_leverage", {"type": "perps_leverage_update", "marketIndex": 4, "leverage": 5}),
+        ("on_market_terms", {"type": "market_terms_update", "marketIndex": 4, "l2": {"status": "EXPIRED"}}),
+    ],
+)
+def test_each_new_frame_reaches_its_handler(register, fields):
+    ws = _client()
+    seen = []
+    getattr(ws, register)(seen.append)
+    ws._dispatch(_frame(**fields))
+    assert seen == [{**fields, "timestamp": 0}]
 
 
 def test_perps_markets_live_reaches_its_handler():
     ws = _client()
     seen = []
     ws.on_perps_markets_live(seen.append)
-    live = {"marketIndex": 4, "riskOnly": True, "asOfMs": 1_800_000_001_250, "tradingState": "OPEN"}
+    live = {
+        "marketIndex": 4, "markPrice": 2510, "riskOnly": True, "asOfMs": 1_800_000_001_250,
+        "tradingState": "OPEN",
+    }
     ws._dispatch(_frame(type="perps_markets_live", markets=[live], timestamp=0))
     (frame,) = seen
     assert frame.markets == [live]

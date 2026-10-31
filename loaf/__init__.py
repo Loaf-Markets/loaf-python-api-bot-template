@@ -5,7 +5,7 @@ Quick start::
     from loaf import LoafClient
 
     loaf = LoafClient()   # reads $LOAF_TRADING_KEY
-    print(loaf.portfolio.component().balances)
+    print(loaf.portfolio.summary().balances)
     print(loaf.market.list())
     loaf.orders.limit_buy("MUS", quantity=10, price=167.49)   # signed with your trading key
 
@@ -25,6 +25,7 @@ from .constants import (
     MAX_POOL,
     MAX_PRICE_DECIMALS,
     MAX_QUANTITY_DECIMALS,
+    PERPS_DEFAULT_LEVERAGE,
     PERPS_SPOT_SIDE,
 )
 from .enums import (
@@ -80,6 +81,7 @@ __all__ = [
     "MAX_POOL",
     "MAX_PRICE_DECIMALS",
     "MAX_QUANTITY_DECIMALS",
+    "PERPS_DEFAULT_LEVERAGE",
     "PERPS_SPOT_SIDE",
     # enums
     "OrderSide",

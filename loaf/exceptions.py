@@ -359,8 +359,9 @@ class LoafServerError(LoafAPIError):
 
 
 class LoafServiceUnavailableError(LoafServerError):
-    """503 — a service is temporarily unavailable, e.g. the trading service, or
-    candle history under load (``Candle history is busy…``).
+    """503 — a service is temporarily unavailable, e.g. the trading service,
+    candle history under load (``Candle history is busy…``), or your perps read
+    through ``loaf.perps`` (a summary's ``perps`` is ``None``).
 
     Transient: the client retries reads, and re-sends signed placements (see
     :meth:`~loaf.resources.orders.OrdersResource.create`), before raising it.

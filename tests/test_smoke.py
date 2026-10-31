@@ -247,6 +247,17 @@ def test_models_list_every_shape():
     assert {"orderId", "role"} <= models.TradeHistoryItem.__optional_keys__
     # A holding names its spot market as mark_price frames do; None: the asset has none.
     assert get_type_hints(models.Holding)["marketIndex"] == Optional[int]
+    # A fill always has its tradeId (its journal seq); one that is no trade has no txHash, and
+    # only a close has a closed PnL.
+    trade = get_type_hints(models.TradeHistoryItem)
+    assert trade["tradeId"] is int
+    assert (trade["orderId"], trade["txHash"]) == (Optional[int], Optional[str])
+    assert trade["closedPnl"] == Optional[float]
+    # A summary's perps is None when unread, never an empty account; its saved leverage is a list.
+    summary = get_type_hints(models.PortfolioSummary)
+    assert summary["perps"] == Optional[models.PerpsAccount]
+    assert summary["perpsLeverage"] == list[models.PerpsLeverage]
+    assert models.PerpsLeverage.__required_keys__ == {"marketIndex", "leverage"}
 
 
 # --------------------------------------------------------------------------- #
@@ -411,11 +422,6 @@ def test_a_liquidation_take_on_the_tape():
     hints = typing.get_type_hints(models.TradeTick)
     assert hints["isLiquidation"] is bool and hints["txHash"] is str
     assert {"isLiquidation", "txHash"} <= models.TradeTick.__optional_keys__
-    # The maker side of a take is the user's liquidation fill: a fill, no trade.
-    assert models.LiquidationFill.__required_keys__ == {
-        "perpsSeq", "orderId", "marketIndex", "ticker", "side", "role", "quantity", "price", "fee",
-        "executedAt",
-    }
 
 
 def test_trades_params_and_no_auth():
@@ -509,8 +515,9 @@ def test_iter_candles_pages_backwards():
     [
         ("orders", lambda c: c.history.iter_orders(page_size=2)),
         ("trades", lambda c: c.history.iter_trades(page_size=2)),
+        ("funding", lambda c: c.history.iter_funding(page_size=2)),
     ],
-    ids=["orders", "trades"],
+    ids=["orders", "trades", "funding"],
 )
 def test_iter_history_follows_the_cursor(key, iterate):
     pages = {
@@ -529,6 +536,25 @@ def test_iter_history_follows_the_cursor(key, iterate):
     assert sent == [
         (f"/api/history/{key}", {"pageSize": "2"}),
         (f"/api/history/{key}", {"pageSize": "2", "cursor": "MTAwOjI"}),
+    ]
+
+
+def test_portfolio_and_funding_routes():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, dict(request.url.params)))
+        verify_login(request.headers["authorization"][len("Bearer ") :])  # a login token
+        return httpx.Response(200, json={})
+
+    client = make_client(handler)
+    client.portfolio.summary()
+    client.portfolio.component()
+    client.history.funding(page_size=5, cursor="abc")
+    assert sent == [
+        ("/api/portfolio/summary", {}),
+        ("/api/portfolio/component", {}),
+        ("/api/history/funding", {"pageSize": "5", "cursor": "abc"}),
     ]
 
 

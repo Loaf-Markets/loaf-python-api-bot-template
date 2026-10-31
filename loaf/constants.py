@@ -115,9 +115,6 @@ MAX_POOL = 7
 #: An allocate's side for your spot USDC balance, beside the pools 0 to 7.
 PERPS_SPOT_SIDE = 255
 
-#: The most rows one page of a perps history read (funding ticks, closes) holds.
-PERPS_HISTORY_MAX = 200
-
 #: The quote asset of every perps market: USDC.
 PERPS_QUOTE_ASSET_ID = 3
 
@@ -126,6 +123,12 @@ PERPS_FLAG_CROSS = 1
 
 #: A perps market's ``flags``: it is reduce-only, and no order may add to a position.
 PERPS_FLAG_REDUCE_ONLY = 2
+
+#: A perps market's leverage while you have saved none, at most the market's most.
+PERPS_DEFAULT_LEVERAGE = 3
+
+#: The highest leverage the exchange saves, a risk-1 market's most: a market's is 65,536 // (2 x risk).
+MAX_PERPS_LEVERAGE = 32_768
 
 #: How long a signed allocate or exit stays valid when ``ttl_ms=`` is omitted: 10 minutes. The
 #: exchange applies it only before its ``l2ExpiryMs`` (now + this), so an outcome left unknown

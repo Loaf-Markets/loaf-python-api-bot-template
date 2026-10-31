@@ -45,12 +45,11 @@ MARKET_L2 = {
     "baseAssetId": 6,
     "quoteAssetId": 3,
 }
-# Perp 4 (OPRA-PERP), as a row of GET /l2/perps/markets; its market.l2 is PERP_L2.
-PERPS_MARKET = {
+# Perp 4 (OPRA-PERP)'s market.l2.
+PERP_L2 = {
     "chainId": 421614,
     "proxyAddress": "0x" + "11" * 20,
     "l2ChainId": 4242,
-    "marketIndex": 4,
     "quoteAssetId": 3,
     "status": "ACTIVE",
     "sem": 1000,
@@ -65,9 +64,8 @@ PERPS_MARKET = {
     "minQuote": 0,
     "quoteLimit": 0,
 }
-PERP_L2 = {k: v for k, v in PERPS_MARKET.items() if k != "marketIndex"}
-# The perps markets' collateral: USDC of 6 decimals, a tick of 10,000 base units (0.01 USDC), and
-# 100 extended units a tick.
+# The perps collateral: USDC of 6 decimals, a tick of 10,000 base units (0.01 USDC), and 100
+# extended units a tick.
 PERPS_COLLATERAL = {
     "assetId": 3,
     "symbol": "USDC",
@@ -75,9 +73,11 @@ PERPS_COLLATERAL = {
     "tickSize": "10000",
     "extensionMultiplier": "100",
 }
-# GET /l2/perps/markets/live: perp 4 open, rated, in the engine's risk-only mode.
+# A perp's market.live: open, rated, risk-only, its mark off its index.
 PERPS_LIVE = {
     "marketIndex": 4,
+    "status": "ACTIVE",
+    "markPrice": 2510,
     "indexPrice": 2500,
     "observedAtMs": 1_800_000_000_000,
     "openInterest": "18446744073709551615",
@@ -94,35 +94,9 @@ PERPS_LIVE = {
     "tradingState": "OPEN",
     "stateReason": None,
 }
-# GET /l2/perps/funding and GET /l2/perps/closes: one row each.
-PERPS_FUNDING_TICK = {
-    "journalSeq": 812,
-    "sampleBp": -3,
-    "rateCbp": -250,
-    "moved": True,
-    "fundingIndex": "-4294967296",
-    "indexPrice": 2500,
-    "tickAtMs": 1_800_000_000_000,
-}
-PERPS_CLOSE = {
-    "journalSeq": 990,
-    "atMs": 1_800_000_002_000,
-    "kind": "LIQUIDATION",
-    "market": 9,
-    "pool": 2,
-    "side": "SHORT",
-    "baseAfter": "0",
-    "price": 2610,
-    "base": "18446744073709551615",
-    "quote": 4_814_784,
-    "fee": 2_407,
-    "quoteExtended": "48147840000000",
-    "feeExtended": "24070000000",
-    "adl": False,
-}
-# GET /l2/perps/positions: pool 0 holds a long in perp 4 and a reduce-only SELL resting there,
-# pool 2 a short in perp 9.
+# GET /portfolio/summary's perps: pool 0 holds a long in perp 4, pool 2 a short in perp 9.
 PERPS_ACCOUNT = {
+    "collateral": PERPS_COLLATERAL,
     "l2AccountIndex": ACCOUNT_INDEX,
     "pools": [
         {
@@ -135,6 +109,10 @@ PERPS_ACCOUNT = {
             "positions": [
                 {
                     "market": 4,
+                    "ticker": "OPRA-PERP",
+                    "qem": "1000000",
+                    "risk": 3277,
+                    "band": 500,
                     "base": "20",
                     "fundingIndex": "4294967296",
                     "entryQuote": "203000",
@@ -142,17 +120,6 @@ PERPS_ACCOUNT = {
                     "fundingOwed": "-1200",
                     "notional": "2050000000000",
                     "liquidationPrice": "52000",
-                    "adlRank": 2,
-                }
-            ],
-            "openOrders": [
-                {
-                    "orderId": 77,
-                    "market": 4,
-                    "side": "SELL",
-                    "quantityLeft": "20",
-                    "price": 104000,
-                    "reduceOnly": True,
                 }
             ],
         },
@@ -166,6 +133,10 @@ PERPS_ACCOUNT = {
             "positions": [
                 {
                     "market": 9,
+                    "ticker": "MUS-PERP",
+                    "qem": "1000000",
+                    "risk": 3277,
+                    "band": 500,
                     "base": "-5",
                     "fundingIndex": "-12",
                     "entryQuote": "50000",
@@ -173,10 +144,8 @@ PERPS_ACCOUNT = {
                     "fundingOwed": "35",
                     "notional": "490000000000",
                     "liquidationPrice": None,
-                    "adlRank": None,
                 }
             ],
-            "openOrders": [],
         },
     ],
 }
@@ -284,7 +253,8 @@ def market_detail(
     l2: Any = _TYPES_L2,
     market_price: float = 160,
 ) -> dict:
-    """A ``GET /trade/{ticker}`` body with the fields order placement reads.
+    """A ``GET /trade/{ticker}`` body with the fields order placement reads, and a perp's
+    ``live``.
 
     ``market_index=...`` or ``l2=...`` leaves that field out. ``l2`` defaults to its
     type's: ``PERP_L2`` for a perp (its ticker ends in -PERP), else ``MARKET_L2``.
@@ -302,17 +272,27 @@ def market_detail(
         "l2": l2,
     }
     market = {k: v for k, v in market.items() if v is not ...}
-    listed = [{"ticker": ticker, "name": _NAMES.get(ticker, ticker), "marketPrice": market_price}]
+    if perp:
+        market["live"] = PERPS_LIVE
+    listed = [{
+        "ticker": ticker,
+        "type": "PERP" if perp else "SPOT",
+        "risk": PERP_L2["risk"] if perp else None,
+        "name": _NAMES.get(ticker, ticker),
+        "marketPrice": market_price,
+    }]
     if ticker != "MUS":  # another market ahead of it: the reference is found by its ticker
-        listed.insert(0, {"ticker": "MUS", "name": "Musgrave", "marketPrice": 50})
+        listed.insert(
+            0, {"ticker": "MUS", "type": "SPOT", "risk": None, "name": "Musgrave", "marketPrice": 50}
+        )
     return {"market": market, "marketList": listed}
 
 
 class FakeExchange:
     """The exchange's routes an order uses, in memory, for ``httpx.MockTransport``.
 
-    * Every route but ``GET /trade…`` and the perps markets' reads (public) and the
-      placements (signed) takes a login token, ``Authorization: Bearer <token>``: one the exchange does not take
+    * Every route but ``GET /trade…`` (public) and the placements (signed) takes a
+      login token, ``Authorization: Bearer <token>``: one the exchange does not take
       (:func:`login_refusal`, the account's api key 0 in force ``key_in_force``, the
       clock ``now_ms``, ``None``: the SDK's own) is answered 401 with the backend's
       text, before anything queued. A signature is checked once per key, as the
@@ -325,10 +305,12 @@ class FakeExchange:
       up, for the account, at ``reserved_at_ms`` (``None``: the real clock's now).
     * ``POST /orders`` and ``/orders/conditional`` place the order: 200 with a
       fresh ``orderId`` (and one per attached leg).
-    * ``GET /l2/perps/markets`` lists ``perps_markets`` and ``perps_collateral``
-      (``None``: null, as when the exchange could not read it), ``/markets/live`` ``perps_live`` and
-      ``/funding`` ``PERPS_FUNDING_TICK``; ``GET /l2/perps/positions`` serves
-      ``perps_account`` and ``/closes`` ``PERPS_CLOSE``.
+    * ``GET /portfolio/summary`` serves no balances or holdings, and as its
+      ``perps`` ``perps_account`` with ``perps_collateral`` as its collateral
+      (``perps_account`` ``None``: ``perps`` null, as when the exchange could not
+      read it), and as its ``perpsLeverage`` the ``perps_leverage`` saved.
+    * ``PUT /portfolio/perps-leverage`` saves its body's leverage in
+      ``perps_leverage`` (by market index) and answers the body.
     * ``POST /l2/allocations`` and ``/l2/exits`` apply a signed op at the account's
       nonce (``keys["withdrawalNonce"]``, which moves up by one): 202 with the next
       ``journalSeq``; a re-send of an applied op is its duplicate, and any other op
@@ -352,10 +334,9 @@ class FakeExchange:
         self._lock = threading.Lock()
         self._next_index = 4097
         self._next_id = 0
-        self.perps_markets: list[dict[str, Any]] = [dict(PERPS_MARKET)]
         self.perps_collateral: dict[str, Any] | None = dict(PERPS_COLLATERAL)
-        self.perps_account: dict[str, Any] = json.loads(json.dumps(PERPS_ACCOUNT))
-        self.perps_live: list[dict[str, Any]] = [json.loads(json.dumps(PERPS_LIVE))]
+        self.perps_account: dict[str, Any] | None = json.loads(json.dumps(PERPS_ACCOUNT))
+        self.perps_leverage: dict[int, int] = {}
         # The ops applied, by nonce: (their body, their journal seq).
         self.applied: dict[int, tuple[bytes, int]] = {}
         self._next_seq = 1000
@@ -378,9 +359,7 @@ class FakeExchange:
     def _refusal(self, request: httpx.Request) -> httpx.Response | None:
         """The 401 of a request whose login token the exchange does not take, if any."""
         route = request.method + " " + request.url.path[len("/api") :]
-        if route.startswith(("GET /trade", "GET /l2/perps/markets", "GET /l2/perps/funding")) or (
-            route in ("POST /orders", "POST /orders/conditional")
-        ):
+        if route.startswith("GET /trade") or route in ("POST /orders", "POST /orders/conditional"):
             return None
         bearer = request.headers.get("authorization", "")
         if not bearer.startswith("Bearer "):
@@ -417,17 +396,16 @@ class FakeExchange:
                     "reservedAtMs": reserved_at,
                 },
             )
-        if route == "GET /l2/perps/markets":
-            reply = {"markets": self.perps_markets, "collateral": self.perps_collateral}
-            return httpx.Response(200, json=reply)
-        if route == "GET /l2/perps/markets/live":
-            return httpx.Response(200, json={"markets": self.perps_live})
-        if route == "GET /l2/perps/funding":
-            return httpx.Response(200, json={"ticks": [PERPS_FUNDING_TICK]})
-        if route in ("GET /l2/perps/positions", "GET /l2/perps/closes"):
-            if route == "GET /l2/perps/closes":
-                return httpx.Response(200, json={"closes": [PERPS_CLOSE]})
-            return httpx.Response(200, json=self.perps_account)
+        if route == "GET /portfolio/summary":
+            perps = self.perps_account and {**self.perps_account, "collateral": self.perps_collateral}
+            leverage = [{"marketIndex": m, "leverage": v} for m, v in sorted(self.perps_leverage.items())]
+            return httpx.Response(
+                200, json={"balances": [], "holdings": [], "perps": perps, "perpsLeverage": leverage}
+            )
+        if route == "PUT /portfolio/perps-leverage":
+            body = json.loads(request.content)
+            self.perps_leverage[body["marketIndex"]] = body["leverage"]
+            return httpx.Response(200, json=body)
         if route in ("POST /l2/allocations", "POST /l2/exits"):
             return self._apply(request.content)
         if route == "POST /orders/conditional":

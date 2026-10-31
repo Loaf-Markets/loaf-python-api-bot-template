@@ -24,9 +24,9 @@ def main() -> None:
     with LoafClient() as client:
         print(f"Talking to {client.base_url}")
 
-        # portfolio.component is authenticated (a login token your trading key
+        # portfolio.summary is authenticated (a login token your trading key
         # signs), so it doubles as a check of the key.
-        comp = client.portfolio.component()
+        comp = client.portfolio.summary()
         balances = comp.get("balances") or []
         # Amounts are base-unit strings; the isQuote rows are your cash.
         cash = sum(

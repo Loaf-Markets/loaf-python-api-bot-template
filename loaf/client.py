@@ -155,7 +155,7 @@ class LoafClient:
         from loaf import LoafClient
 
         with LoafClient() as loaf:   # reads $LOAF_TRADING_KEY
-            print(loaf.portfolio.component().balances)
+            print(loaf.portfolio.summary().balances)
             print(loaf.market.list())
 
     Args:
@@ -275,11 +275,11 @@ class LoafClient:
         self.market: MarketResource = MarketResource(self)
         #: Trading: place (signed with your trading key) and cancel orders, stop & take orders.
         self.orders: OrdersResource = OrdersResource(self)
-        #: Perps: markets, your pools and positions, margin moves and exits (signed like orders).
+        #: Perps: your pools and positions, margin moves and exits (signed like orders).
         self.perps: PerpsResource = PerpsResource(self)
         #: Balances, holdings, and recent activity.
         self.portfolio: PortfolioResource = PortfolioResource(self)
-        #: Paginated order & trade history.
+        #: Paginated order, trade & funding history.
         self.history: HistoryResource = HistoryResource(self)
 
     # ------------------------------------------------------------------ #

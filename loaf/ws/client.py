@@ -34,9 +34,11 @@ chart:{ticker}      public    OHLCV candle updates (note: singular "chart")
 markprice:{ticker}  public    canonical mark price (1s, on change)
 volume:{ticker}     public    rolling-24h traded volume (replaces ``volume24h``)
 market:{ticker}     public    halt / resume status for one market
-perps:markets       public    every perp's live state, about once a second
-portfolio           PRIVATE   your order transitions, fills, queue places and whole L2 balance book
-                              (and a liquidation's fill of your resting perps order)
+perps:markets       public    every perp's live state, about once a second, and its terms
+                              when they change
+portfolio           PRIVATE   your order transitions, fills, queue places, whole L2 balance book,
+                              perps account, funding payments, holdings, transfers, fees, keys and
+                              saved perps leverage
 ==================  ========  ===========================================
 
 Prices and quantities are human units (dollars / tokens); ``balances_update``
@@ -217,8 +219,10 @@ class LoafWebSocketClient:
         Every ``markprice`` channel you subscribe feeds this one handler, and a
         frame names its market by ``marketIndex`` alone, never by ticker: match
         on it. A holding's ``marketIndex`` is its spot market's
-        (:meth:`loaf.resources.portfolio.PortfolioResource.component`); ``None``
-        means no spot market, so no frame values it.
+        (:meth:`loaf.resources.portfolio.PortfolioResource.summary`); ``None``
+        means no spot market, so no frame values it. On a perp this is the
+        book's reference, not the mark positions are valued at and stops fire
+        on: that is ``markPrice`` of :meth:`on_perps_markets_live`.
         """
         return self.on(WSMessageType.MARK_PRICE, handler)
 
@@ -240,11 +244,19 @@ class LoafWebSocketClient:
 
     def on_perps_markets_live(self, handler: Handler | None = None) -> Any:
         """Every perps market's live state (``perps_markets_live``: ``{markets}``,
-        the whole list as :meth:`loaf.resources.perps.PerpsResource.markets_live`
-        serves it), about once a second while you hold ``perps:markets``:
-        replace what you hold. A second the exchange could not read the engine
-        pushes nothing; bound a row's age by its ``asOfMs``."""
+        the whole list, each row a perp's ``market.get(ticker).market.live``),
+        once when you subscribe and then about once a second while you hold
+        ``perps:markets``: replace what you hold. A second the exchange could
+        not read the engine pushes nothing; bound a row's age by its
+        ``asOfMs``."""
         return self.on(WSMessageType.PERPS_MARKETS_LIVE, handler)
+
+    def on_market_terms(self, handler: Handler | None = None) -> Any:
+        """A perp's terms changed (``market_terms_update``: ``{marketIndex, ticker,
+        l2}``, its ``market.get(ticker).market.l2``), while you hold
+        ``perps:markets``: replace what you hold for it. A perp that expired
+        arrives this way, ``l2.status`` ``EXPIRED``."""
+        return self.on(WSMessageType.MARKET_TERMS_UPDATE, handler)
 
     # private portfolio deltas
     def on_balances(self, handler: Handler | None = None) -> Any:
@@ -297,44 +309,31 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.ORDER_UPDATE, handler)
 
     def on_trade(self, handler: Handler | None = None) -> Any:
-        """Your own fills on the private portfolio channel (``trade_new``).
+        """Your own fills on the private portfolio channel (``trade_new``:
+        ``{trade}``, a :class:`~loaf.models.TradeHistoryItem` as
+        ``history.trades()`` lists it, without ``proof``).
 
-        Exactly one frame per fill, final when it matches. ``trade.orderId`` is
-        your order the fill belongs to, and ``trade.role`` is ``"MAKER"`` (that
-        order rested) or ``"TAKER"`` (it aggressed). ``trade.txHash`` is the
-        trade's content hash (``0x`` + 64 hex), not an on-chain transaction;
-        ``trade.proof`` is ``{"status": "PENDING"}``, or ``None`` with proofs
-        off; ``trade.fee`` is dollars to 0.001. Each engine update's burst
+        Exactly one frame per fill of yours, final when it matches.
+        ``trade.source`` says what made it: ``TRADE`` (``orderId`` your order,
+        ``role`` ``"MAKER"`` if it rested, ``"TAKER"`` if it aggressed,
+        ``txHash`` the trade's content hash, not an on-chain transaction) or,
+        on a perp, ``LIQUIDATION``, ``BACKSTOP_LIQUIDATION``, ``DELEVERAGE``,
+        ``EXIT``, ``SETTLE``, ``FORCED`` or ``FORCED_DELEVERAGE``: no trade, so
+        ``txHash`` is ``None``. ``trade.tradeId`` is always the fill's journal
+        seq, and a fill is keyed by ``(tradeId, side)``. A liquidation's take
+        from your resting order is ``LIQUIDATION``, ``role`` ``"MAKER"``,
+        ``orderId`` your order, ``fee`` 0, and its public print
+        (:meth:`on_trades`, ``isLiquidation: True``) has the same ``tradeId``.
+        ``trade.direction`` and ``trade.closedPnl`` say what it did to the
+        position; ``trade.fee`` is dollars to 0.001. Each engine update's burst
         carries its ``order_status`` frames, then its ``trade_new`` frames,
         then ``balances_update``; an update with more than 200 statuses or
         trades comes as several such bursts, ``balances_update`` in the last
         only. Match a fill to its order by ``trade.orderId``, not by frame
         order. Delivery is at most once (no replay after a reconnect), so
         reconcile with ``history.trades()``.
-
-        A liquidation's take from one of your resting perps orders fills it
-        but is no trade: it comes to :meth:`on_liquidation_fill`, not here.
         """
         return self.on(WSMessageType.TRADE_NEW, handler)
-
-    def on_liquidation_fill(self, handler: Handler | None = None) -> Any:
-        """A liquidation took from one of your resting orders on a perps market
-        (``liquidation_fill``: ``{fill}``, a :class:`~loaf.models.LiquidationFill`).
-
-        It is a fill of your order, at its price, but no trade: ``fill`` has
-        no ``tradeId`` or ``txHash``, and ``fill.perpsSeq`` (the liquidation's
-        journal seq) names it. The take's public print (:meth:`on_trades`,
-        ``isLiquidation: True``) carries the same seq as its ``tradeId``, so
-        a client that follows both the tape and its fills counts the take
-        once by that seq, whichever arrives first. ``fill.orderId`` is your order, ``fill.role``
-        ``"MAKER"``, and ``fill.fee`` 0 (a liquidation's maker pays none). The
-        order's status moves with an ``order_status`` frame, as with a trade's
-        fill, and the balances with ``balances_update``. Count it with your
-        trade fills wherever you track an order's fills or your position.
-        Delivery is at most once. A liquidation of your own position closes it
-        instead: see :meth:`loaf.resources.perps.PerpsResource.closes`.
-        """
-        return self.on(WSMessageType.LIQUIDATION_FILL, handler)
 
     def on_order_queue(self, handler: Handler | None = None) -> Any:
         """Your resting orders' places in one market's book (``order_queue``:
@@ -367,6 +366,63 @@ class LoafWebSocketClient:
         absolute; recomputed after fills."""
         return self.on(WSMessageType.LIFETIME_VOLUME_UPDATE, handler)
 
+    def on_perps_account(self, handler: Handler | None = None) -> Any:
+        """Your perps account changed (``perps_account_update``: ``{perps}``,
+        ``{l2AccountIndex, pools}`` as
+        :meth:`loaf.resources.perps.PerpsResource.positions` serves them),
+        after every engine commit that touches it: replace the pools you hold
+        (a pool it does not list holds nothing). Its values are as of that
+        commit: between pushes recompute them from ``perps:markets`` (README,
+        **Perps**). Delivery is at most once: re-read after a reconnect."""
+        return self.on(WSMessageType.PERPS_ACCOUNT_UPDATE, handler)
+
+    def on_funding_payment(self, handler: Handler | None = None) -> Any:
+        """A funding tick charged one of your positions (``funding_payment``:
+        ``{funding}``, a :class:`~loaf.models.FundingPayment`): add it unless
+        you hold its ``(journalSeq, pool)``. Delivery is at most once:
+        reconcile with ``history.funding()``."""
+        return self.on(WSMessageType.FUNDING_PAYMENT, handler)
+
+    def on_holding(self, handler: Handler | None = None) -> Any:
+        """One of your holdings changed (``holding_update``: ``{holding}``,
+        whole, as ``portfolio.summary().holdings`` lists it): upsert by
+        ``holding.ticker``. An IPO allocation's ``quantity`` 0 removes it; an
+        L2 holding's amounts stay its ``balances`` row. Fills close together
+        send one frame. Its ``averageEntryPrice`` is ``None`` until the
+        exchange has read its fills, and a later frame brings it: show none
+        meanwhile, never the earlier one."""
+        return self.on(WSMessageType.HOLDING_UPDATE, handler)
+
+    def on_transfer(self, handler: Handler | None = None) -> Any:
+        """A deposit or withdrawal of yours was journaled or moved on
+        (``transfer_update``: ``{transfer}``, whole, as
+        ``portfolio.component().transfers`` lists it): upsert by
+        ``transfer.journalSeq``; it can repeat."""
+        return self.on(WSMessageType.TRANSFER_UPDATE, handler)
+
+    def on_fees(self, handler: Handler | None = None) -> Any:
+        """The fees that apply to you changed (``fees_update``:
+        ``{applicableFees}``): replace what
+        ``portfolio.component().applicableFees`` gave you."""
+        return self.on(WSMessageType.FEES_UPDATE, handler)
+
+    def on_l2_keys(self, handler: Handler | None = None) -> Any:
+        """A change to your account's keys was journaled (``l2_keys_update``:
+        ``{apiKeyIndices}``, the api key indices it names), such as a reset of
+        your trading key in the web app: read ``GET /l2/keys`` once
+        (``loaf.get("/l2/keys", params={"apiKeyIndex": 0})``), which raises
+        :class:`~loaf.exceptions.LoafAuthError` once your trading key is no
+        longer the one in force."""
+        return self.on(WSMessageType.L2_KEYS_UPDATE, handler)
+
+    def on_perps_leverage(self, handler: Handler | None = None) -> Any:
+        """You saved a leverage on a perp (``perps_leverage_update``:
+        ``{marketIndex, leverage}``), here
+        (:meth:`loaf.resources.portfolio.PortfolioResource.set_perps_leverage`)
+        or in the web app: replace that market's row of
+        ``portfolio.summary().perpsLeverage``."""
+        return self.on(WSMessageType.PERPS_LEVERAGE_UPDATE, handler)
+
     # lifecycle / control
     def on_error(self, handler: Handler | None = None) -> Any:
         """Server-sent ``error`` frames: ``{message, code}``.
@@ -391,9 +447,9 @@ class LoafWebSocketClient:
         a re-seed here and do the REST reads from your own thread, as
         ``bot.py`` does: handlers run on the socket's thread, and a slow read
         inside one stalls the socket until the server's heartbeat drops it.
-        The private reads (``portfolio.component()`` and the ``history`` reads)
-        first wait, up to 2 s, until every change pushed before them is
-        readable.
+        The private reads (``portfolio.summary()``, ``portfolio.component()``
+        and the ``history`` reads) first wait, up to 2 s, until every change
+        pushed before them is readable.
         """
         return self.on(_ON_CONNECT, handler)
 
@@ -486,8 +542,8 @@ class LoafWebSocketClient:
         return self.subscribe(f"market:{ticker}")
 
     def subscribe_perps_markets(self) -> LoafWebSocketClient:
-        """Every perps market's live state (no id — one global channel), about once
-        a second: see :meth:`on_perps_markets_live`."""
+        """Every perps market's live state and terms changes (no id — one global
+        channel): see :meth:`on_perps_markets_live` and :meth:`on_market_terms`."""
         return self.subscribe("perps:markets")
 
     def subscribe_portfolio(self) -> LoafWebSocketClient:

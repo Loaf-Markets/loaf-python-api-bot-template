@@ -623,9 +623,11 @@ class OrdersResource(Resource):
                 two common cases out for you.
             trigger_price: the mark level that fires the row, dollars, at most
                 2 decimals. The mark is the order book mid, else the last trade,
-                else the last candle close. Refused (400) if the mark is already
-                at or through it — triggering is level-based, so a trigger EQUAL
-                to the mark is refused too. Round it yourself
+                else the last candle close. On a perp it is
+                ``market.get(ticker).market.live.markPrice`` (dollars x 1000),
+                which the ``perps:markets`` channel pushes. Refused (400) if the
+                mark is already at or through it — triggering is level-based, so
+                a trigger EQUAL to the mark is refused too. Round it yourself
                 (``round(mark * 0.95, 2)``): a raw float product carries 17
                 decimals and fails the 2-decimal check.
             price: ``*_LIMIT`` types only (required): dollars, at most 2

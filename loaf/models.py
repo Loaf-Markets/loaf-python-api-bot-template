@@ -83,12 +83,6 @@ class PerpMarketL2(TypedDict):
     quoteLimit: int  # the most quote of any order; 0: none
 
 
-class L2PerpsMarket(PerpMarketL2):
-    """A row of ``perps.markets()``: a perp's ``marketIndex`` and its ``l2``."""
-
-    marketIndex: int  # 0 to 254
-
-
 class PerpsCollateral(TypedDict):
     """``perps.collateral()``: the one asset every margin pool holds (USDC)."""
 
@@ -99,66 +93,58 @@ class PerpsCollateral(TypedDict):
     extensionMultiplier: str  # the reads' extended units per tick, a decimal string
 
 
-class PerpsMarkets(TypedDict):
-    """``perps.markets()``: every perps market, ascending by ``marketIndex``, and the
-    collateral their pools hold."""
-
-    markets: list[L2PerpsMarket]
-    collateral: Optional[PerpsCollateral]  # None when the exchange could not read it just now
-
-
 class PerpsPosition(TypedDict):
-    """One open position of a pool. Amounts are decimal strings in the engine's units."""
+    """One open position of a pool. Amounts are decimal strings in the engine's units, valued
+    at the mark."""
 
     market: int  # the perps market, 0 to 254
+    ticker: str  # the market's
+    qem: str  # its quote extension multiplier, a decimal string
+    risk: int  # its maintenance margin factor per 65,536
+    band: int  # how far (bp) an order's price may sit from its index; 0: no bound
     base: str  # signed, in base units (an order's signed quantity): + long, - short
-    fundingIndex: str  # the funding index it last settled at, 32.32 fixed point
+    fundingIndex: str  # the funding index it last settled at: it owes base x (F - this)
     entryQuote: str  # the quote of the fills that opened and grew it
     entryPrice: str  # 10 x entryQuote / |base|, in the market's price units
     fundingOwed: str  # extended USDC units: positive pays, negative receives
-    notional: str  # |base| x index x qem, extended USDC units
-    liquidationPrice: Optional[str]  # the index past which the pool is liquidatable, or None
-    adlRank: Optional[int]  # 1 (deleveraged last) to 5 (first); None: unranked
-
-
-class PerpsOpenOrder(TypedDict):
-    """One of a pool's open perps orders, as the engine's admission counts them."""
-
-    orderId: int
-    market: int  # the perp's market index
-    side: str  # OrderSide
-    quantityLeft: str  # what is left of it, base units (tokens x 10), a decimal string
-    price: int  # its signed limit price, dollars x 1000
-    reduceOnly: bool
+    notional: str  # |base| x mark x qem, extended USDC units
+    liquidationPrice: Optional[str]  # the mark past which the pool is liquidatable, or None
 
 
 class PerpsPool(TypedDict):
-    """One margin pool of yours: its collateral, positions and open orders."""
+    """One margin pool of yours: its collateral and positions."""
 
     pool: int  # 0, the cross pool, or 1 to 7
     collateral: str  # signed, extended USDC units
     value: Optional[str]  # collateral + each position's signed notional - its funding owed
     requirement: Optional[str]  # maintenance margin, extended USDC units x 65,536
     liquidatable: Optional[bool]  # value < 0 or value x 65,536 < requirement
-    initialMarginOk: Optional[bool]  # value x 65,536 >= 2 x requirement: collateral may leave
+    initialMarginOk: Optional[bool]  # value x 65,536 >= 2 x requirement: K1's initial margin
     positions: list[PerpsPosition]  # ascending by market, at most 8
-    openOrders: list[PerpsOpenOrder]  # ascending by orderId; at most 200 across your pools
 
 
 class PerpsAccount(TypedDict):
-    """``perps.positions()``: your pools that hold anything, ascending."""
+    """``perps.positions()``, a summary's ``perps``: the collateral, and your pools that hold
+    anything, ascending."""
 
-    l2AccountIndex: int
+    collateral: PerpsCollateral
+    l2AccountIndex: Optional[int]  # None: no trading account yet, so no pools
     pools: list[PerpsPool]
 
 
-class PerpsFunding(TypedDict):
-    """One row of ``perps.funding()``."""
+class FundingPayment(TypedDict):
+    """What one funding tick charged one of your positions, ``base`` x the tick's move of F: a
+    ``fundingHistory`` or ``history.funding()`` row, or a ``funding_payment`` frame's
+    ``funding``. Keyed by ``(journalSeq, pool)``."""
 
+    journalSeq: int  # the tick's journal row
+    marketIndex: int
+    ticker: str  # the market's
     pool: int
-    market: int
-    fundingIndex: str
-    fundingOwed: str  # extended USDC units: positive pays, negative receives
+    base: str  # the position's signed base at the tick, a decimal string: + long, - short
+    payment: str  # extended USDC units, a decimal string: + the position paid, - it received
+    rateCbp: int  # the rate the tick applied, centi-bp of the index per period
+    atMs: int  # the tick's clock, unix ms
 
 
 class PerpsHeldPrice(TypedDict):
@@ -169,18 +155,21 @@ class PerpsHeldPrice(TypedDict):
 
 
 class PerpsMarketLive(TypedDict):
-    """One row of ``perps.markets_live()``: a perps market's live state, the engine's."""
+    """``market.get(ticker).market.live``, a perp's, and a row of a ``perps_markets_live``
+    frame: its live state, the engine's."""
 
     marketIndex: int  # 0 to 254
+    status: str  # "ACTIVE", or "EXPIRED": no more orders; positions leave by perps.exit()
+    markPrice: int  # what positions are valued at, dollars x 1000 (0 before the first report)
     indexPrice: int  # the accepted index (0 before the first report), as of observedAtMs
     observedAtMs: int
-    openInterest: str  # base units, a decimal string
-    fundingIndex: str  # 32.32 fixed point, signed, a decimal string
+    openInterest: str  # base units, a decimal string: longs plus shorts (one side's is half)
+    fundingIndex: str  # F, extended USDC units per base unit, signed, a decimal string
     tickAtMs: int  # the last funding tick
     nextTickAtMs: int  # when the next is due; 0: none (an expired or unpriced market)
-    fundingPeriodMs: int  # the period premiumSampleBp and fundingRateCbp are per
+    fundingPeriodMs: int  # the period fundingRateCbp is per
     premiumSampleBp: Optional[int]  # what a tick would apply now; None: the market is not rated
-    fundingRateCbp: Optional[int]  # centi-bp per period; None with premiumSampleBp
+    fundingRateCbp: Optional[int]  # centi-bp of the index per period; None with premiumSampleBp
     heldPrice: Optional[PerpsHeldPrice]  # while one stands, no order that can add risk is admitted
     halted: bool  # the engine's trading pause: every new order refused
     riskOnly: bool  # the engine's risk-only mode: only orders that reduce, and no withdrawal
@@ -190,52 +179,9 @@ class PerpsMarketLive(TypedDict):
 
 
 class PerpsMarketsLive(TypedDict):
-    """``perps.markets_live()``, and a ``perps_markets_live`` frame's ``markets``."""
+    """A ``perps_markets_live`` frame: ``markets``, every perp's live state, ascending."""
 
     markets: list[PerpsMarketLive]
-
-
-class PerpsFundingTick(TypedDict):
-    """One applied funding tick of a perps market."""
-
-    journalSeq: int
-    sampleBp: int  # the premium sample, bp per period
-    rateCbp: int  # the rate the funding index moved by, centi-bp per period
-    moved: bool  # False: the index was stale, so the tick paid nothing
-    fundingIndex: str  # after the tick, 32.32 fixed point, signed, a decimal string
-    indexPrice: int
-    tickAtMs: int
-
-
-class PerpsFundingTicks(TypedDict):
-    """``perps.funding_ticks()``: newest first."""
-
-    ticks: list[PerpsFundingTick]
-
-
-class PerpsClose(TypedDict):
-    """One of your positions closed by the engine or by an exit."""
-
-    journalSeq: int
-    atMs: int  # its commit's clock
-    kind: str  # LIQUIDATION, DELEVERAGE (auto-deleveraging), EXIT or SETTLE (an expired market)
-    market: int
-    pool: int
-    side: str  # the position's: LONG or SHORT
-    baseAfter: str  # its signed base after the close, a decimal string: "0" closed, never flipped
-    price: int
-    base: str  # the close's base units, a decimal string
-    quote: int  # in the market's quote units (10 x qem extended units)
-    fee: int  # yours, likewise
-    quoteExtended: str  # quote in extended USDC units, a decimal string
-    feeExtended: str  # fee in extended USDC units, a decimal string
-    adl: bool  # True: you were a deleverage's counterparty, closed against the deleveraged
-
-
-class PerpsCloses(TypedDict):
-    """``perps.closes()``: newest first."""
-
-    closes: list[PerpsClose]
 
 
 class PerpsOpAccepted(TypedDict):
@@ -252,9 +198,9 @@ class TradeTick(TypedDict, total=False):
     On a perps market the tape also carries liquidation takes: a liquidated position taken
     against a resting order. A take has ``isLiquidation: True`` and is no trade: it has no
     ``txHash`` key, its ``aggressorSide`` is the liquidated side, and its ``tradeId`` is the
-    liquidation's journal seq, the ``perpsSeq`` of its maker's ``liquidation_fill``. A trade
-    always has its ``txHash``, and ``isLiquidation`` absent or ``False``: read
-    ``tick.get("txHash")``."""
+    liquidation's journal seq, the ``tradeId`` of its maker's row (``source``
+    ``LIQUIDATION``). A trade always has its ``txHash``, and ``isLiquidation`` absent or
+    ``False``: read ``tick.get("txHash")``."""
 
     tradeId: int
     marketIndex: int
@@ -306,6 +252,8 @@ class OrderHistoryItem(TypedDict, total=False):
 
     id: int
     marketIndex: int  # the order's market: the index it signed
+    pool: Optional[int]  # a perps order's margin pool; None on spot
+    reduceOnly: bool  # its fills may only shrink the pool's position; False on spot
     # The market's, a delisted one's too; "" only for a market no asset is bound to: key on
     # marketIndex.
     ticker: str
@@ -356,37 +304,32 @@ class TradeProofStatus(TypedDict, total=False):
     final: bool
 
 
-class LiquidationFill(TypedDict):
-    """A ``liquidation_fill`` frame's ``fill``: a liquidation took from your resting order on a
-    perps market. It is a fill of that order but no trade (no ``tradeId``, no ``txHash``):
-    ``perpsSeq`` names it, and the take's tape print (``isLiquidation: True``) carries it as its
-    ``tradeId``. You are its maker and pay no fee; amounts are display units, as a trade's."""
-
-    perpsSeq: int  # the liquidation's journal seq = its tape print's tradeId
-    orderId: int  # your order it filled
-    marketIndex: int
-    ticker: str  # the market's
-    side: str  # OrderSide of your order
-    role: str  # "MAKER"
-    quantity: float
-    price: float
-    fee: float  # dollars; 0 for the maker of a liquidation
-    executedAt: int  # unix seconds
-
-
 class TradeHistoryItem(TypedDict, total=False):
-    tradeId: int
-    orderId: int  # this user's order the fill belongs to
+    """Your fill: a ``tradeHistory`` or ``history.trades()`` row, or a ``trade_new`` frame's
+    ``trade``. Keyed by ``(tradeId, side)``: a deleverage between two of your pools is two rows
+    of one ``tradeId``, one each side."""
+
+    tradeId: int  # the row's journal seq: a trade's id, or a perps fill's journal row
+    orderId: Optional[int]  # this user's order the fill belongs to; None: it filled no order
     marketIndex: int
     ticker: str  # the market's
-    txHash: str  # the trade's content hash (0x + 64 hex), not an on-chain transaction
+    # A trade's content hash (0x + 64 hex), not an on-chain transaction; None: no trade.
+    txHash: Optional[str]
     side: str  # OrderSide, relative to this user
-    role: str  # "MAKER" | "TAKER": the resting order is the MAKER, the aggressor's the TAKER
+    # "MAKER" | "TAKER": a TRADE's resting or aggressing order; on any other source TAKER is the
+    # pool the row closed and MAKER the other side.
+    role: str
+    pool: Optional[int]  # a perps fill's margin pool; None on spot
     quantity: float
     price: float
     fee: float  # this user's fee, dollars, to 0.001
+    closedPnl: Optional[float]  # dollars, signed, before fees; None unless it reduced a position
+    # TRADE (an order matched), or on a perp LIQUIDATION, BACKSTOP_LIQUIDATION, DELEVERAGE, EXIT,
+    # SETTLE, FORCED or FORCED_DELEVERAGE.
+    source: str
+    direction: str  # BUY or SELL on spot; OPEN_LONG, CLOSE_LONG, OPEN_SHORT or CLOSE_SHORT
     executedAt: int
-    proof: Optional[TradeProofStatus]  # None with proofs off
+    proof: Optional[TradeProofStatus]  # history.trades() alone; None with proofs off or no trade
 
 
 class L2AssetBalance(TypedDict):
@@ -417,22 +360,37 @@ class Holding(TypedDict, total=False):
     assetId: int  # L2 holding only: its balances row
     quantity: float  # IPO allocation only, tokens
     imageUrl: str
-    sparkline: list[float]
+
+
+class PerpsLeverage(TypedDict):
+    """A leverage you saved on a perp: a summary's ``perpsLeverage`` row, the answer to
+    ``portfolio.set_perps_leverage()``, and a ``perps_leverage_update`` frame's fields."""
+
+    marketIndex: int  # the perp's, 0 to 254
+    leverage: int  # 1 to the market's most, 65,536 // (2 x risk)
+
+
+class PortfolioSummary(TypedDict):
+    """``portfolio.summary()``: what you hold."""
+
+    balances: list[L2AssetBalance]  # the whole L2 book; a missing row is 0
+    holdings: list[Holding]
+    perps: Optional[PerpsAccount]  # None: not read just now, which never means you hold none
+    perpsLeverage: list[PerpsLeverage]  # the ones saved, one a market; read even when perps is None
 
 
 class PortfolioComponent(TypedDict, total=False):
-    balances: list[L2AssetBalance]  # the whole L2 book; a missing row is 0
+    """``portfolio.component()``: your recent activity, fees and lifetime volume."""
+
     lifetimeVolume: float  # dollars traded over the account's lifetime
-    holdings: list[Holding]
     applicableFees: dict[str, int]  # {takerFeeBps, makerFeeBps}
     offeringOrders: list[dict[str, Any]]
     openOrders: list[OrderHistoryItem]  # booked orders + PENDING/ARMED conditionals, merged
-    tradeHistory: list[TradeHistoryItem]
-    # Your newest liquidation fills, newest first: each a liquidation_fill frame's fill (no
-    # trade: tradeHistory never holds one).
-    liquidationFills: list[LiquidationFill]
+    tradeHistory: list[TradeHistoryItem]  # without proof
     orderHistory: list[OrderHistoryItem]  # newest rows of both kinds, ANY status
     transfers: list[dict[str, Any]]  # newest first, keyed by journalSeq; `amount` in base units
+    fundingHistory: list[FundingPayment]  # newest first
+    holdingSparklines: dict[str, list[float]]  # by holding ticker: up to 48 closes, oldest first
 
 
 __all__ = [
@@ -442,21 +400,14 @@ __all__ = [
     "CandleHistory",
     "MarketL2",
     "PerpMarketL2",
-    "L2PerpsMarket",
     "PerpsCollateral",
-    "PerpsMarkets",
     "PerpsPosition",
-    "PerpsOpenOrder",
     "PerpsPool",
     "PerpsAccount",
-    "PerpsFunding",
+    "FundingPayment",
     "PerpsHeldPrice",
     "PerpsMarketLive",
     "PerpsMarketsLive",
-    "PerpsFundingTick",
-    "PerpsFundingTicks",
-    "PerpsClose",
-    "PerpsCloses",
     "PerpsOpAccepted",
     "TradeTick",
     "OrderResult",
@@ -466,8 +417,9 @@ __all__ = [
     "OrderQueueEntry",
     "TradeProofStatus",
     "TradeHistoryItem",
-    "LiquidationFill",
     "L2AssetBalance",
     "Holding",
+    "PerpsLeverage",
+    "PortfolioSummary",
     "PortfolioComponent",
 ]

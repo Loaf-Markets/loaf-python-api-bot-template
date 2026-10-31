@@ -28,17 +28,16 @@ from conftest import (
     BAD_SIGNATURE,
     KAT,
     KEY_DISABLED,
+    L2_SECRET,
     MARKET_L2,
     MARKET_STATES,
     NONCE_REFUSAL,
     PERPS_ACCOUNT,
-    PERPS_CLOSE,
     PERPS_COLLATERAL,
-    PERPS_FUNDING_TICK,
     PERPS_LIVE,
-    PERPS_MARKET,
     PERP_L2,
     UNKNOWN_KEY,
+    WRONG_CHAIN,
     freeze,
     market_detail,
     routes,
@@ -77,8 +76,7 @@ def _bearer(request: httpx.Request) -> str:
     """The login token a request carries as its ``Authorization: Bearer``."""
     return request.headers["authorization"][len("Bearer ") :]
 
-WRONG_CHAIN = "l2 chain id: not the engine's L2 chain"
-PAUSED = "Trading is paused. Your perps request was not submitted — please try again shortly."
+PAUSED ="Trading is paused. Your perps request was not submitted — please try again shortly."
 NOT_TAKEN = (
     "perps: the engine did not take the op and nothing was journaled; send it again in a moment"
 )
@@ -104,47 +102,7 @@ def perps_exchange(exchange):
 # --------------------------------------------------------------------------- #
 
 
-def test_markets_and_market(exchange, trading_client):
-    perps = trading_client().perps  # public: a client with a key sends it no token
-    assert perps.markets() == {"markets": [PERPS_MARKET], "collateral": PERPS_COLLATERAL}
-    assert perps.market(4) == PERPS_MARKET
-    assert perps.market(5) is None
-    assert perps.collateral() == PERPS_COLLATERAL
-    gets = exchange.gets("/l2/perps/markets")
-    assert [request.headers.get("authorization") for request in gets] == [None] * 4
-
-
-def test_live_state_and_funding_ticks_are_public(exchange, trading_client):
-    perps = trading_client().perps
-    assert perps.markets_live() == {"markets": [PERPS_LIVE]}
-    assert perps.market_live(4) == PERPS_LIVE
-    assert perps.market_live(5) is None
-    assert perps.funding_ticks(4) == {"ticks": [PERPS_FUNDING_TICK]}
-    perps.funding_ticks(4, limit=200, before=812)
-    assert [dict(r.url.params) for r in exchange.gets("/l2/perps/funding")] == [
-        {"market": "4"},
-        {"market": "4", "limit": "200", "before": "812"},
-    ]
-    assert len(exchange.gets("/l2/perps/markets/live")) == 3
-    assert [r.headers.get("authorization") for r in exchange.requests] == [None] * 5
-
-
-def test_closes(exchange, trading_client):
-    perps = trading_client().perps
-    assert perps.closes() == {"closes": [PERPS_CLOSE]}
-    perps.closes(limit=1, before=990)
-    gets = exchange.gets("/l2/perps/closes")
-    assert [dict(r.url.params) for r in gets] == [{}, {"limit": "1", "before": "990"}]
-    for request in gets:  # a login token the trading key signed for its account
-        assert verify_login(_bearer(request))["l2AccountIndex"] == ACCOUNT_INDEX
-    with pytest.raises(loaf.LoafConfigError, match="needs your trading key"):
-        trading_client(trading_key=None).perps.closes()
-    exchange.key_in_force = None
-    with pytest.raises(loaf.LoafAuthError, match=re.escape(UNKNOWN_KEY)):
-        perps.closes()
-
-
-def test_positions_pools_and_funding(exchange, trading_client):
+def test_positions_and_pools_are_the_summarys_perps(exchange, trading_client):
     perps = trading_client().perps
     assert perps.positions() == PERPS_ACCOUNT
     cross, isolated = PERPS_ACCOUNT["pools"]
@@ -155,14 +113,42 @@ def test_positions_pools_and_funding(exchange, trading_client):
     assert perps.position(9, pool=2) == isolated["positions"][0]
     assert perps.position(9) is None  # pool 0 holds none there
     assert perps.position(4, pool=1) is None
-    assert perps.funding() == [
-        {"pool": 0, "market": 4, "fundingIndex": "4294967296", "fundingOwed": "-1200"},
-        {"pool": 2, "market": 9, "fundingIndex": "-12", "fundingOwed": "35"},
-    ]
-    gets = exchange.gets("/l2/perps/positions")
-    assert len(gets) == 9
+    gets = exchange.gets("/portfolio/summary")
+    assert len(gets) == 8
     for request in gets:
         assert verify_login(_bearer(request))["l2AccountIndex"] == ACCOUNT_INDEX
+
+
+def test_the_collateral_is_read_once_and_needs_the_trading_key(exchange, trading_client):
+    perps = trading_client().perps
+    assert perps.collateral() == PERPS_COLLATERAL
+    perps.add_margin(5)
+    assert perps.collateral() == PERPS_COLLATERAL
+    assert len(exchange.gets("/portfolio/summary")) == 1
+    with pytest.raises(loaf.LoafConfigError, match="needs your trading key"):
+        trading_client(trading_key=None).perps.collateral()
+
+
+def test_a_null_perps_is_unavailable_and_never_no_positions(exchange, trading_client):
+    exchange.perps_account = None
+    perps = trading_client().perps
+    for read in (perps.positions, perps.pool, lambda: perps.position(4), perps.collateral,
+                 lambda: perps.add_margin(5)):
+        with pytest.raises(loaf.LoafServiceUnavailableError, match="does not mean you hold none"):
+            read()
+    assert exchange.posts("/l2/allocations") == []
+    exchange.perps_account = json.loads(json.dumps(PERPS_ACCOUNT))
+    assert perps.position(4) == PERPS_ACCOUNT["pools"][0]["positions"][0]  # nothing kept from the failure
+
+
+def test_a_perps_live_state_is_its_markets(perps_exchange, trading_client):
+    # Public: a perp's detail carries its live state, whose mark is not its index.
+    live = trading_client(trading_key=None).market.get("OPRA-PERP").market.live
+    assert live == PERPS_LIVE
+    assert live.markPrice != live.indexPrice
+    (request,) = perps_exchange.requests
+    assert "authorization" not in request.headers
+    assert "live" not in trading_client().market.get("OPRA").market  # a spot market has none
 
 
 def test_positions_need_the_trading_key_in_force(exchange, trading_client):
@@ -177,22 +163,10 @@ def test_positions_need_the_trading_key_in_force(exchange, trading_client):
 @pytest.mark.parametrize(
     "read",
     [
-        lambda perps: perps.market(255),
-        lambda perps: perps.market(-1),
-        lambda perps: perps.market(True),
-        lambda perps: perps.market("4"),
         lambda perps: perps.pool(8),
         lambda perps: perps.pool(1.0),
         lambda perps: perps.position(255),
         lambda perps: perps.position(4, pool=-1),
-        lambda perps: perps.market_live(255),
-        lambda perps: perps.funding_ticks(-1),
-        lambda perps: perps.funding_ticks(4, limit=0),
-        lambda perps: perps.funding_ticks(4, limit=201),
-        lambda perps: perps.funding_ticks(4, before=0),
-        lambda perps: perps.closes(limit=True),
-        lambda perps: perps.closes(before=2**53),
-        lambda perps: perps.closes(before="990"),
     ],
 )
 def test_reads_check_their_arguments_locally(exchange, trading_client, read):
@@ -242,6 +216,88 @@ def test_a_perps_l2_is_no_spot_l2_and_back(exchange, trading_client):
 
 
 # --------------------------------------------------------------------------- #
+# The leverage setting
+# --------------------------------------------------------------------------- #
+
+
+def test_a_leverage_is_saved_by_market_index_or_ticker(perps_exchange, trading_client):
+    portfolio = trading_client().portfolio
+    assert portfolio.summary().perpsLeverage == []
+    assert portfolio.set_perps_leverage(4, 5) == {"marketIndex": 4, "leverage": 5}
+    assert portfolio.set_perps_leverage("OPRA-PERP", 32_768) == {"marketIndex": 4, "leverage": 32_768}
+    assert portfolio.set_perps_leverage(0, 1) == {"marketIndex": 0, "leverage": 1}
+    assert portfolio.summary().perpsLeverage == [
+        {"marketIndex": 0, "leverage": 1}, {"marketIndex": 4, "leverage": 32_768}
+    ]
+    assert routes(perps_exchange.requests) == [
+        "GET /portfolio/summary",
+        "PUT /portfolio/perps-leverage",
+        "GET /trade/OPRA-PERP",  # a ticker names its market by the detail's marketIndex
+        "PUT /portfolio/perps-leverage",
+        "PUT /portfolio/perps-leverage",
+        "GET /portfolio/summary",
+    ]
+    puts = [r for r in perps_exchange.requests if r.method == "PUT"]
+    # Shared-Types' perpsLeverageBodySchema: strict, both whole numbers; sent with a login token.
+    assert [json.loads(r.content) for r in puts] == [
+        {"marketIndex": 4, "leverage": 5}, {"marketIndex": 4, "leverage": 32_768},
+        {"marketIndex": 0, "leverage": 1},
+    ]
+    assert all(list(json.loads(r.content)) == ["marketIndex", "leverage"] for r in puts)
+    for request in puts:
+        assert verify_login(_bearer(request))["l2AccountIndex"] == ACCOUNT_INDEX
+    assert "authorization" not in perps_exchange.requests[2].headers  # the detail is public
+    assert loaf.PERPS_DEFAULT_LEVERAGE == 3  # a market with none saved, at most its most
+
+
+@pytest.mark.parametrize(
+    "market, leverage, message",
+    [
+        (4, 0, "leverage must be"),
+        (4, 32_769, "leverage must be"),
+        (4, 2.5, "leverage must be"),
+        (4, "3", "leverage must be"),
+        (4, True, "leverage must be"),
+        (4, None, "leverage must be"),
+        (255, 3, "market must be a perps market index"),
+        (-1, 3, "market must be a perps market index"),
+        (4.0, 3, "market must be a perps market index"),
+        (None, 3, "market must be a perps market index"),
+        ("OPRA", 3, "OPRA is a spot market"),
+        ("opra-perp", 3, "ticker must be a market's ticker"),
+    ],
+)
+def test_a_leverage_is_checked_locally(exchange, trading_client, market, leverage, message):
+    with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
+        trading_client().portfolio.set_perps_leverage(market, leverage)
+    assert info.value.status_code == 0
+    assert exchange.requests == []
+
+
+def test_a_leverage_the_exchange_refuses_saves_nothing(perps_exchange, trading_client):
+    with pytest.raises(loaf.LoafConfigError, match="needs your trading key"):
+        trading_client(trading_key=None).portfolio.set_perps_leverage(4, 3)
+    assert perps_exchange.requests == []
+    refusal = "perps: leverage is malformed"
+    perps_exchange.queue("/portfolio/perps-leverage", error_reply(400, refusal))
+    portfolio = trading_client().portfolio
+    with pytest.raises(loaf.LoafValidationError, match=re.escape(refusal)) as info:
+        portfolio.set_perps_leverage(4, 10)
+    assert info.value.status_code == 400
+    with pytest.raises(loaf.LoafNotFoundError, match="Market not found"):
+        portfolio.set_perps_leverage("MUS-PERP", 3)
+    # A detail that serves no perp's index: the SDK never guesses one.
+    perps_exchange.details["OPRA-PERP"] = market_detail("OPRA-PERP", market_index=2050)
+    message = "GET /trade/OPRA-PERP answered an unusable market.marketIndex"
+    with pytest.raises(loaf.LoafServerError, match=re.escape(message)):
+        portfolio.set_perps_leverage("OPRA-PERP", 3)
+    assert routes(perps_exchange.requests) == [
+        "PUT /portfolio/perps-leverage", "GET /trade/MUS-PERP", "GET /trade/OPRA-PERP"
+    ]
+    assert perps_exchange.perps_leverage == {}
+
+
+# --------------------------------------------------------------------------- #
 # Allocates and exits
 # --------------------------------------------------------------------------- #
 
@@ -265,11 +321,11 @@ def test_add_margin(exchange, trading_client, l2_clock):
     }
     verify_op(body)
     assert routes(exchange.requests) == [
-        "GET /l2/perps/markets",
+        "GET /portfolio/summary",
         "GET /l2/keys",
         "POST /l2/allocations",
     ]
-    assert "authorization" not in exchange.requests[0].headers  # the perps markets are public
+    assert verify_login(_bearer(exchange.requests[0]))["l2AccountIndex"] == ACCOUNT_INDEX
     assert exchange.requests[1].url.params["apiKeyIndex"] == "0"
     # Signed with the trading key, sent with a login token it signs: the exchange checks the
     # account is yours.
@@ -288,9 +344,9 @@ def test_return_margin_and_a_move_between_pools(exchange, trading_client):
     ]
     for body in (first, second):
         verify_op(body)
-    # The chain id is read once; the nonce before every op.
+    # The collateral is read once; the nonce before every op.
     assert routes(exchange.requests) == [
-        "GET /l2/perps/markets",
+        "GET /portfolio/summary",
         "GET /l2/keys",
         "POST /l2/allocations",
         "GET /l2/keys",
@@ -384,7 +440,7 @@ def test_an_amount_is_whole_ticks_of_the_served_collateral(exchange, trading_cli
             perps.add_margin(amount)
         assert info.value.status_code == 0
     assert len(exchange.bodies("/l2/allocations")) == 4
-    assert len(exchange.gets("/l2/perps/markets")) == 1
+    assert len(exchange.gets("/portfolio/summary")) == 1
 
 
 def test_an_amount_is_counted_in_the_collateral_served_not_an_assumed_one(
@@ -434,29 +490,19 @@ def test_a_reply_without_a_usable_collateral_is_a_server_error(
         with pytest.raises(loaf.LoafServerError, match="answered no usable collateral"):
             call()
     assert exchange.posts("/l2/allocations") == []
-    assert routes(exchange.requests) == ["GET /l2/perps/markets"] * 3
+    assert routes(exchange.requests) == ["GET /portfolio/summary"] * 3
 
 
-@pytest.mark.parametrize(
-    "collateral",
-    [None, {k: v for k, v in PERPS_COLLATERAL.items() if k != "tickSize"}],
-    ids=["null", "no-tickSize"],
-)
-def test_an_exit_needs_no_collateral(exchange, trading_client, collateral):
-    # An exit moves no amount: a reply without a usable collateral never blocks it, as nothing
-    # unrelated may block a position's way out.
-    exchange.perps_collateral = collateral
+def test_an_exit_needs_no_collateral(exchange, trading_client):
+    # An exit moves no amount: it never reads the summary, so a perps read the exchange cannot
+    # make never blocks it, as nothing unrelated may block a position's way out.
+    exchange.perps_account = None
     perps = trading_client().perps
     assert perps.exit(4, pool=1) == {"journalSeq": 1001, "duplicate": False}
     (body,) = exchange.bodies("/l2/exits")
     assert (body["pool"], body["market"], body["l2ChainId"]) == (1, 4, 4242)
     verify_op(body)
-    # An allocate still refuses it, and the exit's read stays good for the next exit.
-    with pytest.raises(loaf.LoafServerError, match="answered no usable collateral"):
-        perps.add_margin(5)
-    perps.exit(4, pool=2)
-    assert len(exchange.bodies("/l2/exits")) == 2
-    assert exchange.posts("/l2/allocations") == []
+    assert routes(exchange.requests) == ["GET /l2/keys", "POST /l2/exits"]
 
 
 def test_ops_need_the_trading_key(exchange, trading_client):
@@ -485,10 +531,11 @@ def test_an_op_is_never_signed_while_the_trading_key_is_not_in_force(
 
 
 def test_an_op_is_never_signed_with_another_deployments_key(exchange, trading_client):
-    exchange.perps_markets = [dict(PERPS_MARKET, l2ChainId=4243)]
-    with pytest.raises(loaf.LoafConfigError, match="is from another Loaf deployment"):
-        trading_client().perps.exit(4)
-    assert routes(exchange.requests) == ["GET /l2/perps/markets"]
+    # The trading key names its L2 chain: the nonce read's login token is refused for it.
+    client = trading_client(trading_key=f"loaf_tk_4243_{ACCOUNT_INDEX}_{L2_SECRET}")
+    with pytest.raises(loaf.LoafAuthError, match=re.escape(WRONG_CHAIN)):
+        client.perps.exit(4)
+    assert routes(exchange.requests) == ["GET /l2/keys"]
 
 
 @pytest.mark.parametrize("index", [6, None, "5", True, -1])
@@ -505,39 +552,6 @@ def test_an_unusable_nonce_is_a_server_error(exchange, trading_client, nonce):
     with pytest.raises(loaf.LoafServerError, match="/l2/keys answered an unusable withdrawalNonce"):
         trading_client().perps.add_margin(5)
     assert exchange.posts("/l2/allocations") == []
-
-
-def test_no_perps_market_listed_yet(exchange, trading_client):
-    exchange.perps_markets = []
-    with pytest.raises(loaf.LoafConfigError, match="lists no perps market yet"):
-        trading_client().perps.add_margin(5)
-    exchange.queue("/l2/perps/markets", httpx.Response(200, json={"markets": None}))
-    with pytest.raises(loaf.LoafServerError, match="answered no markets list"):
-        trading_client().perps.add_margin(5)
-    assert routes(exchange.requests) == ["GET /l2/perps/markets"] * 2
-
-
-@pytest.mark.parametrize("chain_id", [0, 2130706433, "4242", None, True])
-def test_an_unusable_l2_chain_id_is_a_server_error(exchange, trading_client, chain_id):
-    exchange.perps_markets = [dict(PERPS_MARKET, l2ChainId=chain_id)]
-    with pytest.raises(loaf.LoafServerError, match="unusable l2ChainId"):
-        trading_client().perps.exit(4)
-    assert routes(exchange.requests) == ["GET /l2/perps/markets"]
-
-
-def test_a_refused_chain_id_is_read_again(exchange, trading_client):
-    perps = trading_client().perps
-    perps.add_margin(5)
-    exchange.perps_markets = [dict(PERPS_MARKET, l2ChainId=4343)]  # the exchange moved
-    exchange.queue("/l2/allocations", error_reply(400, WRONG_CHAIN))
-    with pytest.raises(loaf.LoafValidationError, match="l2 chain id"):
-        perps.add_margin(5)  # signed with the chain id read before
-    # Read again, the perps markets are on another chain than the trading key's (a key is one
-    # deployment's): nothing more is signed or sent.
-    with pytest.raises(loaf.LoafConfigError, match="is from another Loaf deployment"):
-        perps.add_margin(5)
-    assert [body["l2ChainId"] for body in exchange.bodies("/l2/allocations")] == [4242, 4242]
-    assert len(exchange.gets("/l2/perps/markets")) == 2
 
 
 def test_an_op_sent_elsewhere_first_is_refused_and_the_next_signs_the_new_nonce(
@@ -579,7 +593,7 @@ def test_concurrent_ops_sign_consecutive_nonces(exchange, trading_client):
     assert errors == []
     nonces = sorted(body["l2Nonce"] for body in exchange.bodies("/l2/allocations"))
     assert nonces == [0, 1, 2, 3, 4]
-    assert len(exchange.gets("/l2/perps/markets")) == 1
+    assert len(exchange.gets("/portfolio/summary")) == 1
 
 
 # --------------------------------------------------------------------------- #

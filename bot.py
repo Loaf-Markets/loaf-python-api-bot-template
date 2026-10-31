@@ -92,7 +92,7 @@ def trading_started(starts_at: int | None) -> bool:
 def preflight(client: LoafClient) -> None:
     """Confirm credentials work and print balances/holdings."""
     try:
-        comp = client.portfolio.component()
+        comp = client.portfolio.summary()
     except loaf.LoafAuthError as exc:
         sys.exit(f"Your trading key was refused: {exc.message}")
 
@@ -240,17 +240,10 @@ class Strategy:
                 self.last_trade = trades[0]
 
     def on_my_fill(self, msg) -> None:
-        # A fill on YOUR orders.
+        # A fill of YOURS: a trade, or a perp's liquidation, deleverage, exit, ... (source).
         t = msg.trade
-        print(f"  *** FILLED: {t.side} {t.quantity} {t.ticker} @ {t.price} "
-              f"(fee {t.fee}) #{t.tradeId}")
-
-    def on_my_liquidation_fill(self, msg) -> None:
-        # A liquidation took from one of YOUR resting perps orders: a fill of it,
-        # but no trade (no tradeId or txHash; perpsSeq names it).
-        f = msg.fill
-        print(f"  *** FILLED by a liquidation: {f.side} {f.quantity} {f.ticker} @ {f.price} "
-              f"(order #{f.orderId}, seq {f.perpsSeq})")
+        print(f"  *** FILLED ({t.source}): {t.side} {t.quantity} {t.ticker} @ {t.price} "
+              f"(fee {t.fee}, order #{t.orderId}) #{t.tradeId}")
 
     def on_my_order(self, msg) -> None:
         # `order_status` is the transition only (FILLED / CANCELLED / ...).
@@ -405,7 +398,6 @@ def main() -> None:
     ws.on_market_halt(strategy.on_halt)       # public: halt/resume for this market
     ws.on_trades(strategy.on_trade_tick)
     ws.on_trade(strategy.on_my_fill)          # private: your fills
-    ws.on_liquidation_fill(strategy.on_my_liquidation_fill)  # private: liquidation fills
     ws.on_order_update(strategy.on_my_order_accepted)  # private: your new orders
     ws.on_order_status(strategy.on_my_order)  # private: your order transitions
     ws.on_balances(strategy.on_balances)      # private: your balance changes

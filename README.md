@@ -18,7 +18,7 @@ from loaf import LoafClient
 
 loaf = LoafClient()   # reads $LOAF_TRADING_KEY (see §2)
 
-print(loaf.portfolio.component().balances)                 # your balances (base units)
+print(loaf.portfolio.summary().balances)                   # your balances (base units)
 print(loaf.market.list())                                  # listed markets
 loaf.orders.limit_buy("MUS", quantity=10, price=167.49)    # signed locally with your trading key
 ```
@@ -193,11 +193,11 @@ Create one `LoafClient` and reach everything through grouped resources:
 
 | Resource | What it covers |
 | --- | --- |
-| `loaf.market` | markets, market detail, candle history, trade backfill (all public) |
+| `loaf.market` | markets, market detail (a perp's terms and live state), candle history, trade backfill (all public) |
 | `loaf.orders` | place (signed) / cancel / cancel-all orders, stop & take (conditional) orders |
-| `loaf.perps` | perps markets, your margin pools and positions, margin moves and exits (signed) |
-| `loaf.portfolio` | balances, holdings, recent activity |
-| `loaf.history` | paginated order & trade history, cancelled & active orders |
+| `loaf.perps` | your margin pools and positions, margin moves and exits (signed) |
+| `loaf.portfolio` | balances, holdings, perps and your perps leverage setting; recent activity and fees |
+| `loaf.history` | paginated order, trade & funding history, cancelled & active orders |
 
 Responses are `LoafObject`s — dicts that also allow attribute access, so
 `book.bids[0].price` and `book["bids"][0]["price"]` are equivalent. Unknown
@@ -211,7 +211,7 @@ competitions, IPO offerings and fiat ramps are not part of this SDK):
 
 ```
 market.list()                         GET    /trade
-market.get(ticker)                    GET    /trade/{ticker}
+market.get(ticker)                    GET    /trade/{ticker}         (a perp's market.l2: terms; market.live: live state)
 market.candles(ticker, resolution)    GET    /trade/{ticker}/candles
 market.iter_candles(ticker, res)      (auto-paginate candle history)
 market.trades(ticker)                 GET    /trade/{ticker}/trades
@@ -225,25 +225,23 @@ orders.cancel_conditional(order_id)   POST   /orders/conditional/cancel
 orders.cancel_row(order)              (routes a row to the right cancel)
 orders.cancel_all()                   POST   /orders/cancel-all
 
-perps.markets() / market(index)       GET    /l2/perps/markets
-perps.collateral()                    (its collateral: USDC's decimals and tick size)
-perps.markets_live() / market_live    GET    /l2/perps/markets/live (index, funding, trading state)
-perps.funding_ticks(market, limit=, before=)
-                                      GET    /l2/perps/funding      (applied funding ticks)
-perps.closes(limit=, before=)         GET    /l2/perps/closes       (liquidations, ADL, exits)
-perps.positions() / pool / position   GET    /l2/perps/positions
-perps.funding()                       (each position's funding, from /l2/perps/positions)
+perps.positions() / pool / position   GET    /portfolio/summary     (its perps: your pools and positions)
+perps.collateral()                    GET    /portfolio/summary     (read once: USDC's decimals and tick size)
 perps.allocate / add_margin / return_margin
                                       POST   /l2/allocations        (signed; with a login token)
 perps.exit(market, pool=)             POST   /l2/exits              (signed; with a login token)
 perps.resubmit(signed_body)           POST   /l2/allocations or /l2/exits (re-send unchanged)
 
-portfolio.component()                 GET    /portfolio/component
+portfolio.summary()                   GET    /portfolio/summary     (balances, holdings, perps, saved leverage)
+portfolio.component()                 GET    /portfolio/component   (recent activity, fees, lifetime volume)
+portfolio.set_perps_leverage(m, lev)  PUT    /portfolio/perps-leverage (your leverage setting on a perp)
 
-history.orders() / trades()           GET    /history/orders, /history/trades
+history.orders() / trades() / funding()
+                                      GET    /history/orders, /history/trades, /history/funding
 history.cancelled_orders()            GET    /history/orders/cancelled
 history.active_orders()               GET    /history/orders/active
-history.iter_orders() / iter_trades() (auto-paginate via cursor)
+history.iter_orders() / iter_trades() / iter_funding()
+                                      (auto-paginate via cursor)
 ```
 
 Placements are signed with your trading key and carry no login token. Every
@@ -354,7 +352,7 @@ import math
 from loaf import L2_FEE_RATE_CAP, from_base_units, worst_price
 
 quote = loaf.market.get("MUS").market.l2.quoteAssetId   # the market's cash asset
-row = next((b for b in loaf.portfolio.component().balances if b.assetId == quote), None)
+row = next((b for b in loaf.portfolio.summary().balances if b.assetId == quote), None)
 cash = float(from_base_units(row.available, row.decimals)) if row else 0.0
 worst = worst_price(mark, "BUY", loaf.max_slippage_bps)  # what market_buy(..., reference_price=mark) signs
 qty = math.floor(cash / (worst * (1 + L2_FEE_RATE_CAP / 1_000_000)) * 10) / 10
@@ -607,20 +605,21 @@ holding at most 8 positions margined by that pool's collateral alone. Fund a
 pool from your spot USDC, trade from it, and move what is left back:
 
 ```python
-perp = loaf.market.get("MUS-PERP").market             # type "PERP", its marketIndex and l2 terms
-loaf.perps.markets()                                  # every perp's index and terms, public
-loaf.perps.market_live(perp.marketIndex)              # tradingState, riskOnly, index, funding rate
+perp = loaf.market.get("MUS-PERP").market             # type "PERP", its marketIndex, l2 (terms), live (state)
+perp.live.markPrice, perp.live.indexPrice             # the mark positions are valued at; the oracle's index
 loaf.perps.add_margin(5_000, pool=0)                  # 5,000 USDC: spot -> pool 0
 loaf.orders.limit_buy("MUS-PERP", quantity=2, price=101.5, pool=0)   # a long from pool 0
 loaf.orders.limit_sell("MUS-PERP", quantity=2, price=104, pool=0, reduce_only=True)
-loaf.perps.position(market=perp.marketIndex, pool=0)  # base, entryPrice, liquidationPrice, ...
+loaf.perps.position(market=perp.marketIndex, pool=0)  # base, entryPrice, notional, liquidationPrice, ...
+loaf.history.funding()                                # your funding payments, newest first
+loaf.portfolio.set_perps_leverage("MUS-PERP", 5)      # your leverage setting on it (the web app's)
 loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
 ```
 
-Orders name a perp by its ticker; the perps reads and ops name it by its
-`marketIndex` (0 to 254), as the exchange's perps API does, and so do their
-rows (`market`, `marketIndex`). `market.list()` rows and
-`market.get(ticker).market` carry both.
+Orders name a perp by its ticker; the perps ops and a position name it by its
+`marketIndex` (0 to 254), as the exchange's perps API does. A position also
+carries its `ticker`, and `market.list()` rows, or any detail's `marketList`,
+map an index to its ticker for `market.get`.
 
 - **Orders** take `pool=` (0 by default) and `reduce_only=True` (its fills
   may only shrink the pool's position), signed with the order; both are
@@ -645,7 +644,7 @@ rows (`market`, `marketIndex`). `market.list()` rows and
   fresh op for the same intent.
 - **Units.** An allocate's `amount` is in USDC. The exchange moves whole
   ticks of it, so the SDK counts the amount in the collateral that
-  `GET /l2/perps/markets` serves (`perps.collateral()`: ticks = amount x
+  your portfolio summary serves (`perps.collateral()`: ticks = amount x
   10^`decimals` / `tickSize`). It refuses an amount that is not a whole number
   of ticks, and a reply without a usable collateral: it never assumes one.
   An exit moves no amount, so it never needs the collateral.
@@ -658,11 +657,49 @@ rows (`market`, `marketIndex`). `market.list()` rows and
   `MarketStateError` with `.state`): halted, outside its trading hours,
   reduce-only, its price stale, or reduce-only while its latest price waits
   for review (`PriceHeldError`). In the last three a `reduce_only=True` order
-  is still taken. `perps.markets_live()` (and the `perps:markets` channel)
-  serves each market's state as the engine decides it, before you send:
-  `tradingState`, `stateReason`, `halted`, `heldPrice`, and `riskOnly` (the
-  engine's risk-only mode: only an order that reduces is taken, and no
+  is still taken. `market.get(ticker).market.live` (and the `perps:markets`
+  channel) serves each market's state as the engine decides it, before you
+  send: `tradingState`, `stateReason`, `halted`, `heldPrice`, and `riskOnly`
+  (the engine's risk-only mode: only an order that reduces is taken, and no
   withdrawal, whatever `tradingState` says), all as of `asOfMs`.
+  An EXPIRED perp's `tradingState` and `stateReason` are the exchange's,
+  `HALTED` and `MARKET_CLOSED`.
+- **The mark.** A perp's `markPrice` is not its `indexPrice`: margin, PnL and
+  liquidations are valued at the mark, within 5 % of the index, and stops and
+  takes fire on it. Order price bands, funding (its premium and its payments,
+  at a rate in centi-bp of the index) and a final settlement stay on the index.
+- **Leverage.** `loaf.portfolio.set_perps_leverage(market, leverage)` saves
+  your leverage on a perp, `market` its ticker or its `marketIndex`: a whole
+  number from 1 to the market's most, `65536 // (2 x risk)`.
+  `portfolio.summary().perpsLeverage` lists the ones saved, `{marketIndex,
+  leverage}`, and `ws.on_perps_leverage` brings each one saved; a market with
+  none is at `loaf.PERPS_DEFAULT_LEVERAGE` (3), and any leverage reads at most
+  the market's most. It is the web app's setting, as on Hyperliquid: the web
+  app sizes an order's margin by it, and shows a position's margin
+  `notional / leverage` and ROE `unrealized PnL / (entryQuote x 10 x qem /
+  leverage)`. The exchange's margin checks never read it: they use the
+  market's terms (`risk`, any initial-margin tiers, and a tenth of a pool's
+  notional when collateral leaves it), so no order or allocate of the SDK
+  reads it.
+- **Live, no polling.** `ws.on_perps_account` replaces your pools after every
+  commit that touches them, and `on_trade` and `on_funding_payment` bring your
+  fills and payments. Between pushes, from each `perps:markets` row
+  (`on_perps_markets_live`, about once a second):
+  `notional = |base| x markPrice x qem`,
+  `fundingOwed = base x (fundingIndex - position.fundingIndex)`,
+  `value = collateral + sum(±notional - fundingOwed)`,
+  `requirement = sum(risk x notional)`, unrealized PnL
+  `= ±(notional - entryQuote x 10 x qem)` (+ long, - short; all extended
+  units). A position's liquidation price, every other term held, with
+  `k = |base| x qem`, `tro = requirement - risk x notional` and
+  `c = value - (±notional)`: a long's
+  `ceil((tro - 65536 c) / (k (65536 - risk)))` (none when `tro <= 65536 c`),
+  a short's `floor((65536 c - tro) / (k (65536 + risk)))` (0 when that is
+  below 0). `requirement` is as served, already x 65,536.
+- **History.** `history.trades()` holds every fill of yours (`source`,
+  `direction`, `closedPnl`): liquidations, deleverages, exits and settlements
+  too, with `txHash` `None` and their journal seq as `tradeId`;
+  `history.funding()` your funding payments.
 
 ---
 
@@ -681,10 +718,11 @@ quantities in **tokens** — for what you send and the market data you receive:
 - **Balances and transfer amounts are the exception**: decimal strings in the
   token's base units (`"1500000"` is 1.5 of a 6-decimal token). Turn one into an
   exact `Decimal` of tokens with `loaf.from_base_units(row.available, row.decimals)`.
-- A trade's `fee` is in dollars, to 0.001.
+- A trade's `fee` is in dollars, to 0.001. A trade row's `closedPnl` is
+  dollars, signed, before fees.
 - **Perps** amounts are the exchange engine's units (see **Perps**): an
-  allocate's `amount` in USDC ticks, and `perps.positions()` values as decimal
-  strings.
+  allocate's `amount` in USDC ticks, and `perps.positions()` values and a
+  funding payment's `payment` as decimal strings.
 - `*Bps` fields are raw basis points (`30` = 0.30%); use `loaf.bps_to_fraction`.
 - `*Percent` / `*Percentage` fields are already percentages (`5.2` = 5.2%).
 
@@ -730,8 +768,8 @@ Channels:
 | `markprice:{ticker}` | public | `on_mark_price` | canonical mark price (1s, on change) |
 | `volume:{ticker}` | public | `on_volume` | rolling-24h traded volume (replaces `volume24h`) |
 | `market:{ticker}` | public | `on_market_halt` | halt / resume status for that market |
-| `perps:markets` | public | `on_perps_markets_live` | every perps market's live state, as `perps.markets_live()` serves it, about once a second — replace what you hold |
-| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_liquidation_fill`, `on_order_queue`, `on_lifetime_volume` | your account deltas, and your resting orders' places in their books; a liquidation's take from your resting perps order is a fill but no trade: `on_liquidation_fill`, not `on_trade` |
+| `perps:markets` | public | `on_perps_markets_live`, `on_market_terms` | every perp's live state (each row `market.get(ticker).market.live`, with its `markPrice`), once on subscribe, then about once a second — replace what you hold; a perp's terms when they change |
+| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_order_queue`, `on_lifetime_volume`, `on_perps_account`, `on_funding_payment`, `on_holding`, `on_transfer`, `on_fees`, `on_l2_keys`, `on_perps_leverage` | your account deltas, and your resting orders' places in their books; every fill of yours is `on_trade`, a liquidation's, a deleverage's and an exit's too (`trade.source`) |
 
 A client with a trading key authenticates each connection with a login token
 the key signs (the `auth` frame, never the URL), and sends a fresh one on the
@@ -753,10 +791,21 @@ frames:
   `balances_update`; an update with more than 200 statuses or trades comes as
   several such bursts, `balances_update` in the last only. So match a fill to
   its order by `trade.orderId`, not by frame order; `trade.role` is
-  `MAKER` (that order rested) or `TAKER` (it aggressed). A fill pushes no
-  holding frame: your holdings are balances rows. `trade.txHash` is the
-  trade's content hash, not an on-chain transaction; `trade.proof` is
-  `{"status": "PENDING"}`, or `None` with proofs off.
+  `MAKER` (that order rested) or `TAKER` (it aggressed). `trade.source` is
+  `TRADE`, or on a perp a liquidation, deleverage, exit or settlement, which
+  is no trade: `txHash` is `None`, and `tradeId` is its journal seq. Key a
+  fill by `(trade.tradeId, trade.side)`. `trade.txHash` is a trade's content
+  hash, not an on-chain transaction.
+- `perps_account_update` (`on_perps_account`) carries your perps pools whole
+  after every commit that touches them, `funding_payment`
+  (`on_funding_payment`) each funding tick's charge to a position of yours,
+  `holding_update` (`on_holding`) a holding, `transfer_update`
+  (`on_transfer`) a deposit or withdrawal as it moves on, `fees_update`
+  (`on_fees`) the fees that apply to you when they change,
+  `l2_keys_update` (`on_l2_keys`) a change to your account's keys (a reset of
+  your trading key, say: read `GET /l2/keys` once), and
+  `perps_leverage_update` (`on_perps_leverage`) a leverage you saved on a perp,
+  `{marketIndex, leverage}`.
 - `order_update` carries the whole committed order, with its `expiryMs`. For an
   order that trades immediately it can arrive after the fill frames and already
   show FILLED. Stop and take orders (TP/SL legs included) ride the same frame,
@@ -785,7 +834,7 @@ frames:
   before it can still arrive; `ws.on("subscription_confirmed", handler)` gets
   it), not in `on_connect`. It can arrive before the order's `order_update`.
 - Delivery is at most once, so after a reconnect reconcile from
-  `loaf.portfolio.component()` / `loaf.history.trades()`.
+  `loaf.portfolio.summary()`, `loaf.portfolio.component()` and the `history` reads.
 
 **Valuing holdings live.** The server does not push portfolio totals: combine
 your balances with the `markprice` channel. A `mark_price` frame is
@@ -793,12 +842,13 @@ your balances with the `markprice` channel. A `mark_price` frame is
 subscribe feeds the one `on_mark_price` handler, so match each frame to the
 holding with that `marketIndex`. A holding's `marketIndex` is its spot market's,
 whose ticker is the holding's; `None` means the asset has no spot market, so no
-mark streams for it. An L2 holding is read, not pushed: read the portfolio
-again when a token's balances row appears that no holding names (a first buy, a
-deposit, a graduated IPO).
+mark streams for it. An L2 holding is pushed too: `on_holding` upserts it by
+its ticker, with its average entry (`None` until the exchange has read your
+fills, and a later push brings it: show none meanwhile, never the earlier one),
+when your fills or a deposit change it. Its amounts stay its balances row.
 
 ```python
-holdings = loaf.portfolio.component().holdings
+holdings = loaf.portfolio.summary().holdings
 by_market = {h.marketIndex: h for h in holdings if h.marketIndex is not None}
 
 @ws.on_mark_price
@@ -820,8 +870,8 @@ read's. `bot.py` does both, and takes the book from a read only if the feed was
 live from the request until the answer is applied: a read made before the first
 `on_connect`, between an `on_disconnect` and the next `on_connect`, or in flight
 when the feed drops or comes back can miss a change that no frame brings. The
-private reads (`portfolio.component()` and the `history` reads) first wait, up
-to 2 s, until every change pushed before them
+private reads (`portfolio.summary()`, `portfolio.component()` and the `history`
+reads) first wait, up to 2 s, until every change pushed before them
 is readable. The `order_queue` lists have no REST read: drop them in
 `on_disconnect` (and, after you unsubscribe `portfolio`, at the
 `subscription_confirmed` that answers it), and the next subscription (the
@@ -934,8 +984,10 @@ local `LoafValidationError` (status_code 0).
 A perps allocate or exit raises the same errors, with
 `PerpsOutcomeUnknownError` in place of `OrderOutcomeUnknownError` (re-send it
 with `loaf.perps.resubmit(e.signed_body)`); its refusals by the exchange's
-rules (above your available spot USDC, a pool left under initial margin, the
-nonce) are plain `LoafAPIError`s with status 422, and applied nothing.
+rules (above your available spot USDC, a pool left under initial margin, or
+under a tenth of its positions' notional or an initial-margin tier's extra
+(`TRANSFER_MARGIN_FLOOR`), the nonce) are plain `LoafAPIError`s with status
+422, and applied nothing.
 
 ## Rate limits & retries
 

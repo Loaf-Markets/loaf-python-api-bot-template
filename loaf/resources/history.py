@@ -5,7 +5,7 @@
 take ``nextCursor`` from one response and pass it as ``cursor`` to the next.
 Pass back only ``nextCursor`` values: a malformed cursor silently returns the
 first page. Do not derive "has more" from ``total`` (it is capped at 10000, for
-trades too).
+trades too). ``funding`` pages by cursor alone.
 """
 
 from __future__ import annotations
@@ -61,14 +61,31 @@ class HistoryResource(Resource):
     ) -> Any:
         """``GET /history/trades`` — paginated executed-trade history, newest first.
 
+        Every fill of yours, each row a :class:`~loaf.models.TradeHistoryItem`:
+        ``source`` is ``TRADE`` (your order matched) or, on a perp,
+        ``LIQUIDATION``, ``BACKSTOP_LIQUIDATION``, ``DELEVERAGE``, ``EXIT``,
+        ``SETTLE``, ``FORCED`` or ``FORCED_DELEVERAGE``: no trade, so its
+        ``txHash`` is ``None``, and its ``orderId`` too unless it filled your
+        resting order. ``tradeId`` is always the row's journal seq, a trade's
+        id or the perps row's: a deleverage between two of your pools is two
+        rows of one ``tradeId``, one each side, so key a row by ``(tradeId,
+        side)``. ``role`` off a trade is ``TAKER`` for the pool the row closed,
+        ``MAKER`` for the other side (your resting order, a deleverage's
+        counterparty, the backstop). ``direction`` is ``BUY`` / ``SELL`` on
+        spot, ``OPEN_LONG`` / ``CLOSE_LONG`` / ``OPEN_SHORT`` / ``CLOSE_SHORT``
+        on a perp; ``pool`` is a perps fill's margin pool (``None`` on spot);
+        ``closedPnl`` is dollars, signed, before fees, ``None`` unless the fill
+        reduced a position.
+
         Returns ``{trades, total, page, pageSize, nextCursor}``. ``side``,
         ``fee`` (dollars, to 0.001), ``orderId`` (your order the fill belongs
         to) and ``role`` (``"MAKER"`` or ``"TAKER"``) are reported from this
         user's perspective.
 
         Trades are final when they match. ``txHash`` is the trade's content
-        hash (``0x`` + 64 hex, never ``""``), not an on-chain transaction.
-        ``proof`` is ``None`` (proofs off), ``{"status": "PENDING"}``, or
+        hash (``0x`` + 64 hex, never ``""``; ``None`` on a row with no trade),
+        not an on-chain transaction. ``proof`` is ``None`` (proofs off, and on
+        a row with no trade), ``{"status": "PENDING"}``, or
         ``{"status": "IN_BATCH", batchNumber, l2BlockNumber, rowIndex,
         l2TradeDigest, batchTxHash, final}`` once a proven batch includes the
         trade (:class:`~loaf.models.TradeProofStatus`).
@@ -76,6 +93,25 @@ class HistoryResource(Resource):
         return self._client.get(
             "/history/trades",
             params={"page": page, "pageSize": page_size, "cursor": cursor},
+        )
+
+    def funding(self, *, page_size: int | None = None, cursor: str | None = None) -> Any:
+        """``GET /history/funding`` — your funding payments, newest first: one
+        row per funding tick and position it charged.
+
+        Returns ``{funding, nextCursor}``. ``page_size`` max is 100 (default
+        20). Each row is a :class:`~loaf.models.FundingPayment`, keyed by
+        ``(journalSeq, pool)``: ``base`` the position's signed base at the
+        tick, ``payment`` what the tick charged it, in the extended USDC units
+        of a pool's collateral (a decimal string, positive paid, negative
+        received), ``rateCbp`` the rate it applied, centi-bp of the index per
+        period (funding is paid on the index). The pool's ``value`` counts
+        it at once, and its ``collateral`` moves at its next refresh. What a
+        position owes since it last settled is its ``fundingOwed``
+        (:meth:`loaf.resources.perps.PerpsResource.positions`).
+        """
+        return self._client.get(
+            "/history/funding", params={"pageSize": page_size, "cursor": cursor}
         )
 
     def cancelled_orders(self) -> Any:
@@ -112,6 +148,12 @@ class HistoryResource(Resource):
         ``nextCursor`` the server already gave raises
         :class:`~loaf.exceptions.LoafError` instead of paging forever."""
         yield from self._iter("/history/trades", "trades", page_size)
+
+    def iter_funding(self, *, page_size: int = 100) -> Iterator[Any]:
+        """Yield every funding payment across all pages using cursor pagination. A
+        ``nextCursor`` the server already gave raises
+        :class:`~loaf.exceptions.LoafError` instead of paging forever."""
+        yield from self._iter("/history/funding", "funding", page_size)
 
     def _iter(self, path: str, key: str, page_size: int) -> Iterator[Any]:
         cursor: str | None = None

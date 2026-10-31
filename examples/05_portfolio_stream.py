@@ -1,6 +1,7 @@
 """05 — Stream your PRIVATE portfolio events (requires your trading key).
 
-Receives your balance book, order transitions and your fills in real time.
+Receives your balance book, order transitions, your fills and your perps account
+in real time.
 
     python examples/05_portfolio_stream.py
 
@@ -42,14 +43,13 @@ def main() -> None:
                                        f"{m.order.ticker} @ {m.order.price} -> {m.order.status}"))
     ws.on_order_status(lambda m: print(f"ORDER #{m.orderId} -> {m.status} "
                                        f"(left {m.get('quantityLeft')})"))
-    # txHash is the trade's content hash, not an on-chain transaction.
-    ws.on_trade(lambda m: print(f"FILL {m.trade.side} {m.trade.quantity} "
-                                f"{m.trade.ticker} @ {m.trade.price} "
-                                f"fee={m.trade.fee} #{m.trade.tradeId} {m.trade.txHash[:10]}"))
-    # A liquidation's take from your resting perps order: a fill, but no trade.
-    ws.on_liquidation_fill(lambda m: print(f"LIQUIDATION FILL {m.fill.side} {m.fill.quantity} "
-                                           f"{m.fill.ticker} @ {m.fill.price} "
-                                           f"order #{m.fill.orderId} seq {m.fill.perpsSeq}"))
+    # Every fill of yours; source says what made it. txHash is a trade's content hash, not an
+    # on-chain transaction, and None on a fill that is no trade (a liquidation's, say).
+    ws.on_trade(lambda m: print(f"FILL {m.trade.source} {m.trade.side} {m.trade.quantity} "
+                                f"{m.trade.ticker} @ {m.trade.price} fee={m.trade.fee} "
+                                f"#{m.trade.tradeId}"))
+    # Your perps pools, whole, after every commit that touches them.
+    ws.on_perps_account(lambda m: print(f"PERPS {len(m.perps.pools)} pools"))
     # Every ended connection attempt (code None: no connection was made); it reconnects.
     ws.on_disconnect(lambda m: print(f"DISCONNECTED code={m.code} reason={m.reason!r}"))
     ws.on_error(lambda m: print(f"ERROR {m.get('message')}"))
