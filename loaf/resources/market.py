@@ -104,7 +104,7 @@ class MarketResource(Resource):
         * ``asOfMs``, the engine clock those four are as of: bound their age
           by it;
         * ``markPrice``, what your positions are valued at, margin is checked
-          at and stops and takes fire on (within 5 % of the index; 0 before
+          at and stops and takes fire on (within 2 % of the index; 0 before
           the first report), and ``indexPrice``, the oracle's accepted index
           (0 before the first report), as of ``observedAtMs``, both in the
           market's price units (dollars x 1000); ``openInterest`` (base units,

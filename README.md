@@ -665,7 +665,7 @@ map an index to its ticker for `market.get`.
   An EXPIRED perp's `tradingState` and `stateReason` are the exchange's,
   `HALTED` and `MARKET_CLOSED`.
 - **The mark.** A perp's `markPrice` is not its `indexPrice`: margin, PnL and
-  liquidations are valued at the mark, within 5 % of the index, and stops and
+  liquidations are valued at the mark, within 2 % of the index, and stops and
   takes fire on it. Order price bands, funding (its premium and its payments,
   at a rate in centi-bp of the index) and a final settlement stay on the index.
 - **Leverage.** `loaf.portfolio.set_perps_leverage(market, leverage)` saves

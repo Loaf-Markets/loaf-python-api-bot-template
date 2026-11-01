@@ -1611,7 +1611,7 @@ def step_perps(run: Run) -> None:
     run.walk(m, run.to_index(tp * Decimal("1.004")))
     live = run.live(m)
     index, mark = int(live["indexPrice"]), int(live["markPrice"])
-    check(mark != index and abs(mark - index) * 100 <= 5 * index, f"the mark {mark} lags the index {index}, within 5 %")
+    check(mark != index and abs(mark - index) * 50 <= index, f"the mark {mark} lags the index {index}, within 2 %")
     run.wait_base(a, m, 3, 0, run.cfg.final_wait_s)
     rows = legs_of(a, parent)
     log(f"  legs after the trigger: {[(o.get('id'), o.get('type'), o.get('status')) for o in rows]}")

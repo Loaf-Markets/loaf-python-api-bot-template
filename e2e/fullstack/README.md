@@ -164,7 +164,7 @@ fee, and the fill is in C's history. C's fill pushes its holding_update with its
 - a reduce-only sell of half A's long fills; a reduce-only buy in a flat pool opens nothing (with MM's ask resting at
   its price);
 - a buy with TP/SL legs from pool 3: two legs, both ARMED once the parent fills; the index walks above the
-  take-profit: the mark lags it, within 5 %, and when it gets there the leg fires and closes the long into MM's bid;
+  take-profit: the mark lags it, within 2 %, and when it gets there the leg fires and closes the long into MM's bid;
 - A's fills read source, direction and closed PnL (the pool 1 close exactly (bid - ask) x size), its push carries
   the long, and its open order its pool;
 - A's and B's positions read ticker, qem, risk, band, entry, entry quote, notional, funding owed and liquidation
