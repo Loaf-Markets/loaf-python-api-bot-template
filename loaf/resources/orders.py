@@ -223,6 +223,23 @@ class OrdersResource(Resource):
         #: The markets, account and order numbers your orders sign, refreshed on refusals.
         self._l2 = L2State(client)
 
+    def warm(self, *tickers: str) -> None:
+        """Do now what a first placement would do first: read each ticker's market and your
+        account, and reserve order numbers. The next placement on them sends only the order.
+
+        Raises what those reads raise when a placement makes them.
+        """
+        key = self._credentials()
+        for ticker in tickers:
+            _check_market_ticker(ticker)
+            detail = self._client._request(
+                "GET", f"/trade/{ticker}", auth=False, before_order=True
+            )
+            market = market_of(detail, ticker)
+            self._check_chain(market, key, ticker)
+            self._l2.remember(ticker, market)
+        self._l2.warm(self._l2.account(key.l2_account_index))
+
     def create(
         self,
         ticker: str,
@@ -982,6 +999,16 @@ class OrdersResource(Resource):
             )
         return validate_slippage_bps(max_slippage_bps, field)
 
+    def _check_chain(self, market: Market, key: TradingKey, ticker: str) -> None:
+        if market.l2_chain_id != key.l2_chain_id:
+            raise LoafConfigError(
+                f"{ticker}'s market is on L2 chain {market.l2_chain_id} and your trading key "
+                f"is for L2 chain {key.l2_chain_id}: {ENV_TRADING_KEY} is from another Loaf "
+                f"deployment than the one at {self._client.base_url} ({ENV_BASE_URL}). Set "
+                f"{ENV_TRADING_KEY} to the trading key this deployment's web app shows "
+                f"(README §2), or {ENV_BASE_URL} to the key's deployment."
+            )
+
     def _place(
         self,
         key: TradingKey,
@@ -1019,14 +1046,7 @@ class OrdersResource(Resource):
                 l2.remember(ticker, market)
                 if not isinstance(price, Decimal):
                     price = price(_reference_from(detail, ticker))
-            if market.l2_chain_id != key.l2_chain_id:
-                raise LoafConfigError(
-                    f"{ticker}'s market is on L2 chain {market.l2_chain_id} and your trading key "
-                    f"is for L2 chain {key.l2_chain_id}: {ENV_TRADING_KEY} is from another Loaf "
-                    f"deployment than the one at {self._client.base_url} ({ENV_BASE_URL}). Set "
-                    f"{ENV_TRADING_KEY} to the trading key this deployment's web app shows "
-                    f"(README §2), or {ENV_BASE_URL} to the key's deployment."
-                )
+            self._check_chain(market, key, ticker)
             market_keys, base_field, leg_field = _market_keys(market, ticker, side, perps, legs)
             account = l2.account(key.l2_account_index)
             first, block, expiry_ms = l2.take(account, span, ttl)

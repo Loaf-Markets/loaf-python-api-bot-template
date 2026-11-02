@@ -445,7 +445,11 @@ longest `ttl_ms`, weeks for the default and shorter.
   is given at least 45 seconds to answer, because the exchange replies only
   once the order is committed. With the default 3 retries a call can
   therefore block for a few minutes while the exchange is struggling; use
-  `LoafClient(max_retries=1)` in a latency-sensitive loop.
+  `LoafClient(max_retries=1)` in a latency-sensitive loop. To wait less, set
+  `LoafClient(placement_timeout=2.0)`: each attempt then gives up after that many
+  seconds. An order you gave up on can still land, so it ends in
+  `OrderOutcomeUnknownError` like any other timeout, and its order number stays
+  spent.
 - Two rules cover every outcome:
   - **Any error other than `OrderOutcomeUnknownError` means the order was not
     placed.** Place it again if you still want it.
@@ -473,6 +477,25 @@ longest `ttl_ms`, weeks for the default and shorter.
   after only a few orders. So keep a bot running rather than restarting it
   often, and restart it after a crash with a growing delay. Many stops that never fire, or
   many processes on one account, add up too.
+- **Order numbers for a fast bot.** The exchange takes one reservation a second per
+  account, so a block of N numbers sustains about N orders a second. The defaults
+  start at one number and double up to 64, which keeps a restart cheap but pauses
+  a new process's early orders on that limit. A quoting bot can set:
+  ```python
+  client = LoafClient(
+      order_number_start=256,   # the first reservation's size
+      order_number_block=256,   # the largest, up to 4096
+      reserve_ahead=True,       # reserve the next block on a background thread
+  )
+  client.orders.warm("BTC-PERP")  # read the market and account, reserve now
+  ```
+  With `reserve_ahead`, the next block is reserved once the current one is half
+  used, so a placement waits on neither that request nor the limit, unless it
+  outruns them: then it waits for the one in flight. A background failure is logged
+  (logger `loaf._l2`) and retried, and placements still reserve for themselves and
+  raise what they meet. Larger blocks leave more numbers unused at each stop, and
+  a stop leaves up to two blocks with `reserve_ahead`, so weigh them against the
+  allowance above. Call `client.close()` to stop the thread.
 - The client keeps the trading key only inside its signer and never logs it,
   and the same goes for its login tokens, which are credentials too until they
   expire: none is ever put in a log, an error or a `repr`. Prefer

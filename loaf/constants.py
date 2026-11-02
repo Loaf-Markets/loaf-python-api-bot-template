@@ -97,10 +97,15 @@ MIN_ORDER_TTL_MS = 60_000
 #: for each clock and the buffer.
 MAX_ORDER_TTL_MS = L2_MAX_ORDER_LIFE_MS - 2 * L2_ORDER_LIFE_MARGIN_MS - L2_BUFFER_MS
 
-#: The most order numbers one reservation asks for. Reservations grow from what a process's first
-#: order needs up to this, doubling each time, so a process that stops after a few orders leaves
-#: few of them unused.
+#: The most order numbers one reservation asks for unless ``order_number_block=`` says otherwise.
+#: Reservations grow from ``order_number_start=`` up to this, doubling each time, so a process that
+#: stops after a few orders leaves few of them unused.
 L2_ORDER_INDEX_BLOCK = 64
+
+#: The most order numbers one reservation can ask for: the backend's limit on one call, and so the
+#: largest ``order_number_block=``. The exchange takes one reservation a second per account, so a
+#: block of N sustains about N orders a second.
+L2_ORDER_INDEX_BLOCK_MAX = 4096
 
 # --------------------------------------------------------------------------- #
 # Perps

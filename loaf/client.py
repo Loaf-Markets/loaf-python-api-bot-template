@@ -27,6 +27,8 @@ from .constants import (
     ENV_MAX_SLIPPAGE_BPS,
     ENV_TRADING_KEY,
     ENV_WS_URL,
+    L2_ORDER_INDEX_BLOCK,
+    L2_ORDER_INDEX_BLOCK_MAX,
     USER_AGENT,
 )
 from .exceptions import (
@@ -140,11 +142,39 @@ def _max_slippage_bps(value: Any) -> int:
     return int(match.group(1))
 
 
-def _placement_timeout(timeout: Any) -> httpx.Timeout:
-    """The client's timeout, with its read wait raised to at least DEFAULT_PLACEMENT_TIMEOUT."""
+def _placement_timeout(timeout: Any, placement_timeout: float | None) -> httpx.Timeout:
+    """The client's timeout, with its read wait set to ``placement_timeout``, else raised to at
+    least DEFAULT_PLACEMENT_TIMEOUT."""
     t = httpx.Timeout(timeout)
-    read = None if t.read is None else max(t.read, DEFAULT_PLACEMENT_TIMEOUT)
+    if placement_timeout is None:
+        read = None if t.read is None else max(t.read, DEFAULT_PLACEMENT_TIMEOUT)
+    elif (
+        isinstance(placement_timeout, (int, float))
+        and not isinstance(placement_timeout, bool)
+        and 0 < placement_timeout < float("inf")
+    ):
+        read = placement_timeout
+    else:
+        raise LoafConfigError(
+            f"placement_timeout must be a number of seconds above 0, got {placement_timeout!r}"
+        )
     return httpx.Timeout(connect=t.connect, read=read, write=t.write, pool=t.pool)
+
+
+def _order_numbers(block: int, start: int) -> tuple[int, int]:
+    """``(order_number_block, order_number_start)`` once each is usable."""
+    for name, value in (("order_number_block", block), ("order_number_start", start)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise LoafConfigError(f"{name} must be a whole number, got {value!r}")
+        if not 1 <= value <= L2_ORDER_INDEX_BLOCK_MAX:
+            raise LoafConfigError(
+                f"{name} must be from 1 to {L2_ORDER_INDEX_BLOCK_MAX}, got {value!r}"
+            )
+    if start > block:
+        raise LoafConfigError(
+            f"order_number_start ({start}) cannot exceed order_number_block ({block})"
+        )
+    return block, start
 
 
 class LoafClient:
@@ -189,6 +219,12 @@ class LoafClient:
             Order placements wait at least
             :data:`~loaf.constants.DEFAULT_PLACEMENT_TIMEOUT` (45 s) for the
             answer, and follow this argument even with your own ``http_client``.
+        placement_timeout: Seconds each attempt of a signed placement (and a
+            perps allocate or exit) waits for its answer, in place of that 45 s
+            floor. The exchange answers only once the order is committed, so a
+            shorter wait can give up on an order that then lands: past it the SDK
+            re-sends (``max_retries``), then raises
+            :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
         max_retries: Automatic retries for transient failures. Reads retry 429,
             503 and network errors. Signed placements (and perps allocates and
             exits) retry network errors and 5xx by re-sending the identical
@@ -196,6 +232,19 @@ class LoafClient:
             attempt can wait out the placement timeout, so lower this (e.g.
             ``1``) for a latency-sensitive loop.
             Cancels and other POSTs are never retried.
+        order_number_block: The most order numbers one reservation asks for, 1
+            to :data:`~loaf.constants.L2_ORDER_INDEX_BLOCK_MAX`. The exchange takes
+            one reservation a second per account, so this caps your orders a
+            second. Default :data:`~loaf.constants.L2_ORDER_INDEX_BLOCK` (64). The
+            numbers a process has reserved when it stops stay unused against your
+            allowance (README, "The order-number allowance").
+        order_number_start: The size of the first reservation, from which they
+            double up to ``order_number_block``. Default 1, so a process that
+            stops after a few orders leaves few numbers unused.
+        reserve_ahead: Reserve the next block on a background thread once the
+            current one is half used, so a placement waits on neither that
+            request nor its one-a-second limit. One that outruns the thread still
+            reserves for itself. Default ``False``: no thread.
         verify: TLS verification for REST and the WebSocket (only the WebSocket
             with your own ``http_client``): an ``ssl.SSLContext``, such as
             ``ssl.create_default_context(cafile=...)``, trusts your own CAs. Set
@@ -217,7 +266,11 @@ class LoafClient:
         ws_url: str | None = None,
         max_slippage_bps: int | None = None,
         timeout: float | tuple | httpx.Timeout | None = DEFAULT_TIMEOUT,
+        placement_timeout: float | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        order_number_block: int = L2_ORDER_INDEX_BLOCK,
+        order_number_start: int = 1,
+        reserve_ahead: bool = False,
         verify: bool | ssl.SSLContext = True,
         http_client: httpx.Client | None = None,
     ) -> None:
@@ -238,7 +291,9 @@ class LoafClient:
 
         self.base_url = (base_url or os.environ.get(ENV_BASE_URL) or DEFAULT_BASE_URL).rstrip("/")
         self._ws_url_override = ws_url or os.environ.get(ENV_WS_URL) or None
-        self._placement_timeout = _placement_timeout(timeout)
+        self._placement_timeout = _placement_timeout(timeout, placement_timeout)
+        self._order_numbers = _order_numbers(order_number_block, order_number_start)
+        self._reserve_ahead = bool(reserve_ahead)
         self.max_retries = max(0, int(max_retries))
         self._verify = verify
 
@@ -599,6 +654,7 @@ class LoafClient:
     # ------------------------------------------------------------------ #
 
     def close(self) -> None:
+        self.orders._l2.close()
         if self._owns_http:
             self._http.close()
 

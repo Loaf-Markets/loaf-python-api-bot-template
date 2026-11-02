@@ -10,6 +10,7 @@ and exits with the :class:`TradingKey` at the nonce :func:`read_signing_account`
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -25,7 +26,6 @@ from .constants import (
     L2_LOGIN_TOKEN_LIFE_MS,
     L2_LOGIN_TOKEN_PREFIX,
     L2_MAX_ORDER_LIFE_MS,
-    L2_ORDER_INDEX_BLOCK,
     L2_ORDER_LIFE_MARGIN_MS,
     PERPS_QUOTE_ASSET_ID,
     TRADING_KEY_PREFIX,
@@ -68,6 +68,10 @@ _KB_MODULUS = 2_130_706_433  # an L2 chain id is a KoalaBear element, below this
 _PERP_L2_STATUSES = ("ACTIVE", "EXPIRED")
 
 _RESERVED_TOO_SOON = "l2 order_index: the account's last reservation is less than 1 s old"
+logger = logging.getLogger(__name__)
+
+# The longest wait between background reservation attempts after failures.
+_AHEAD_MAX_PAUSE_S = 30.0
 # A 403 for a market that is the ticker's still (listed, its start time not reached yet).
 _NOT_STARTED = "Trading on this market has not started yet"
 
@@ -249,16 +253,20 @@ class _Block:
     """Reserved order indices: ``next`` up to ``end`` (exclusive), and the ``(first, span)``
     definite refusals gave back below ``next``, for orders that expire by ``latest_expiry_ms``."""
 
-    __slots__ = ("next", "end", "latest_expiry_ms", "returned")
+    __slots__ = ("next", "end", "size", "latest_expiry_ms", "returned")
 
     def __init__(self, next: int, end: int, latest_expiry_ms: int) -> None:
         self.next = next
         self.end = end
+        self.size = end - next
         self.latest_expiry_ms = latest_expiry_ms
         self.returned: list[tuple[int, int]] = []
 
     def serves(self, span: int, expiry_ms: int) -> bool:
         return self.next + span <= self.end and expiry_ms <= self.latest_expiry_ms
+
+    def half_used(self) -> bool:
+        return 2 * (self.end - self.next) <= self.size
 
 
 def market_of(detail: Any, ticker: str) -> Market:
@@ -358,6 +366,11 @@ class L2State:
     One lock guards the account and the block, and is held across the account read
     and a reservation, so concurrent placements wait for and share the one in flight.
     Signing and sending happen outside it.
+
+    With ``reserve_ahead``, a background thread reserves the next block (``_standby``) once
+    the current one is half used, outside the lock, so a placement with numbers left never
+    waits for it. A placement that runs out waits for a reservation already in flight rather
+    than sending a second, which the one-a-second limit would refuse.
     """
 
     def __init__(self, client: LoafClient) -> None:
@@ -368,6 +381,16 @@ class L2State:
         self._account: AccountState | None = None
         self._block: _Block | None = None
         self._last_count = 0
+        self._max_count, self._first_count = client._order_numbers
+        self._ahead = client._reserve_ahead
+        self._standby: _Block | None = None
+        self._ahead_account: AccountState | None = None
+        self._ahead_thread: threading.Thread | None = None
+        self._ahead_wake = threading.Event()
+        self._ahead_busy = False  # a background reservation is in flight
+        self._ahead_done = threading.Condition(self._lock)
+        self._reserved_ns = 0  # when the last reservation was answered, on the clock below
+        self._closed = False
 
     def market(self, ticker: str) -> Market | None:
         """``ticker``'s market as last read, if any."""
@@ -416,7 +439,7 @@ class L2State:
                         del block.returned[i]
                         return first, block, expiry_ms
             if block is None or not block.serves(span, expiry_ms):
-                block = self._reserve(account, span)
+                block = self._next_block(account, span, expiry_ms)
                 expiry_ms = time.time_ns() // 1_000_000 + L2_BUFFER_MS + ttl_ms
                 if not block.serves(span, expiry_ms):
                     # The block stays: it serves shorter lives.
@@ -428,7 +451,23 @@ class L2State:
             # Advanced before signing, so no two signings in flight share an index.
             first = block.next
             block.next += span
+            if self._ahead:
+                self._wake_ahead(account)
             return first, block, expiry_ms
+
+    def warm(self, account: AccountState) -> None:
+        """Reserve the first block now, so the next placement sends only the order."""
+        with self._lock:
+            if self._block is None:
+                self._next_block(account, 1, 0)
+            if self._ahead:
+                self._wake_ahead(account)
+
+    def close(self) -> None:
+        """Stop the background reservations. What is reserved stays unused."""
+        with self._lock:
+            self._closed = True
+            self._ahead_wake.set()
 
     def give_back(self, block: _Block, first: int, span: int) -> None:
         """Return a definitely refused order's indices, so a later order signs them,
@@ -480,19 +519,46 @@ class L2State:
             if self._block is block and any(text in message for text in _INDEX_TEXTS):
                 self._block = None  # by identity: a block another thread just reserved survives
 
+    def _next_block(self, account: AccountState, span: int, expiry_ms: int) -> _Block:
+        """The block a placement takes from once its own cannot serve it (under the lock): one a
+        background reservation just brought, the one reserved ahead, else one reserved now."""
+        while self._ahead_busy:
+            self._ahead_done.wait()
+        block = self._block
+        if block is not None and block.serves(span, expiry_ms):
+            return block
+        # One that cannot serve this order is let go like a block's tail: left in place, it would
+        # keep the background from reserving another.
+        standby, self._standby = self._standby, None
+        if standby is not None and standby.serves(span, expiry_ms):
+            self._block = standby
+            return standby
+        return self._reserve(account, span)
+
     def _reserve(self, account: AccountState, span: int) -> _Block:
         """``POST /l2/order-indices`` for at least ``span`` indices (under the lock)."""
+        block = self._reserved(account, self._post_reservation(self._next_count(span)))
+        self._block = block
+        return block
+
+    def _next_count(self, span: int) -> int:
         # The exchange counts every reserved index no order uses against the account's allowance
         # for about 49.5 days, and an in-memory block's tail is lost at every restart: so the
-        # count grows from the first order's span, doubling up to L2_ORDER_INDEX_BLOCK.
-        count = min(L2_ORDER_INDEX_BLOCK, max(span, 2 * self._last_count))
+        # count grows from order_number_start, doubling up to order_number_block.
+        grown = 2 * self._last_count if self._last_count else self._first_count
+        return max(span, min(self._max_count, grown))
+
+    def _post_reservation(self, count: int) -> Any:
         try:
-            answer = self._client._request("POST", "/l2/order-indices", json={"count": count})
+            return self._client._request("POST", "/l2/order-indices", json={"count": count})
         except LoafAPIError as exc:
             if _RESERVED_TOO_SOON not in exc.message:  # too soon after the last reservation
                 raise
             time.sleep(1.0)
-            answer = self._client._request("POST", "/l2/order-indices", json={"count": count})
+            return self._client._request("POST", "/l2/order-indices", json={"count": count})
+
+    def _reserved(self, account: AccountState, answer: Any) -> _Block:
+        """The block a reservation's answer gives, noted as the last one (under the lock)."""
         values = answer if isinstance(answer, Mapping) else {}
         index = values.get("accountIndex")
         first = values.get("firstIndex")
@@ -509,15 +575,80 @@ class L2State:
             # The exchange admits an order on the range only if it expires by reservedAtMs plus
             # the longest order life; one margin covers this machine's clock.
             latest = reserved_at + L2_MAX_ORDER_LIFE_MS - L2_ORDER_LIFE_MARGIN_MS
-            self._block = _Block(first, first + got, latest)
             self._last_count = got
-            return self._block
+            self._reserved_ns = time.time_ns()
+            return _Block(first, first + got, latest)
         shown = dict(answer) if isinstance(answer, Mapping) else answer
         raise LoafServerError(
             f"POST /l2/order-indices answered a range no order can be signed in: {shown!r}",
             status_code=201,
             body=answer,
         )
+
+    def _wake_ahead(self, account: AccountState) -> None:
+        """Start the next block's reservation once this one is half used (under the lock)."""
+        block = self._block
+        if (
+            self._closed
+            or self._standby is not None
+            or self._ahead_busy
+            or not (block is None or block.half_used())
+        ):
+            return
+        self._ahead_account = account
+        self._ahead_wake.set()
+        if self._ahead_thread is None:
+            self._ahead_thread = threading.Thread(
+                target=self._run_ahead, name="loaf-order-numbers", daemon=True
+            )
+            self._ahead_thread.start()
+
+    def _run_ahead(self) -> None:
+        pause = 1.0
+        while True:
+            self._ahead_wake.wait()
+            self._ahead_wake.clear()
+            if self._closed:
+                return
+            try:
+                self._reserve_ahead()
+                pause = 1.0
+            except Exception as exc:  # the thread outlives any one failure
+                # Your placements still reserve for themselves, and they raise what this hides.
+                logger.warning("Reserving order numbers ahead failed: %s", exc)
+                time.sleep(pause)
+                pause = min(2 * pause, _AHEAD_MAX_PAUSE_S)
+                self._ahead_wake.set()
+
+    def _reserve_ahead(self) -> None:
+        """One background reservation: the request outside the lock, its block kept under it."""
+        with self._lock:
+            account = self._ahead_account
+            block = self._block
+            if (
+                account is None
+                or self._closed
+                or self._standby is not None
+                or not (block is None or block.half_used())
+            ):
+                return
+            self._ahead_busy = True
+            count = self._next_count(1)
+            since_s = (time.time_ns() - self._reserved_ns) / 1e9
+        try:
+            if since_s < 1.0:
+                time.sleep(1.0 - since_s)  # sent now, the limit would refuse it
+            answer = self._post_reservation(count)
+            with self._lock:
+                fresh = self._reserved(account, answer)
+                if self._block is None:
+                    self._block = fresh
+                else:
+                    self._standby = fresh
+        finally:
+            with self._lock:
+                self._ahead_busy = False
+                self._ahead_done.notify_all()
 
 
 def _is_int(value: object) -> TypeGuard[int]:
