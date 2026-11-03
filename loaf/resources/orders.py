@@ -32,7 +32,7 @@ parent's life. An ARMED stop, take or leg is not cancelled when its life ends:
 it keeps its open-order slot until you cancel it or it fires, and FAILS if it
 fires later, so cancel and re-arm it before then. After an epoch
 move — a Reset trading key in the web app, a cancel-all sent on chain, or any
-placement refused ``l2 epoch: …`` — the exchange has cancelled your resting
+placement refused ``SETTLE_EPOCH_MISMATCH`` — the exchange has cancelled your resting
 orders, but the stops, takes and TP/SL legs signed before it stay ARMED and
 FAIL when they fire: cancel and re-arm them, a TP/SL leg as a separate
 :meth:`OrdersResource.stop_loss` / :meth:`OrdersResource.take_profit` (not OCO).
@@ -74,41 +74,85 @@ never to a reduce-only one; each leg is a reduce-only order on the other side,
 in the order's pool. An expired perp takes no orders: close a position in it
 with :meth:`~loaf.resources.perps.PerpsResource.exit`.
 
+**Refusals name a code.** Every refusal of a placement or a cancel carries
+``code`` (:attr:`~loaf.exceptions.LoafAPIError.code`), one of
+:class:`~loaf.enums.OrderErrorCode`: branch on it, never on the message, which
+is for people and may change. The exchange may add codes; treat one you do not
+know by its status (its exception class). The SDK picks the exception class
+from the status and the code.
+
 Order placement can be rejected with a 403 when:
 
-* trading is halted, platform-wide or for the market
-  (:class:`~loaf.exceptions.TradingHaltedError`),
-* the market does not trade (:class:`~loaf.exceptions.LoafForbiddenError`):
-  before it is listed, before its trading starts, or once it is delisted, or
+* trading is halted, platform-wide (``TRADING_HALTED``) or for the market
+  (``MARKET_HALTED``) (:class:`~loaf.exceptions.TradingHaltedError`),
+* the market does not trade (``MARKET_NOT_LIVE``,
+  :class:`~loaf.exceptions.LoafForbiddenError`): before it is listed, before
+  its trading starts, or once it is delisted, or
 * the market's own state refuses it (:class:`~loaf.exceptions.MarketStateError`,
   its ``state`` the reason): halted (:class:`~loaf.exceptions.MarketHaltedError`),
-  outside its trading hours, reduce-only, its price stale, or reduce-only while
-  its latest price waits for review (:class:`~loaf.exceptions.PriceHeldError`).
+  outside its trading hours (``MARKET_CLOSED``), reduce-only (``REDUCE_ONLY``),
+  its price stale (``PRICE_STALE``), or reduce-only while its latest price
+  waits for review (``PRICE_HELD``, :class:`~loaf.exceptions.PriceHeldError`).
   In the last three an order that reduces your position is still taken.
 
 Server-side checks reject an order the SDK cannot pre-validate for you (all 400,
 :class:`~loaf.exceptions.LoafValidationError`):
 
-* **Minimum order value** — price x quantity must be at least $10, measured
-  at the price you **sign** (a MARKET order's worst price). A SELL closing your
-  ENTIRE available holding of the asset is exempt, so a dust holding can
-  always be flattened.
-* **Limit price deviation** — an order of **any** type, MARKET included, whose
-  signed price is too far from the market reference is refused. The ceiling is
-  a deployment setting; the message quotes the limit and the reference it used.
-* **Daily price band** — a separate per-market band around the daily
-  reference price, whose message carries the price, the limit, the reference
-  and the band width.
-* **Balance and open-order caps** — not enough available balance, or too many
-  open orders (resting stops count too).
-* **Fee-rate cap** — ``l2 fee: the signed fee-rate cap is below the account's
-  fee rate``: your account's fee rate is above
-  :data:`~loaf.constants.L2_FEE_RATE_CAP`, which every order signs.
-* **Time in force** — an IOC or MARKET order that fills nothing (``Order
-  rejected: no resting order could fill any of it``), a FOK order that cannot
-  fill in full (``Fill-or-kill order rejected: it could not be filled in
-  full``), and a POST_ONLY order that would trade at once
-  (:class:`~loaf.exceptions.PostOnlyWouldTakeError`).
+* **Minimum order value** (``BELOW_MIN_ORDER_VALUE``) — price x quantity must
+  be at least $10, measured at the price you **sign** (a MARKET order's worst
+  price). A SELL closing your ENTIRE available holding of the asset is exempt,
+  so a dust holding can always be flattened.
+* **Price band** (``PRICE_BAND``) — an order of **any** type, MARKET included,
+  whose signed price is too far from the market reference, or outside the
+  market's daily band around its daily reference price. The limits are
+  deployment and market settings; the message quotes them.
+* **Balance and open-order caps** (``INSUFFICIENT_BALANCE``,
+  ``OPEN_ORDER_LIMIT``) — not enough available balance, or too many open
+  orders (resting stops count too).
+* **Fee-rate cap** (``FEE_RATE_CAP_TOO_LOW``) — your account's fee rate is
+  above :data:`~loaf.constants.L2_FEE_RATE_CAP`, which every order signs.
+* **Time in force** — an IOC or MARKET order that fills nothing
+  (``NOT_FILLED``), a FOK order that cannot fill in full (``FOK_NOT_FILLED``),
+  and a POST_ONLY order that would trade at once (``POST_ONLY_WOULD_TAKE``,
+  :class:`~loaf.exceptions.PostOnlyWouldTakeError`).
+
+An order that would trade with a resting order of your own is not refused: the
+exchange cancels the resting one (``order_status`` ``CANCELLED``) and the new
+order goes on matching.
+
+**Order controls.** :meth:`OrdersResource.create` and its four wrappers (not
+the stops and takes) take three controls that are sent with the order but not
+signed:
+
+* ``order_tag=``, 1 to 4,294,967,295: your label for a group of orders. The
+  order keeps it while it rests; :meth:`OrdersResource.cancel_all` and
+  :meth:`OrdersResource.cancel_after` can select by it, and its rows and its
+  ``order_status`` / ``order_update`` frames carry it as ``orderTag``, with its
+  ``l2OrderIndex``.
+* ``send_by_ms=``, unix ms: the latest time the exchange may decide the order.
+  Arriving later, or decided later, it is refused
+  (:class:`~loaf.exceptions.SendByPassedError`): nothing is placed, and the
+  order number is not spent. A quote delayed in transit never lands late.
+* ``replaces_order_id=``: your order resting on the same market, which the
+  exchange cancels in the batch that decides the new order, before it: the two
+  never rest together, the old order's hold is free for the new one's checks,
+  and the open-order cap counts one order less. If the old order no longer
+  rests there, the new one is refused
+  (:class:`~loaf.exceptions.ReplaceTargetGoneError`) and nothing changes. If
+  the cancel went through and the new order is then refused for another
+  reason, the old one stays cancelled, and the error's
+  ``replaced_order_cancelled`` is ``True``.
+
+**Cancels.** :meth:`OrdersResource.cancel` cancels one order by id,
+:meth:`OrdersResource.cancel_conditional` one stop or take, and
+:meth:`OrdersResource.cancel_all` every order, or one market's, or one tag's.
+:meth:`OrdersResource.cancel_after` is the dead man's switch: the exchange
+cancels a scope's orders unless you call it again before its deadline (call it
+every 15 to 30 s with a 60 to 120 s timeout, from the loop that quotes).
+:meth:`OrdersResource.cancel_by_index` settles an order by the order number it
+signed, with no read: an order whose placement's answer you lost
+(:class:`~loaf.exceptions.OrderOutcomeUnknownError`) is cancelled if it rests,
+reported if it ended, and voided if it never arrived.
 
 A **conditional** (stop / take) order goes to ``POST /orders/conditional``
 instead. It rests server-side until the mark price reaches your trigger,
@@ -143,10 +187,10 @@ answered as a duplicate, never placed twice. Two rules cover the rest:
 * any error other than :class:`~loaf.exceptions.OrderOutcomeUnknownError`
   means the order was not placed: place it again if you still want it;
 * on :class:`~loaf.exceptions.OrderOutcomeUnknownError`,
-  ``resubmit(error.signed_body)`` while it can still rest, or find it in
-  ``history.orders()`` by its ``expiryMs``, where a miss proves nothing while
-  it can still rest. Never place a fresh order for the same intent while one
-  may be live.
+  ``resubmit(error.signed_body)`` while you still want it and it can still
+  rest; once you do not, ``cancel_by_index(error.signed_body["l2OrderIndex"])``
+  settles it. Never place a fresh order for the same intent while one may be
+  live.
 
 **Order-number allowance.** A reservation refused ``l2 order_index: the account
 would hold more than … reserved indices no order uses`` means the account has
@@ -170,16 +214,31 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from .. import k1
-from .._l2 import AccountState, L2State, Market, TradingKey, _is_int, market_of
+from .._l2 import (
+    _MAX_ORDER_INDEX,
+    _MAX_SAFE_INT,
+    AccountState,
+    L2State,
+    Market,
+    TradingKey,
+    _is_int,
+    _whole,
+    market_of,
+)
 from ..constants import (
+    CANCEL_AFTER_MAX_MS,
+    CANCEL_AFTER_MIN_MS,
     DEFAULT_ORDER_TTL_MS,
     ENV_BASE_URL,
     ENV_TRADING_KEY,
     L2_BUFFER_MS,
     L2_FEE_RATE_CAP,
+    MAX_MARKET_INDEX,
     MAX_ORDER_TTL_MS,
     MAX_POOL,
     MIN_ORDER_TTL_MS,
+    ORDER_TAG_MAX,
+    SEND_BY_MS_MAX,
 )
 from ..enums import (
     CONDITIONAL_ORDER_TYPES,
@@ -194,7 +253,9 @@ from ..exceptions import (
     LoafAPIError,
     LoafConfigError,
     LoafError,
+    LoafServerError,
     OrderOutcomeUnknownError,
+    SendByPassedError,
     _client_validation_error,
 )
 from ..money import (
@@ -216,12 +277,17 @@ _TIMES_IN_FORCE = frozenset(member.value for member in TimeInForce)
 _SIGNED_BODY_STRS = ("l2SigS", "l2SigE")
 _SIGNED_BODY_INTS = ("l2OrderIndex", "l2AccountIndex", "l2ExpiryMs")
 
+_TAG_RULE = f"a whole number from 1 to {ORDER_TAG_MAX:,}"
+_SEND_BY_RULE = "a unix time in milliseconds, a whole number from 1 to 2^48 - 1"
+
 
 class OrdersResource(Resource):
     def __init__(self, client: LoafClient) -> None:
         super().__init__(client)
         #: The markets, account and order numbers your orders sign, refreshed on refusals.
         self._l2 = L2State(client)
+        #: The market index a cancel's ``ticker=`` names, as last read.
+        self._market_indices: dict[str, int] = {}
 
     def warm(self, *tickers: str) -> None:
         """Do now what a first placement would do first: read each ticker's market and your
@@ -257,6 +323,9 @@ class OrdersResource(Resource):
         pool: int | None = None,
         reduce_only: bool = False,
         time_in_force: str = TimeInForce.GTC,
+        order_tag: int | None = None,
+        send_by_ms: int | None = None,
+        replaces_order_id: int | None = None,
     ) -> Any:
         """``POST /orders`` — place a trading order, signed with your trading key.
 
@@ -323,6 +392,18 @@ class OrdersResource(Resource):
             reduce_only: perps only: ``True`` lets the order's fills
                 only shrink the pool's position in the market, never open or
                 flip one. Refused on a spot market.
+            order_tag: your label for the order, a whole number from 1 to
+                4,294,967,295 (default: none). :meth:`cancel_all` and
+                :meth:`cancel_after` can select the orders carrying it, and
+                its rows and frames show it as ``orderTag``.
+            send_by_ms: the latest time, unix ms, the exchange may decide the
+                order (default: none). Later, it is refused
+                (:class:`~loaf.exceptions.SendByPassedError`) and nothing is
+                placed. The exchange compares it with its own clock.
+            replaces_order_id: the id of your order resting on the same
+                market, to cancel in the same step, before this one is
+                matched (default: none). See the module docs, **Order
+                controls**.
 
         Returns:
             ``{success, orderId, status, quantityLeft, duplicate,
@@ -352,8 +433,12 @@ class OrdersResource(Resource):
                 its latest price waits for review.
             PostOnlyWouldTakeError: a ``POST_ONLY`` order would have traded at
                 once (400); nothing was placed.
+            SendByPassedError: ``send_by_ms`` passed before the exchange
+                decided the order (400); nothing was placed.
+            ReplaceTargetGoneError: the order ``replaces_order_id`` names does
+                not rest on the market (409); nothing changed.
             LoafValidationError: refused locally (``status_code`` 0) or by the
-                exchange (400), including its ``l2 …`` texts.
+                exchange (400); its ``code`` says why.
             OrderOutcomeUnknownError: the order may or may not be live (or
                 already filled); :meth:`resubmit` it while you still want it, or
                 look for it in ``history.orders()``, never place it afresh.
@@ -395,6 +480,7 @@ class OrdersResource(Resource):
         tif = _time_in_force(time_in_force, otype)
         qty_d = validate_quantity(quantity)
         perps = _perps_terms(pool, reduce_only)
+        controls = _order_controls(order_tag, send_by_ms, replaces_order_id)
 
         limit_d: Decimal | None = None  # a LIMIT's own price; a MARKET's is derived below
         if otype == OrderType.LIMIT:
@@ -462,7 +548,17 @@ class OrdersResource(Resource):
                 order_price = _worst_price(reference_price, side, bps)
         ttl = _ttl(ttl_ms)
         return self._place(
-            key, ticker, side, otype, qty_d, order_price, ttl, perps, legs=legs, time_in_force=tif
+            key,
+            ticker,
+            side,
+            otype,
+            qty_d,
+            order_price,
+            ttl,
+            perps,
+            legs=legs,
+            time_in_force=tif,
+            controls=controls,
         )
 
     # -- Convenience wrappers --------------------------------------------- #
@@ -480,6 +576,9 @@ class OrdersResource(Resource):
         pool: int | None = None,
         reduce_only: bool = False,
         time_in_force: str = TimeInForce.GTC,
+        order_tag: int | None = None,
+        send_by_ms: int | None = None,
+        replaces_order_id: int | None = None,
     ) -> Any:
         """Place a LIMIT BUY, optionally with take-profit / stop-loss legs, ``GTC`` unless
         ``time_in_force=`` says otherwise (see :meth:`create`)."""
@@ -496,6 +595,9 @@ class OrdersResource(Resource):
             pool=pool,
             reduce_only=reduce_only,
             time_in_force=time_in_force,
+            order_tag=order_tag,
+            send_by_ms=send_by_ms,
+            replaces_order_id=replaces_order_id,
         )
 
     def limit_sell(
@@ -511,6 +613,9 @@ class OrdersResource(Resource):
         pool: int | None = None,
         reduce_only: bool = False,
         time_in_force: str = TimeInForce.GTC,
+        order_tag: int | None = None,
+        send_by_ms: int | None = None,
+        replaces_order_id: int | None = None,
     ) -> Any:
         """Place a LIMIT SELL, on a perp optionally with take-profit / stop-loss legs, ``GTC``
         unless ``time_in_force=`` says otherwise (see :meth:`create`)."""
@@ -527,6 +632,9 @@ class OrdersResource(Resource):
             pool=pool,
             reduce_only=reduce_only,
             time_in_force=time_in_force,
+            order_tag=order_tag,
+            send_by_ms=send_by_ms,
+            replaces_order_id=replaces_order_id,
         )
 
     def market_buy(
@@ -542,6 +650,9 @@ class OrdersResource(Resource):
         ttl_ms: int | None = None,
         pool: int | None = None,
         reduce_only: bool = False,
+        order_tag: int | None = None,
+        send_by_ms: int | None = None,
+        replaces_order_id: int | None = None,
     ) -> Any:
         """Place a MARKET BUY that pays at most
         ``reference_price x (1 + max_slippage_bps/10,000)``.
@@ -563,6 +674,9 @@ class OrdersResource(Resource):
             ttl_ms=ttl_ms,
             pool=pool,
             reduce_only=reduce_only,
+            order_tag=order_tag,
+            send_by_ms=send_by_ms,
+            replaces_order_id=replaces_order_id,
         )
 
     def market_sell(
@@ -578,6 +692,9 @@ class OrdersResource(Resource):
         ttl_ms: int | None = None,
         pool: int | None = None,
         reduce_only: bool = False,
+        order_tag: int | None = None,
+        send_by_ms: int | None = None,
+        replaces_order_id: int | None = None,
     ) -> Any:
         """Place a MARKET SELL that sells at no less than
         ``reference_price x (1 - max_slippage_bps/10,000)``.
@@ -600,6 +717,9 @@ class OrdersResource(Resource):
             ttl_ms=ttl_ms,
             pool=pool,
             reduce_only=reduce_only,
+            order_tag=order_tag,
+            send_by_ms=send_by_ms,
+            replaces_order_id=replaces_order_id,
         )
 
     # -- Conditional orders (stop / take) ---------------------------------- #
@@ -806,9 +926,10 @@ class OrdersResource(Resource):
 
     # -- Re-send ------------------------------------------------------------ #
 
-    def resubmit(self, signed_body: Mapping[str, Any]) -> Any:
+    def resubmit(self, signed_body: Mapping[str, Any], *, send_by_ms: int | None = None) -> Any:
         """Re-send a signed placement exactly as it was (e.g. the ``signed_body``
-        of an :class:`~loaf.exceptions.OrderOutcomeUnknownError`).
+        of an :class:`~loaf.exceptions.OrderOutcomeUnknownError`), with a new
+        ``sendByMs`` when ``send_by_ms=`` is given (it is not signed).
 
         If the first attempt landed, the answer is that same order as it is
         now (on ``/orders`` with ``duplicate: True``). A stop or take is
@@ -831,15 +952,23 @@ class OrdersResource(Resource):
         status) then; an order that filled is not in ``openOrders``.
 
         After an epoch move (a Reset trading key, or a cancel-all sent on chain)
-        the exchange refuses it (``l2 epoch: …``) and has cancelled any resting
+        the exchange refuses it (``SETTLE_EPOCH_MISMATCH``) and has cancelled any resting
         order of the old epoch.
 
         Needs no trading key. Once the order can no longer rest (its
         ``l2ExpiryMs`` minus 72 hours has passed) nothing is sent, since the
         exchange refuses it then: the ``OrderOutcomeUnknownError`` has
         ``attempts`` 0 and the reason in ``last_error``. Stop resubmitting it:
-        find it in ``history.orders()`` by its ``expiryMs``, and cancel any
-        stop, take or TP/SL leg of it that is still ``ARMED``.
+        settle it with :meth:`cancel_by_index`, or find it in
+        ``history.orders()`` by its ``expiryMs``, and cancel any stop, take or
+        TP/SL leg of it that is still ``ARMED``.
+
+        A body whose ``sendByMs`` has passed is not sent either (``attempts``
+        0, ``last_error`` a :class:`~loaf.exceptions.SendByPassedError`): the
+        exchange refuses it before it looks for the first attempt, so the
+        answer would say nothing. Settle it with :meth:`cancel_by_index`, or,
+        to have it placed late after all, resubmit it with a later
+        ``send_by_ms=``.
         """
         body = signed_body if isinstance(signed_body, Mapping) else {}
         if not (
@@ -850,9 +979,22 @@ class OrdersResource(Resource):
                 "resubmit needs a signed placement body (its l2 fields and signature), "
                 "e.g. OrderOutcomeUnknownError.signed_body"
             )
+        conditional = "triggerPrice" in body
+        body = dict(body)
+        if send_by_ms is not None:
+            if conditional:
+                raise _client_validation_error(
+                    "send_by_ms applies to orders only: a stop or take takes no send-by time"
+                )
+            body["sendByMs"] = _whole_number(
+                send_by_ms, "send_by_ms", 1, SEND_BY_MS_MAX, _SEND_BY_RULE
+            )
+        now_ms = time.time_ns() // 1_000_000
         expiry_ms = body["l2ExpiryMs"]
         rests_until_ms = expiry_ms - L2_BUFFER_MS
-        if time.time_ns() // 1_000_000 >= rests_until_ms:
+        send_by = body.get("sendByMs")
+        refusal: LoafError | None = None
+        if now_ms >= rests_until_ms:
             until = datetime.fromtimestamp(rests_until_ms // 1000, tz=timezone.utc)
             refusal = _client_validation_error(
                 f"This order could rest only until {until.isoformat()} (its l2ExpiryMs minus "
@@ -861,12 +1003,22 @@ class OrdersResource(Resource):
                 "stays ARMED, holding an open-order slot, until it fires and FAILS: find it in "
                 f"history.orders() (expiryMs {expiry_ms}) and cancel it."
             )
+        elif _is_int(send_by) and now_ms > send_by:
+            refusal = SendByPassedError(
+                f"This order's sendByMs {send_by} has passed: the exchange refuses it before it "
+                "looks for an earlier attempt, so a re-send would say nothing. Settle it with "
+                f"orders.cancel_by_index({body['l2OrderIndex']}), or resubmit it with a later "
+                "send_by_ms= to have it placed now if it never was.",
+                status_code=0,
+                code="SEND_BY_PASSED",
+            )
+        if refusal is not None:
             # Nothing is sent, but the first attempt may have landed, and filled: still unknown.
             raise OrderOutcomeUnknownError(
-                signed_body=copy.deepcopy(dict(body)), attempts=0, last_error=refusal
+                signed_body=copy.deepcopy(body), attempts=0, last_error=refusal
             ) from refusal
-        path = "/orders/conditional" if "triggerPrice" in body else "/orders"
-        return self._client._send_signed(path, dict(body), ambiguous=True)
+        path = "/orders/conditional" if conditional else "/orders"
+        return self._client._send_signed(path, body, ambiguous=True)
 
     # -- Cancel ------------------------------------------------------------ #
 
@@ -949,35 +1101,178 @@ class OrdersResource(Resource):
             return self.cancel(placed)
         return self.cancel_conditional(order_id)
 
-    def cancel_all(self) -> Any:
-        """``POST /orders/cancel-all`` — cancel every open order.
+    def cancel_all(self, ticker: str | None = None, *, order_tag: int | None = None) -> Any:
+        """``POST /orders/cancel-all`` — cancel your open orders: every one, or
+        one market's (``ticker=``), or the ones carrying one ``order_tag=``, or
+        both.
 
-        Returns ``{requestedCount, cancelledOrderIds, failedOrders}``, where
-        ``requestedCount`` is ``len(cancelledOrderIds) + len(failedOrders)``.
+        Returns ``{requestedCount, cancelledOrderIds, failedOrders}``
+        (:class:`~loaf.models.CancelAllResult`), where ``requestedCount`` is
+        ``len(cancelledOrderIds) + len(failedOrders)``.
 
-        It cancels your ``PENDING`` / ``ARMED`` conditionals FIRST and prepends
-        their conditional-row ids to ``cancelledOrderIds``, so those ids will
-        404 against any booked-order lookup. Then one request to the matching
-        engine cancels all your resting orders at once, atomically: an order
-        placed while it runs may or may not be included, one placed after the
-        response is not.
+        One request to the matching engine cancels the scope's resting orders
+        at once, atomically: an order placed while it runs may or may not be
+        included, one placed after the response is not. With no
+        ``order_tag=`` it also cancels the scope's ``PENDING`` / ``ARMED``
+        stops and takes (a stop or take carries no tag), and their
+        conditional-row ids come first in ``cancelledOrderIds``, so those ids
+        will 404 against any booked-order lookup.
 
         ``failedOrders`` lists only orders the engine could not cancel because
         the request did not complete on their market (it failed there, or
         the outcome there is unknown). They stay open, each with the
         ``errorMessage`` "Trading service is temporarily unavailable. Please
-        try again in a moment."; calling ``cancel_all()`` again is safe (the
-        request is idempotent).
+        try again in a moment."; calling it again is safe (the request is
+        idempotent).
+
+        No epoch moves: an order signed earlier with an unused order number
+        can still be sent and fill. To make sure one never lands, void its
+        number with :meth:`cancel_by_index`.
 
         It is NOT available under a platform-wide halt — it refuses before
         cancelling anything (:class:`~loaf.exceptions.TradingHaltedError`), and
         :meth:`cancel_conditional` is the only cancel that still works then. A
         503 (:class:`~loaf.exceptions.LoafServiceUnavailableError`) means the
-        engine did not process the request or its outcome is unknown; it can
-        arrive after the conditionals were already cancelled, and retrying is
-        safe.
+        engine did not process the request or its outcome is unknown, and
+        retrying is safe. ``ticker=`` costs one public read the first time
+        it names a market no order of yours was placed on here.
         """
-        return self._client.post("/orders/cancel-all")
+        scope = self._scope(ticker, order_tag)
+        if not scope:
+            return self._client.post("/orders/cancel-all")
+        return self._client.post("/orders/cancel-all", json=scope)
+
+    def cancel_after(
+        self, timeout_ms: int, *, ticker: str | None = None, order_tag: int | None = None
+    ) -> Any:
+        """``POST /orders/cancel-after`` — the dead man's switch: unless you call
+        again within ``timeout_ms``, the exchange cancels the scope's orders.
+
+        The scope is every market or one (``ticker=``), and every order or the
+        ones carrying one ``order_tag=``, as :meth:`cancel_all` names them;
+        each scope has its own timer, and each call replaces its scope's
+        deadline. When the deadline passes, the exchange cancels the scope's
+        orders as ``cancel_all`` with that scope would (an untagged scope's
+        stops and takes too), and the timer stays off until you set it again.
+        ``timeout_ms`` 0 turns the scope's timer off.
+
+        Call it every 15 to 30 s with a ``timeout_ms`` of 60,000 to 120,000,
+        from the loop that quotes, never from a thread of its own: the timer
+        is there to fire when that loop stops. The deadline is the exchange's
+        and durable: one that passes while its engine is down fires as it
+        starts, before any order.
+
+        Args:
+            timeout_ms: 0 (off), or a whole number of milliseconds from 10,000
+                to 120,000.
+            ticker: the market of the scope (default: every market).
+            order_tag: the tag of the scope (default: every order).
+
+        Returns:
+            ``{deadlineMs}`` (:class:`~loaf.models.CancelAfterResult`): when
+            the scope's orders are cancelled, unix ms of the exchange's clock;
+            0 when ``timeout_ms`` was 0.
+
+        Raises:
+            LoafRateLimitError: more than one call a second (429). The limit
+                is per account, across every scope.
+            LoafServiceUnavailableError: 503. ``code`` ``NOT_PROCESSED``:
+                nothing changed (the scope's previous deadline stands);
+                ``SERVICE_UNAVAILABLE``: the exchange did not answer. Either
+                way, call again: a repeat sets the same scope.
+
+        It is taken under a platform-wide halt, which freezes the other
+        cancels: a timer that could not be renewed then would fire during the
+        halt.
+        """
+        whole = isinstance(timeout_ms, numbers.Integral) and not isinstance(timeout_ms, bool)
+        timeout = int(timeout_ms) if whole else None
+        if timeout is None or not (
+            timeout == 0 or CANCEL_AFTER_MIN_MS <= timeout <= CANCEL_AFTER_MAX_MS
+        ):
+            raise _client_validation_error(
+                f"timeout_ms must be 0 (off) or a whole number of milliseconds from "
+                f"{CANCEL_AFTER_MIN_MS:,} to {CANCEL_AFTER_MAX_MS:,} (got {timeout_ms!r})"
+            )
+        body = {"timeoutMs": timeout, **self._scope(ticker, order_tag)}
+        return self._client.post("/orders/cancel-after", json=body)
+
+    def cancel_by_index(self, order_index: int) -> Any:
+        """``POST /orders/cancel-by-index`` — settle an order by the order number
+        it signed (``l2OrderIndex``), with no read.
+
+        For an order whose placement's answer was lost
+        (:class:`~loaf.exceptions.OrderOutcomeUnknownError`: pass its
+        ``signed_body["l2OrderIndex"]``) once you no longer want it. The answer
+        (:class:`~loaf.models.CancelByIndexResult`) is final:
+
+        * ``CANCELLED`` (:class:`~loaf.enums.CancelByIndexOutcome`): the order
+          was resting, and is cancelled now, as :meth:`cancel` cancels it;
+        * ``ENDED``: the order was placed and no longer rests (``status`` says
+          how it ended: ``FILLED``, ``CANCELLED``); nothing changed;
+        * ``VOIDED``: no order was placed with the number, and none ever will
+          be: an attempt still on its way is refused ``ORDER_INDEX_USED``
+          whenever it arrives. ``orderId`` and ``status`` are ``None``.
+
+        A repeat answers ``ENDED`` or ``VOIDED``. The number is your trading
+        key's account's; the SDK never signs it again.
+
+        Raises:
+            LoafValidationError: 400. ``code`` ``ORDER_INDEX_NOT_RESERVED``: no
+                range reserved to your account holds the number;
+                ``INVALID_REQUEST``: a placed stop or take holds it, and the
+                message names its id (cancel it with
+                :meth:`cancel_conditional`, since voiding it would leave it
+                unable to fire). Nothing changed. Locally (``status_code`` 0,
+                nothing sent): ``order_index`` is not a whole number from 1 to
+                2^40 - 1.
+            LoafForbiddenError: 403 ``ORDER_NOT_OWNED``: the number is another
+                account's. Nothing changed.
+            TradingHaltedError: a platform-wide halt (403), as for every
+                cancel but :meth:`cancel_conditional`.
+            LoafServiceUnavailableError: 503 (``NOT_PROCESSED`` or
+                ``SERVICE_UNAVAILABLE``): call it again; a repeat settles it.
+        """
+        key = self._credentials()
+        index = _whole_number(
+            order_index, "order_index", 1, _MAX_ORDER_INDEX,
+            "an order number, a whole number from 1 to 2^40 - 1",
+        )
+        # Whatever the answer, a number you asked to settle is never signed again: voided, a later
+        # order on it would be refused as used.
+        self._l2.spent(index)
+        return self._client.post(
+            "/orders/cancel-by-index",
+            json={"l2AccountIndex": key.l2_account_index, "l2OrderIndex": index},
+        )
+
+    def _scope(self, ticker: str | None, order_tag: Any) -> dict[str, int]:
+        """A cancel's scope: ``ticker``'s market index and the tag, each when given."""
+        scope: dict[str, int] = {}
+        if order_tag is not None:  # checked before the read a ticker can cost
+            scope["orderTag"] = _whole_number(order_tag, "order_tag", 1, ORDER_TAG_MAX, _TAG_RULE)
+        if ticker is not None:
+            scope = {"marketIndex": self._market_index(ticker), **scope}
+        return scope
+
+    def _market_index(self, ticker: str) -> int:
+        """``ticker``'s market index: the one an order here signed, else read once."""
+        _check_market_ticker(ticker)
+        market = self._l2.market(ticker)
+        if market is not None:
+            return market.market_index
+        index = self._market_indices.get(ticker)
+        if index is not None:
+            return index
+        detail = self._client._request("GET", f"/trade/{ticker}", auth=False)
+        values = detail.get("market") if isinstance(detail, Mapping) else None
+        index = values.get("marketIndex") if isinstance(values, Mapping) else None
+        if not _whole(index, 0, MAX_MARKET_INDEX):
+            raise LoafServerError(
+                f"GET /trade/{ticker} answered no market index", status_code=200, body=detail
+            )
+        self._market_indices[ticker] = index
+        return index
 
     # -- Signing & sending ------------------------------------------------- #
 
@@ -1022,6 +1317,7 @@ class OrdersResource(Resource):
         trigger_d: Decimal | None = None,
         legs: Sequence[tuple[str, Decimal, Decimal]] = (),
         time_in_force: str = TimeInForce.GTC.value,
+        controls: Mapping[str, int] | None = None,
     ) -> Any:
         """Read what the order signs, take its order numbers, sign it and send it.
 
@@ -1029,7 +1325,8 @@ class OrdersResource(Resource):
         ``reference_price``) the function that derives it from the exchange's
         reference; ``perps`` its ``(pool, reduce_only)`` as passed;
         ``trigger_d`` makes it a conditional (always GTC); ``legs`` are its
-        TP/SL legs as ``("tp" | "sl", trigger, price)``.
+        TP/SL legs as ``("tp" | "sl", trigger, price)``; ``controls`` its
+        unsigned order controls' body keys (:func:`_order_controls`).
         """
         l2 = self._l2
         span = 1 + len(legs)
@@ -1071,6 +1368,7 @@ class OrdersResource(Resource):
                 **market_keys,
                 "l2QuoteAssetId": market.quote_asset_id,
                 **_signed(key, market, base_field, account, first, expiry_ms, side, price, qty_d),
+                **(controls or {}),  # sent beside the signed fields, not signed
             })
             # Each leg is an order of the parent's quantity on the other side, at its own price,
             # with the parent's expiry and the next order number (tp, then sl), and its own
@@ -1188,6 +1486,34 @@ def _ttl(ttl_ms: Any) -> int:
             f"(got {ttl_ms!r})"
         )
     return int(ttl_ms)
+
+
+def _whole_number(value: Any, field: str, low: int, high: int, rule: str) -> int:
+    """``value`` checked as a whole number from ``low`` to ``high``, never rounded or read from
+    text; refused locally with ``field must be {rule}`` otherwise."""
+    whole = isinstance(value, numbers.Integral) and not isinstance(value, bool)
+    if not whole or not low <= int(value) <= high:
+        # A mapping shows only its type: a signed body passed by mistake must stay out of logs.
+        shown = type(value).__name__ if isinstance(value, Mapping) else repr(value)
+        raise _client_validation_error(f"{field} must be {rule} (got {shown})")
+    return int(value)
+
+
+def _order_controls(order_tag: Any, send_by_ms: Any, replaces_order_id: Any) -> dict[str, int]:
+    """An order's unsigned controls, checked, as its body keys: only the ones given."""
+    controls: dict[str, int] = {}
+    if order_tag is not None:
+        controls["orderTag"] = _whole_number(order_tag, "order_tag", 1, ORDER_TAG_MAX, _TAG_RULE)
+    if send_by_ms is not None:
+        controls["sendByMs"] = _whole_number(
+            send_by_ms, "send_by_ms", 1, SEND_BY_MS_MAX, _SEND_BY_RULE
+        )
+    if replaces_order_id is not None:
+        controls["replacesOrderId"] = _whole_number(
+            replaces_order_id, "replaces_order_id", 1, _MAX_SAFE_INT,
+            "an order's id, a whole number from 1",
+        )
+    return controls
 
 
 def _order_id(order_id: Any) -> int:

@@ -49,6 +49,11 @@ except ImportError:
 # while none trades).
 TARGET_TICKER = ""
 
+# The tag this bot's orders carry once your strategy places some (order_tag=, a whole number
+# from 1 to 4,294,967,295): its cancels and its dead man's switch then touch its own orders
+# only, never the ones you place by hand in the web app.
+BOT_ORDER_TAG = 7
+
 
 def build_client() -> LoafClient:
     """Create a client from the environment, with friendly errors."""
@@ -182,6 +187,10 @@ class Strategy:
         # otherwise can miss a change to the book that no frame brings.
         self.feed_live = False
         self.feed_changes = 0
+        # Whether your private stream is live, by the exchange's account beat: None until
+        # the first snapshot (always, on a deployment without perps), then on_stale and
+        # on_fresh turn it. A strategy that quotes pulls its quotes while it is False.
+        self.private_fresh: bool | None = None
 
     # -- WebSocket handlers (called on the WS thread) --------------------- #
 
@@ -224,6 +233,21 @@ class Strategy:
             print(f"  feed: no connection ({msg.reason}); retrying")
         else:
             print(f"  feed closed: {msg.code} {msg.reason}; reconnecting")
+
+    def on_stale(self, msg) -> None:
+        # No news from the exchange's engine for stale_after seconds, the connection
+        # dropped (before on_disconnect), or portfolio was unsubscribed: your fills and
+        # orders may be out of date. The next tick acts on it, from the main thread.
+        with self._lock:
+            self.private_fresh = False
+        print(f"  *** private stream STALE ({msg.reason}; last news {msg.silentSeconds} s ago)")
+
+    def on_fresh(self, _msg) -> None:
+        # A connection's first account snapshot, or news again after on_stale.
+        with self._lock:
+            was, self.private_fresh = self.private_fresh, True
+        if was is False:
+            print("  *** private stream live again")
 
     def on_halt(self, msg) -> None:
         # `isHalted` is the effective state (this market's own flag OR a
@@ -308,10 +332,14 @@ class Strategy:
         with self._lock:
             bid, ask, mark = self.best_bid, self.best_ask, self.mark_price
             halted, waiting = self.is_halted, self._waiting()
+            stale = self.private_fresh is False
             if waiting:
                 self.needs_seed = True  # the next tick reads the market again
         spread = (ask - bid) if (bid is not None and ask is not None) else None
-        flags = "".join(f" [{reason}]" for reason in (["HALTED"] if halted else []) + waiting)
+        flags = "".join(
+            f" [{reason}]"
+            for reason in (["HALTED"] if halted else []) + waiting + (["STALE"] if stale else [])
+        )
         print(f"[{self.ticker}] bid={bid} ask={ask} spread={spread} mark={mark}{flags}")
 
         if halted:
@@ -356,6 +384,25 @@ class Strategy:
         #   # Cancel every open order, stop and take (it sells nothing):
         #   self.client.orders.cancel_all()
         #
+        #   # Quoting: tag the bot's quotes, replace in one step, never let a
+        #   # quote land late, and keep the exchange's dead man's switch armed
+        #   # from this loop, scoped to the tag: if this loop stops, the
+        #   # exchange cancels the bot's quotes within 60 s. While the private
+        #   # stream is stale, pull them and quote nothing.
+        #   if stale:
+        #       self.client.orders.cancel_all(self.ticker, order_tag=BOT_ORDER_TAG)
+        #       return
+        #   self.client.orders.cancel_after(60_000, order_tag=BOT_ORDER_TAG)
+        #   if bid:
+        #       res = self.client.orders.limit_buy(
+        #           self.ticker, quantity=1, price=round(bid * 0.99, 2), ttl_ms=3_600_000,
+        #           order_tag=BOT_ORDER_TAG,
+        #           send_by_ms=time.time_ns() // 1_000_000 + 2_000,
+        #           replaces_order_id=self.quote_id)  # set self.quote_id = None in __init__
+        #       self.quote_id = res.orderId
+        #   # On loaf.ReplaceTargetGoneError the old quote no longer rests (it
+        #   # filled or was cancelled): set self.quote_id = None and quote again.
+        #
         # Wrap calls in try/except. Every loaf.LoafAPIError from a placement
         # means it was not placed: loaf.TradingHaltedError (halted), and the rest.
         # A loaf.LoafForbiddenError about the market itself (delisted, not yet
@@ -366,9 +413,9 @@ class Strategy:
         # set the new one, README §2, restart, and re-arm your stops).
         # On loaf.OrderOutcomeUnknownError the order may be live or already
         # filled. If you still want it, resubmit(e.signed_body) (the same order
-        # if it landed, placed now if not); otherwise look for it in
-        # history.orders() by its expiryMs, where a miss proves nothing until
-        # its ttl_ms has passed: never place it afresh before then.
+        # if it landed, placed now if not); otherwise settle it with
+        # cancel_by_index(e.signed_body["l2OrderIndex"]): CANCELLED, ENDED or
+        # VOIDED (never placed, and never will be). Never place it afresh.
         # ----------------------------------------------------------------- #
 
 
@@ -401,6 +448,8 @@ def main() -> None:
     ws.on_order_update(strategy.on_my_order_accepted)  # private: your new orders
     ws.on_order_status(strategy.on_my_order)  # private: your order transitions
     ws.on_balances(strategy.on_balances)      # private: your balance changes
+    ws.on_stale(strategy.on_stale)            # private stream: no news for stale_after s
+    ws.on_fresh(strategy.on_fresh)            # private stream: live (again)
     ws.on_error(lambda m: print(f"  WS error: {m.get('message')}"))
 
     ws.subscribe_orderbook(target.ticker)

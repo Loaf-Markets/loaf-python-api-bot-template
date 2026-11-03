@@ -25,9 +25,9 @@ market has expired, a position in it is closed by an exit
 **Signing.** An allocate or an exit is signed on your machine with your
 trading key over the exchange's message, as an order is, and is sent with a
 login token your trading key signs (the exchange checks the account is yours).
-Each spends your account's next nonce, one counter your withdrawals spend too:
-the SDK reads it (``GET /l2/keys``) for every op, and sends one op at a time
-per client. An op
+Each spends your account's next nonce, one counter your withdrawals
+(:meth:`~loaf.resources.funds.FundsResource.withdraw`) spend too: the SDK reads
+it (``GET /l2/keys``) for every op, and sends one op at a time per client. An op
 sent elsewhere (the web app, another process) between that read and the send
 makes the exchange refuse this one, ``l2 money: the nonce is not the api key's
 nonce …`` (422): send it again, and the SDK reads the new nonce.
@@ -53,13 +53,12 @@ from __future__ import annotations
 
 import numbers
 import threading
-import time
 from decimal import Context, Decimal, localcontext
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any, Callable, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
 
 from .. import k1
-from .._l2 import _is_int, _whole, read_signing_account
+from .._l2 import _is_int, _whole, submit_signed_op
 from ..constants import (
     DEFAULT_PERPS_OP_TTL_MS,
     ENV_TRADING_KEY,
@@ -91,14 +90,13 @@ _EXACT = Context(prec=100)  # every collateral bound below fits in it
 
 class _Collateral(NamedTuple):
     """A summary's perps collateral, checked: ``row`` as served, ``tick`` one tick in
-    the token's units and ``most`` the largest allocate (2^60 - 1 ticks), both exact."""
+    the token's units, exact."""
 
     row: Mapping[str, Any]
     symbol: str
     decimals: int
     tick_size: int
     tick: Decimal
-    most: Decimal
 
 _SIGNED_OP_STRS = ("l2SigS", "l2SigE")
 _SIGNED_OP_INTS = ("l2ChainId", "l2AccountIndex", "l2Nonce", "l2ExpiryMs")
@@ -109,8 +107,6 @@ _EXIT_KEYS = ("pool", "market")
 class PerpsResource(Resource):
     def __init__(self, client: LoafClient) -> None:
         super().__init__(client)
-        # One op at a time: each signs the nonce GET /l2/keys serves, which only an applied op moves.
-        self._lock = threading.Lock()
         #: The collateral an allocate is counted in, read once (under ``_collateral_lock``).
         self._collateral_lock = threading.Lock()
         self._kept_collateral: _Collateral | None = None
@@ -288,7 +284,7 @@ class PerpsResource(Resource):
             )
 
         terms = {"fromSide": source, "toSide": target, "amount": str(ticks)}
-        return self._submit("/l2/allocations", key, terms, ttl, message)
+        return submit_signed_op(self._client, key, "/l2/allocations", terms, ttl, message, "perps")
 
     def add_margin(
         self, amount: float | Decimal, *, pool: int = 0, ttl_ms: int | None = None
@@ -340,7 +336,7 @@ class PerpsResource(Resource):
             )
 
         terms = {"pool": number, "market": index}
-        return self._submit("/l2/exits", key, terms, ttl, message)
+        return submit_signed_op(self._client, key, "/l2/exits", terms, ttl, message, "perps")
 
     def resubmit(self, signed_body: Mapping[str, Any]) -> Any:
         """Re-send a signed allocate or exit exactly as it was (the ``signed_body``
@@ -369,7 +365,7 @@ class PerpsResource(Resource):
                 "e.g. PerpsOutcomeUnknownError.signed_body"
             )
         path = "/l2/allocations" if kind is _ALLOCATE_KEYS else "/l2/exits"
-        return self._client._send_signed(path, dict(body), ambiguous=True, perps=True)
+        return self._client._send_signed(path, dict(body), ambiguous=True, op="perps")
 
     # -- Signing & sending --------------------------------------------------- #
 
@@ -382,38 +378,6 @@ class PerpsResource(Resource):
                 "app's Show trading key (README §2), or pass trading_key=..."
             )
         return key
-
-    def _submit(
-        self,
-        path: str,
-        key: TradingKey,
-        terms: dict[str, Any],
-        ttl: int,
-        message: Callable[[int, int, int, int], bytes],
-    ) -> Any:
-        """Read your account's nonce, sign the op at now + ``ttl`` and send it; one op at a
-        time, so no two sign the same nonce. Your trading key names the L2 chain: another
-        deployment's is refused at the nonce read's login."""
-        with self._lock:
-            chain_id, account_index = key.l2_chain_id, key.l2_account_index
-            nonce = read_signing_account(self._client, account_index)
-            expiry_ms = time.time_ns() // 1_000_000 + ttl
-            try:
-                signed = message(chain_id, account_index, nonce, expiry_ms)
-            except k1.K1Error as exc:
-                # The engine's own text, e.g. an account index past an op's width; nothing was sent.
-                raise _client_validation_error(str(exc)) from None
-            s, e = key.sign(signed)
-            body = {
-                "l2ChainId": chain_id,
-                "l2AccountIndex": account_index,
-                **terms,
-                "l2Nonce": nonce,
-                "l2ExpiryMs": expiry_ms,
-                "l2SigS": s,
-                "l2SigE": e,
-            }
-            return self._client._send_signed(path, body, perps=True)
 
     def _collateral(self) -> _Collateral:
         """The collateral an allocate's amount is counted in, from your summary: read once, and
@@ -469,8 +433,7 @@ def _collateral_of(answer: Any) -> _Collateral:
         raise unusable("collateral.extensionMultiplier")
     with localcontext(_EXACT):
         tick = Decimal(tick_size).scaleb(-decimals)
-        most = (Decimal(tick_size) * (_ALLOCATE_LIMIT - 1)).scaleb(-decimals)
-    return _Collateral(row, symbol, decimals, tick_size, tick, most)
+    return _Collateral(row, symbol, decimals, tick_size, tick)
 
 
 def _decimal_string(value: Any, high: int) -> int | None:
@@ -482,14 +445,18 @@ def _decimal_string(value: Any, high: int) -> int | None:
     return int(value)
 
 
-def _ticks(value: Decimal, given: Any, collateral: _Collateral) -> int:
-    """An allocate's ``amount`` (USDC) as the whole number of ticks it signs: amount x
-    10^decimals / tickSize, exactly, or refused (never rounded)."""
+def _ticks(value: Decimal, given: Any, collateral: _Collateral, limit: int = _ALLOCATE_LIMIT) -> int:
+    """An ``amount`` of USDC (an allocate's, or a withdrawal's) as the whole number of ticks it
+    signs, below ``limit`` (a power of two): amount x 10^decimals / tickSize, exactly, or refused
+    (never rounded)."""
     symbol = collateral.symbol
-    if not collateral.tick <= value <= collateral.most:
+    with localcontext(_EXACT):
+        most = (Decimal(collateral.tick_size) * (limit - 1)).scaleb(-collateral.decimals)
+    if not collateral.tick <= value <= most:
         raise _client_validation_error(
             f"amount must be from {_plain(collateral.tick)} {symbol} (one tick) to "
-            f"{_plain(collateral.most, ',')} {symbol} (2^60 - 1 ticks) (got {given!r})"
+            f"{_plain(most, ',')} {symbol} (2^{limit.bit_length() - 1} - 1 ticks) "
+            f"(got {given!r})"
         )
     ticks = Fraction(value) * 10**collateral.decimals / collateral.tick_size
     if ticks.denominator != 1:

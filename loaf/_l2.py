@@ -5,7 +5,9 @@ key signs, which authenticate every other request you make.
 Internal. :class:`~loaf.client.LoafClient` keeps one :class:`TradingKey` and its
 :class:`LoginTokens`; :class:`~loaf.resources.orders.OrdersResource` keeps one
 :class:`L2State`; :class:`~loaf.resources.perps.PerpsResource` signs its allocates
-and exits with the :class:`TradingKey` at the nonce :func:`read_signing_account` reads.
+and exits, and :class:`~loaf.resources.funds.FundsResource` its withdrawals, with the
+:class:`TradingKey` at the nonce :func:`read_signing_account` reads
+(:func:`submit_signed_op`).
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import re
 import threading
 import time
 import traceback
-from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Mapping, NamedTuple
 
 from . import k1
 from .constants import (
@@ -35,12 +37,15 @@ from .exceptions import (
     LoafConfigError,
     LoafError,
     LoafServerError,
+    MarketStateError,
     TradingHaltedError,
     _client_validation_error,
 )
 
 if TYPE_CHECKING:
-    from typing import TypeGuard  # Python 3.10+: annotations only
+    # typing has it from Python 3.10; type checkers ship typing_extensions, and annotations only
+    # use it, so the package needs no runtime dependency.
+    from typing_extensions import TypeGuard
 
     from .client import LoafClient
 
@@ -93,6 +98,11 @@ _INDEX_TEXTS = (
     "l2 order_index: the range was reserved more than K1's longest order life before the expiry; "
     "reserve a new one",
 )
+# The order routes' codes for some of the refusals above, which hold whatever the text says: the
+# account's epoch or key, and an order number used or voided. The texts stay for the refusals no
+# code names apart (INVALID_REQUEST covers several).
+_CONTEXT_CODES = frozenset({"SETTLE_EPOCH_MISMATCH", "INVALID_SIGNATURE"})
+_INDEX_CODES = frozenset({"ORDER_INDEX_USED"})
 
 
 class TradingKey:
@@ -358,6 +368,46 @@ def read_signing_account(client: LoafClient, account_index: int) -> int:
     )
 
 
+def submit_signed_op(
+    client: LoafClient,
+    key: TradingKey,
+    path: str,
+    terms: dict[str, Any],
+    lead_ms: int,
+    message: Callable[[int, int, int, int], bytes],
+    op: str,
+) -> Any:
+    """Sign a perps allocate or exit, or a withdrawal, at your account's next nonce
+    (:func:`read_signing_account`) and expiry now + ``lead_ms``, and send it
+    (``client._send_signed``, ``op`` its kind). ``message(chain_id, account_index,
+    nonce, expiry_ms)`` builds the K1 message it signs, and ``terms`` are its body's
+    own fields.
+
+    One op at a time per client (``client._op_lock``): the three spend one counter, so
+    no two sign the same nonce. Your trading key names the L2 chain: another
+    deployment's is refused at the nonce read's login."""
+    with client._op_lock:
+        chain_id, account_index = key.l2_chain_id, key.l2_account_index
+        nonce = read_signing_account(client, account_index)
+        expiry_ms = time.time_ns() // 1_000_000 + lead_ms
+        try:
+            signed = message(chain_id, account_index, nonce, expiry_ms)
+        except k1.K1Error as exc:
+            # The engine's own text, e.g. an account index past an op's width; nothing was sent.
+            raise _client_validation_error(str(exc)) from None
+        s, e = key.sign(signed)
+        body = {
+            "l2ChainId": chain_id,
+            "l2AccountIndex": account_index,
+            **terms,
+            "l2Nonce": nonce,
+            "l2ExpiryMs": expiry_ms,
+            "l2SigS": s,
+            "l2SigE": e,
+        }
+        return client._send_signed(path, body, op=op)
+
+
 class L2State:
     """What an orders resource keeps between placements: each ticker's market, your
     account and the block of order indices being handed out. In memory only, and
@@ -482,6 +532,22 @@ class L2State:
             else:  # another order took the indices after them since
                 block.returned.append((first, span))
 
+    def spent(self, order_index: int) -> None:
+        """Never sign ``order_index`` again: ``cancel_by_index`` settled it (an order carries
+        it, or it is voided), and the exchange would refuse a later order on it as used."""
+        with self._lock:
+            for block in (self._block, self._standby):
+                if block is None:
+                    continue
+                # Given back by a definite refusal: the whole span goes, its legs' numbers with it.
+                block.returned = [
+                    (first, span)
+                    for first, span in block.returned
+                    if not first <= order_index < first + span
+                ]
+                if block.next <= order_index < block.end:  # not handed out yet: end before it
+                    block.end = order_index
+
     def after_refusal(
         self,
         ticker: str,
@@ -492,22 +558,25 @@ class L2State:
         """Forget what a refusal of an order on ``ticker`` shows stale: the order
         started with ``account`` and took its indices from ``block`` (``None`` until
         they are reserved: a refusal that comes with one answered the placement)."""
-        # Texts count on refusals only: the 503s for an unreadable account or an unchecked
-        # signature carry the l2 prefixes too, and show nothing stale.
-        message = error.message if error.status_code < 500 else ""
-        context = any(text in message for text in _CONTEXT_TEXTS)
+        # Texts and codes count on refusals only: the 503s for an unreadable account or an
+        # unchecked signature carry the l2 prefixes too, and show nothing stale.
+        refusal = error.status_code < 500
+        message = error.message if refusal else ""
+        code = error.code if refusal and isinstance(error.code, str) else None
+        context = any(text in message for text in _CONTEXT_TEXTS) or code in _CONTEXT_CODES
         # Only the placement's own answer shows the ticker's market stale: the account read and the
         # reservation never name it, and a refusal of their login token ('l2 key: …', say) shows
         # your trading key not in force. A placement names its market by the signed index alone:
         # refused as no market (404) or as one that does not trade (403: delisted, say), it shows
-        # the market stale, since the ticker may name another market by now. A halt or a start not
-        # reached shows nothing.
+        # the market stale, since the ticker may name another market by now. A halt, the market's
+        # own state (closed, reduce-only, its price stale or held) and a start not reached say what
+        # the market takes now, and show nothing.
         market_stale = block is not None and (
             context
             or error.status_code == 404
             or (
                 error.status_code == 403
-                and not isinstance(error, TradingHaltedError)
+                and not isinstance(error, (TradingHaltedError, MarketStateError))
                 and _NOT_STARTED not in message
             )
         )
@@ -516,7 +585,9 @@ class L2State:
         with self._lock:
             if context and self._account == account:  # by value: a fresh, different read survives
                 self._account = None
-            if self._block is block and any(text in message for text in _INDEX_TEXTS):
+            if self._block is block and (
+                any(text in message for text in _INDEX_TEXTS) or code in _INDEX_CODES
+            ):
                 self._block = None  # by identity: a block another thread just reserved survives
 
     def _next_block(self, account: AccountState, span: int, expiry_ms: int) -> _Block:

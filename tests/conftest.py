@@ -146,23 +146,32 @@ PERPS_ACCOUNT = {
         },
     ],
 }
-# A market's state refusals: the exchange's 403 text, the error it raises, and its state.
+# A market's state refusals: the exchange's 403 body (its text and code), the error it raises, and
+# its state.
 MARKET_STATES = [
-    ("Trading is halted on this market", loaf.MarketHaltedError, "MARKET_HALTED"),
-    ("This market is outside its trading hours", loaf.MarketStateError, "MARKET_CLOSED"),
+    ("Trading is halted on this market", "MARKET_HALTED", loaf.MarketHaltedError, "MARKET_HALTED"),
+    (
+        "This market is outside its trading hours",
+        "MARKET_CLOSED",
+        loaf.MarketStateError,
+        "MARKET_CLOSED",
+    ),
     (
         "This market is reduce-only: it takes only orders that reduce a position",
+        "REDUCE_ONLY",
         loaf.MarketStateError,
         "REDUCE_ONLY",
     ),
     (
         "This market's price is stale: it takes only orders that reduce a position",
+        "PRICE_STALE",
         loaf.MarketStateError,
         "PRICE_STALE",
     ),
     (
         "This market is reduce-only while its latest price waits for review: it takes only "
         "orders that reduce a position",
+        "PRICE_HELD",
         loaf.PriceHeldError,
         "REDUCE_ONLY",
     ),
@@ -177,6 +186,8 @@ KEYS = {
 }
 # The exchange's 422 for a perps op not signed at the account's api key 0 nonce.
 NONCE_REFUSAL = "l2 money: the nonce is not the api key's nonce (tx_nonce == api_key.nonce)"
+# The backend's 400 for a withdrawal whose expiry is inside the 72-hour buffer (L2_REASONS).
+EXPIRY_INSIDE_BUFFER = "l2 expiry: the expiry is inside the buffer"
 
 # The backend's 401s to a request whose login token it does not take (Shared-Types'
 # L2_LOGIN_REASONS, and the account's and the key's L2_BACKEND_REASONS).
@@ -215,13 +226,13 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     # The client's retries back off with real sleeps (honouring Retry-After); skip them. Only the
     # SDK modules' `time` is replaced, so time.sleep elsewhere stays real.
     monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=lambda seconds: None))
-    # One clock for loaf._l2 (an order's expiry, the order-number pool, login tokens) and
-    # resubmit's guard: tests freeze or advance it by replacing time_ns.
+    # One clock for loaf._l2 (an order's expiry, the order-number pool, login tokens, a perps
+    # op's or a withdrawal's expiry) and resubmit's guard: tests freeze or advance it by replacing
+    # time_ns.
     slept: list[float] = []
     clock = SimpleNamespace(sleep=slept.append, slept=slept, time_ns=time.time_ns)
     monkeypatch.setattr("loaf._l2.time", clock)
     monkeypatch.setattr("loaf.resources.orders.time", clock)
-    monkeypatch.setattr("loaf.resources.perps.time", clock)  # an allocate's or exit's expiry
     return clock
 
 
@@ -308,10 +319,13 @@ class FakeExchange:
       ``perps_leverage`` saved.
     * ``PUT /portfolio/perps-leverage`` saves its body's leverage in
       ``perps_leverage`` (by market index) and answers the body.
-    * ``POST /l2/allocations`` and ``/l2/exits`` apply a signed op at the account's
-      nonce (``keys["withdrawalNonce"]``, which moves up by one): 202 with the next
-      ``journalSeq``; a re-send of an applied op is its duplicate, and any other op
-      off the nonce is refused (422).
+    * ``POST /l2/allocations``, ``/l2/exits`` and ``/l2/withdrawals`` apply a signed
+      op at the account's nonce (``keys["withdrawalNonce"]``, which moves up by one,
+      one counter for the three): 202 with the next ``journalSeq``; a re-send of an
+      applied op is its duplicate, and any other op off the nonce is refused (422). A
+      withdrawal is first refused 400 when its expiry is inside the buffer (by
+      ``now_ms``), as the backend does, and its 202 echoes its terms with
+      ``status`` PENDING.
 
     ``queue(path, *replies)`` makes ``path`` (without ``/api``) answer with each
     reply in turn before any of that, once its login token is taken: an
@@ -405,6 +419,25 @@ class FakeExchange:
             return httpx.Response(200, json=body)
         if route in ("POST /l2/allocations", "POST /l2/exits"):
             return self._apply(request.content)
+        if route == "POST /l2/withdrawals":
+            body = json.loads(request.content)
+            now_ms = self.now_ms if self.now_ms is not None else loaf._l2.time.time_ns() // 1_000_000
+            if body["l2ExpiryMs"] - loaf.L2_BUFFER_MS < now_ms:
+                return httpx.Response(400, json={"error": EXPIRY_INSIDE_BUFFER})
+            reply = self._apply(request.content)
+            if reply.status_code != 202:
+                return reply
+            return httpx.Response(
+                202,
+                json={
+                    **reply.json(),
+                    "accountIndex": body["l2AccountIndex"],
+                    "assetId": body["l2AssetId"],
+                    "amount": int(body["amount"]),
+                    "nonce": body["l2Nonce"],
+                    "status": {"status": "PENDING"},
+                },
+            )
         if route == "POST /orders/conditional":
             self._next_id += 1
             return httpx.Response(200, json={"success": True, "orderId": self._next_id})
@@ -539,10 +572,22 @@ def verify_order(body: dict, leg: str | None = None) -> None:
 
 
 def verify_op(body: dict) -> None:
-    """Check the signature of a posted perps allocate or exit ``body`` under
-    ``L2_PUBLIC_KEY``, or raise :class:`loaf.k1.K1Error`: its message rebuilt from the
-    JSON, the allocate's amount from its decimal string."""
-    if "fromSide" in body:
+    """Check the signature of a posted perps allocate or exit, or withdrawal, ``body``
+    under ``L2_PUBLIC_KEY``, or raise :class:`loaf.k1.K1Error`: its message rebuilt from
+    the JSON, the amount from its decimal string."""
+    if "l2Route" in body:
+        assert isinstance(body["amount"], str)
+        message = k1._withdraw_message(
+            body["l2ChainId"],
+            body["l2AccountIndex"],
+            body["l2ApiKeyIndex"],
+            body["l2AssetId"],
+            body["l2Route"],
+            int(body["amount"]),
+            body["l2Nonce"],
+            body["l2ExpiryMs"],
+        )
+    elif "fromSide" in body:
         assert isinstance(body["amount"], str)
         message = k1._allocate_message(
             body["l2ChainId"],

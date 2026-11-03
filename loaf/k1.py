@@ -16,6 +16,9 @@ for byte (``tests/k1-sign.json``), and the engine's for the login message
   allocate (USDC moved between the spot balance and a margin pool, or between
   two pools) and a perps exit (the close of a position in an expired market)
   sign, likewise checked;
+* :func:`withdraw_message`: the 32 bytes a withdrawal (an amount of an asset
+  out of the spot balance, paid on chain to the account's own wallet) signs,
+  likewise checked;
 * :func:`login_message`: the 32 bytes a login token signs, the same digest of
   its 3 signed fields (the L2 chain, the account and the token's expiry);
 * :func:`sign` and :func:`verify`: the Schnorr pair ``(s, e)``, 40 bytes
@@ -215,6 +218,40 @@ def exit_message(
     return _exit_message(l2_chain_id, l2_account_index, pool, market, l2_nonce, l2_expiry_ms)
 
 
+def withdraw_message(
+    *,
+    l2_chain_id: int,
+    l2_account_index: int,
+    l2_asset_id: int,
+    amount: int,
+    l2_nonce: int,
+    l2_expiry_ms: int,
+) -> bytes:
+    """K1's withdraw message: the 32 bytes a withdrawal signs with the account's
+    api key 0, on route 1 (spot), the only route the exchange takes. It moves
+    ``amount`` of asset ``l2_asset_id`` (1 to 62) in its L2 units (base units /
+    the asset's tick size) out of the spot balance; K1 pays it on chain to the
+    account's own wallet, which the message does not name: nobody can send it
+    elsewhere.
+
+    The arguments are its signed fields, its body keys in snake case, with
+    ``amount`` an integer (the body's decimal string) and ``l2_nonce`` api key
+    0's next nonce. A field the message cannot carry is refused first, in K1's
+    order (the chain id, the account), then the asset and the amount the engine
+    takes, then the nonce and the expiry: ``Width`` with ``l2 width: <field>
+    out of range``.
+    """
+    _width("l2_chain_id", l2_chain_id, 0, _KB_P - 1)
+    _width("l2_account_index", l2_account_index, 0, _MAX_48)
+    _width("l2_asset_id", l2_asset_id, 1, _MAX_WITHDRAW_ASSET)
+    _width("amount", amount, 1, _WITHDRAW_AMOUNT_LIMIT - 1)
+    _width("l2_nonce", l2_nonce, 0, _MAX_48)
+    _width("l2_expiry_ms", l2_expiry_ms, 0, _MAX_48)
+    return _withdraw_message(
+        l2_chain_id, l2_account_index, 0, l2_asset_id, _SPOT_ROUTE, amount, l2_nonce, l2_expiry_ms
+    )
+
+
 def login_message(*, l2_chain_id: int, l2_account_index: int, l2_expiry_ms: int) -> bytes:
     """The login message: the 32 bytes an account's api key 0, its trading key, signs
     for a login token (``loaf_lt_…``), the Bearer that authenticates the account's
@@ -313,6 +350,12 @@ _MAX_OP_ACCOUNT = _MAX_48 - 1
 # Element 1 of an allocate and an exit message, api key 0's (its index shifts in above them).
 _ALLOCATE_TAG = 23
 _EXIT_TAG = 25
+# A withdraw message's element 1 is 13 + 2^8 x its api key; it pays route 1 (spot) alone, an
+# asset the exchange lists (1 to 62), an amount below 2^53 (the engine's AmountNotBelow2Pow53).
+_WITHDRAW_TAG = 13
+_SPOT_ROUTE = 1
+_MAX_WITHDRAW_ASSET = 62
+_WITHDRAW_AMOUNT_LIMIT = 1 << 53
 
 
 def _width(field: str, value: int, low: int, high: int) -> None:
@@ -383,6 +426,27 @@ def _exit_message(
     return _message_bytes(_kb_hash((
         chain_id, _EXIT_TAG, account & _M24, account >> 24 & _M24, pool, market,
         nonce & _M24, nonce >> 24 & _M24, expiry & _M24, expiry >> 24 & _M24, 0, 0, 0, 0, 0, 0,
+    )))
+
+
+def _withdraw_message(
+    chain_id: int,
+    account: int,
+    api_key: int,
+    asset: int,
+    route: int,
+    amount: int,
+    nonce: int,
+    expiry: int,
+) -> bytes:
+    """The withdraw message of fields in range, unchecked: chain id; 13 + 2^8 x the api
+    key; the account (low 24, middle 24 bits); the asset; the route; the amount (low 24,
+    middle 24, the 16 bits above 48); the nonce and the expiry (low 24, middle 24 bits
+    each); three zeros (k1-sign ``WithdrawFields::elements``)."""
+    return _message_bytes(_kb_hash((
+        chain_id, _WITHDRAW_TAG + (api_key << 8), account & _M24, account >> 24 & _M24, asset,
+        route, amount & _M24, amount >> 24 & _M24, amount >> 48,
+        nonce & _M24, nonce >> 24 & _M24, expiry & _M24, expiry >> 24 & _M24, 0, 0, 0,
     )))
 
 
