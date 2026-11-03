@@ -8,7 +8,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 For market makers: order controls, scoped and timed cancels, error codes, a
 live-stream watchdog, and withdrawals. It needs the exchange API that serves
-them (Shared-Types 2.0.99).
+them (Shared-Types 2.0.100).
 
 ### Breaking
 
@@ -29,7 +29,10 @@ them (Shared-Types 2.0.99).
   `premiumSampleBp`; a pool's `initialMarginOk`; an asset's `assetId` and
   `tokenAddress`; a market detail's `recentTrades` rows' `marketIndex` and
   `txHash` (`market.trades()` keeps them); and its `marketList` rows carry
-  `maxLeverage` in place of `risk`, with no `name`.
+  `maxLeverage` in place of `risk` and a perp's `live` figures, with no
+  `name`, `kind` or `totalTokens`. An offering's row (`type` `IPO`, its
+  `marketIndex` `None` without a spot market) stands in for its asset's spot
+  market while that is missing or `PENDING`.
 - **A liquidation's fill is a trade frame.** `on_liquidation_fill` and the
   `liquidation_fill` frame are gone: a liquidation's take from your resting
   perps order is a `trade_new` (`on_trade`) with `trade.source`

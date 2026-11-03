@@ -751,7 +751,11 @@ loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
 Orders name a perp by its ticker; the perps ops and a position name it by its
 `marketIndex` (0 to 254), as the exchange's perps API does. A position also
 carries its `ticker`, and `market.list()` rows, or any detail's `marketList`,
-map an index to its ticker for `market.get`.
+map an index to its ticker for `market.get`. A `marketList` row of a perp also
+carries its `live` figures (`markPrice`, `openInterest`, `fundingRateCbp`,
+`fundingPeriodMs`), and an offering's row (`type` `IPO`) stands in for its
+asset's spot market while that is missing or `PENDING`, its `marketIndex`
+then `None` without one.
 
 - **Orders** take `pool=` (0 by default) and `reduce_only=True` (its fills
   may only shrink the pool's position), signed with the order; both are

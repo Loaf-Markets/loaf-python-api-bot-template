@@ -55,9 +55,13 @@ class MarketResource(Resource):
         """``GET /trade/{ticker}`` — full detail for one market.
 
         Returns the ``market``, its ``asset``, a ``marketList`` selector (each
-        row's ``marketIndex``, ``ticker``, ``type``, and a perp's
-        ``maxLeverage``, ``None`` on spot: it maps a market index to its
-        ticker), the current
+        row's ``marketIndex``, ``ticker``, ``type``, ``status`` and
+        ``marketPrice``, and a perp's ``maxLeverage`` and ``live`` figures,
+        ``{markPrice, openInterest, fundingRateCbp, fundingPeriodMs}`` as in
+        :class:`~loaf.models.PerpsMarketLive`, both ``None`` on spot: it maps
+        a market index to its ticker. An offering's row, ``type`` ``IPO``,
+        stands in for its asset's spot market while that is missing or
+        ``PENDING``, with that market's index or ``None``), the current
         ``orderBook`` snapshot (``bids``/``asks`` price levels),
         ``recentTrades``, ``volume24h``, ``dailyReferencePrice`` and
         ``liquidity``. Candle history is NOT included — fetch it from the
