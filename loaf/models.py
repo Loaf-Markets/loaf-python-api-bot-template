@@ -70,14 +70,13 @@ class PerpMarketL2(TypedDict):
     l2ChainId: int
     quoteAssetId: int  # 3, USDC
     status: str  # "ACTIVE", or "EXPIRED": no more orders; positions leave by perps.exit()
-    sem: int  # the market's size extension multiplier
     qem: str  # its quote extension multiplier, a decimal string (it can pass 2^53)
     takerFee: int  # per 1,000,000; an order's signed fee-rate cap must cover it
     makerFee: int
     risk: int  # the maintenance margin factor per 65,536 (initial margin is twice it)
+    maxLeverage: int  # the most leverage it takes: 65,536 // (2 x risk), at least 1
     band: int  # how far (bp) an order's price may sit from the index; 0: no bound
     flags: int  # PERPS_FLAG_CROSS (pool 0 may trade it) | PERPS_FLAG_REDUCE_ONLY
-    oiCap: int  # the open-interest cap, in base units
     minBase: int  # the least signed quantity of an order that adds to a position; 0: none
     minQuote: int  # the least quote (signed quantity x signed price / 10) of one; 0: none
     quoteLimit: int  # the most quote of any order; 0: none
@@ -101,6 +100,7 @@ class PerpsPosition(TypedDict):
     ticker: str  # the market's
     qem: str  # its quote extension multiplier, a decimal string
     risk: int  # its maintenance margin factor per 65,536
+    maxLeverage: int  # the most leverage it takes
     band: int  # how far (bp) an order's price may sit from its index; 0: no bound
     base: str  # signed, in base units (an order's signed quantity): + long, - short
     fundingIndex: str  # the funding index it last settled at: it owes base x (F - this)
@@ -119,7 +119,6 @@ class PerpsPool(TypedDict):
     value: Optional[str]  # collateral + each position's signed notional - its funding owed
     requirement: Optional[str]  # maintenance margin, extended USDC units x 65,536
     liquidatable: Optional[bool]  # value < 0 or value x 65,536 < requirement
-    initialMarginOk: Optional[bool]  # value x 65,536 >= 2 x requirement: K1's initial margin
     positions: list[PerpsPosition]  # ascending by market, at most 8
 
 
@@ -165,11 +164,9 @@ class PerpsMarketLive(TypedDict):
     observedAtMs: int
     openInterest: str  # base units, a decimal string: longs plus shorts (one side's is half)
     fundingIndex: str  # F, extended USDC units per base unit, signed, a decimal string
-    tickAtMs: int  # the last funding tick
     nextTickAtMs: int  # when the next is due; 0: none (an expired or unpriced market)
     fundingPeriodMs: int  # the period fundingRateCbp is per
-    premiumSampleBp: Optional[int]  # what a tick would apply now; None: the market is not rated
-    fundingRateCbp: Optional[int]  # centi-bp of the index per period; None with premiumSampleBp
+    fundingRateCbp: Optional[int]  # what a tick would apply now, centi-bp of the index per period; None: not rated
     heldPrice: Optional[PerpsHeldPrice]  # while one stands, no order that can add risk is admitted
     halted: bool  # the engine's trading pause: every new order refused
     riskOnly: bool  # the engine's risk-only mode: only orders that reduce, and no withdrawal
@@ -192,15 +189,15 @@ class PerpsOpAccepted(TypedDict):
 
 
 class TradeTick(TypedDict, total=False):
-    """A public trade: the detail's ``recentTrades`` or a ``trades_batch`` frame (newest first),
-    or a ``market.trades`` row (oldest first).
+    """A public trade: the detail's ``recentTrades`` (no ``marketIndex`` or ``txHash``), or a
+    ``trades_batch`` frame (newest first), or a ``market.trades`` row (oldest first).
 
     On a perps market the tape also carries liquidation takes: a liquidated position taken
     against a resting order. A take has ``isLiquidation: True`` and is no trade: it has no
     ``txHash`` key, its ``aggressorSide`` is the liquidated side, and its ``tradeId`` is the
     liquidation's journal seq, the ``tradeId`` of its maker's row (``source``
     ``LIQUIDATION``). A trade always has its ``txHash``, and ``isLiquidation`` absent or
-    ``False``: read ``tick.get("txHash")``."""
+    ``False``: read ``tick.get("txHash")`` on a frame or a ``market.trades`` row."""
 
     tradeId: int
     marketIndex: int
@@ -349,9 +346,6 @@ class Holding(TypedDict, total=False):
 
     ticker: str  # the asset's, its spot market's too
     marketIndex: Optional[int]  # its spot market's, which mark_price frames name; None without one
-    name: str  # the asset's display name
-    kind: str  # AssetKind
-    totalTokens: Optional[float]  # a property's token supply; None for any other kind
     averageEntryPrice: Optional[float]  # None when the cost is unknown
     # The mark when read: its spot market's for an L2 holding; an IPO allocation's unit price
     # until it trades.
@@ -359,15 +353,23 @@ class Holding(TypedDict, total=False):
     isIpoAllocation: bool
     assetId: int  # L2 holding only: its balances row
     quantity: float  # IPO allocation only, tokens
+
+
+class HoldingDetails(TypedDict):
+    """A holding's display facts: a component's ``holdingDetails`` row, and a ``holding_update``
+    frame's ``details``."""
+
+    name: str  # the asset's display name
+    totalTokens: Optional[float]  # a property's token supply; None for any other kind
     imageUrl: str
 
 
 class PerpsLeverage(TypedDict):
-    """A leverage you saved on a perp: a summary's ``perpsLeverage`` row, the answer to
+    """A leverage you saved on a perp: a component's ``perpsLeverage`` row, the answer to
     ``portfolio.set_perps_leverage()``, and a ``perps_leverage_update`` frame's fields."""
 
     marketIndex: int  # the perp's, 0 to 254
-    leverage: int  # 1 to the market's most, 65,536 // (2 x risk)
+    leverage: int  # 1 to the market's maxLeverage
 
 
 class PortfolioSummary(TypedDict):
@@ -376,11 +378,11 @@ class PortfolioSummary(TypedDict):
     balances: list[L2AssetBalance]  # the whole L2 book; a missing row is 0
     holdings: list[Holding]
     perps: Optional[PerpsAccount]  # None: not read just now, which never means you hold none
-    perpsLeverage: list[PerpsLeverage]  # the ones saved, one a market; read even when perps is None
 
 
 class PortfolioComponent(TypedDict, total=False):
-    """``portfolio.component()``: your recent activity, fees and lifetime volume."""
+    """``portfolio.component()``: your recent activity, fees, lifetime volume, holdings' details and
+    saved leverage."""
 
     lifetimeVolume: float  # dollars traded over the account's lifetime
     applicableFees: dict[str, int]  # {takerFeeBps, makerFeeBps}
@@ -390,7 +392,9 @@ class PortfolioComponent(TypedDict, total=False):
     orderHistory: list[OrderHistoryItem]  # newest rows of both kinds, ANY status
     transfers: list[dict[str, Any]]  # newest first, keyed by journalSeq; `amount` in base units
     fundingHistory: list[FundingPayment]  # newest first
+    holdingDetails: dict[str, HoldingDetails]  # by holding ticker
     holdingSparklines: dict[str, list[float]]  # by holding ticker: up to 48 closes, oldest first
+    perpsLeverage: list[PerpsLeverage]  # the ones saved, one a market
 
 
 __all__ = [
@@ -419,6 +423,7 @@ __all__ = [
     "TradeHistoryItem",
     "L2AssetBalance",
     "Holding",
+    "HoldingDetails",
     "PerpsLeverage",
     "PortfolioSummary",
     "PortfolioComponent",

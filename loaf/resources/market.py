@@ -55,8 +55,9 @@ class MarketResource(Resource):
         """``GET /trade/{ticker}`` — full detail for one market.
 
         Returns the ``market``, its ``asset``, a ``marketList`` selector (each
-        row's ``marketIndex``, ``ticker``, ``type``, and a perp's ``risk``,
-        ``None`` on spot: it maps a market index to its ticker), the current
+        row's ``marketIndex``, ``ticker``, ``type``, and a perp's
+        ``maxLeverage``, ``None`` on spot: it maps a market index to its
+        ticker), the current
         ``orderBook`` snapshot (``bids``/``asks`` price levels),
         ``recentTrades``, ``volume24h``, ``dailyReferencePrice`` and
         ``liquidity``. Candle history is NOT included — fetch it from the
@@ -71,9 +72,8 @@ class MarketResource(Resource):
         ``marketIndex``, what every order
         on the market signs (the SDK reads both for you), or ``None``: the
         market cannot be traded now. ``asset`` is ``{ticker, name, kind,
-        assetId, tokenAddress, videoUrl, stakeholders, property}``:
-        ``assetId`` is its token's balances row (``None`` without one), and
-        ``property`` a property's own facts (``None`` for any other kind). A
+        videoUrl, stakeholders, property}``:
+        ``property`` is a property's own facts (``None`` for any other kind). A
         spot market and the perp of one asset carry the same ``asset``. The
         detail has no ``marketPrice``: the reference MARKET orders are priced
         from is the ``marketList`` entry with the same ``ticker``.
@@ -111,12 +111,11 @@ class MarketResource(Resource):
           K1's two-sided sum: longs plus shorts, so one side's is half)
           and ``fundingIndex`` (F: a position owes base x (F - its
           ``fundingIndex``), signed), decimal strings;
-        * ``tickAtMs`` and ``nextTickAtMs``, the last funding tick and when the
-          next is due (0: none, an expired or unpriced market), and
-          ``fundingPeriodMs``, the period ``fundingRateCbp`` (centi-bp of the
-          index: funding is paid on the index) is per; it and
-          ``premiumSampleBp`` (bp) are what a tick would apply now, ``None``
-          when the market is not rated;
+        * ``nextTickAtMs``, when the next funding tick is due (0: none, an
+          expired or unpriced market), and ``fundingPeriodMs``, the period
+          ``fundingRateCbp`` (centi-bp of the index: funding is paid on the
+          index) is per; it is what a tick would apply now, ``None`` when the
+          market is not rated;
         * ``heldPrice``, ``{price, observedAtMs}``: the newest price report,
           held for an operator's answer, while no order that can add to a
           position is admitted; ``None`` when there is none.
@@ -126,10 +125,10 @@ class MarketResource(Resource):
         and its terms when they change
         (:meth:`~loaf.ws.client.LoafWebSocketClient.on_market_terms`).
 
-        ``recentTrades`` holds the newest trades first (at most 20), each with a
-        ``txHash``: the trade's content hash (``0x`` + 64 hex), not an on-chain
-        transaction (a perp's liquidation take has ``isLiquidation: True`` and
-        no ``txHash``: :class:`~loaf.models.TradeTick`). ``orderBook`` is
+        ``recentTrades`` holds the newest trades first (at most 20), with no
+        ``marketIndex`` or ``txHash``: :meth:`trades` and the ``trades_batch``
+        frames carry them (a perp's liquidation take has ``isLiquidation:
+        True``: :class:`~loaf.models.TradeTick`). ``orderBook`` is
         ``None`` when the market is not LIVE or no fresh book is known: treat
         ``None`` as unknown, not empty.
 

@@ -384,9 +384,10 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.FUNDING_PAYMENT, handler)
 
     def on_holding(self, handler: Handler | None = None) -> Any:
-        """One of your holdings changed (``holding_update``: ``{holding}``,
-        whole, as ``portfolio.summary().holdings`` lists it): upsert by
-        ``holding.ticker``. An IPO allocation's ``quantity`` 0 removes it; an
+        """One of your holdings changed (``holding_update``: ``{holding,
+        details}``, ``holding`` whole, as ``portfolio.summary().holdings`` lists
+        it, ``details`` its row of ``portfolio.component().holdingDetails``):
+        upsert by ``holding.ticker``. An IPO allocation's ``quantity`` 0 removes it; an
         L2 holding's amounts stay its ``balances`` row. Fills close together
         send one frame. Its ``averageEntryPrice`` is ``None`` until the
         exchange has read its fills, and a later frame brings it: show none
@@ -420,7 +421,7 @@ class LoafWebSocketClient:
         ``{marketIndex, leverage}``), here
         (:meth:`loaf.resources.portfolio.PortfolioResource.set_perps_leverage`)
         or in the web app: replace that market's row of
-        ``portfolio.summary().perpsLeverage``."""
+        ``portfolio.component().perpsLeverage``."""
         return self.on(WSMessageType.PERPS_LEVERAGE_UPDATE, handler)
 
     # lifecycle / control

@@ -222,20 +222,20 @@ def test_a_perps_l2_is_no_spot_l2_and_back(exchange, trading_client):
 
 def test_a_leverage_is_saved_by_market_index_or_ticker(perps_exchange, trading_client):
     portfolio = trading_client().portfolio
-    assert portfolio.summary().perpsLeverage == []
+    assert portfolio.component().perpsLeverage == []
     assert portfolio.set_perps_leverage(4, 5) == {"marketIndex": 4, "leverage": 5}
     assert portfolio.set_perps_leverage("OPRA-PERP", 32_768) == {"marketIndex": 4, "leverage": 32_768}
     assert portfolio.set_perps_leverage(0, 1) == {"marketIndex": 0, "leverage": 1}
-    assert portfolio.summary().perpsLeverage == [
+    assert portfolio.component().perpsLeverage == [
         {"marketIndex": 0, "leverage": 1}, {"marketIndex": 4, "leverage": 32_768}
     ]
     assert routes(perps_exchange.requests) == [
-        "GET /portfolio/summary",
+        "GET /portfolio/component",
         "PUT /portfolio/perps-leverage",
         "GET /trade/OPRA-PERP",  # a ticker names its market by the detail's marketIndex
         "PUT /portfolio/perps-leverage",
         "PUT /portfolio/perps-leverage",
-        "GET /portfolio/summary",
+        "GET /portfolio/component",
     ]
     puts = [r for r in perps_exchange.requests if r.method == "PUT"]
     # Shared-Types' perpsLeverageBodySchema: strict, both whole numbers; sent with a login token.

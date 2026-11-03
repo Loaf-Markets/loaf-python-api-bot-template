@@ -25,7 +25,7 @@ class PortfolioResource(Resource):
     def summary(self) -> Any:
         """``GET /portfolio/summary`` — what you hold.
 
-        Returns ``{balances, holdings, perps, perpsLeverage}``
+        Returns ``{balances, holdings, perps}``
         (:class:`~loaf.models.PortfolioSummary`).
 
         ``balances`` is your whole L2 book, one row per asset with a balance or
@@ -39,26 +39,20 @@ class PortfolioResource(Resource):
 
         ``holdings`` are the tokens you hold, facts only: ``ticker`` (the
         asset's, its spot market's too), ``marketIndex`` (its spot market's,
-        which ``mark_price`` frames name; ``None`` without one), ``name``,
-        ``kind``, ``totalTokens`` (a property's supply; ``None`` for any other
-        kind), ``averageEntryPrice`` (``None`` when the cost is unknown),
+        which ``mark_price`` frames name; ``None`` without one),
+        ``averageEntryPrice`` (``None`` when the cost is unknown),
         ``marketPrice`` (the mark when read: its spot market's for an L2
-        holding; an IPO allocation's unit price until it trades),
-        ``imageUrl`` and ``isIpoAllocation``, plus ``assetId``
-        (an L2 holding: its amounts are its ``balances`` row) or ``quantity``
-        (an IPO allocation). Values and P&L are yours to compute: to value a
+        holding; an IPO allocation's unit price until it trades) and
+        ``isIpoAllocation``, plus ``assetId`` (an L2 holding: its amounts are
+        its ``balances`` row) or ``quantity`` (an IPO allocation). Its name,
+        supply and image are :meth:`component`'s ``holdingDetails``. Values and
+        P&L are yours to compute: to value a
         holding live, match ``mark_price`` frames to it by ``marketIndex``
         (:meth:`loaf.ws.client.LoafWebSocketClient.on_mark_price`).
 
         ``perps`` is :meth:`loaf.resources.perps.PerpsResource.positions`'
         answer, ``None`` when the exchange could not read it just now, which
         never means you hold none.
-
-        ``perpsLeverage`` is the leverage you saved on each perp
-        (:meth:`set_perps_leverage`), ``{marketIndex, leverage}``, served even
-        when ``perps`` is ``None``. A market you saved none on is at
-        :data:`~loaf.constants.PERPS_DEFAULT_LEVERAGE` (3), and any leverage
-        reads at most the market's most, 65,536 // (2 x its ``risk``).
 
         Raises :class:`~loaf.exceptions.LoafServiceUnavailableError` (503
         ``The L2 balance is temporarily unavailable; try again in a moment``)
@@ -72,10 +66,10 @@ class PortfolioResource(Resource):
         whose ``marketIndex`` :meth:`~loaf.resources.market.MarketResource.get`
         reads first).
 
-        ``leverage`` is a whole number from 1 to the market's most, 65,536 //
-        (2 x its ``risk``), which the exchange checks. It keeps one a market
+        ``leverage`` is a whole number from 1 to the market's ``maxLeverage``,
+        which the exchange checks. It keeps one a market
         for your account and answers it, ``{marketIndex, leverage}``
-        (:class:`~loaf.models.PerpsLeverage`); :meth:`summary` lists them as
+        (:class:`~loaf.models.PerpsLeverage`); :meth:`component` lists them as
         ``perpsLeverage``, and your ``portfolio`` channel brings each one saved
         (:meth:`~loaf.ws.client.LoafWebSocketClient.on_perps_leverage`).
 
@@ -133,12 +127,14 @@ class PortfolioResource(Resource):
         return index
 
     def component(self) -> Any:
-        """``GET /portfolio/component`` — your recent activity, fees and
-        lifetime volume, nothing :meth:`summary` carries.
+        """``GET /portfolio/component`` — your recent activity, fees, lifetime
+        volume, holdings' details and saved leverage, nothing :meth:`summary`
+        carries.
 
         Returns ``{lifetimeVolume, applicableFees, offeringOrders, openOrders,
-        tradeHistory, orderHistory, transfers, fundingHistory,
-        holdingSparklines}`` (:class:`~loaf.models.PortfolioComponent`).
+        tradeHistory, orderHistory, transfers, fundingHistory, holdingDetails,
+        holdingSparklines, perpsLeverage}``
+        (:class:`~loaf.models.PortfolioComponent`).
 
         ``applicableFees`` is raw bps, and streams on the private WS channel as
         ``fees_update``; ``lifetimeVolume`` (dollars) also streams on the
@@ -153,7 +149,15 @@ class PortfolioResource(Resource):
         first, keyed by ``journalSeq``, each ``amount`` in base units.
         ``fundingHistory`` is your funding payments
         (:meth:`loaf.resources.history.HistoryResource.funding`).
-        ``holdingSparklines`` is each holding's recent closes by its ticker: up
-        to 48, oldest first (draw its entry price, then them, then its mark).
+        ``holdingDetails`` is each holding's ``{name, totalTokens, imageUrl}``
+        by its ticker (``totalTokens``: a property's supply; ``None`` for any
+        other kind). ``holdingSparklines`` is each holding's recent closes by
+        its ticker: up to 48, oldest first (draw its entry price, then them,
+        then its mark).
+
+        ``perpsLeverage`` is the leverage you saved on each perp
+        (:meth:`set_perps_leverage`), ``{marketIndex, leverage}``. A market you
+        saved none on is at :data:`~loaf.constants.PERPS_DEFAULT_LEVERAGE` (3),
+        and any leverage reads at most the market's ``maxLeverage``.
         """
         return self._client.get("/portfolio/component")

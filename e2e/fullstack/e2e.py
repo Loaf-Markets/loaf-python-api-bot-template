@@ -1625,7 +1625,7 @@ def step_perps(run: Run) -> None:
     for user, sign in ((a, 1), (b, -1)):
         pos, pool = position_of(user, m, 0), pool_of(user, 0)
         assert pos is not None and pool is not None
-        for k in ("ticker", "qem", "risk", "band", "entryPrice", "entryQuote", "notional", "fundingOwed",
+        for k in ("ticker", "qem", "risk", "maxLeverage", "band", "entryPrice", "entryQuote", "notional", "fundingOwed",
                   "liquidationPrice"):
             check(k in pos, f"{user.name}'s position reads {k} = {pos.get(k)}")
         check("adlRank" not in pos and "openOrders" not in pool, f"{user.name}'s read carries no ADL rank and no pool orders")
@@ -1636,14 +1636,14 @@ def step_perps(run: Run) -> None:
         if liq is not None:
             check((int(liq) - int(pos["entryPrice"])) * sign < 0,
                   f"{user.name}'s liquidation price {liq} is on the losing side of its entry {pos['entryPrice']}")
-        check(pool["initialMarginOk"] is True and pool["liquidatable"] is False, f"{user.name}'s pool 0 is healthy")
+        check(pool["liquidatable"] is False, f"{user.name}'s pool 0 is healthy")
     live = run.live(m)
     for k in ("indexPrice", "markPrice", "openInterest", "fundingIndex", "nextTickAtMs", "fundingPeriodMs",
               "tradingState"):
         check(live.get(k) is not None, f"market {m}'s live state reads {k} = {live.get(k)}")
     check(int(live["openInterest"]) >= units, "the open interest counts the run's positions")
 
-    # the leverage setting: saved by the market's ticker, read back from the answer, the summary and the push
+    # the leverage setting: saved by the market's ticker, read back from the answer, the component and the push
     save_leverage(run, a, m)
 
 
@@ -1653,8 +1653,8 @@ def save_leverage(run: Run, user: User, market: int) -> None:
     pushes0 = len(run.sent(user, "perps_leverage_update"))
     got = user.c.portfolio.set_perps_leverage(run.ticker(market), want["leverage"])
     check(got == want, f"{user.name} saved leverage {want['leverage']} on market {market}: {short(got)}")
-    run.until(f"{user.name}'s summary reading its leverage on market {market}",
-              lambda: want in user.c.portfolio.summary()["perpsLeverage"])
+    run.until(f"{user.name}'s component reading its leverage on market {market}",
+              lambda: want in user.c.portfolio.component()["perpsLeverage"])
     run.until(f"{user.name}'s perps_leverage_update for market {market}", lambda: any(
         {k: f.get(k) for k in want} == want for f in run.sent(user, "perps_leverage_update")[pushes0:]))
 

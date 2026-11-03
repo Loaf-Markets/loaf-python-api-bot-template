@@ -232,8 +232,8 @@ perps.allocate / add_margin / return_margin
 perps.exit(market, pool=)             POST   /l2/exits              (signed; with a login token)
 perps.resubmit(signed_body)           POST   /l2/allocations or /l2/exits (re-send unchanged)
 
-portfolio.summary()                   GET    /portfolio/summary     (balances, holdings, perps, saved leverage)
-portfolio.component()                 GET    /portfolio/component   (recent activity, fees, lifetime volume)
+portfolio.summary()                   GET    /portfolio/summary     (balances, holdings, perps)
+portfolio.component()                 GET    /portfolio/component   (recent activity, fees, lifetime volume, holdings' details, saved leverage)
 portfolio.set_perps_leverage(m, lev)  PUT    /portfolio/perps-leverage (your leverage setting on a perp)
 
 history.orders() / trades() / funding()
@@ -693,8 +693,8 @@ map an index to its ticker for `market.get`.
   at a rate in centi-bp of the index) and a final settlement stay on the index.
 - **Leverage.** `loaf.portfolio.set_perps_leverage(market, leverage)` saves
   your leverage on a perp, `market` its ticker or its `marketIndex`: a whole
-  number from 1 to the market's most, `65536 // (2 x risk)`.
-  `portfolio.summary().perpsLeverage` lists the ones saved, `{marketIndex,
+  number from 1 to the market's `maxLeverage`.
+  `portfolio.component().perpsLeverage` lists the ones saved, `{marketIndex,
   leverage}`, and `ws.on_perps_leverage` brings each one saved; a market with
   none is at `loaf.PERPS_DEFAULT_LEVERAGE` (3), and any leverage reads at most
   the market's most. It is the web app's setting, as on Hyperliquid: the web

@@ -167,11 +167,11 @@ fee, and the fill is in C's history. C's fill pushes its holding_update with its
   take-profit: the mark lags it, within 2 %, and when it gets there the leg fires and closes the long into MM's bid;
 - A's fills read source, direction and closed PnL (the pool 1 close exactly (bid - ask) x size), its push carries
   the long, and its open order its pool;
-- A's and B's positions read ticker, qem, risk, band, entry, entry quote, notional, funding owed and liquidation
+- A's and B's positions read ticker, qem, risk, max leverage, band, entry, entry quote, notional, funding owed and liquidation
   price (on the losing side of the entry), no ADL rank and no pool orders; uPnL is logged; their pools are healthy;
   the market's live state reads the index, the mark, open interest (at least the run's size), funding index, next
   tick, period and trading state;
-- A saves its leverage on the market by its ticker (2, or the market's most when lower): the answer, the summary's
+- A saves its leverage on the market by its ticker (2, or the market's most when lower): the answer, the component's
   `perpsLeverage` and a `perps_leverage_update` pushed after the save read it.
 
 **mixed** (spot and perps at once, `E2E_MIXED_SECS` long): in one thread C takes MM's spot ask and then its bid, one

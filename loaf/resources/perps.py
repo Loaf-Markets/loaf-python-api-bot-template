@@ -154,14 +154,14 @@ class PerpsResource(Resource):
         * a pool's ``requirement`` (its maintenance margin, the sum of each
           position's ``risk`` x ``notional``) is in those units x 65,536;
           ``liquidatable`` is ``value < 0`` or ``value x 65,536 <
-          requirement``, and ``initialMarginOk`` is K1's initial margin,
-          ``value x 65,536 >= 2 x requirement``: collateral can leave the pool
-          only while the pool also keeps a tenth of its positions'
-          ``notional`` and any initial-margin tier's extra, otherwise the
-          exchange answers 422 ``TRANSFER_MARGIN_FLOOR``. The four are
+          requirement``. Collateral can leave the pool only at K1's initial
+          margin, ``value x 65,536 >= 2 x requirement``, and while the pool
+          also keeps a tenth of its positions' ``notional`` and any
+          initial-margin tier's extra, otherwise the exchange answers 422
+          ``TRANSFER_MARGIN_FLOOR``. The three are
           ``None`` together when the engine's summary of the pool is past its
           range;
-        * a position's ``ticker``, ``qem``, ``risk`` and ``band`` are its
+        * a position's ``ticker``, ``qem``, ``risk``, ``maxLeverage`` and ``band`` are its
           market's, so valuing it needs no market read;
         * a position's ``base`` is signed (positive long, negative short) in
           the market's base units, an order's signed quantity (tokens x 10);

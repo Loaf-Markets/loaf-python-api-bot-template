@@ -52,14 +52,13 @@ PERP_L2 = {
     "l2ChainId": 4242,
     "quoteAssetId": 3,
     "status": "ACTIVE",
-    "sem": 1000,
     "qem": "1000000",
     "takerFee": 500,
     "makerFee": 200,
     "risk": 3277,
+    "maxLeverage": 9,
     "band": 500,
     "flags": 1,
-    "oiCap": 1_000_000_000,
     "minBase": 0,
     "minQuote": 0,
     "quoteLimit": 0,
@@ -82,10 +81,8 @@ PERPS_LIVE = {
     "observedAtMs": 1_800_000_000_000,
     "openInterest": "18446744073709551615",
     "fundingIndex": "-4294967296",
-    "tickAtMs": 1_800_000_000_000,
     "nextTickAtMs": 1_800_003_600_000,
     "fundingPeriodMs": 3_600_000,
-    "premiumSampleBp": -3,
     "fundingRateCbp": -250,
     "heldPrice": {"price": 2600, "observedAtMs": 1_800_000_001_000},
     "halted": False,
@@ -105,13 +102,13 @@ PERPS_ACCOUNT = {
             "value": "5100000000000",
             "requirement": "16384000000000000",
             "liquidatable": False,
-            "initialMarginOk": True,
             "positions": [
                 {
                     "market": 4,
                     "ticker": "OPRA-PERP",
                     "qem": "1000000",
                     "risk": 3277,
+                    "maxLeverage": 9,
                     "band": 500,
                     "base": "20",
                     "fundingIndex": "4294967296",
@@ -129,13 +126,13 @@ PERPS_ACCOUNT = {
             "value": None,
             "requirement": None,
             "liquidatable": None,
-            "initialMarginOk": None,
             "positions": [
                 {
                     "market": 9,
                     "ticker": "MUS-PERP",
                     "qem": "1000000",
                     "risk": 3277,
+                    "maxLeverage": 9,
                     "band": 500,
                     "base": "-5",
                     "fundingIndex": "-12",
@@ -201,7 +198,6 @@ LOGIN_TOKEN_RE = re.compile(
 LOGIN_TOKEN_MAX_LIFE_MS = 900_000
 
 _ENV_VARS = ("LOAF_TRADING_KEY", "LOAF_API_BASE_URL", "LOAF_WS_URL", "LOAF_MAX_SLIPPAGE_BPS")
-_NAMES = {"MUS": "Musgrave", "OPRA": "Opera"}
 
 
 @pytest.fixture(autouse=True)
@@ -277,13 +273,12 @@ def market_detail(
     listed = [{
         "ticker": ticker,
         "type": "PERP" if perp else "SPOT",
-        "risk": PERP_L2["risk"] if perp else None,
-        "name": _NAMES.get(ticker, ticker),
+        "maxLeverage": PERP_L2["maxLeverage"] if perp else None,
         "marketPrice": market_price,
     }]
     if ticker != "MUS":  # another market ahead of it: the reference is found by its ticker
         listed.insert(
-            0, {"ticker": "MUS", "type": "SPOT", "risk": None, "name": "Musgrave", "marketPrice": 50}
+            0, {"ticker": "MUS", "type": "SPOT", "maxLeverage": None, "marketPrice": 50}
         )
     return {"market": market, "marketList": listed}
 
@@ -308,7 +303,9 @@ class FakeExchange:
     * ``GET /portfolio/summary`` serves no balances or holdings, and as its
       ``perps`` ``perps_account`` with ``perps_collateral`` as its collateral
       (``perps_account`` ``None``: ``perps`` null, as when the exchange could not
-      read it), and as its ``perpsLeverage`` the ``perps_leverage`` saved.
+      read it).
+    * ``GET /portfolio/component`` serves as its ``perpsLeverage`` the
+      ``perps_leverage`` saved.
     * ``PUT /portfolio/perps-leverage`` saves its body's leverage in
       ``perps_leverage`` (by market index) and answers the body.
     * ``POST /l2/allocations`` and ``/l2/exits`` apply a signed op at the account's
@@ -398,10 +395,10 @@ class FakeExchange:
             )
         if route == "GET /portfolio/summary":
             perps = self.perps_account and {**self.perps_account, "collateral": self.perps_collateral}
+            return httpx.Response(200, json={"balances": [], "holdings": [], "perps": perps})
+        if route == "GET /portfolio/component":
             leverage = [{"marketIndex": m, "leverage": v} for m, v in sorted(self.perps_leverage.items())]
-            return httpx.Response(
-                200, json={"balances": [], "holdings": [], "perps": perps, "perpsLeverage": leverage}
-            )
+            return httpx.Response(200, json={"perpsLeverage": leverage})
         if route == "PUT /portfolio/perps-leverage":
             body = json.loads(request.content)
             self.perps_leverage[body["marketIndex"]] = body["leverage"]

@@ -829,7 +829,7 @@ def test_a_saved_leverage_is_read_back_from_its_answer_the_summary_and_a_push(en
                 frames.append({"type": "perps_leverage_update", "marketIndex": 6, "leverage": leverage})
             return {"marketIndex": 6, "leverage": leverage}
 
-        def summary(self):
+        def component(self):
             return {"perpsLeverage": [{"marketIndex": m, "leverage": v} for m, v in saved.items()]}
 
     portfolio = Portfolio()
@@ -843,8 +843,8 @@ def test_a_saved_leverage_is_read_back_from_its_answer_the_summary_and_a_push(en
     portfolio.push = False  # the last push matches, but it came before this save
     with pytest.raises(e2e.Failed, match="no A's perps_leverage_update for market 6 within"):
         e2e.save_leverage(run, user, 6)
-    portfolio.summary = lambda: {"perpsLeverage": []}
-    with pytest.raises(e2e.Failed, match="no A's summary reading its leverage on market 6 within"):
+    portfolio.component = lambda: {"perpsLeverage": []}
+    with pytest.raises(e2e.Failed, match="no A's component reading its leverage on market 6 within"):
         e2e.save_leverage(run, user, 6)
 
 

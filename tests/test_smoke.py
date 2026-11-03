@@ -253,10 +253,11 @@ def test_models_list_every_shape():
     assert trade["tradeId"] is int
     assert (trade["orderId"], trade["txHash"]) == (Optional[int], Optional[str])
     assert trade["closedPnl"] == Optional[float]
-    # A summary's perps is None when unread, never an empty account; its saved leverage is a list.
+    # A summary's perps is None when unread, never an empty account; the saved leverage is the component's.
     summary = get_type_hints(models.PortfolioSummary)
     assert summary["perps"] == Optional[models.PerpsAccount]
-    assert summary["perpsLeverage"] == list[models.PerpsLeverage]
+    assert "perpsLeverage" not in summary
+    assert get_type_hints(models.PortfolioComponent)["perpsLeverage"] == list[models.PerpsLeverage]
     assert models.PerpsLeverage.__required_keys__ == {"marketIndex", "leverage"}
 
 
