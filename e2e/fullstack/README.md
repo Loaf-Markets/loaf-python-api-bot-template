@@ -4,7 +4,7 @@
 admin routes in front of the engine, settled, the K1 prover and the devnet (anvil L1 with ZkLoaf on TEST keys), with
 the kit's price pump moving the indexes. Money that moves on chain is checked on L1 too.
 
-On the P5 kit's fullstack phase (box 3):
+On the P5 kit's fullstack phase, with `P5_KIT` naming the kit's directory and `P5_HEAVY_LOCK` the box's heavy-job lock:
 
     ./p5-fullstack.sh <sdk tree> <log file>
     E2E_STEPS=restore ./p5-fullstack.sh <sdk tree> <log file>     # the one-shot restore (below)
@@ -21,12 +21,11 @@ files, or the kit's `run/psql`), keeps the run's wallet seed in `state/wallet.se
 and runs `python -I e2e.py`, teeing the log. The exit status is the driver's.
 
 One driver at a time on the stack: this e2e and the browser pass share the price control's seq, the backstop knob
-and the funder. `p5-fullstack.sh` takes an exclusive flock(2) on `P5_DRIVER_LOCK` (default
-`/mnt/zk/g/locks/p5-fullstack-driver.lock`, or the phase's `fullstack.env`) at once or exits 2 naming the lock,
-and holds it through every exec until the run ends. Every driver takes the same lock the same way (`flock -n -x
-<lock> <command>` does), never a POSIX record lock (`lockf`, `fcntl` F_SETLK), which flock(2) does not see. The
-holder writes the file's first line, `pid <pid> <who> since <UTC time>`; a refused driver names it while that pid
-lives.
+and the funder. `p5-fullstack.sh` takes an exclusive flock(2) on `P5_DRIVER_LOCK` (the environment's, or the phase's
+`fullstack.env`) at once or exits 2 naming the lock, and holds it through every exec until the run ends. Every driver
+takes the same lock the same way (`flock -n -x <lock> <command>` does), never a POSIX record lock (`lockf`, `fcntl`
+F_SETLK), which flock(2) does not see. The holder writes the file's first line, `pid <pid> <who> since <UTC time>`; a
+refused driver names it while that pid lives.
 
 ## Log
 

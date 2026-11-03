@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Runs the full-stack perps e2e (README.md) against the P5 kit's fullstack phase.
-# Usage: p5-fullstack.sh <sdk tree> <log file>. P5_KIT names the kit's directory, P5_HEAVY_LOCK the box's
-# heavy-job lock (held shared), P5_DRIVER_LOCK the stack's one-driver lock (held exclusively), P5_SCOPE_MEM the
-# memory scope; E2E_* set beforehand win over the phase's.
+# Usage: p5-fullstack.sh <sdk tree> <log file>. Required: P5_KIT names the kit's directory, P5_HEAVY_LOCK the box's
+# heavy-job lock (held shared), P5_DRIVER_LOCK the stack's one-driver lock (held exclusively; the phase's
+# fullstack.env may set it). P5_SCOPE_MEM the memory scope; E2E_* set beforehand win over the phase's.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 sdk=${1:?usage: p5-fullstack.sh <sdk tree> <log file>}
 out=${2:?usage: p5-fullstack.sh <sdk tree> <log file>}
-kit=${P5_KIT:-/mnt/zk/g/final/me-p5-bench}
-lock=${P5_HEAVY_LOCK:-/mnt/zk/g/locks/box3-heavy.lock}
+kit=${P5_KIT:?P5_KIT names no kit directory}
+lock=${P5_HEAVY_LOCK:?P5_HEAVY_LOCK names no heavy-job lock}
 run=$kit/run
 
 die() { echo "p5-fullstack.sh: $*" >&2; exit 2; }
@@ -37,7 +37,7 @@ done < "$run/fullstack.env"
 # One driver at a time on the stack (this e2e, the browser pass): they share the price control's seq, the backstop
 # knob and the funder. An exclusive flock(2) on one file, taken at once or refused, held through every exec below
 # until the run ends. Its holder writes the first line, "pid <pid> <who> since <time>".
-dlock=${P5_DRIVER_LOCK:-/mnt/zk/g/locks/p5-fullstack-driver.lock}
+dlock=${P5_DRIVER_LOCK:?P5_DRIVER_LOCK names no driver lock, here or in the phase\'s fullstack.env}
 command -v python3 >/dev/null || die "no python3 to take the driver lock"
 exec 9>>"$dlock" || die "cannot open the driver lock $dlock"
 got=0

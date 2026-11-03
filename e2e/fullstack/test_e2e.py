@@ -1331,6 +1331,17 @@ def p5kit(tmp_path):
     return script, kit, env, tmp_path
 
 
+@pytest.mark.parametrize("name", ["P5_KIT", "P5_HEAVY_LOCK", "P5_DRIVER_LOCK"])
+def test_p5_fullstack_refuses_without_a_path_of_its_own(p5kit, name):
+    script, kit, env, tmp = p5kit
+    del env[name]
+    (kit / "run" / "fullstack.env").write_text("P5_LB_URL=http://127.0.0.1:48005\nP5_RPC=http://127.0.0.1:48545\n")
+    done = subprocess.run([str(script), "/sdk", "/log"], capture_output=True, text=True, env=env, timeout=60)
+    assert done.returncode != 0
+    assert name in done.stderr
+    assert "args /sdk /log" not in done.stdout
+
+
 def test_p5_fullstack_maps_the_phase_and_evaluates_nothing(p5kit):
     script, kit, env, tmp = p5kit
     done = subprocess.run([str(script), "/sdk", "/log"], capture_output=True, text=True, env=env, timeout=60)
