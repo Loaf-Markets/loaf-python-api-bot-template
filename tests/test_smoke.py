@@ -270,7 +270,7 @@ def test_is_conditional_order():
 
 def test_models_list_every_shape():
     # __all__ names every public TypedDict the module defines; an underscored one is only the
-    # base that holds a shape's optional keys.
+    # base that holds part of a shape's keys.
     shapes = {
         name for name, value in vars(models).items()
         if isinstance(value, type) and issubclass(value, dict)
@@ -292,7 +292,7 @@ def test_models_list_every_shape():
     assert models.CancelByIndexResult.__required_keys__ == {"outcome", "orderId", "status"}
     assert (by_index["orderId"], by_index["status"]) == (Optional[int], Optional[str])
     assert {"orderId", "role"} <= models.TradeHistoryItem.__optional_keys__
-    # A holding names its spot market as mark_price frames do; None: the asset has none.
+    # A holding names its spot market; None: the asset has none.
     assert get_type_hints(models.Holding)["marketIndex"] == Optional[int]
     # A fill always has its tradeId (its journal seq); one that is no trade has no txHash, and
     # only a close has a closed PnL.
@@ -304,8 +304,19 @@ def test_models_list_every_shape():
     summary = get_type_hints(models.PortfolioSummary)
     assert summary["perps"] == Optional[models.PerpsAccount]
     assert "perpsLeverage" not in summary
-    assert get_type_hints(models.PortfolioComponent)["perpsLeverage"] == list[models.PerpsLeverage]
-    assert models.PerpsLeverage.__required_keys__ == {"marketIndex", "leverage"}
+    # Every section of a component is there, None when its read failed, never empty.
+    component = get_type_hints(models.PortfolioComponent)
+    assert models.PortfolioComponent.__required_keys__ == set(component) == {
+        "lifetimeVolume", "applicableFees", "offeringOrders", "openOrders", "tradeHistory", "orderHistory",
+        "transfers", "fundingHistory", "holdingDetails", "holdingSparklines", "perpsLeverage",
+    }
+    assert all(type(None) in typing.get_args(hint) for hint in component.values())
+    assert component["perpsLeverage"] == Optional[list[models.PerpsLeverage]]
+    assert get_type_hints(models.PerpsLeverage) == {"ticker": str, "leverage": int}
+    assert models.PerpsLeverage.__required_keys__ == {"ticker", "leverage"}
+    # A book frame names its ticker, never the index.
+    assert get_type_hints(models.OrderBook)["ticker"] is str
+    assert "marketIndex" not in get_type_hints(models.OrderBook)
 
 
 # --------------------------------------------------------------------------- #
@@ -456,11 +467,11 @@ def test_a_liquidation_take_on_the_tape():
     # A perps tape row may be a liquidation take: isLiquidation true and, being no trade, no
     # txHash. It parses like a trade, and the model says so.
     trade = {
-        "tradeId": 41, "marketIndex": 4, "txHash": "0x" + "ab" * 32, "aggressorSide": "BUY",
+        "tradeId": 41, "txHash": "0x" + "ab" * 32, "aggressorSide": "BUY",
         "price": 101.5, "quantity": 2, "timestamp": 1_700_000_000_000,
     }
     take = {
-        "tradeId": 42, "marketIndex": 4, "aggressorSide": "SELL", "price": 99.25, "quantity": 1,
+        "tradeId": 42, "aggressorSide": "SELL", "price": 99.25, "quantity": 1,
         "timestamp": 1_700_000_000_500, "isLiquidation": True,
     }
     client = make_client(lambda request: httpx.Response(200, json={"trades": [trade, take]}))
@@ -470,6 +481,7 @@ def test_a_liquidation_take_on_the_tape():
     hints = typing.get_type_hints(models.TradeTick)
     assert hints["isLiquidation"] is bool and hints["txHash"] is str
     assert {"isLiquidation", "txHash"} <= models.TradeTick.__optional_keys__
+    assert "marketIndex" not in hints
 
 
 def test_trades_params_and_no_auth():
@@ -604,6 +616,23 @@ def test_portfolio_and_funding_routes():
         ("/api/portfolio/component", {}),
         ("/api/history/funding", {"pageSize": "5", "cursor": "abc"}),
     ]
+
+
+def test_an_unread_component_section_stays_none_beside_an_empty_one():
+    sections = {"openOrders": None, "holdingDetails": None, "lifetimeVolume": None, "perpsLeverage": [], "transfers": []}
+    component = make_client(lambda request: httpx.Response(200, json=sections)).portfolio.component()
+    assert component == sections
+    assert component.openOrders is None and component.lifetimeVolume is None and component.perpsLeverage == []
+
+
+@pytest.mark.parametrize(
+    "status, error", [(500, loaf.LoafServerError), (503, loaf.LoafServiceUnavailableError)]
+)
+def test_a_component_with_no_section_read_raises(status, error):
+    client = make_client(lambda request: httpx.Response(status, json={"error": "unread"}), max_retries=0)
+    with pytest.raises(error, match="unread") as info:
+        client.portfolio.component()
+    assert type(info.value) is error and info.value.status_code == status
 
 
 def test_a_repeated_cursor_stops_paging():

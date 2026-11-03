@@ -816,8 +816,13 @@ def active_ids(user: User) -> set[int]:
     return {int(o["orderId"]) for o in user.c.history.active_orders().get("activeOrders", [])}
 
 
+def section(user: User, name: str) -> Any:
+    """A section of ``user``'s component; one the backend could not read (None) has nothing yet, so a wait goes on."""
+    return user.c.portfolio.component()[name] or []
+
+
 def legs_of(user: User, parent: int) -> list[Mapping[str, Any]]:
-    return [o for o in user.c.portfolio.component()["openOrders"] if int(o.get("parentOrderId") or 0) == parent]
+    return [o for o in section(user, "openOrders") if int(o.get("parentOrderId") or 0) == parent]
 
 
 def newest_trade(user: User) -> int:
@@ -1570,7 +1575,7 @@ def step_perps(run: Run) -> None:
     r = placed(a.c.orders.limit_buy(t, float(q), float(lo), pool=0, time_in_force="POST_ONLY"), "A's post-only bid")
     check(left(r) == q, "A's post-only bid rests whole")
     row = run.until("A's post-only bid in openOrders", lambda: next(
-        (o for o in a.c.portfolio.component()["openOrders"] if int(o["id"]) == int(r["orderId"])), None))
+        (o for o in section(a, "openOrders") if int(o["id"]) == int(r["orderId"])), None))
     check(row["pool"] == 0 and row["reduceOnly"] is False, f"A's open order reads pool 0, not reduce-only: {short(row)}")
     a.c.orders.cancel(int(r["orderId"]))
     placed(mm.c.orders.limit_sell(t, float(q), float(hi), pool=0), "MM's ask")
@@ -1653,12 +1658,12 @@ def step_perps(run: Run) -> None:
 
 def save_leverage(run: Run, user: User, market: int) -> None:
     """``user`` saves 2 on ``market``, or the market's most (65536 // (2 x risk)) when lower, by its ticker."""
-    want = {"marketIndex": market, "leverage": min(2, 65_536 // (2 * int(run.perps[market]["risk"])))}
+    want = {"ticker": run.ticker(market), "leverage": min(2, 65_536 // (2 * int(run.perps[market]["risk"])))}
     pushes0 = len(run.sent(user, "perps_leverage_update"))
-    got = user.c.portfolio.set_perps_leverage(run.ticker(market), want["leverage"])
+    got = user.c.portfolio.set_perps_leverage(want["ticker"], want["leverage"])
     check(got == want, f"{user.name} saved leverage {want['leverage']} on market {market}: {short(got)}")
     run.until(f"{user.name}'s component reading its leverage on market {market}",
-              lambda: want in user.c.portfolio.component()["perpsLeverage"])
+              lambda: want in section(user, "perpsLeverage"))
     run.until(f"{user.name}'s perps_leverage_update for market {market}", lambda: any(
         {k: f.get(k) for k in want} == want for f in run.sent(user, "perps_leverage_update")[pushes0:]))
 
@@ -2013,7 +2018,7 @@ def step_liquidation(run: Run) -> None:
     check(row["source"] == "LIQUIDATION" and position_of(c, m0, 4) is None,
           f"the liquidation took C's whole long into the book: {short(row)}")
     fill = run.until("MM's liquidation row in its portfolio", lambda: next(
-        (f for f in mm.c.portfolio.component()["tradeHistory"]
+        (f for f in section(mm, "tradeHistory")
          if int(f["tradeId"]) == seq and f.get("source") == "LIQUIDATION" and f.get("role") == "MAKER"), None))
     check(int(fill["orderId"]) == int(bid["orderId"]) and Decimal(str(fill.get("fee") or 0)) == 0,
           f"MM's bid {bid['orderId']} filled by take {seq} as MAKER, no fee: {short(fill)}")

@@ -245,7 +245,8 @@ funds.resubmit(signed_body)           POST   /l2/withdrawals        (re-send unc
 
 portfolio.summary()                   GET    /portfolio/summary     (balances, holdings, perps)
 portfolio.component()                 GET    /portfolio/component   (recent activity, fees, lifetime volume, holdings' details, saved leverage)
-portfolio.set_perps_leverage(m, lev)  PUT    /portfolio/perps-leverage (your leverage setting on a perp)
+portfolio.set_perps_leverage(ticker, leverage)
+                                      PUT    /portfolio/perps-leverage (your leverage setting on a perp)
 
 history.orders() / trades() / funding()
                                       GET    /history/orders, /history/trades, /history/funding
@@ -265,9 +266,14 @@ its nonce with `GET /l2/keys` first).
 
 A market (an order book, spot or perp) is named by its ticker: its asset's
 ticker, with `-PERP` appended for a perp (`MUS`, `H100-PERP`). `market.get`,
-`market.candles`, `market.trades`, orders and the WebSocket's market channels
-take a market's ticker; your holdings name the asset by its own ticker (a spot
-market's ticker is its asset's).
+`market.candles`, `market.trades`, orders, `portfolio.set_perps_leverage` and the
+WebSocket's market channels take a market's ticker; your holdings name the asset
+by its own ticker (a spot market's ticker is its asset's).
+
+`portfolio.component()` answers every section, and one the exchange could not
+read just now is `None`, which never means empty: read again, and keep what you
+hold of it meanwhile. When no section could be read it raises `LoafServerError`,
+or on a 503 `LoafServiceUnavailableError`.
 
 Candle history is a dedicated, paginated endpoint (the market detail response
 does not include it):
@@ -804,10 +810,9 @@ then `None` without one.
   liquidations are valued at the mark, within 2 % of the index, and stops and
   takes fire on it. Order price bands, funding (its premium and its payments,
   at a rate in centi-bp of the index) and a final settlement stay on the index.
-- **Leverage.** `loaf.portfolio.set_perps_leverage(market, leverage)` saves
-  your leverage on a perp, `market` its ticker or its `marketIndex`: a whole
-  number from 1 to the market's `maxLeverage`.
-  `portfolio.component().perpsLeverage` lists the ones saved, `{marketIndex,
+- **Leverage.** `loaf.portfolio.set_perps_leverage(ticker, leverage)` saves
+  your leverage on a perp: a whole number from 1 to the market's `maxLeverage`.
+  `portfolio.component().perpsLeverage` lists the ones saved, `{ticker,
   leverage}`, and `ws.on_perps_leverage` brings each one saved; a market with
   none is at `loaf.PERPS_DEFAULT_LEVERAGE` (3), and any leverage reads at most
   the market's most. It is the web app's setting, as on Hyperliquid: the web
@@ -932,7 +937,7 @@ ws = loaf.websocket()
 
 @ws.on_orderbook
 def on_book(msg):
-    print(msg.marketIndex, msg.bids[0].price, msg.asks[0].price)
+    print(msg.ticker, msg.bids[0].price, msg.asks[0].price)
 
 @ws.on_trade            # YOUR fills (private portfolio channel)
 def on_fill(msg):
@@ -956,7 +961,7 @@ Channels:
 
 | Channel | Auth | Handler | Payload |
 | --- | --- | --- | --- |
-| `orderbook:{ticker}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (throttled); no initial frame — seed from `market.get(ticker).orderBook` |
+| `orderbook:{ticker}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (throttled) and again every 5 s even when it did not, empty books included; no initial frame — seed from `market.get(ticker).orderBook` |
 | `trades:{ticker}` | public | `on_trades` | every trade, in at most one frame every 100 ms holding every trade since the previous one, newest first; right after subscribing, the recent trades (up to 20) once, before `on_connect` — dedupe by `tradeId` |
 | `chart:{ticker}` | public | `on_candle` | OHLCV candle updates |
 | `markprice:{ticker}` | public | `on_mark_price` | canonical mark price (1s, on change) |
@@ -964,6 +969,10 @@ Channels:
 | `market:{ticker}` | public | `on_market_halt` | halt / resume status for that market |
 | `perps:markets` | public | `on_perps_markets_live`, `on_market_terms` | every perp's live state (each row `market.get(ticker).market.live`, with its `markPrice`), once on subscribe, then about once a second — replace what you hold; a perp's terms when they change |
 | `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_order_queue`, `on_lifetime_volume`, `on_perps_account`, `on_funding_payment`, `on_holding`, `on_transfer`, `on_fees`, `on_l2_keys`, `on_perps_leverage` | your account deltas, and your resting orders' places in their books; every fill of yours is `on_trade`, a liquidation's, a deleverage's and an exit's too (`trade.source`); your perps account as a snapshot about once a second (the beat: `on_stale`, `on_fresh`, below) |
+
+The frames of `orderbook`, `trades`, `chart`, `markprice`, `volume` and `market`
+name their market as `ticker`, the channel's own string, so one handler can
+serve several markets.
 
 A client with a trading key authenticates each connection with a login token
 the key signs (the `auth` frame, never the URL), and sends a fresh one on the
@@ -999,7 +1008,7 @@ frames:
   `l2_keys_update` (`on_l2_keys`) a change to your account's keys (a reset of
   your trading key, say: read `GET /l2/keys` once), and
   `perps_leverage_update` (`on_perps_leverage`) a leverage you saved on a perp,
-  `{marketIndex, leverage}`.
+  `{ticker, leverage}`.
 - `order_update` carries the whole committed order, with its `expiryMs`. For an
   order that trades immediately it can arrive after the fill frames and already
   show FILLED. Stop and take orders (TP/SL legs included) ride the same frame,
@@ -1016,17 +1025,20 @@ frames:
   `{marketIndex, orders}`, bids best first, then asks, each `{orderId, side,
   price, quantity, quantityAhead, ordersAhead}` (`ordersAhead`: how many orders
   at its price are ahead of it in time priority; `quantityAhead`: their
-  unfilled tokens). It replaces what you hold for that market, and an empty
-  list means none of yours rests there. Each time a connection your trading
-  key authenticated newly subscribes `portfolio`, as the client does on every
-  connection (subscribing again while subscribed sends nothing), one arrives
-  for each market where you have resting orders (before or after
-  `on_connect` on a new connection), then one on every change; a market
-  where none rests sends nothing, and no REST read serves queue places, so
-  drop every list you hold in `on_disconnect` and, after you unsubscribe
-  `portfolio`, at the `subscription_confirmed` that answers it (frames sent
-  before it can still arrive; `ws.on("subscription_confirmed", handler)` gets
-  it), not in `on_connect`. It can arrive before the order's `order_update`.
+  unfilled tokens), and optionally `l2OrderIndex` (its signed order number) and
+  `orderTag` (your label for it). It replaces what you hold for that market,
+  and an empty list means none of yours rests there. Each time a connection
+  your trading key authenticated newly subscribes `portfolio`, as the client
+  does on every connection (subscribing again while subscribed sends nothing),
+  one arrives for each market where you have resting orders (before or after
+  `on_connect` on a new connection), then one on every change, and each
+  non-empty list again every 5 s, changed or not, so treat a frame as the list,
+  not as a change. A market where none rests sends nothing, and no REST read
+  serves queue places, so drop every list you hold in `on_disconnect` and,
+  after you unsubscribe `portfolio`, at the `subscription_confirmed` that
+  answers it (frames sent before it can still arrive;
+  `ws.on("subscription_confirmed", handler)` gets it), not in `on_connect`. It
+  can arrive before the order's `order_update`.
 - Delivery is at most once, so after a reconnect reconcile from
   `loaf.portfolio.summary()`, `loaf.portfolio.component()` and the `history` reads.
 - `order_status` and `order_update` carry the order's `orderTag` (when you
@@ -1075,28 +1087,24 @@ side of the same guard: `on_stale` covers a feed that stops while your bot
 runs, `cancel_after` a bot that stops.
 
 **Valuing holdings live.** The server does not push portfolio totals: combine
-your balances with the `markprice` channel. A `mark_price` frame is
-`{marketIndex, price}`, with no ticker, and every `markprice` channel you
-subscribe feeds the one `on_mark_price` handler, so match each frame to the
-holding with that `marketIndex`. A holding's `marketIndex` is its spot market's,
-whose ticker is the holding's; `None` means the asset has no spot market, so no
-mark streams for it. An L2 holding is pushed too: `on_holding` upserts it by
-its ticker, with its average entry (`None` until the exchange has read your
-fills, and a later push brings it: show none meanwhile, never the earlier one),
-when your fills or a deposit change it. Its amounts stay its balances row.
+your balances with the `markprice` channel. A `mark_price` frame is `{ticker,
+price}`, so match it to the holding with that ticker; a holding whose
+`marketIndex` is `None` has no spot market, so no mark streams for it. An L2
+holding is pushed too: `on_holding` upserts it by its ticker, with its average
+entry (`None` until the exchange has read your fills, and a later push brings
+it: show none meanwhile, never the earlier one), when your fills or a deposit
+change it. Its amounts stay its balances row.
 
 ```python
-holdings = loaf.portfolio.summary().holdings
-by_market = {h.marketIndex: h for h in holdings if h.marketIndex is not None}
+held = {h.ticker for h in loaf.portfolio.summary().holdings if h.marketIndex is not None}
 
 @ws.on_mark_price
-def on_mark(msg):                       # {marketIndex, price}, from every markprice channel
-    held = by_market.get(msg.marketIndex)
-    if held is not None:
-        print(held.ticker, "marked at", msg.price)
+def on_mark(msg):                       # {ticker, price}, from every markprice channel
+    if msg.ticker in held:
+        print(msg.ticker, "marked at", msg.price)
 
-for h in by_market.values():
-    ws.subscribe_mark_price(h.ticker)   # a holding's ticker is its spot market's
+for ticker in held:
+    ws.subscribe_mark_price(ticker)     # a holding's ticker is its spot market's
 ```
 
 **Reconnects.** `on_connect` fires once the server has answered the auth and

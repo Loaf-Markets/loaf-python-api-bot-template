@@ -222,80 +222,66 @@ def test_a_perps_l2_is_no_spot_l2_and_back(exchange, trading_client):
 # --------------------------------------------------------------------------- #
 
 
-def test_a_leverage_is_saved_by_market_index_or_ticker(perps_exchange, trading_client):
+def test_a_leverage_is_saved_by_ticker(perps_exchange, trading_client):
     portfolio = trading_client().portfolio
     assert portfolio.component().perpsLeverage == []
-    assert portfolio.set_perps_leverage(4, 5) == {"marketIndex": 4, "leverage": 5}
-    assert portfolio.set_perps_leverage("OPRA-PERP", 32_768) == {"marketIndex": 4, "leverage": 32_768}
-    assert portfolio.set_perps_leverage(0, 1) == {"marketIndex": 0, "leverage": 1}
+    assert portfolio.set_perps_leverage("OPRA-PERP", 5) == {"ticker": "OPRA-PERP", "leverage": 5}
+    assert portfolio.set_perps_leverage("OPRA-PERP", 32_768) == {"ticker": "OPRA-PERP", "leverage": 32_768}
+    assert portfolio.set_perps_leverage("H100-PERP", 1) == {"ticker": "H100-PERP", "leverage": 1}
     assert portfolio.component().perpsLeverage == [
-        {"marketIndex": 0, "leverage": 1}, {"marketIndex": 4, "leverage": 32_768}
+        {"ticker": "H100-PERP", "leverage": 1}, {"ticker": "OPRA-PERP", "leverage": 32_768}
     ]
-    assert routes(perps_exchange.requests) == [
+    assert routes(perps_exchange.requests) == [  # the ticker is the body: no market read first
         "GET /portfolio/component",
         "PUT /portfolio/perps-leverage",
-        "GET /trade/OPRA-PERP",  # a ticker names its market by the detail's marketIndex
         "PUT /portfolio/perps-leverage",
         "PUT /portfolio/perps-leverage",
         "GET /portfolio/component",
     ]
     puts = [r for r in perps_exchange.requests if r.method == "PUT"]
-    # Shared-Types' perpsLeverageBodySchema: strict, both whole numbers; sent with a login token.
+    # Shared-Types' perpsLeverageBodySchema: strict, a perp's ticker and a whole number; sent with a login token.
     assert [json.loads(r.content) for r in puts] == [
-        {"marketIndex": 4, "leverage": 5}, {"marketIndex": 4, "leverage": 32_768},
-        {"marketIndex": 0, "leverage": 1},
+        {"ticker": "OPRA-PERP", "leverage": 5}, {"ticker": "OPRA-PERP", "leverage": 32_768},
+        {"ticker": "H100-PERP", "leverage": 1},
     ]
-    assert all(list(json.loads(r.content)) == ["marketIndex", "leverage"] for r in puts)
+    assert all(list(json.loads(r.content)) == ["ticker", "leverage"] for r in puts)
     for request in puts:
         assert verify_login(_bearer(request))["l2AccountIndex"] == ACCOUNT_INDEX
-    assert "authorization" not in perps_exchange.requests[2].headers  # the detail is public
     assert loaf.PERPS_DEFAULT_LEVERAGE == 3  # a market with none saved, at most its most
 
 
 @pytest.mark.parametrize(
-    "market, leverage, message",
+    "ticker, leverage, message",
     [
-        (4, 0, "leverage must be"),
-        (4, 32_769, "leverage must be"),
-        (4, 2.5, "leverage must be"),
-        (4, "3", "leverage must be"),
-        (4, True, "leverage must be"),
-        (4, None, "leverage must be"),
-        (255, 3, "market must be a perps market index"),
-        (-1, 3, "market must be a perps market index"),
-        (4.0, 3, "market must be a perps market index"),
-        (None, 3, "market must be a perps market index"),
-        ("OPRA", 3, "OPRA is a spot market"),
+        ("OPRA-PERP", 0, "leverage must be"),
+        ("OPRA-PERP", 32_769, "leverage must be"),
+        ("OPRA-PERP", 2.5, "leverage must be"),
+        ("OPRA-PERP", "3", "leverage must be"),
+        ("OPRA-PERP", True, "leverage must be"),
+        ("OPRA-PERP", None, "leverage must be"),
+        (4, 3, "ticker must be a market's ticker"),  # an index names no perp here
+        (None, 3, "ticker must be a market's ticker"),
         ("opra-perp", 3, "ticker must be a market's ticker"),
+        ("OPRA", 3, "OPRA is a spot market"),
     ],
 )
-def test_a_leverage_is_checked_locally(exchange, trading_client, market, leverage, message):
+def test_a_leverage_is_checked_locally(exchange, trading_client, ticker, leverage, message):
     with pytest.raises(loaf.LoafValidationError, match=re.escape(message)) as info:
-        trading_client().portfolio.set_perps_leverage(market, leverage)
+        trading_client().portfolio.set_perps_leverage(ticker, leverage)
     assert info.value.status_code == 0
     assert exchange.requests == []
 
 
-def test_a_leverage_the_exchange_refuses_saves_nothing(perps_exchange, trading_client):
+@pytest.mark.parametrize("refusal", ["perps: leverage is malformed", "perps: ticker is malformed"])
+def test_a_leverage_the_exchange_refuses_saves_nothing(perps_exchange, trading_client, refusal):
     with pytest.raises(loaf.LoafConfigError, match="needs your trading key"):
-        trading_client(trading_key=None).portfolio.set_perps_leverage(4, 3)
+        trading_client(trading_key=None).portfolio.set_perps_leverage("OPRA-PERP", 3)
     assert perps_exchange.requests == []
-    refusal = "perps: leverage is malformed"
     perps_exchange.queue("/portfolio/perps-leverage", error_reply(400, refusal))
-    portfolio = trading_client().portfolio
     with pytest.raises(loaf.LoafValidationError, match=re.escape(refusal)) as info:
-        portfolio.set_perps_leverage(4, 10)
+        trading_client().portfolio.set_perps_leverage("OPRA-PERP", 10)
     assert info.value.status_code == 400
-    with pytest.raises(loaf.LoafNotFoundError, match="Market not found"):
-        portfolio.set_perps_leverage("MUS-PERP", 3)
-    # A detail that serves no perp's index: the SDK never guesses one.
-    perps_exchange.details["OPRA-PERP"] = market_detail("OPRA-PERP", market_index=2050)
-    message = "GET /trade/OPRA-PERP answered an unusable market.marketIndex"
-    with pytest.raises(loaf.LoafServerError, match=re.escape(message)):
-        portfolio.set_perps_leverage("OPRA-PERP", 3)
-    assert routes(perps_exchange.requests) == [
-        "PUT /portfolio/perps-leverage", "GET /trade/MUS-PERP", "GET /trade/OPRA-PERP"
-    ]
+    assert routes(perps_exchange.requests) == ["PUT /portfolio/perps-leverage"]
     assert perps_exchange.perps_leverage == {}
 
 
