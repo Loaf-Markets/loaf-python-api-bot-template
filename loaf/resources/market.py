@@ -126,9 +126,9 @@ class MarketResource(Resource):
         (:meth:`~loaf.ws.client.LoafWebSocketClient.on_market_terms`).
 
         ``recentTrades`` holds the newest trades first (at most 20), with no
-        ``marketIndex`` or ``txHash``: :meth:`trades` and the ``trades_batch``
-        frames carry them (a perp's liquidation take has ``isLiquidation:
-        True``: :class:`~loaf.models.TradeTick`). ``orderBook`` is
+        ``txHash``: :meth:`trades` and the ``trades_batch`` frames carry it (a
+        perp's liquidation take has ``isLiquidation: True``:
+        :class:`~loaf.models.TradeTick`). ``orderBook`` is
         ``None`` when the market is not LIVE or no fresh book is known: treat
         ``None`` as unknown, not empty.
 
@@ -216,8 +216,8 @@ class MarketResource(Resource):
 
         Returns ``{"trades": [...]}``: at most ``limit`` (1-1000) trades whose
         ``tradeId`` is above ``after_trade_id`` (0: from the first), each
-        ``{tradeId, marketIndex, txHash, aggressorSide, price, quantity,
-        timestamp}`` as the channel pushes it (a perp's liquidation take has
+        ``{tradeId, txHash, aggressorSide, price, quantity, timestamp}`` as
+        the channel pushes it (a perp's liquidation take has
         ``isLiquidation: True`` and no ``txHash``:
         :class:`~loaf.models.TradeTick`). While a page comes back full,
         pass its last ``tradeId`` as ``after_trade_id`` for the next; stop at

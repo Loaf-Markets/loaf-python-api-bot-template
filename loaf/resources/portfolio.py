@@ -12,13 +12,11 @@ recent activity lists of :meth:`PortfolioResource.component` are capped:
 from __future__ import annotations
 
 import numbers
-from typing import Any, Mapping
+from typing import Any
 
-from .._l2 import _whole
-from ..constants import MAX_PERP_MARKET_INDEX, MAX_PERPS_LEVERAGE
-from ..exceptions import LoafServerError, _client_validation_error
+from ..constants import MAX_PERPS_LEVERAGE
+from ..exceptions import _client_validation_error
 from .base import Resource, _check_market_ticker
-from .perps import _ranged
 
 
 class PortfolioResource(Resource):
@@ -38,8 +36,8 @@ class PortfolioResource(Resource):
         ``quoteAssetId``; ``available`` is what a new order can use.
 
         ``holdings`` are the tokens you hold, facts only: ``ticker`` (the
-        asset's, its spot market's too), ``marketIndex`` (its spot market's,
-        which ``mark_price`` frames name; ``None`` without one),
+        asset's, its spot market's too), ``marketIndex`` (its spot market's;
+        ``None`` without one),
         ``averageEntryPrice`` (``None`` when the cost is unknown),
         ``marketPrice`` (the mark when read: its spot market's for an L2
         holding; an IPO allocation's unit price until it trades) and
@@ -47,7 +45,7 @@ class PortfolioResource(Resource):
         its ``balances`` row) or ``quantity`` (an IPO allocation). Its name,
         supply and image are :meth:`component`'s ``holdingDetails``. Values and
         P&L are yours to compute: to value a
-        holding live, match ``mark_price`` frames to it by ``marketIndex``
+        holding live, match ``mark_price`` frames to it by ``ticker``
         (:meth:`loaf.ws.client.LoafWebSocketClient.on_mark_price`).
 
         ``perps`` is :meth:`loaf.resources.perps.PerpsResource.positions`'
@@ -60,17 +58,16 @@ class PortfolioResource(Resource):
         """
         return self._client.get("/portfolio/summary")
 
-    def set_perps_leverage(self, market: int | str, leverage: int) -> Any:
+    def set_perps_leverage(self, ticker: str, leverage: int) -> Any:
         """``PUT /portfolio/perps-leverage`` — save your leverage on a perp,
-        named by its ``marketIndex`` (0 to 254) or by its ticker (``"MUS-PERP"``,
-        whose ``marketIndex`` :meth:`~loaf.resources.market.MarketResource.get`
-        reads first).
+        named by its ticker (``"MUS-PERP"``).
 
         ``leverage`` is a whole number from 1 to the market's ``maxLeverage``,
-        which the exchange checks. It keeps one a market
-        for your account and answers it, ``{marketIndex, leverage}``
-        (:class:`~loaf.models.PerpsLeverage`); :meth:`component` lists them as
-        ``perpsLeverage``, and your ``portfolio`` channel brings each one saved
+        which the exchange checks. It keeps one a ticker for your account (a
+        perp relisted on its ticker reads the same one) and answers it,
+        ``{ticker, leverage}`` (:class:`~loaf.models.PerpsLeverage`);
+        :meth:`component` lists them as ``perpsLeverage``, and your
+        ``portfolio`` channel brings each one saved
         (:meth:`~loaf.ws.client.LoafWebSocketClient.on_perps_leverage`).
 
         It is the web app's leverage setting, as on Hyperliquid: the web app
@@ -84,12 +81,10 @@ class PortfolioResource(Resource):
         Raises:
             LoafConfigError: no trading key.
             LoafValidationError: refused locally (``status_code`` 0, nothing
-                sent): a leverage or market index out of range, or a spot
-                market's ticker; or by the exchange (400), saving nothing:
-                ``perps: marketIndex is malformed`` (no perp at that
-                index) or ``perps: leverage is malformed`` (above the market's
-                most).
-            LoafNotFoundError: no market has this ticker.
+                sent): a leverage out of range, a malformed ticker or a spot
+                market's; or by the exchange (400), saving nothing:
+                ``perps: ticker is malformed`` (no perp has this ticker) or
+                ``perps: leverage is malformed`` (above the market's most).
             LoafAPIError: the exchange refused it otherwise. Nothing was saved.
         """
         whole = isinstance(leverage, numbers.Integral) and not isinstance(leverage, bool)
@@ -98,33 +93,16 @@ class PortfolioResource(Resource):
                 f"leverage must be a whole number from 1 to {MAX_PERPS_LEVERAGE:,}, and the exchange "
                 f"takes at most the market's most, 65,536 // (2 x risk) (got {leverage!r})"
             )
-        if isinstance(market, str):
-            index = self._perps_index(market)
-        else:
-            index = _ranged(market, "market", 0, MAX_PERP_MARKET_INDEX, "a perps market index")
-        return self._client.request(
-            "PUT",
-            "/portfolio/perps-leverage",
-            json={"marketIndex": index, "leverage": int(leverage)},
-        )
-
-    def _perps_index(self, ticker: str) -> int:
-        """A perp's ``marketIndex``, as its ``GET /trade/{ticker}`` serves it."""
         _check_market_ticker(ticker)
         if not ticker.endswith("-PERP"):
             raise _client_validation_error(
                 f"{ticker} is a spot market: a leverage is saved on a perp, whose ticker ends in -PERP"
             )
-        detail = self._client.market.get(ticker)
-        market = detail.get("market") if isinstance(detail, Mapping) else None
-        index = market.get("marketIndex") if isinstance(market, Mapping) else None
-        if not _whole(index, 0, MAX_PERP_MARKET_INDEX):
-            raise LoafServerError(
-                f"GET /trade/{ticker} answered an unusable market.marketIndex",
-                status_code=200,
-                body=detail,
-            )
-        return index
+        return self._client.request(
+            "PUT",
+            "/portfolio/perps-leverage",
+            json={"ticker": ticker, "leverage": int(leverage)},
+        )
 
     def component(self) -> Any:
         """``GET /portfolio/component`` — your recent activity, fees, lifetime
@@ -135,6 +113,12 @@ class PortfolioResource(Resource):
         tradeHistory, orderHistory, transfers, fundingHistory, holdingDetails,
         holdingSparklines, perpsLeverage}``
         (:class:`~loaf.models.PortfolioComponent`).
+
+        Every key is always there, and a section the exchange could not read
+        just now is ``None``, which never means empty: read again, and keep
+        what you hold of it meanwhile. ``openOrders``, ``tradeHistory``,
+        ``orderHistory`` and ``offeringOrders`` are one read, and so are
+        ``holdingDetails`` and ``holdingSparklines``; the others fail alone.
 
         ``applicableFees`` is raw bps, and streams on the private WS channel as
         ``fees_update``; ``lifetimeVolume`` (dollars) also streams on the
@@ -156,8 +140,14 @@ class PortfolioResource(Resource):
         then its mark).
 
         ``perpsLeverage`` is the leverage you saved on each perp
-        (:meth:`set_perps_leverage`), ``{marketIndex, leverage}``. A market you
+        (:meth:`set_perps_leverage`), ``{ticker, leverage}``. A market you
         saved none on is at :data:`~loaf.constants.PERPS_DEFAULT_LEVERAGE` (3),
         and any leverage reads at most the market's ``maxLeverage``.
+
+        Raises:
+            LoafServerError: no section could be read (500 ``Failed to fetch
+                portfolio component``).
+            LoafServiceUnavailableError: no section could be read, the
+                exchange's engine among the causes (503) — transient, so retry.
         """
         return self._client.get("/portfolio/component")

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +20,8 @@ from loaf import LoafClient, LoafConfigError, LoafWebSocketClient, from_base_uni
 from loaf._object import parse
 
 from conftest import TRADING_KEY
+
+README = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
 
 
 def _client() -> LoafWebSocketClient:
@@ -84,40 +87,21 @@ def test_a_subscribe_as_the_loop_closes_is_left_to_the_next_connection(
     assert [str(w.message) for w in recwarn] == []
 
 
-def test_market_halt_dispatch():
-    ws = _client()
-    seen = []
-    ws.on_market_halt(seen.append)
-    ws._dispatch(_frame(type="market_halt", marketIndex=2050, ticker="OPRA", isHalted=True))
-    assert (seen[0].marketIndex, seen[0].ticker, seen[0].isHalted) == (2050, "OPRA", True)
-
-
-def test_mark_price_frames_match_holdings_by_market_index():
-    # Every markprice channel feeds on_mark_price and a frame names its market by index alone, so
-    # a frame is matched to the holding with that marketIndex, as the README shows. A holding with
-    # None has no spot market: nothing to subscribe, and no frame names it.
-    holdings = parse({"holdings": [
+def test_mark_price_frames_match_holdings_by_ticker_as_the_readme_shows(capsys):
+    # The README's own code: a frame's ticker finds its holding; marketIndex None subscribes nothing.
+    code = README.split("**Valuing holdings live.**")[1].split("```python\n")[1].split("```")[0]
+    summary = parse({"holdings": [
         {"ticker": "OPRA", "marketIndex": 2050, "isIpoAllocation": False, "assetId": 6},
         {"ticker": "MUS", "marketIndex": 2049, "isIpoAllocation": False, "assetId": 4},
         {"ticker": "EFL", "marketIndex": None, "isIpoAllocation": True, "quantity": 5},
-    ]}).holdings
-    by_market = {h.marketIndex: h for h in holdings if h.marketIndex is not None}
+    ]})
     ws = _client()
-    marks = {}
-
-    @ws.on_mark_price
-    def on_mark(msg):
-        held = by_market.get(msg.marketIndex)
-        if held is not None:
-            marks[held.ticker] = msg.price
-
-    for h in by_market.values():
-        ws.subscribe_mark_price(h.ticker)
+    exec(code, {"loaf": SimpleNamespace(portfolio=SimpleNamespace(summary=lambda: summary)), "ws": ws})
     assert ws._channels == {"markprice:OPRA", "markprice:MUS"}
-    ws._dispatch(_frame(type="mark_price", marketIndex=2049, price=50.5))
-    ws._dispatch(_frame(type="mark_price", marketIndex=2050, price=101.25))
-    ws._dispatch(_frame(type="mark_price", marketIndex=2051, price=7))  # a market none is held on
-    assert marks == {"MUS": 50.5, "OPRA": 101.25}
+    ws._dispatch(_frame(type="mark_price", ticker="MUS", price=50.5))
+    ws._dispatch(_frame(type="mark_price", ticker="OPRA", price=101.25))
+    ws._dispatch(_frame(type="mark_price", ticker="H100", price=7))  # a market none is held on
+    assert capsys.readouterr().out == "MUS marked at 50.5\nOPRA marked at 101.25\n"
 
 
 def test_trade_new_dispatch():
@@ -175,8 +159,14 @@ def test_a_liquidation_row_reaches_on_trade():
         ("on_transfer", {"type": "transfer_update", "transfer": {"journalSeq": 9}}),
         ("on_fees", {"type": "fees_update", "applicableFees": {"takerFeeBps": 30, "makerFeeBps": 10}}),
         ("on_l2_keys", {"type": "l2_keys_update", "apiKeyIndices": [0]}),
-        ("on_perps_leverage", {"type": "perps_leverage_update", "marketIndex": 4, "leverage": 5}),
+        ("on_perps_leverage", {"type": "perps_leverage_update", "ticker": "OPRA-PERP", "leverage": 5}),
         ("on_market_terms", {"type": "market_terms_update", "marketIndex": 4, "l2": {"status": "EXPIRED"}}),
+        ("on_orderbook", {"type": "orderbook_update", "ticker": "H100-PERP", "bids": [], "asks": []}),
+        ("on_candle", {"type": "candle_update", "ticker": "H100-PERP", "candle": {"time": 60, "close": 101.5}}),
+        ("on_trades", {"type": "trades_batch", "ticker": "H100-PERP", "trades": [{"tradeId": 7}]}),
+        ("on_mark_price", {"type": "mark_price", "ticker": "H100-PERP", "price": 101.25}),
+        ("on_volume", {"type": "volume_update", "ticker": "H100-PERP", "volume24h": 12.5}),
+        ("on_market_halt", {"type": "market_halt", "ticker": "H100-PERP", "isHalted": True}),
     ],
 )
 def test_each_new_frame_reaches_its_handler(register, fields):

@@ -25,7 +25,7 @@ class PriceLevel(TypedDict):
 
 
 class OrderBook(TypedDict, total=False):
-    marketIndex: int
+    ticker: str  # an orderbook_update frame's, its channel's; absent on a detail's orderBook
     bids: list[PriceLevel]
     asks: list[PriceLevel]
 
@@ -189,8 +189,9 @@ class PerpsOpAccepted(TypedDict):
 
 
 class TradeTick(TypedDict, total=False):
-    """A public trade: the detail's ``recentTrades`` (no ``marketIndex`` or ``txHash``), or a
-    ``trades_batch`` frame (newest first), or a ``market.trades`` row (oldest first).
+    """A public trade, which names no market (its frame or its route does): the detail's
+    ``recentTrades`` (no ``txHash``), or a ``trades_batch`` frame (newest first), or a
+    ``market.trades`` row (oldest first).
 
     On a perps market the tape also carries liquidation takes: a liquidated position taken
     against a resting order. A take has ``isLiquidation: True`` and is no trade: it has no
@@ -200,7 +201,6 @@ class TradeTick(TypedDict, total=False):
     ``False``: read ``tick.get("txHash")`` on a frame or a ``market.trades`` row."""
 
     tradeId: int
-    marketIndex: int
     txHash: str  # a trade's content hash (0x + 64 hex), not an on-chain tx; absent on a take
     aggressorSide: str  # OrderSide of the taker (a take's: the liquidated side)
     price: float
@@ -276,16 +276,21 @@ class OrderHistoryItem(TypedDict, total=False):
     triggeredAt: Optional[int]  # conditional only; unix seconds
 
 
-class OrderQueueEntry(TypedDict):
-    """One of your resting orders in an ``order_queue`` frame and its place in its price
-    level's queue (time priority)."""
-
+class _OrderQueueEntryRequired(TypedDict):
     orderId: int
     side: str  # OrderSide
     price: float  # dollars
     quantity: float  # tokens: its unfilled quantity in the book
     quantityAhead: float  # tokens: the unfilled quantity of the level's orders ahead of it
     ordersAhead: int  # how many of the level's orders are ahead of it
+
+
+class OrderQueueEntry(_OrderQueueEntryRequired, total=False):
+    """One of your resting orders in an ``order_queue`` frame and its place in its price
+    level's queue (time priority)."""
+
+    l2OrderIndex: int  # its signed order number
+    orderTag: int  # your label for it
 
 
 class TradeProofStatus(TypedDict, total=False):
@@ -345,7 +350,7 @@ class Holding(TypedDict, total=False):
     """A held asset's token: facts only. An L2 holding's amounts are its ``balances`` row."""
 
     ticker: str  # the asset's, its spot market's too
-    marketIndex: Optional[int]  # its spot market's, which mark_price frames name; None without one
+    marketIndex: Optional[int]  # its spot market's; None without one, so no mark streams for it
     averageEntryPrice: Optional[float]  # None when the cost is unknown
     # The mark when read: its spot market's for an L2 holding; an IPO allocation's unit price
     # until it trades.
@@ -368,7 +373,7 @@ class PerpsLeverage(TypedDict):
     """A leverage you saved on a perp: a component's ``perpsLeverage`` row, the answer to
     ``portfolio.set_perps_leverage()``, and a ``perps_leverage_update`` frame's fields."""
 
-    marketIndex: int  # the perp's, 0 to 254
+    ticker: str  # the perp's
     leverage: int  # 1 to the market's maxLeverage
 
 
@@ -380,21 +385,21 @@ class PortfolioSummary(TypedDict):
     perps: Optional[PerpsAccount]  # None: not read just now, which never means you hold none
 
 
-class PortfolioComponent(TypedDict, total=False):
+class PortfolioComponent(TypedDict):
     """``portfolio.component()``: your recent activity, fees, lifetime volume, holdings' details and
-    saved leverage."""
+    saved leverage. A section is ``None`` when its read failed: unread, never empty."""
 
-    lifetimeVolume: float  # dollars traded over the account's lifetime
-    applicableFees: dict[str, int]  # {takerFeeBps, makerFeeBps}
-    offeringOrders: list[dict[str, Any]]
-    openOrders: list[OrderHistoryItem]  # booked orders + PENDING/ARMED conditionals, merged
-    tradeHistory: list[TradeHistoryItem]  # without proof
-    orderHistory: list[OrderHistoryItem]  # newest rows of both kinds, ANY status
-    transfers: list[dict[str, Any]]  # newest first, keyed by journalSeq; `amount` in base units
-    fundingHistory: list[FundingPayment]  # newest first
-    holdingDetails: dict[str, HoldingDetails]  # by holding ticker
-    holdingSparklines: dict[str, list[float]]  # by holding ticker: up to 48 closes, oldest first
-    perpsLeverage: list[PerpsLeverage]  # the ones saved, one a market
+    lifetimeVolume: Optional[float]  # dollars traded over the account's lifetime
+    applicableFees: Optional[dict[str, int]]  # {takerFeeBps, makerFeeBps}
+    offeringOrders: Optional[list[dict[str, Any]]]
+    openOrders: Optional[list[OrderHistoryItem]]  # booked orders + PENDING/ARMED conditionals, merged
+    tradeHistory: Optional[list[TradeHistoryItem]]  # without proof
+    orderHistory: Optional[list[OrderHistoryItem]]  # newest rows of both kinds, ANY status
+    transfers: Optional[list[dict[str, Any]]]  # newest first, keyed by journalSeq; `amount` in base units
+    fundingHistory: Optional[list[FundingPayment]]  # newest first
+    holdingDetails: Optional[dict[str, HoldingDetails]]  # by holding ticker
+    holdingSparklines: Optional[dict[str, list[float]]]  # by holding ticker: up to 48 closes, oldest first
+    perpsLeverage: Optional[list[PerpsLeverage]]  # the ones saved, one a ticker
 
 
 __all__ = [

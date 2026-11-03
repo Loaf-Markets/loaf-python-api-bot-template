@@ -40,7 +40,7 @@ REFUSED = (1006, "the server did not accept the login token")
 
 async def _push_book(ws: Any) -> None:
     await ws.send(json.dumps({
-        "type": "orderbook_update", "marketIndex": 2050,
+        "type": "orderbook_update", "ticker": "OPRA",
         "bids": [{"price": 100.0, "quantity": 1.0}], "asks": [], "timestamp": 0,
     }))
 
@@ -147,7 +147,7 @@ class _Server:
                     for channel in added:
                         if channel.startswith("trades:") and self.recent_trades:
                             await self._send(
-                                ws, type="trades_batch", marketIndex=2050, trades=self.recent_trades
+                                ws, type="trades_batch", ticker="OPRA", trades=self.recent_trades
                             )
                 else:
                     await self._send(ws, type="echo", data=frame)

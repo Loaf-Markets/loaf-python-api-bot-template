@@ -7,7 +7,7 @@ Typical usage::
 
     @ws.on_orderbook
     def handle_book(msg):
-        print(msg.marketIndex, msg.bids[0].price)
+        print(msg.ticker, msg.bids[0].price)
 
     ws.subscribe_orderbook("OPRA")
     ws.subscribe_trades("OPRA")
@@ -28,7 +28,8 @@ perp):
 ==================  ========  ===========================================
 Channel             Auth      What you receive
 ==================  ========  ===========================================
-orderbook:{ticker}  public    full bid/ask book snapshots, on change (no initial frame)
+orderbook:{ticker}  public    full bid/ask book snapshots, on change and again every 5 s, empty books
+                              included (no initial frame)
 trades:{ticker}     public    every trade, at most one frame per 100 ms (the recent ones on subscribe)
 chart:{ticker}      public    OHLCV candle updates (note: singular "chart")
 markprice:{ticker}  public    canonical mark price (1s, on change)
@@ -40,6 +41,9 @@ portfolio           PRIVATE   your order transitions, fills, queue places, whole
                               perps account, funding payments, holdings, transfers, fees, keys and
                               saved perps leverage
 ==================  ========  ===========================================
+
+A market channel's frames name its market as ``ticker``, the channel's own
+string; a trade in a ``trades_batch`` names none.
 
 Prices and quantities are human units (dollars / tokens); ``balances_update``
 amounts are base-unit decimal strings (see :func:`loaf.from_base_units`);
@@ -192,10 +196,11 @@ class LoafWebSocketClient:
 
     # public market data
     def on_orderbook(self, handler: Handler | None = None) -> Any:
+        """A market's whole book (``orderbook_update``: ``{ticker, bids, asks}``)."""
         return self.on(WSMessageType.ORDERBOOK_UPDATE, handler)
 
     def on_trades(self, handler: Handler | None = None) -> Any:
-        """A market's public trades (``trades_batch``: ``{marketIndex, trades}``,
+        """A market's public trades (``trades_batch``: ``{ticker, trades}``,
         each a :class:`~loaf.models.TradeTick`; on a perp a liquidation take
         too, ``isLiquidation: True``, with no ``txHash``).
 
@@ -210,30 +215,31 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.TRADES_BATCH, handler)
 
     def on_candle(self, handler: Handler | None = None) -> Any:
+        """A market's candle changed (``candle_update``: ``{ticker, candle}``, a
+        :class:`~loaf.models.Candle`)."""
         return self.on(WSMessageType.CANDLE_UPDATE, handler)
 
     def on_mark_price(self, handler: Handler | None = None) -> Any:
-        """A market's canonical mark price (``mark_price``: ``{marketIndex,
-        price}``), checked once a second and pushed on change.
+        """A market's canonical mark price (``mark_price``: ``{ticker, price}``),
+        checked once a second and pushed on change.
 
-        Every ``markprice`` channel you subscribe feeds this one handler, and a
-        frame names its market by ``marketIndex`` alone, never by ticker: match
-        on it. A holding's ``marketIndex`` is its spot market's
-        (:meth:`loaf.resources.portfolio.PortfolioResource.summary`); ``None``
-        means no spot market, so no frame values it. On a perp this is the
-        book's reference, not the mark positions are valued at and stops fire
-        on: that is ``markPrice`` of :meth:`on_perps_markets_live`.
+        Every ``markprice`` channel you subscribe feeds this one handler: match
+        on ``ticker``. A holding's ticker is its spot market's
+        (:meth:`loaf.resources.portfolio.PortfolioResource.summary`); its
+        ``marketIndex`` ``None`` means no spot market, so no frame values it. On
+        a perp this is the engine's mark in dollars, ``markPrice`` of
+        :meth:`on_perps_markets_live`: what positions are valued at and stops
+        fire on.
         """
         return self.on(WSMessageType.MARK_PRICE, handler)
 
     def on_volume(self, handler: Handler | None = None) -> Any:
         """A market's rolling-24h traded volume changed (``volume_update``:
-        ``{marketIndex, volume24h}``). Replaces the REST ``volume24h``."""
+        ``{ticker, volume24h}``). Replaces the REST ``volume24h``."""
         return self.on(WSMessageType.VOLUME_UPDATE, handler)
 
     def on_market_halt(self, handler: Handler | None = None) -> Any:
-        """A market was halted or resumed (``market_halt``:
-        ``{marketIndex, ticker, isHalted}``).
+        """A market was halted or resumed (``market_halt``: ``{ticker, isHalted}``).
 
         ``isHalted`` is the EFFECTIVE state — the market's own flag OR'd with
         the platform-wide kill switch — so assign it straight over the
@@ -341,22 +347,25 @@ class LoafWebSocketClient:
 
         ``orders`` lists your orders resting there, bids best first, then asks
         best first, each ``{orderId, side, price, quantity, quantityAhead,
-        ordersAhead}`` (:class:`~loaf.models.OrderQueueEntry`): ``quantity`` is
-        its unfilled remainder, ``ordersAhead`` how many orders at its price
-        are ahead of it (time priority) and ``quantityAhead`` their unfilled
-        tokens. The frame is absolute for ``marketIndex``: replace what you hold
+        ordersAhead}``, and optionally ``l2OrderIndex`` and ``orderTag``
+        (:class:`~loaf.models.OrderQueueEntry`): ``quantity`` is its unfilled
+        remainder, ``ordersAhead`` how many orders at its price are ahead of it
+        (time priority), ``quantityAhead`` their unfilled tokens,
+        ``l2OrderIndex`` its signed order number and ``orderTag`` your label for
+        it. The frame is absolute for ``marketIndex``: replace what you hold
         for it, and an empty list means none of your orders rests there now.
         Each time a connection your trading key authenticated newly subscribes
         ``portfolio``, as the client does on every connection (subscribing
         again while subscribed sends nothing), one arrives for each market
         where you have resting orders (before or after :meth:`on_connect` on a
-        new connection), then another whenever your entries there change. A
-        market where none rests sends nothing, and no REST read serves queue
-        places, so drop every list you hold in :meth:`on_disconnect` and,
-        after you :meth:`unsubscribe` ``portfolio``, at the
-        ``subscription_confirmed`` that answers it (frames sent before it can
-        still arrive; :meth:`on` ``"subscription_confirmed"`` gets it), not in
-        :meth:`on_connect`. It can arrive before the order's
+        new connection), then another whenever your entries there change, and
+        each non-empty list again every 5 s, changed or not, so treat a frame
+        as the list, not as a change. A market where none rests sends nothing,
+        and no REST read serves queue places, so drop every list you hold in
+        :meth:`on_disconnect` and, after you :meth:`unsubscribe` ``portfolio``,
+        at the ``subscription_confirmed`` that answers it (frames sent before it
+        can still arrive; :meth:`on` ``"subscription_confirmed"`` gets it), not
+        in :meth:`on_connect`. It can arrive before the order's
         :meth:`on_order_update`.
         """
         return self.on(WSMessageType.ORDER_QUEUE, handler)
@@ -418,9 +427,9 @@ class LoafWebSocketClient:
 
     def on_perps_leverage(self, handler: Handler | None = None) -> Any:
         """You saved a leverage on a perp (``perps_leverage_update``:
-        ``{marketIndex, leverage}``), here
+        ``{ticker, leverage}``), here
         (:meth:`loaf.resources.portfolio.PortfolioResource.set_perps_leverage`)
-        or in the web app: replace that market's row of
+        or in the web app: replace that ticker's row of
         ``portfolio.component().perpsLeverage``."""
         return self.on(WSMessageType.PERPS_LEVERAGE_UPDATE, handler)
 

@@ -307,7 +307,7 @@ class FakeExchange:
     * ``GET /portfolio/component`` serves as its ``perpsLeverage`` the
       ``perps_leverage`` saved.
     * ``PUT /portfolio/perps-leverage`` saves its body's leverage in
-      ``perps_leverage`` (by market index) and answers the body.
+      ``perps_leverage`` (by ticker) and answers the body.
     * ``POST /l2/allocations`` and ``/l2/exits`` apply a signed op at the account's
       nonce (``keys["withdrawalNonce"]``, which moves up by one): 202 with the next
       ``journalSeq``; a re-send of an applied op is its duplicate, and any other op
@@ -333,7 +333,7 @@ class FakeExchange:
         self._next_id = 0
         self.perps_collateral: dict[str, Any] | None = dict(PERPS_COLLATERAL)
         self.perps_account: dict[str, Any] | None = json.loads(json.dumps(PERPS_ACCOUNT))
-        self.perps_leverage: dict[int, int] = {}
+        self.perps_leverage: dict[str, int] = {}
         # The ops applied, by nonce: (their body, their journal seq).
         self.applied: dict[int, tuple[bytes, int]] = {}
         self._next_seq = 1000
@@ -397,11 +397,11 @@ class FakeExchange:
             perps = self.perps_account and {**self.perps_account, "collateral": self.perps_collateral}
             return httpx.Response(200, json={"balances": [], "holdings": [], "perps": perps})
         if route == "GET /portfolio/component":
-            leverage = [{"marketIndex": m, "leverage": v} for m, v in sorted(self.perps_leverage.items())]
+            leverage = [{"ticker": t, "leverage": v} for t, v in sorted(self.perps_leverage.items())]
             return httpx.Response(200, json={"perpsLeverage": leverage})
         if route == "PUT /portfolio/perps-leverage":
             body = json.loads(request.content)
-            self.perps_leverage[body["marketIndex"]] = body["leverage"]
+            self.perps_leverage[body["ticker"]] = body["leverage"]
             return httpx.Response(200, json=body)
         if route in ("POST /l2/allocations", "POST /l2/exits"):
             return self._apply(request.content)

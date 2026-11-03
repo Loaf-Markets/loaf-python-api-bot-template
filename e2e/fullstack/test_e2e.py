@@ -813,24 +813,24 @@ def test_mark_near_waits_for_the_mark_to_follow_the_index(env, monkeypatch):
     assert run.mark(2) == 1_496_249
 
 
-def test_a_saved_leverage_is_read_back_from_its_answer_the_summary_and_a_push(env, monkeypatch):
+def test_a_saved_leverage_is_read_back_from_its_answer_the_component_and_a_push(env, monkeypatch):
     """save_leverage saves 2, or the market's most (65536 // (2 x risk)) when lower, by the market's ticker: its
-    answer, the summary and a perps_leverage_update sent after it read it; a push from before the save does not."""
+    answer, the component and a perps_leverage_update sent after it read it; a push from before the save does not."""
     monkeypatch.setattr(e2e.time, "sleep", lambda s: None)
     saved, frames, sent = {}, [], []
 
     class Portfolio:
         push = True
 
-        def set_perps_leverage(self, market, leverage):
-            sent.append((market, leverage))
-            saved[6] = leverage
+        def set_perps_leverage(self, ticker, leverage):
+            sent.append((ticker, leverage))
+            saved[ticker] = leverage
             if self.push:
-                frames.append({"type": "perps_leverage_update", "marketIndex": 6, "leverage": leverage})
-            return {"marketIndex": 6, "leverage": leverage}
+                frames.append({"type": "perps_leverage_update", "ticker": ticker, "leverage": leverage})
+            return {"ticker": ticker, "leverage": leverage}
 
         def component(self):
-            return {"perpsLeverage": [{"marketIndex": m, "leverage": v} for m, v in saved.items()]}
+            return {"perpsLeverage": [{"ticker": t, "leverage": v} for t, v in saved.items()]}
 
     portfolio = Portfolio()
     run = e2e.Run(dataclasses.replace(e2e.Config.read(), wait_s=0.05), tickers={6: "H100-PERP"},
@@ -839,13 +839,22 @@ def test_a_saved_leverage_is_read_back_from_its_answer_the_summary_and_a_push(en
     e2e.save_leverage(run, user, 6)
     run.perps[6] = {"risk": 32_768}  # its most is 1
     e2e.save_leverage(run, user, 6)
-    assert sent == [("H100-PERP", 2), ("H100-PERP", 1)] and saved == {6: 1}
+    assert sent == [("H100-PERP", 2), ("H100-PERP", 1)] and saved == {"H100-PERP": 1}
     portfolio.push = False  # the last push matches, but it came before this save
     with pytest.raises(e2e.Failed, match="no A's perps_leverage_update for market 6 within"):
         e2e.save_leverage(run, user, 6)
-    portfolio.component = lambda: {"perpsLeverage": []}
-    with pytest.raises(e2e.Failed, match="no A's component reading its leverage on market 6 within"):
-        e2e.save_leverage(run, user, 6)
+    for unread in ([], None):  # None: the backend could not read the section, and the wait goes on
+        portfolio.component = lambda rows=unread: {"perpsLeverage": rows}
+        with pytest.raises(e2e.Failed, match="no A's component reading its leverage on market 6 within"):
+            e2e.save_leverage(run, user, 6)
+
+
+def test_a_section_the_backend_could_not_read_has_nothing_yet():
+    rows = {"openOrders": None, "tradeHistory": [{"tradeId": 1}]}
+    user = e2e.User("A", wallet=None, client=types.SimpleNamespace(
+        portfolio=types.SimpleNamespace(component=lambda: rows)))
+    assert e2e.section(user, "openOrders") == [] and e2e.legs_of(user, 9) == []
+    assert e2e.section(user, "tradeHistory") == [{"tradeId": 1}]
 
 
 SECRET = "s3cr3t-p@ss/word"

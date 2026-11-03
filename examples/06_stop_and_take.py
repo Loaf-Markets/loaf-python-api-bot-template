@@ -87,6 +87,7 @@ def main() -> None:
 
     # Conditionals show up in portfolio openOrders, NOT in history.active_orders(),
     # and share that list with booked orders — narrow on the type before reading them.
+    # The list is None when it went unread just now, which never means empty.
     open_orders = client.portfolio.component().get("openOrders") or []
     row = next(
         (o for o in open_orders if loaf.is_conditional_order(o) and o.get("id") == order_id),
@@ -95,7 +96,7 @@ def main() -> None:
     if row is not None:
         print(f"  type={row.type:<12} status={row.status:<10} trigger={row.triggerPrice}")
     else:
-        print("  Row not in the openOrders snapshot yet — it can lag placement slightly.")
+        print("  Row not in the openOrders snapshot — it can lag placement, or the list went unread.")
 
     # Cancel it. A PENDING/ARMED conditional goes to its own cancel route; once it
     # is PLACED you cancel the booked order it created (orders.cancel_row picks).
