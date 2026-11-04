@@ -370,11 +370,13 @@ class Strategy:
         #   if res.status in ("OPEN", "PARTIALLY_FILLED"):
         #       self.client.orders.cancel(res.orderId)
         #
-        #   # Arm a stop-loss 5% below the mark (STOP_MARKET SELL; rests
-        #   # server-side, and books at up to the max slippage below the trigger).
-        #   # It FAILS if it fires after its life (ttl_ms, default 7 days), yet
-        #   # keeps its open-order slot until it fires or you cancel it, so
-        #   # cancel and re-arm it before then. Move a trailing stop on meaningful
+        #   # Arm a stop-loss 5% below the mark (STOP_MARKET SELL; the exchange
+        #   # holds it, and it books at up to the max slippage below the trigger).
+        #   # The exchange FAILS it if it is still ARMED once its life (ttl_ms,
+        #   # default 7 days) ends, fired or not (a fired one it has not booked
+        #   # yet stays ARMED); once it has booked its order (PLACED), that order
+        #   # is cancelled at the same life's end instead. So cancel and re-arm it
+        #   # before then if you want it kept. Move a trailing stop on meaningful
         #   # moves, never on every tick: each stop holds one of your account's
         #   # order numbers until it fires.
         #   if mark:

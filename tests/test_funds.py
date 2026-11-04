@@ -1,7 +1,7 @@
 """Withdrawals against an in-memory exchange: the signed body (its terms, its
 signature, the nonce perps ops spend too, the expiry), the amount in the
 collateral's ticks, what is refused locally, the retries, resubmit, and the
-exchange's refusals as the backend sends them.
+exchange's refusals as it sends them, each with its code and the error it raises.
 
 Signatures are checked with ``conftest.verify_op``, which rebuilds K1's withdraw
 message from the posted JSON as the exchange reads it.
@@ -32,6 +32,7 @@ from loaf.constants import (
 from conftest import (
     ACCOUNT_INDEX,
     BAD_SIGNATURE,
+    EXPIRED,
     EXPIRY_INSIDE_BUFFER,
     KAT,
     KEY_DISABLED,
@@ -52,15 +53,60 @@ WITHDRAW_KEYS = (
     "l2SigE"
 ).split()
 NOW_MS = 1_800_000_000_000
-# The backend's 503s for a withdrawal: paused, which
-# journaled nothing; its account unread, before the engine; the engine's answer lost.
+# The exchange's 503s for a withdrawal: paused (TRADING_PAUSED) and not processed
+# (NOT_PROCESSED), which journaled nothing; its account unread before anything was sent on
+# (SERVICE_UNAVAILABLE, "nothing was done"); undecided, its answer lost (SERVICE_UNAVAILABLE).
 PAUSED = "Trading is paused. Your withdrawal was not submitted — please try again shortly."
+NOT_PROCESSED = (
+    "Trading service is temporarily unavailable. Your withdrawal was not submitted — please send "
+    "it again in a moment."
+)
 ACCOUNT_UNREAD = (
     "l2 account: the trading account could not be read; nothing was done, try again in a moment"
 )
 UNDECIDED = "the engine did not decide the withdrawal; resend the same signed body"
 NOT_YOURS = "l2 account: the account is not this user's"
+KEY_HELD = "l2 money: the idempotency key already names another movement"
+ABOVE_BALANCE = "l2 money: the withdrawal is above the account's available L2 balance"
+IN_FLIGHT = (
+    "l2 money: the account has 16 L2 withdrawals journaled and not yet in an executed batch, the "
+    "cap per account; try again once the chain executes them"
+)
+# The per-account request limit's 429, before the exchange's rules.
+TOO_MANY_REQUESTS = "Too many requests for this account. Please slow down."
+OTHER_CHAIN = "l2 chain id: not the engine's L2 chain"
 BELOW_MINIMUM = "l2 money: the amount is below the asset's minimum withdrawal"
+# Every 401 INVALID_SIGNATURE the exchange answers a withdrawal whose login token it took: the
+# withdrawal's own signature, or the key it was signed with, refused.
+SIGNATURE_REFUSALS = [
+    BAD_SIGNATURE,
+    "l2 signature: a signature scalar is not below the ECgFp5 group order",
+    "l2 signature: the api key has no usable public key",
+    "l2 key: no L1 change-pubkey is journaled for the account's api_key_index",
+    "l2 money: the signing key is not the key the journal set for the api key",
+    UNKNOWN_KEY,
+    KEY_DISABLED,
+]
+# Every 422 by the exchange's rules, with its code: nothing was journaled.
+RULE_REFUSALS = [
+    (NONCE_REFUSAL, "ORDER_INDEX_USED"),
+    (KEY_HELD, "ORDER_INDEX_USED"),
+    (ABOVE_BALANCE, "INSUFFICIENT_BALANCE"),
+    ("l2 money: the debited account's balance is below the amount", "INSUFFICIENT_BALANCE"),
+    (BELOW_MINIMUM, "BELOW_MIN_ORDER_VALUE"),
+    (IN_FLIGHT, "RATE_LIMITED"),
+    (
+        "l2 money: 1024 L2 withdrawals are journaled and not yet in an executed batch, the "
+        "engine's cap; try again once the chain executes them",
+        "RATE_LIMITED",
+    ),
+    (EXPIRY_INSIDE_BUFFER, "ORDER_EXPIRY_INVALID"),
+    ("l2 money: the withdrawn asset is not listed (its leaf is empty)", "INVALID_REQUEST"),
+    (
+        "l2 money: the withdrawn asset's minimum withdrawal is unknown to the engine",
+        "UNKNOWN_REASON",
+    ),
+]
 
 
 def error_reply(status: int, message: str, code: str | None = None, **kwargs: Any) -> httpx.Response:
@@ -158,7 +204,7 @@ def test_ttl_ms_sets_how_long_the_exchange_takes_it(exchange, trading_client, l2
 def test_a_withdrawal_signs_fresh_randomness(exchange, trading_client):
     # The same terms at the same nonce sign the same message, never the same signature.
     funds = trading_client().funds
-    exchange.queue("/l2/withdrawals", error_reply(422, BELOW_MINIMUM))
+    exchange.queue("/l2/withdrawals", error_reply(422, BELOW_MINIMUM, "BELOW_MIN_ORDER_VALUE"))
     with pytest.raises(loaf.LoafAPIError):
         funds.withdraw(5)
     funds.withdraw(5)
@@ -270,7 +316,7 @@ def test_a_withdrawal_is_never_signed_with_another_deployments_key(exchange, tra
 
 def test_no_credential_is_left_in_a_traceback_local(exchange, trading_client):
     funds = trading_client().funds
-    exchange.queue("/l2/withdrawals", error_reply(401, BAD_SIGNATURE))
+    exchange.queue("/l2/withdrawals", error_reply(401, BAD_SIGNATURE, "INVALID_SIGNATURE"))
     with pytest.raises(loaf.LoafAuthError) as refused:
         funds.withdraw(5)
     exchange.queue("/l2/withdrawals", *(httpx.ReadTimeout("slow") for _ in range(4)))
@@ -304,7 +350,11 @@ def test_an_op_sent_elsewhere_first_is_refused_and_the_next_signs_the_new_nonce(
     funds = trading_client().funds
     with pytest.raises(loaf.LoafAPIError) as info:
         funds.withdraw(5)
-    assert (info.value.status_code, info.value.message) == (422, NONCE_REFUSAL)
+    assert (info.value.status_code, info.value.code, info.value.message) == (
+        422,
+        "ORDER_INDEX_USED",  # a withdrawal's number is its nonce
+        NONCE_REFUSAL,
+    )
     assert not isinstance(info.value, WithdrawalOutcomeUnknownError)
     assert funds.withdraw(5)["nonce"] == 1
 
@@ -312,17 +362,124 @@ def test_an_op_sent_elsewhere_first_is_refused_and_the_next_signs_the_new_nonce(
 @pytest.mark.parametrize(
     "reply, cls",
     [
-        (error_reply(422, BELOW_MINIMUM), loaf.LoafAPIError),
-        (error_reply(403, NOT_YOURS), loaf.LoafForbiddenError),
-        (error_reply(400, EXPIRY_INSIDE_BUFFER), loaf.LoafValidationError),
+        (error_reply(403, NOT_YOURS, "ORDER_NOT_OWNED"), loaf.LoafForbiddenError),
+        (error_reply(400, EXPIRY_INSIDE_BUFFER, "ORDER_EXPIRY_INVALID"), loaf.LoafValidationError),
+        (error_reply(400, OTHER_CHAIN, "INVALID_REQUEST"), loaf.LoafValidationError),
+        (
+            httpx.Response(
+                400,
+                json={
+                    "error": "Validation failed",
+                    "code": "INVALID_REQUEST",
+                    "details": ["l2Route: l2 withdrawal: l2Route must be 1 (spot)"],
+                },
+            ),
+            loaf.LoafValidationError,
+        ),
+        (
+            error_reply(429, TOO_MANY_REQUESTS, "RATE_LIMITED", headers={"Retry-After": "3"}),
+            loaf.LoafRateLimitError,
+        ),
     ],
-    ids=["422-rules", "403-not-yours", "400-expiry"],
+    ids=["403-not-yours", "400-expiry", "400-chain", "400-body", "429-rate"],
 )
 def test_a_4xx_is_final_and_never_resent(exchange, trading_client, reply, cls):
     exchange.queue("/l2/withdrawals", reply)
     with pytest.raises(loaf.LoafAPIError) as info:
         trading_client().funds.withdraw(5)
     assert type(info.value) is cls
+    sent = reply.json()
+    assert (info.value.code, info.value.message) == (sent["code"], sent["error"])
+    assert info.value.details == sent.get("details", [])
+    if isinstance(info.value, loaf.LoafRateLimitError):
+        assert info.value.retry_after == 3.0
+    assert len(withdrawal_posts(exchange)) == 1
+    assert exchange.applied == {}
+
+
+@pytest.mark.parametrize(
+    "message, code", RULE_REFUSALS, ids=[f"{code}-{i}" for i, (_, code) in enumerate(RULE_REFUSALS)]
+)
+def test_a_refusal_by_the_exchanges_rules_is_a_422_with_its_code(
+    exchange, trading_client, message, code
+):
+    # Refused by name: a plain LoafAPIError with the exchange's code and text, never re-sent.
+    # Nothing was journaled and the nonce did not move, so the next withdrawal signs it again.
+    funds = trading_client().funds
+    exchange.queue("/l2/withdrawals", error_reply(422, message, code))
+    with pytest.raises(loaf.LoafAPIError) as info:
+        funds.withdraw(5)
+    error = info.value
+    assert type(error) is loaf.LoafAPIError
+    assert (error.status_code, error.code, error.message) == (422, code, message)
+    assert code in {known.value for known in loaf.OrderErrorCode}
+    assert len(withdrawal_posts(exchange)) == 1
+    assert funds.withdraw(5)["nonce"] == 0
+    assert [body["l2Nonce"] for body in exchange.bodies("/l2/withdrawals")] == [0, 0]
+
+
+@pytest.mark.parametrize("reason", SIGNATURE_REFUSALS)
+def test_a_signature_or_key_refusal_names_the_trading_key_not_in_force(
+    exchange, trading_client, reason
+):
+    # Its login token taken, the withdrawal's own signature or key is refused: 401
+    # INVALID_SIGNATURE, as an order's, whatever the text. The message says what it means; the
+    # exchange's own body stays in body. Never re-sent, nothing journaled.
+    exchange.queue("/l2/withdrawals", error_reply(401, reason, "INVALID_SIGNATURE"))
+    with pytest.raises(loaf.LoafAuthError) as info:
+        trading_client().funds.withdraw(5)
+    error = info.value
+    assert (error.status_code, error.code) == (401, "INVALID_SIGNATURE")
+    assert error.message.startswith(f"{reason} — ")
+    assert "is not the trading key in force on its account here" in error.message
+    assert error.body == {"error": reason, "code": "INVALID_SIGNATURE"}
+    assert len(withdrawal_posts(exchange)) == 1
+    assert exchange.applied == {}
+
+
+@pytest.mark.parametrize(
+    "change, reason, meaning, not_meant",
+    [
+        # This machine's clock fell 11 minutes behind the exchange's: the token has expired.
+        (
+            {"now_ms": NOW_MS + 660_000},
+            EXPIRED,
+            "this machine's clock is off",
+            "trading key in force",
+        ),
+        # The trading key was reset in the web app: the token's signature is not the new key's.
+        (
+            {"key_in_force": "0x" + KAT["keys"][1]["pk"]},
+            BAD_SIGNATURE,
+            "is not the trading key in force",
+            "clock",
+        ),
+    ],
+    ids=["clock", "key-reset"],
+)
+def test_a_refused_login_token_of_the_withdrawal_says_what_it_means(
+    exchange, trading_client, l2_clock, monkeypatch, change, reason, meaning, not_meant
+):
+    # The nonce read's login token is taken, the withdrawal's own refused: 401 UNAUTHENTICATED,
+    # as the exchange codes every refused login token, and what it means follows its text. Never
+    # re-sent, nothing journaled.
+    l2_clock.time_ns = lambda: NOW_MS * 1_000_000
+    serve = exchange._serve
+
+    def then_change(request: httpx.Request) -> httpx.Response:
+        reply = serve(request)
+        if request.url.path == "/api/l2/keys":
+            for name, value in change.items():
+                setattr(exchange, name, value)
+        return reply
+
+    monkeypatch.setattr(exchange, "_serve", then_change)
+    with pytest.raises(loaf.LoafAuthError) as info:
+        trading_client().funds.withdraw(5)
+    error = info.value
+    assert (error.status_code, error.code) == (401, "UNAUTHENTICATED")
+    assert error.message.startswith(f"{reason} — ")
+    assert meaning in error.message and not_meant not in error.message
     assert len(withdrawal_posts(exchange)) == 1
     assert exchange.applied == {}
 
@@ -352,16 +509,20 @@ def test_a_lost_answer_is_resent_and_answered_as_its_duplicate(
     "reply, cls",
     [
         (error_reply(503, PAUSED, "TRADING_PAUSED", headers={"Retry-After": "7"}), loaf.TradingPausedError),
-        (error_reply(503, ACCOUNT_UNREAD), loaf.LoafServiceUnavailableError),
+        (error_reply(503, NOT_PROCESSED, "NOT_PROCESSED"), loaf.LoafServiceUnavailableError),
+        (error_reply(503, ACCOUNT_UNREAD, "SERVICE_UNAVAILABLE"), loaf.LoafServiceUnavailableError),
     ],
-    ids=["paused", "account-unread"],
+    ids=["paused", "not-processed", "account-unread"],
 )
 def test_a_503_that_journaled_nothing_is_final(exchange, trading_client, reply, cls):
+    # Re-sent as any 5xx is, but each answer says nothing was journaled: the last one is raised,
+    # a definite refusal, never an unknown outcome.
     funds = trading_client(max_retries=1).funds
     exchange.queue("/l2/withdrawals", reply, reply)
     with pytest.raises(loaf.LoafServiceUnavailableError) as info:
         funds.withdraw(5)
     assert type(info.value) is cls
+    assert info.value.code == reply.json()["code"]
     first, second = (r.content for r in withdrawal_posts(exchange))
     assert first == second
     if isinstance(info.value, loaf.TradingPausedError):
@@ -371,11 +532,80 @@ def test_a_503_that_journaled_nothing_is_final(exchange, trading_client, reply, 
     assert [body["l2Nonce"] for body in exchange.bodies("/l2/withdrawals")] == [0, 0, 0]
 
 
+@pytest.mark.parametrize("message", [NONCE_REFUSAL, KEY_HELD], ids=["nonce", "key-held"])
+@pytest.mark.parametrize(
+    "first",
+    [
+        lambda: httpx.ReadTimeout("timed out"),
+        lambda: error_reply(503, UNDECIDED, "SERVICE_UNAVAILABLE"),
+    ],
+    ids=["timeout", "undecided"],
+)
+def test_a_resend_refused_order_index_used_after_a_lost_answer_was_never_journaled(
+    exchange, trading_client, first, message
+):
+    # The first attempt's answer was lost, but the exchange answers a re-send of a journaled
+    # withdrawal as its duplicate before it checks the nonce: a 422 ORDER_INDEX_USED to the re-send
+    # (its nonce spent by another op, or its key held by another withdrawal) says no attempt was
+    # journaled, and none will be. It is raised as itself, a definite refusal: withdraw again.
+    exchange.queue("/l2/withdrawals", first(), error_reply(422, message, "ORDER_INDEX_USED"))
+    with pytest.raises(loaf.LoafAPIError) as info:
+        trading_client(max_retries=1).funds.withdraw(5)
+    error = info.value
+    assert type(error) is loaf.LoafAPIError
+    assert (error.status_code, error.code, error.message) == (422, "ORDER_INDEX_USED", message)
+    sent, resent = (r.content for r in withdrawal_posts(exchange))
+    assert sent == resent
+    assert exchange.applied == {}
+
+
+@pytest.mark.parametrize(
+    "refusal, cls",
+    [
+        (error_reply(422, ABOVE_BALANCE, "INSUFFICIENT_BALANCE"), loaf.LoafAPIError),
+        (error_reply(422, IN_FLIGHT, "RATE_LIMITED"), loaf.LoafAPIError),
+        (error_reply(429, TOO_MANY_REQUESTS, "RATE_LIMITED"), loaf.LoafRateLimitError),
+    ],
+    ids=["balance", "in-flight", "429"],
+)
+def test_any_other_refusal_of_a_resend_after_a_lost_answer_is_still_unknown(
+    exchange, trading_client, refusal, cls
+):
+    # These speak for the re-send alone: the first attempt, still on its way, could be journaled
+    # after it (a spent nonce could not).
+    exchange.queue("/l2/withdrawals", httpx.ReadTimeout("timed out"), refusal)
+    with pytest.raises(WithdrawalOutcomeUnknownError) as info:
+        trading_client(max_retries=1).funds.withdraw(5)
+    last = info.value.last_error
+    assert type(last) is cls
+    assert (last.code, info.value.attempts) == (refusal.json()["code"], 2)
+
+
+def test_not_processed_after_a_lost_answer_is_still_unknown(exchange, trading_client):
+    # The first attempt's answer was lost, so it may have been journaled: a NOT_PROCESSED to the
+    # re-send speaks for the re-send alone.
+    funds = trading_client(max_retries=1).funds
+    exchange.queue(
+        "/l2/withdrawals",
+        httpx.ReadTimeout("timed out"),
+        error_reply(503, NOT_PROCESSED, "NOT_PROCESSED"),
+    )
+    with pytest.raises(WithdrawalOutcomeUnknownError) as info:
+        funds.withdraw(5)
+    last = info.value.last_error
+    assert type(last) is loaf.LoafServiceUnavailableError
+    assert (last.code, info.value.attempts) == ("NOT_PROCESSED", 2)
+
+
 def test_an_undecided_withdrawal_is_an_unknown_outcome_that_resubmit_settles(
     exchange, trading_client
 ):
     funds = trading_client(max_retries=1).funds
-    exchange.queue("/l2/withdrawals", error_reply(503, UNDECIDED), httpx.ReadTimeout("timed out"))
+    exchange.queue(
+        "/l2/withdrawals",
+        error_reply(503, UNDECIDED, "SERVICE_UNAVAILABLE"),
+        httpx.ReadTimeout("timed out"),
+    )
     with pytest.raises(WithdrawalOutcomeUnknownError) as info:
         funds.withdraw(5)
     error = info.value
@@ -416,9 +646,33 @@ def test_a_resubmit_past_the_exchanges_window_stays_unknown_and_the_nonce_settle
     assert again.value.signed_body == body
     last = again.value.last_error
     assert isinstance(last, loaf.LoafValidationError)
-    assert (last.status_code, last.message) == (400, EXPIRY_INSIDE_BUFFER)
+    assert (last.status_code, last.code, last.message) == (
+        400,
+        "ORDER_EXPIRY_INVALID",
+        EXPIRY_INSIDE_BUFFER,
+    )
     # ... and the account's next nonce settles it: still its l2Nonce, never journaled.
     assert exchange.keys["withdrawalNonce"] == body["l2Nonce"] == 0
+
+
+def test_a_resubmit_refused_order_index_used_settles_it_and_the_next_signs_the_new_nonce(
+    exchange, trading_client
+):
+    funds = trading_client(max_retries=0).funds
+    exchange.queue("/l2/withdrawals", httpx.ReadTimeout("timed out"))
+    with pytest.raises(WithdrawalOutcomeUnknownError) as info:
+        funds.withdraw(5)
+    body = info.value.signed_body
+    exchange.keys["withdrawalNonce"] = 1  # another op (the web app's, say) spent nonce 0 since
+    # A journaled body would have been answered as its duplicate: this one never was, nor will be.
+    with pytest.raises(loaf.LoafAPIError) as refused:
+        funds.resubmit(body)
+    error = refused.value
+    assert type(error) is loaf.LoafAPIError
+    assert (error.status_code, error.code) == (422, "ORDER_INDEX_USED")
+    assert error.message == NONCE_REFUSAL
+    assert exchange.applied == {}
+    assert funds.withdraw(5)["nonce"] == 1
 
 
 def test_a_200_without_a_journal_seq_is_unknown(exchange, trading_client):
@@ -477,6 +731,7 @@ def test_the_unknown_outcome_survives_pickle_and_names_how_to_settle_it():
         f"account {ACCOUNT_INDEX} at nonce 0",
         "after 3 attempt(s)",
         "funds.resubmit(error.signed_body)",
+        "a 422 ORDER_INDEX_USED (never journaled: withdraw again)",
         f"l2ExpiryMs {NOW_MS} minus 72 hours",
         "withdrawalNonce): still 0",
     ):

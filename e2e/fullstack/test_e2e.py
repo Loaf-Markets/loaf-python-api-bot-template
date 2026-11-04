@@ -32,7 +32,9 @@ from eth_account import Account  # noqa: E402
 from eth_account.messages import encode_typed_data  # noqa: E402
 from eth_utils import keccak  # noqa: E402
 from loaf import k1  # noqa: E402
+from loaf._l2 import market_of  # noqa: E402
 from loaf.exceptions import LoafValidationError  # noqa: E402
+from loaf.resources.orders import _Derived  # noqa: E402
 
 # The web app's L2Key typed data as viem signs it, by Hardhat's (and Anvil's) public test account #0, never a wallet
 # with funds, for the vault at L2_KEY_PROXY, and the trading key's secret and public key loaf.k1 derives from each
@@ -181,6 +183,77 @@ def test_every_zkloaf_call_is_in_its_abi():
 
 def test_the_spot_side_is_the_sdks():
     assert e2e.PERPS_SPOT_SIDE == 255
+
+
+@pytest.mark.parametrize("band", [0, 30, 99, 100, 150, 199, 200, 500, None, "50"])
+def test_the_take_profits_bid_is_the_limit_the_sdk_signs_its_leg(band):
+    # MM's bid for the perps step's take-profit is the leg's limit as the SDK derives it, at any band: one under 200 bp
+    # holds the leg's 1 % to half of it, which moves the limit above its trigger x 0.99 (an old bid at trigger x 0.995
+    # sat below it under 100 bp). Whether the band admits that bid is the step's band check (below).
+    l2 = {"chainId": 421614, "proxyAddress": "0x" + "11" * 20, "l2ChainId": 4242, "quoteAssetId": 3,
+          "status": "ACTIVE", "band": band}
+    market = market_of({"market": {"marketIndex": 4, "type": "PERP", "l2": l2}}, "MUS-PERP")
+    tp = Decimal("102.35")
+    limit = e2e.leg_limit(l2, tp, "SELL", 100)
+    assert limit == _Derived(tp, "SELL", 100).on(market, "MUS-PERP")
+    assert limit < tp and (tp - limit) * 10_000 <= 100 * tp
+
+
+def test_in_band_is_the_exchanges_rule_and_band_of_reads_the_band_as_the_sdk_does():
+    assert e2e.in_band(1_100, 1_000, 1_000) and e2e.in_band(900, 1_000, 1_000)  # both edges in
+    assert not e2e.in_band(1_101, 1_000, 1_000) and not e2e.in_band(899, 1_000, 1_000)
+    assert e2e.in_band(5_000, 1_000, 0) and e2e.in_band(5_000, 0, 1_000)  # no band, or no mark yet
+    assert e2e.band_of({"band": 140}) == 140
+    for band in (None, 0, -5, "140", 140.0, True):
+        assert e2e.band_of({"band": band}) == 0
+    assert e2e.band_of({}) == 0
+
+
+@pytest.mark.parametrize(
+    "px, band, missed",
+    [
+        # The standard kit's markets ($1,500, 1,000 bp), and no band at all.
+        ("1500", 1_000, []),
+        ("1500", 0, []),
+        # MM's bid at the take-profit's limit, about 2 % above the mark less half the band: from 133 bp.
+        ("1500", 133, []),
+        ("1500", 132, ["MM's bid at the take-profit's limit"]),
+        # The fired take-profit's sell at that limit, with the walk's mark 0.4 % past its trigger: from 79 bp.
+        ("1500", 78, ["MM's bid at the take-profit's limit", "the take-profit's sell at its limit"]),
+        # B's IOC at the ask + $1: 10 + 10,000 / price bp, so 110 at $100 and 1,010 at $10, the edge in.
+        ("100", 133, []),
+        ("100", 110, ["MM's bid at the take-profit's limit"]),
+        ("100", 109, ["B's IOC at the ask + $1", "MM's bid at the take-profit's limit"]),
+        ("10", 1_000, ["B's IOC at the ask + $1"]),
+        ("10", 1_010, []),
+    ],
+)
+def test_the_perps_steps_band_check_names_each_quote_its_band_refuses(env, px, band, missed):
+    run = e2e.Run(e2e.Config.read())
+    price = Decimal(px)
+    misses = e2e.perps_band_misses(run, {"band": band}, price, run.to_index(price))
+    assert [m.split(",")[0] for m in misses] == missed
+    # The limit it checks is the one the step bids at and the SDK signs the leg at.
+    _, _, tp, _, limit = e2e.perps_prices(run, {"band": band}, price)
+    assert limit == e2e.leg_limit({"band": band}, tp, "SELL", 100)
+
+
+def test_the_perps_step_fails_at_once_on_a_band_too_narrow_for_its_quotes(env):
+    """step_perps reads its market's band and mark before it moves anything: with a band of 100 bp at $1,500, MM's bid
+    at the take-profit's limit would be refused PRICE_BAND, so the step fails naming it and what it needs, and no user
+    is touched (each would raise AttributeError)."""
+    run = e2e.Run(e2e.Config.read(), tickers={0: "MUS-PERP"}, perps={0: {"band": 100}},
+                  users={name: types.SimpleNamespace() for name in ("A", "B", "MM")})
+    run.anon = types.SimpleNamespace(market=types.SimpleNamespace(
+        get=lambda t: {"market": {"live": {"indexPrice": 1_500_000, "markPrice": 1_500_000}}}))
+    with pytest.raises(e2e.Failed) as info:
+        e2e.step_perps(run)
+    assert str(info.value) == (
+        "market 0's band is too narrow for this step: MM's bid at the take-profit's limit, $1522.35, lies outside "
+        "100 bp of $1500. The perps step needs a band of at least about 140 bp on its market: MM's bid at the "
+        "take-profit's limit sits about 2 % above the mark less half the band, and B's IOC at the ask + $1 needs "
+        "about 10 + 10,000 / price bp. The standard kit's markets have 1,000 bp."
+    )
 
 
 @pytest.fixture

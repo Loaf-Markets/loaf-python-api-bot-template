@@ -114,9 +114,10 @@ every attempt is refused (see **Real-time WebSocket**). An order carries no
 login token, though, and is signed at the account epoch the SDK read before the
 reset, so the bot's next order may be refused with code `SETTLE_EPOCH_MISMATCH`
 (`LoafValidationError`) or `INVALID_SIGNATURE` (`LoafAuthError`) instead; the
-order after it reads the account again and gets the explained `LoafAuthError`. Also cancel and re-arm every stop, take and TP/SL leg
-(see **Stop & take orders**): those signed with the old key stay ARMED but FAIL
-when they fire.
+order after it reads the account again and gets the explained `LoafAuthError`. The reset moves
+the account's epoch, so the exchange also FAILS every stop, take and TP/SL leg
+signed before it, within about a second: place them again (see **Stop & take
+orders**).
 
 ## 3. Run the bot template
 
@@ -349,6 +350,27 @@ stop means a second sell).
   the default is 200 (2%), and `loaf.max_slippage_bps` shows the value in use.
   Override it for one order with `max_slippage_bps=`. The same setting prices
   stops, take-profits and TP/SL legs (see **Stop & take orders**).
+- **On a perp** the reference is the market's live mark
+  (`market.get(ticker).market.live.markPrice`, dollars × 1000), or the market
+  reference above while the mark is 0 (before the market's first price report)
+  or not served (`live` null, when the exchange may still band the order
+  around its mark). The SDK starts from that reference moved `min(max
+  slippage, band // 2)` basis points (`band` is `market.l2.band`; 0 bounds
+  nothing), as the web app does, rounded toward the reference: within half the
+  band the exchange holds every perps order to (see **Perps**), the other half
+  left for the mark to move. Only the $0.01 floor takes it farther: a BUY off a
+  reference under one cent starts at $0.01, which the SDK signs only if it
+  lies inside the band (off a mark of $0.005, a band of 10,000 bp or more) and
+  else refuses locally (`LoafValidationError`, nothing sent). A mark is in
+  tenths of a cent, and that rounding can cross a mark off the cent grid (a
+  SELL's price above it, a BUY's below it). The SDK then signs the cent on the
+  mark's near side (a SELL's below it, a BUY's above it) if that cent is
+  inside the band and within your max slippage (all of it, not half the band),
+  else the crossing price if that is inside the band, else it refuses the
+  order locally: at a mark of $1.009 and a band of 100 bp, `market_sell` at
+  the default 2% signs 1.00, not 1.01. A `reference_price` with
+  `max_slippage_bps=0` is signed as given (to the cent: off the grid, a BUY's
+  down and a SELL's up), never moved or refused for the band.
 - The exchange matches a MARKET order against resting orders at their prices,
   never worse than the price you signed, and **never rests it**: what it cannot
   fill at once is cancelled (`CANCELLED`), and one that fills nothing is refused
@@ -386,6 +408,7 @@ which is for people and may change.
 | `LoafValidationError` (400) | `BELOW_MIN_ORDER_VALUE` | **Minimum order value** — `price x quantity` must be at least $10, measured at the price you **sign** (a MARKET order's worst price). A SELL closing your *entire* available holding is exempt, so dust can always be flattened. |
 | `LoafValidationError` (400) | `PRICE_BAND` | **Limit price deviation** — any order, MARKET included, whose signed price is too far from the market reference is refused. The ceiling is a deployment setting; keep your max slippage small. |
 | `LoafValidationError` (400) | `PRICE_BAND` | **Daily price band** — a per-market band around the daily reference price, when enabled. The message carries the price, limit, reference and band width. |
+| `LoafValidationError` (400) | `PRICE_BAND` | **Perps band** — on a perp, an order of any kind whose signed price lies outside the market's band around its mark (`l2 perps: the price is outside the market's band around its mark`), and a stop, take or TP/SL leg whose limit lies outside the band around its own trigger. The SDK derives its own prices by the band's rule; a price you give is signed as given (see **Perps**). |
 | `LoafValidationError` (400) | `INSUFFICIENT_BALANCE`, `OPEN_ORDER_LIMIT` | **Balance and open-order caps** — not enough available balance for the order, or too many open orders (resting stops count too). |
 | `LoafValidationError` (400) | `FEE_RATE_CAP_TOO_LOW` | **Fee-rate cap** — your account's fee rate is above the cap every order signs. |
 
@@ -436,10 +459,10 @@ one minute (`60_000`) to about 45.9 days; it is 7 days when omitted. The SDK
 signs the expiry `l2ExpiryMs` = now + 72 hours + `ttl_ms` (`expiryMs` on order
 rows): the exchange stops filling the order 72 hours before it and cancels it, a
 `CANCELLED` you did not request. TP/SL legs share their
-parent's life. An ARMED stop, take or leg is not cancelled when its life ends:
-one that fires later FAILS, so cancel and re-arm stops before then (see
-**Stop & take orders**). A bot's quotes should die with it, so give them a short
-life:
+parent's life. The exchange FAILS an ARMED stop, take or leg once its life
+ends, within about a second, whether or not it has fired: it does not wait for
+it to fire. So cancel and re-arm stops before then (see **Stop & take
+orders**). A bot's quotes should die with it, so give them a short life:
 
 ```python
 loaf.orders.limit_buy("MUS", quantity=10, price=150, ttl_ms=3_600_000)   # rests for an hour at most
@@ -631,12 +654,13 @@ except OrderOutcomeUnknownError as e:
 
 ### Stop & take orders
 
-A stop or take order rests in the backend until the mark price reaches your
-trigger, then books as an ordinary limit order signed when you placed it.
+The exchange holds a stop or take order until the mark price reaches your
+trigger, then books it as an ordinary limit order signed when you placed it.
 Nothing is held until it books, but it does occupy an open-order slot. It has
-an order's life too (`ttl_ms=`, 7 days by default), but nothing removes it when
-that ends: it stays ARMED, in its slot, until you cancel it or it fires (and
-FAILS). So cancel and re-arm a stop before its life ends.
+an order's life too (`ttl_ms=`, 7 days by default): once that ends, the
+exchange FAILS a row still ARMED within about a second (it sweeps them every
+second), fired or not; it does not wait for it to fire. So cancel and re-arm a
+stop before its life ends.
 
 ```python
 # Protect a long: SELL 5 if the mark falls to 90, take profit if it rises to 120.
@@ -668,28 +692,40 @@ Direction comes from the type **and** the side, not the type alone:
 | `TAKE_MARKET` / `TAKE_LIMIT` | **falls** to the trigger | **rises** to the trigger |
 
 **A 200 means the row is ARMED — not that it will ever book.** Your holding and
-cash are not checked until the row fires; a row that fires short of funds
-cancels your own resting orders on its market and side, and tries once more.
+cash are not checked until the row fires; a row that fires short of funds or
+tokens FAILS, with the refusal's text as its `rejectionReason`, and cancels
+none of your orders to free them (a resting order holds what it may spend): when
+other orders or trades take what a row needs, cancel or resize the row yourself.
 Every trigger-time failure (holding gone, cash gone, price band, limit deviation,
 minimum value *again*, engine rejection) raises nothing; it arrives as
 `status: "FAILED"` with a `rejectionReason` on your `portfolio` channel. A
 `rejectionReason` on a row that is still `ARMED` means deferred-and-retrying,
 not dead. The exchange checks a row's price grid and order number only when it
-fires too, so a FAILED `order_update` is also how a stale row shows.
+fires too, so a FAILED `order_update` is also how a stale row shows. On a perp,
+a fired row whose order the band around the mark refuses (the mark moved past
+the band of its limit) is not failed: it stays `ARMED`, and the exchange tries
+it again every second until the mark lets it in, or until its order's life
+ends or its account's epoch moves (`FAILED`), or its position closes
+(`CANCELLED`). Only a row whose limit lies outside the band around its own
+trigger (placed before the exchange checked that, or outside it since the
+market's band was narrowed) FAILS, with `l2 perps: the price is outside the
+market's band around its trigger price` as its `rejectionReason`.
 
 | Rejection | Rule |
 | --- | --- |
 | `LoafValidationError` (400) | **Already through the trigger** — refused if the mark has reached your level. Triggering is level-based, so a trigger *equal* to the mark is refused too. Compare your trigger against the mark yourself (`markprice:{ticker}`); if the mark is already there, place a plain order. |
 | `LoafValidationError` (400) | **Open-order caps** — resting conditionals count against the same caps as booked orders. |
 | `LoafValidationError` (400) | **Minimum order value** — the same floor as a plain order, measured at the price the row will *book* at — for a `*_MARKET` type the trigger moved by your max slippage. A SELL for your whole holding is exempt. Re-checked when the row fires. |
+| `LoafValidationError` (400) | **Perps limit outside the band around its trigger** — `PRICE_BAND`, `l2 perps: the price is outside the market's band around its trigger price`: on a perp, a row whose limit lies outside the market's band around its trigger, `\|limit − trigger\| × 10,000 > band × trigger`. A TP/SL leg is checked so too, and refuses its whole order (the text prefixed `attached_legs[<i>]: `). The SDK keeps the `*_MARKET` and leg prices it derives inside; a `*_LIMIT` row's `price` is signed as given. |
 
 A `*_MARKET` type is a **protected limit, not a market order**. The SDK signs
 `trigger × (1 ± max slippage)` (the client's, or `max_slippage_bps=` on the
-call), rounded toward the trigger to the cent, as the price it books at, fixed
-for life, so after a gap past that price the booked order rests instead of
-executing. The quantity is fixed too and is never clamped — a SELL whose
-holding shrank below it FAILS rather than selling what is left. TP/SL legs
-likewise sell no lower than `trigger × (1 − max slippage)`, using the client's
+call; on a perp at most half the market's band), rounded toward the trigger to
+the cent, as the price it books at, fixed for life, so after a gap past that
+price the booked order rests instead of executing. The quantity is fixed too
+and is never clamped — a SELL whose holding shrank below it FAILS rather than
+selling what is left. TP/SL legs likewise sell no lower than `trigger × (1 −
+max slippage)` (on a perp at most half the band below), using the client's
 value rather than the parent order's `max_slippage_bps=`, so a tight entry
 never tightens your stops; pass `leg_max_slippage_bps=` to change it.
 
@@ -699,8 +735,11 @@ market reference — not your worst price and not the price you end up filling
 at. A `tp_price` just above the reference can sit below your fill; the leg then
 arms already through its trigger and sells at once, no lower than its signed
 price. Leave the take-profit clear of the mark, or place it yourself once you
-see the fill. A leg's own price is first checked (deviation, band, minimum
-value) when it fires; if that fails the leg becomes FAILED. On a spot market a
+see the fill. A leg's own price is checked (deviation, band, minimum value)
+when it fires; if that fails the leg becomes FAILED (a perps leg the band
+around the mark refuses waits instead, above). On a perp the exchange checks
+each leg's limit against the band around its trigger when the order is placed
+too. On a spot market a
 parent that ends partly filled (the cancelled rest of a MARKET or IOC order, or
 your cancel) FAILs its legs; a perp's legs arm on the parent's first fill.
 
@@ -710,11 +749,11 @@ or expired unfired keeps counting against your account's allowance (see
 moves, never on every tick.
 
 **After a Reset trading key, or a cancel-all sent on chain** (the web app's
-Recovery page), the exchange has cancelled your resting orders, but stops,
-takes and TP/SL legs signed before it stay ARMED and FAIL when they fire:
-cancel and re-arm them. A leg comes only with a new BUY, so re-arm one as a
-separate `stop_loss` / `take_profit`; unlike legs, a separate pair is not OCO,
-so once one fires, cancel the other.
+Recovery page), the account's epoch has moved: the exchange has cancelled your
+resting orders and FAILS the stops, takes and TP/SL legs signed before it,
+within about a second. Place them again. A leg comes only with a new order, so
+re-arm one as a separate `stop_loss` / `take_profit`; unlike legs, a separate
+pair is not OCO, so once one fires, cancel the other.
 
 **Two ids, two cancel routes.** A `PENDING` / `ARMED` row is cancelled with
 `loaf.orders.cancel_conditional(row.id)`; once it reaches `PLACED` the trigger
@@ -769,7 +808,10 @@ then `None` without one.
   perps BUY or SELL, never to a reduce-only order: each leg is a reduce-only
   order on the other side in the order's pool. A SELL's are mirrored:
   `tp_price < price < sl_price`, e.g.
-  `limit_sell("MUS-PERP", 2, 104, tp_price=95, sl_price=110)`.
+  `limit_sell("MUS-PERP", 2, 104, tp_price=95, sl_price=110)`. The order's
+  price must lie within the band around the mark, and each leg's limit within
+  the band around its own trigger (the SDK derives the legs' limits so); the
+  triggers themselves may sit anywhere (**The band**, below).
 - **Allocates** (`add_margin`, `return_margin`, `allocate(amount, from_side=,
   to_side=)`, a side a pool or `loaf.PERPS_SPOT_SIDE`, 255, your spot balance)
   and **exits** (`exit(market, pool=)`: closes your position in an EXPIRED
@@ -807,9 +849,41 @@ then `None` without one.
   An EXPIRED perp's `tradingState` and `stateReason` are the exchange's,
   `HALTED` and `MARKET_CLOSED`.
 - **The mark.** A perp's `markPrice` is not its `indexPrice`: margin, PnL and
-  liquidations are valued at the mark, within 2 % of the index, and stops and
-  takes fire on it. Order price bands, funding (its premium and its payments,
-  at a rate in centi-bp of the index) and a final settlement stay on the index.
+  liquidations are valued at the mark, within 2 % of the index, stops and
+  takes fire on it, and the order band centres on it (below). Funding (its
+  premium and its payments, at a rate in centi-bp of the index) and a final
+  settlement stay on the index.
+- **The band.** Each perp has a band, `market.l2.band` basis points (0:
+  none), around its mark. The exchange refuses any perps order (LIMIT,
+  MARKET, IOC, a reduce-only close, the order a stop books when it fires)
+  whose signed price lies outside `markPrice × (1 ± band / 10,000)`, both
+  edges admitted (a mark of 0, before the market's first price report, bands
+  nothing): 400 `PRICE_BAND`, `l2 perps: the price is outside the market's
+  band around its mark`. When it is placed, a stop, take or TP/SL leg whose
+  limit lies outside the band around its own trigger is refused too (`… around
+  its trigger price`). So every price the SDK derives on a perp starts at
+  most half the band from its reference (or at the $0.01 floor, below), as
+  the web app prices: a MARKET order's worst price (off the live mark unless
+  you pass `reference_price`), a `*_MARKET` stop's or take's booked price and
+  a TP/SL leg's limit (off their trigger) move `min(max slippage, band // 2)`
+  basis points, rounded toward the reference, leaving the other half for the
+  mark to move before the order is admitted (a trigger is on the cent grid,
+  so the rounding never takes a stop's or a leg's price across it). A MARKET
+  order's price that the rounding took across an off-grid mark (a SELL's
+  above it, a BUY's below it) gives way to the cent on the mark's near side
+  if that cent is inside the band and within your max slippage, and is kept
+  otherwise if it is inside the band; a MARKET BUY off a mark under one cent
+  starts at $0.01, the lowest price, kept only if that lies inside the band.
+  An order left with no such price is refused locally (see **Placing
+  orders**). A price you give exactly is signed as given, never moved or
+  refused for the band: a LIMIT order's, a `*_LIMIT` row's, or
+  `reference_price` with `max_slippage_bps=0`.
+  The band is read with the market, and read again once an order that signed
+  a price the SDK derived there (its own or a TP/SL leg's limit) is refused
+  `PRICE_BAND`; an order whose prices were all given keeps it. A fired stop
+  the band refuses waits `ARMED` until the mark lets it in, its life ends, its
+  account's epoch moves or its position closes (see **Stop & take orders**).
+  Measure from the mark, never the index: they can be up to 2 % apart.
 - **Leverage.** `loaf.portfolio.set_perps_leverage(ticker, leverage)` saves
   your leverage on a perp: a whole number from 1 to the market's `maxLeverage`.
   `portfolio.component().perpsLeverage` lists the ones saved, `{ticker,
@@ -879,22 +953,46 @@ print(res.journalSeq, res.amount, res.duplicate)
   how long the exchange takes the signed withdrawal. It rests nowhere: the
   exchange journals it at once or refuses it.
 - **Nonce.** It spends your account's next nonce, the counter perps allocates
-  and exits spend too; the SDK reads it for each one. An op sent elsewhere
-  (the web app, another process) between that read and the send makes the
-  exchange refuse this one (422): send it again.
-- **Refusals.** The exchange's rules refuse with 422 (a plain `LoafAPIError`
-  with the reason): less than the minimum withdrawal, more than your spot USDC
-  available (your resting orders hold some), too many of your withdrawals not
-  yet settled, the nonce. A pause is `TradingPausedError` (503, with
-  `retry_after`). None of these journaled anything.
+  and exits spend too; the SDK reads it for each one. A withdrawal's number is
+  its nonce: an op sent elsewhere (the web app, another process) between that
+  read and the send makes the exchange refuse this one as an order on a used
+  number (422 `ORDER_INDEX_USED`): withdraw again.
+- **Refusals** answer as an order's do: each carries `e.code`
+  (`loaf.OrderErrorCode`), the exception class follows from the status and
+  the code, and none journaled anything. Branch on the class or the code,
+  never the message:
+
+  | Error | Status and code | Why |
+  | --- | --- | --- |
+  | `LoafAPIError` | 422 `INSUFFICIENT_BALANCE` | more than your spot USDC available (your resting orders hold some) |
+  | `LoafAPIError` | 422 `BELOW_MIN_ORDER_VALUE` | less than the minimum withdrawal |
+  | `LoafAPIError` | 422 `RATE_LIMITED` | too many withdrawals not yet settled on chain, yours or everyone's: withdraw again later |
+  | `LoafAPIError` | 422 `ORDER_INDEX_USED` | the nonce (above): withdraw again, also after a lost answer (**Retries**, below) |
+  | `LoafAPIError` | 422 `ORDER_EXPIRY_INVALID`, `INVALID_REQUEST`, `UNKNOWN_REASON` | the message says why |
+  | `LoafRateLimitError` | 429 `RATE_LIMITED` | your account's request rate: withdraw again after `retry_after` |
+  | `LoafAuthError` | 401 `UNAUTHENTICATED` | its login token: this machine's clock, or your trading key not the one in force (the message says which) |
+  | `LoafAuthError` | 401 `INVALID_SIGNATURE` | its signature or key: your trading key is not the one in force (the message says so) |
+  | `LoafForbiddenError` | 403 `ORDER_NOT_OWNED` | the account is not yours |
+  | `LoafValidationError` | 400 `ORDER_EXPIRY_INVALID` | its expiry inside the buffer: this machine's clock is behind |
+  | `LoafValidationError` | 400 `INVALID_REQUEST` | another L2 chain, or a body the exchange does not take (`e.details`) |
+  | `TradingPausedError` | 503 `TRADING_PAUSED` | trading is paused: withdraw again after `retry_after` |
+  | `LoafServiceUnavailableError` | 503 `NOT_PROCESSED` | the exchange did not process it: withdraw again |
 - **Retries.** As for orders: a timeout or a 5xx re-sends the same signed
   body, which the exchange journals once at most (`duplicate: True` on a
-  repeat). Any error other than `WithdrawalOutcomeUnknownError` means nothing
-  was journaled. On that one, `loaf.funds.resubmit(e.signed_body)`, never a
-  fresh withdrawal for the same intent: a fresh one signs the next nonce, so
-  both could be paid. The exchange takes the body until its `l2ExpiryMs`
-  minus 72 hours (its `ttl_ms` after signing); once it refuses a re-send for
-  that (400), your account's next nonce (`GET /l2/keys`, `withdrawalNonce`)
+  repeat). A 503 `NOT_PROCESSED` or `TRADING_PAUSED`, or one whose message
+  says nothing was done, journaled nothing, and is raised as itself unless an
+  earlier attempt's answer was lost. A 503 `SERVICE_UNAVAILABLE` that does not
+  say so is undecided. A re-send refused 422 `ORDER_INDEX_USED` is raised as
+  itself even after a lost answer, a resubmit's too: the exchange answers a
+  re-send of a journaled withdrawal as its duplicate before it checks the
+  nonce, so none was journaled, and none will be (its nonce went to another
+  op): withdraw again. Any error other than `WithdrawalOutcomeUnknownError`
+  means nothing was journaled. On that one,
+  `loaf.funds.resubmit(e.signed_body)`, never a fresh withdrawal for the same
+  intent: a fresh one signs the next nonce, so both could be paid. The
+  exchange takes the body until its `l2ExpiryMs` minus 72 hours (its `ttl_ms`
+  after signing); once it refuses a re-send for that (`ORDER_EXPIRY_INVALID`),
+  your account's next nonce (`GET /l2/keys`, `withdrawalNonce`)
   settles it: still the body's `l2Nonce`, it was never journaled and never
   will be.
 - **Deposits** are made in the web app: a deposit is signed by your wallet's
@@ -1018,9 +1116,9 @@ frames:
   `quantityLeft`. It also arrives for orders you never cancelled: the
   order's expiry (72 h before `expiryMs`), an epoch move (a Reset
   trading key, or a cancel-all sent on chain), a delisted (or unlisted)
-  market, a BUY that can no longer fund a fill within its hold, your own order
-  crossing a resting one of yours (the resting one is cancelled), and a firing
-  stop freeing funds by cancelling your resting orders on its side.
+  market, a BUY that can no longer fund a fill within its hold, and your own
+  order crossing a resting one of yours (the resting one is cancelled). A
+  firing stop or take cancels none of your orders.
 - `order_queue` places your resting orders in one market's book:
   `{marketIndex, orders}`, bids best first, then asks, each `{orderId, side,
   price, quantity, quantityAhead, ordersAhead}` (`ordersAhead`: how many orders
@@ -1238,7 +1336,7 @@ A bad per-order `max_slippage_bps=` / `leg_max_slippage_bps=` / `ttl_ms=` /
 `LoafValidationError` (status_code 0).
 
 **Codes.** A refusal of an order request (a placement, a cancel,
-`cancel_after`, `cancel_by_index`) carries `e.code`, one of
+`cancel_after`, `cancel_by_index`) or of a withdrawal carries `e.code`, one of
 `loaf.OrderErrorCode`, and the exception class follows from the status and the
 code. Branch on the class or the code, never the message: the message is for
 people and may change, while a code is never renamed, reused or removed. The
@@ -1255,16 +1353,18 @@ with `loaf.perps.resubmit(e.signed_body)`); its refusals by the exchange's
 rules (above your available spot USDC, a pool left under initial margin, or
 under a tenth of its positions' notional or an initial-margin tier's extra
 (`TRANSFER_MARGIN_FLOOR`), the nonce) are plain `LoafAPIError`s with status
-422, and applied nothing. A withdrawal raises the same errors too, with
-`WithdrawalOutcomeUnknownError` (re-send it with
-`loaf.funds.resubmit(e.signed_body)`); see **Withdrawals**.
+422, and applied nothing. A withdrawal raises the same errors too, each
+refusal with its code (422 by the exchange's rules, 401 `INVALID_SIGNATURE`
+for its signature or key), with `WithdrawalOutcomeUnknownError` (re-send it
+with `loaf.funds.resubmit(e.signed_body)`); see **Withdrawals**.
 
 ## Rate limits & retries
 
 The backend rate limits requests per IP and sends standard `RateLimit-*`
 headers (snapshot at `loaf.last_rate_limit`). Order placements, cancels,
-order-number reservations and portfolio reads are additionally limited **per
-account** (a placement counts for the account it is signed for), so rotating
+order-number reservations, withdrawals, perps allocates and exits, and
+portfolio reads are additionally limited **per account** (a placement counts
+for the account it is signed for), so rotating
 IPs doesn't raise the ceiling. Reads are retried automatically on 429, 503 and
 network errors, with backoff that honours a positive `RateLimit-Reset` /
 `Retry-After` (one of 0 or less backs off exponentially, as with none), each

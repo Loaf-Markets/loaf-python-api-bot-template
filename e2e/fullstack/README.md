@@ -153,6 +153,12 @@ for the ask fills whole; C's bid takes B's ask: the tokens move from B to C, C p
 fee, and the fill is in C's history. C's fill pushes its holding_update with its average entry.
 
 **perps** (market `trade`)
+- first, before anything moves, the band check: the market's band must admit B's IOC at the ask + $1 and MM's bid at
+  the take-profit's limit, both placed with the mark at the index, and the take-profit's sell at that limit once the
+  walk has taken the mark 0.4 % past its trigger. So the step needs a perps band of at least about 140 bp: MM's bid
+  sits about 2 % above the mark less half the band (admitted from 133 bp at $1,500 and at $100), and the IOC needs
+  about 10 + 10,000 / price bp (110 at $100). The standard kit's markets have 1,000 bp; a band under what the step
+  needs fails it at once, naming each quote the band refuses;
 - allocates: into pool 0 and isolated pool 1 and back out of pool 1; the spot USDC moves by exactly the ticks, and a
   flat pool's collateral by ticks x extension;
 - the market is OPEN; A's market buy and B's market sell fill against MM: A long, B short by exactly the size; A's
@@ -162,8 +168,9 @@ fee, and the fill is in C's history. C's fill pushes its holding_update with its
   refused, and the FOK fills nothing;
 - a reduce-only sell of half A's long fills; a reduce-only buy in a flat pool opens nothing (with MM's ask resting at
   its price);
-- a buy with TP/SL legs from pool 3: two legs, both ARMED once the parent fills; the index walks above the
-  take-profit: the mark lags it, within 2 %, and when it gets there the leg fires and closes the long into MM's bid;
+- a buy with TP/SL legs from pool 3: two legs, both ARMED once the parent fills, the take-profit's limit its
+  trigger less 1 % held to half the market's band, as the SDK signs it; the index walks above the take-profit: the
+  mark lags it, within 2 %, and when it gets there the leg fires and closes the long into MM's bid at that limit;
 - A's fills read source, direction and closed PnL (the pool 1 close exactly (bid - ask) x size), its push carries
   the long, and its open order its pool;
 - A's and B's positions read ticker, qem, risk, max leverage, band, entry, entry quote, notional, funding owed and liquidation
@@ -250,7 +257,10 @@ proof step's history pages within the backend's largest, and its wait for trades
 no proof); a user's closes (TAKER rows of a close source on the market and pool, past a tradeId) and funding
 payments; the private channel's frames kept per user and a push's position read; a live state read again until the
 backend has one, and the wait for the mark to follow the index; a saved leverage read back from its answer, the
-summary and a push sent after it; the deleverage SQL on `l2_perps_fills`; each step's
+summary and a push sent after it; the take-profit's bid at the limit the SDK signs its leg; the perps step's band
+check (the exchange's rule, both edges in; each quote a band refuses named, MM's bid under 133 bp at $1,500, B's IOC
+under 110 bp at $100; a band of 100 bp fails the step before it touches a user); the
+deleverage SQL on `l2_perps_fills`; each step's
 restore (a failing step's markets reopened and walked home and the knob put at 0, with and without
 `E2E_HOME_INDEX`; a restore that fails named, a passing step then an error; a stop's restore) and the one-shot
 restore (alone, no setup). `E2E_SDK` names an SDK tree when the venv has none installed.

@@ -28,10 +28,10 @@ Every error the API can return is mapped to a specific exception so a bot can
         └── LoafServerError               5xx  (503 -> LoafServiceUnavailableError)
             └── LoafServiceUnavailableError 503
 
-An order route's refusal names why in :attr:`LoafAPIError.code`, one of
-:class:`~loaf.enums.OrderErrorCode`'s values, which never change meaning (the
-message is for people and may). The SDK picks the exception class from the
-status and that code, never from the message.
+An order route's refusal, and a withdrawal's, names why in
+:attr:`LoafAPIError.code`, one of :class:`~loaf.enums.OrderErrorCode`'s values,
+which never change meaning (the message is for people and may). The SDK picks
+the exception class from the status and that code, never from the message.
 """
 
 from __future__ import annotations
@@ -199,19 +199,24 @@ class WithdrawalOutcomeUnknownError(LoafError):
     Raised by :meth:`~loaf.resources.funds.FundsResource.withdraw` after a
     timeout or a server-side failure that the SDK's own identical re-sends did
     not settle, and by :meth:`~loaf.resources.funds.FundsResource.resubmit` on
-    anything but a 202. Never sign the same withdrawal afresh while it may have
-    been journaled: a fresh one signs the next nonce, so both could be paid.
+    anything but a 202 or a 422 ``ORDER_INDEX_USED``. Never sign the same
+    withdrawal afresh while it may have been journaled: a fresh one signs the
+    next nonce, so both could be paid.
 
     Re-send it unchanged with ``funds.resubmit(error.signed_body)`` instead:
     the exchange journals one withdrawal per account and nonce and answers a
     re-send of a journaled one as its duplicate (``duplicate: True``), so a 202
-    settles it. It takes the body only until its ``l2ExpiryMs`` minus
+    settles it. It answers that before it checks the nonce, so a re-send
+    refused 422 ``ORDER_INDEX_USED`` (raised as that
+    :class:`LoafAPIError`) settles it too: no attempt was journaled, and none
+    will be (its nonce went to another op): withdraw again. It takes the body
+    only until its ``l2ExpiryMs`` minus
     :data:`~loaf.constants.L2_BUFFER_MS` (the withdrawal's ``ttl_ms`` after it
-    was signed), by its own clock. Once it refuses a re-send for that (400,
-    the expiry is inside the buffer), your account's next nonce settles it
-    (``GET /l2/keys``' ``withdrawalNonce``): still ``l2Nonce``, it was never
-    journaled and never will be; past it, this withdrawal or another op you
-    signed at that nonce was.
+    was signed), by its own clock. Once it refuses a re-send for that
+    (``ORDER_EXPIRY_INVALID``: the expiry is inside the buffer), your account's
+    next nonce settles it (``GET /l2/keys``' ``withdrawalNonce``): still
+    ``l2Nonce``, it was never journaled and never will be; past it, this
+    withdrawal or another op you signed at that nonce was.
 
     Attributes:
         signed_body: The exact body that was sent (its nonce, expiry and
@@ -233,7 +238,8 @@ class WithdrawalOutcomeUnknownError(LoafError):
             f"{signed_body.get('l2AccountIndex')} at nonce {signed_body.get('l2Nonce')} was "
             f"journaled after {attempts} attempt(s) (last error: {last_error}). It may have been. "
             "Never sign it afresh: re-send it unchanged with funds.resubmit(error.signed_body), "
-            "whose 202 settles it (duplicate: journaled before; otherwise journaled now). The "
+            "whose 202 settles it (duplicate: journaled before; otherwise journaled now), as does "
+            "a 422 ORDER_INDEX_USED (never journaled: withdraw again). The "
             f"exchange takes it until its l2ExpiryMs {signed_body.get('l2ExpiryMs')} minus 72 "
             "hours; once it refuses a re-send for that, your account's next nonce settles it "
             f"(GET /l2/keys withdrawalNonce): still {signed_body.get('l2Nonce')}, never "
@@ -249,10 +255,10 @@ class LoafAPIError(LoafError):
         message: Human-readable error message (the API's ``error`` field; a
             refused login token's is followed by what it means).
         code: Machine-readable code when present. On the order routes (placements,
-            cancels, ``cancel_after``, ``cancel_by_index``) every refusal has one,
-            an :class:`~loaf.enums.OrderErrorCode` value: compare with it, never
-            with the message. The list grows: treat a code you do not know by
-            its status.
+            cancels, ``cancel_after``, ``cancel_by_index``) and on a withdrawal
+            every refusal has one, an :class:`~loaf.enums.OrderErrorCode` value:
+            compare with it, never with the message. The list grows: treat a
+            code you do not know by its status.
         details: List of field-level messages on a 400 validation error.
         request_id: The ``X-Request-Id`` for support correlation, if any.
         body: The raw parsed response body.
@@ -297,8 +303,8 @@ class LoafAuthError(LoafAPIError):
     refused.
 
     Reads, cancels, the account read and order-number reservation an order
-    placement makes, and perps allocates and exits (and their nonce read) are
-    authenticated by a login token your trading key signs.
+    placement makes, and perps allocates and exits and withdrawals (and their
+    nonce read) are authenticated by a login token your trading key signs.
     A 401 to one is followed, in the message, by what it means (the server's
     own text stays in :attr:`body`):
 
@@ -307,8 +313,8 @@ class LoafAuthError(LoafAPIError):
       another Loaf deployment's (``l2 signature: …``, ``l2 key: …``,
       ``l2 account: …``, or ``l2 login: the token is for another exchange's L2
       chain``). Every request fails the same way until you set the key in force
-      (README §2) and restart; after a reset, cancel and re-arm your stops and
-      takes, which FAIL when they fire;
+      (README §2) and restart; after a reset, place your stops and takes again:
+      the exchange FAILS the ones signed before it;
     * this machine's clock is off (``l2 login: the token has expired``, or
       ``… expires more than 15 minutes ahead``): synchronize it, to within about
       5 minutes of the exchange's.
@@ -323,6 +329,12 @@ class LoafAuthError(LoafAPIError):
     leg), ``l2 key: …``, or ``l2 account: no trading account has this account
     index``. Nothing was placed. The next order re-reads your trading account,
     whose login token is refused, with the cause named, if the key changed.
+
+    From a withdrawal, a 401 with ``code`` ``INVALID_SIGNATURE`` refuses the
+    withdrawal's own signature or key (``l2 signature: …``, ``l2 key: …``, or
+    ``l2 money: the signing key is not the key the journal set for the api
+    key``): nothing was journaled, and the message names your trading key not
+    in force, as for a login token.
     """
 
 

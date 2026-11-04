@@ -63,7 +63,7 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak, to_checksum_address
-from loaf import k1
+from loaf import k1, worst_price
 from loaf.client import LoafClient
 from loaf.constants import PERPS_SPOT_SIDE, TRADING_KEY_PREFIX
 from loaf.exceptions import (
@@ -823,6 +823,62 @@ def legs_of(user: User, parent: int) -> list[Mapping[str, Any]]:
     return [o for o in section(user, "openOrders") if int(o.get("parentOrderId") or 0) == parent]
 
 
+def band_of(l2: Mapping[str, Any]) -> int:
+    """A perp's band, bp, as the SDK reads its ``l2``'s ``band``: 0, no band, when absent, not an int or not
+    positive."""
+    band = l2.get("band")
+    return band if isinstance(band, int) and not isinstance(band, bool) and band > 0 else 0
+
+
+def in_band(price: int, centre: int, band: int) -> bool:
+    """The exchange's perps band, both in one price unit: ``|price - centre| x 10,000 <= band x centre``, both edges
+    in; a band or a centre of 0 bands nothing."""
+    return band == 0 or centre == 0 or abs(price - centre) * 10_000 <= band * centre
+
+
+def leg_limit(l2: Mapping[str, Any], trigger: Decimal, side: str, bps: int) -> Decimal:
+    """The limit a perps TP/SL leg of ``side`` signs off ``trigger`` with ``leg_max_slippage_bps=bps``, as the SDK
+    derives it: moved at most half the market's band (its ``l2``'s ``band`` bp; 0 bounds nothing), to the cent toward
+    the trigger."""
+    band = band_of(l2)
+    return Decimal(str(worst_price(trigger, side, min(bps, band // 2) if band else bps)))
+
+
+# Where the perps step's walk takes the index past its take-profit's trigger.
+PAST_TAKE_PROFIT = Decimal("1.004")
+# What the perps step needs of its market's band: it checks the band before it moves anything.
+PERPS_BAND_NEEDED = (
+    "The perps step needs a band of at least about 140 bp on its market: MM's bid at the take-profit's limit sits "
+    "about 2 % above the mark less half the band, and B's IOC at the ask + $1 needs about 10 + 10,000 / price bp. "
+    "The standard kit's markets have 1,000 bp."
+)
+
+
+def perps_prices(run: Run, l2: Mapping[str, Any], px: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal]:
+    """The perps step's prices off the index ``px`` (dollars): MM's bid and ask, 0.1 % either side of it; the
+    take-profit's and the stop-loss's triggers, 2 % above and 3 % below it; and the take-profit's limit, its trigger
+    less the leg's 1 % as the SDK signs it (leg_limit)."""
+    lo, hi = run.cents(px * Decimal("0.999"), False), run.cents(px * Decimal("1.001"), True)
+    tp, sl = run.cents(px * Decimal("1.02"), True), run.cents(px * Decimal("0.97"), False)
+    return lo, hi, tp, sl, leg_limit(l2, tp, "SELL", 100)
+
+
+def perps_band_misses(run: Run, l2: Mapping[str, Any], px: Decimal, mark: int) -> list[str]:
+    """The perps step's quotes that its market's band (``l2``'s) refuses by the exchange's rule (in_band), named, with
+    the index at ``px`` dollars and the mark at ``mark`` (index units): B's IOC at the ask + $1 and MM's bid at the
+    take-profit's limit, placed while the mark is there, and the fired take-profit's sell at that limit once the walk
+    has taken the mark up to PAST_TAKE_PROFIT x its trigger. Empty when the band admits them all."""
+    band = band_of(l2)
+    _, hi, tp, _, limit = perps_prices(run, l2, px)
+    quotes = (
+        ("B's IOC at the ask + $1", hi + 1, mark),
+        ("MM's bid at the take-profit's limit", limit, mark),
+        ("the take-profit's sell at its limit", limit, run.to_index(tp * PAST_TAKE_PROFIT)),
+    )
+    return [f"{what}, ${price}, lies outside {band} bp of ${run.dollars(centre)}" for what, price, centre in quotes
+            if not in_band(run.to_index(price), centre, band)]
+
+
 def newest_trade(user: User) -> int:
     rows = user.c.history.trades(page_size=1)["trades"]
     return int(rows[0]["tradeId"]) if rows else 0
@@ -1510,6 +1566,12 @@ def step_perps(run: Run) -> None:
     m = run.mkt("trade")
     t = run.ticker(m)
     a, b, mm = run.users["A"], run.users["B"], run.mm
+    # Before anything moves: a band too narrow for the step's quotes would refuse them PRICE_BAND (or leave the fired
+    # take-profit ARMED until the wait for its fill times out).
+    live = run.live(m)
+    misses = perps_band_misses(run, run.perps[m], run.dollars(int(live["indexPrice"])), int(live["markPrice"]))
+    if misses:
+        raise Failed(f"market {m}'s band is too narrow for this step: {'; '.join(misses)}. {PERPS_BAND_NEEDED}")
     run.cancel_all()
     run.fund(mm, 0, Decimal(100_000))
     run.fund(b, 0, Decimal(10_000))
@@ -1529,7 +1591,7 @@ def step_perps(run: Run) -> None:
     px = run.dollars(idx)
     q = run.qty(m)
     units = run.units(q)
-    lo, hi = run.cents(px * Decimal("0.999"), False), run.cents(px * Decimal("1.001"), True)
+    lo, hi, tp, sl, limit = perps_prices(run, run.perps[m], px)
     log(f"  market {m} ({t}): index {idx} = ${px}, size {q}, bid ${lo}, ask ${hi}")
 
     # long by market (A takes MM's ask), short by market (B hits MM's bid)
@@ -1603,7 +1665,6 @@ def step_perps(run: Run) -> None:
 
     # TP/SL legs: armed by the parent's fill; the take-profit fires on the mark's rise and closes the long
     placed(mm.c.orders.limit_sell(t, float(q), float(hi), pool=0), "MM's ask")
-    tp, sl = run.cents(px * Decimal("1.02"), True), run.cents(px * Decimal("0.97"), False)
     r = placed(a.c.orders.limit_buy(t, float(q), float(hi), pool=3, tp_price=float(tp), sl_price=float(sl),
                                     leg_max_slippage_bps=100), f"A's buy from pool 3 with TP ${tp} and SL ${sl}")
     parent = int(r["orderId"])
@@ -1612,9 +1673,15 @@ def step_perps(run: Run) -> None:
     rows = run.until("both legs ARMED by the parent's fill", lambda: (lambda x: x if len(x) == 2 and all(
         o.get("status") == "ARMED" for o in x) else None)(legs_of(a, parent)))
     log(f"  legs: {[(o.get('id'), o.get('type'), o.get('triggerPrice'), o.get('status')) for o in rows]}")
-    placed(mm.c.orders.limit_buy(t, float(q), float(run.cents(tp * Decimal("0.995"), False)), pool=0),
-           "MM's bid for the take-profit")
-    run.walk(m, run.to_index(tp * Decimal("1.004")))
+    # The take-profit sells no lower than its limit, its trigger less the leg's 1 % held to half the market's band, and
+    # MM bids at that limit for the fired leg to sell into. MM's bid goes in with the mark still at the index, about
+    # 2 % under the trigger, so it sits about 2 % above the mark less half the band: the step's first check saw the
+    # band admit it (one under about 140 bp refuses it PRICE_BAND; PERPS_BAND_NEEDED).
+    take = next((o for o in rows if Decimal(str(o.get("triggerPrice"))) == tp), None)
+    check(take is not None and Decimal(str(take.get("price"))) == limit,
+          f"the take-profit sells no lower than ${limit}: {short(take)}")
+    placed(mm.c.orders.limit_buy(t, float(q), float(limit), pool=0), "MM's bid for the take-profit")
+    run.walk(m, run.to_index(tp * PAST_TAKE_PROFIT))
     live = run.live(m)
     index, mark = int(live["indexPrice"]), int(live["markPrice"])
     check(mark != index and abs(mark - index) * 50 <= index, f"the mark {mark} lags the index {index}, within 2 %")

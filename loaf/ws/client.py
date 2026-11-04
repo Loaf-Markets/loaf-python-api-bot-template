@@ -362,8 +362,8 @@ class LoafWebSocketClient:
         trading-key reset or a cancel-all sent on chain), a delisted (or
         unlisted) market, a BUY that can no longer fund a fill within its hold
         (budget exhausted), an aggressing SELL at K1's bound (its remainder does
-        not rest), your own order crossing your resting one (self-trade), and a
-        firing stop freeing funds by cancelling your resting orders.
+        not rest), and your own order crossing your resting one (self-trade). A
+        firing stop or take cancels none of your orders.
         """
         return self.on(WSMessageType.ORDER_STATUS, handler)
 
@@ -374,9 +374,10 @@ class LoafWebSocketClient:
         with :func:`loaf.is_conditional_order` before reading ``filledQuantity``,
         which a conditional does not carry. Every conditional transition
         publishes one of these, TP/SL legs included (they are conditional rows).
-        A firing conditional also cancels your own resting orders on that side
-        of that market to free its funds, so you can receive ``CANCELLED``
-        frames for orders you never cancelled.
+        A firing conditional cancels none of your orders: a TP/SL leg cancels
+        only its OCO sibling (the other leg, ``CANCELLED``), and one that fires
+        short of funds or tokens is ``FAILED``, with the refusal's text as its
+        ``rejectionReason``.
 
         For a booked order it is sent after the exchange commits and carries the
         committed row, with ``expiryMs`` (unix ms, the signed expiry),

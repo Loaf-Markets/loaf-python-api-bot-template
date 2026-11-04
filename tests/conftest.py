@@ -184,12 +184,14 @@ KEYS = {
     "pending": False,
     "withdrawalNonce": 0,
 }
-# The exchange's 422 for a perps op not signed at the account's api key 0 nonce.
+# The exchange's 422 for a perps op or a withdrawal not signed at the account's api key 0 nonce: a
+# withdrawal's with code ORDER_INDEX_USED (its number is its nonce), a perps op's with none.
 NONCE_REFUSAL = "l2 money: the nonce is not the api key's nonce (tx_nonce == api_key.nonce)"
-# The backend's 400 for a withdrawal whose expiry is inside the 72-hour buffer (L2_REASONS).
+# The exchange's 400 ORDER_EXPIRY_INVALID for a withdrawal whose expiry is inside the 72-hour buffer.
 EXPIRY_INSIDE_BUFFER = "l2 expiry: the expiry is inside the buffer"
 
-# The backend's 401s to a request whose login token it does not take.
+# The backend's 401s to a request whose login token it does not take, each with code
+# UNAUTHENTICATED (login_reply).
 NO_BEARER = "Missing or invalid Authorization header"
 MALFORMED = "l2 login: the token is not a trading-key login token"
 WRONG_CHAIN = "l2 login: the token is for another exchange's L2 chain"
@@ -299,8 +301,8 @@ class FakeExchange:
       login token, ``Authorization: Bearer <token>``: one the exchange does not take
       (:func:`login_refusal`, the account's api key 0 in force ``key_in_force``, the
       clock ``now_ms``, ``None``: the SDK's own) is answered 401 with the backend's
-      text, before anything queued. A signature is checked once per key, as the
-      backend caches it.
+      text and code ``UNAUTHENTICATED`` (:func:`login_reply`), before anything
+      queued. A signature is checked once per key, as the backend caches it.
     * ``GET /trade`` lists ``details``; ``GET /trade/{ticker}`` serves
       ``details[ticker]``, and an unknown ticker is a 404 ``Market not found``.
       Replace an entry to change what they serve.
@@ -320,10 +322,11 @@ class FakeExchange:
     * ``POST /l2/allocations``, ``/l2/exits`` and ``/l2/withdrawals`` apply a signed
       op at the account's nonce (``keys["withdrawalNonce"]``, which moves up by one,
       one counter for the three): 202 with the next ``journalSeq``; a re-send of an
-      applied op is its duplicate, and any other op off the nonce is refused (422). A
-      withdrawal is first refused 400 when its expiry is inside the buffer (by
-      ``now_ms``), as the backend does, and its 202 echoes its terms with
-      ``status`` PENDING.
+      applied op is its duplicate, and any other op off the nonce is refused (422, a
+      withdrawal's with code ``ORDER_INDEX_USED``). A withdrawal is first refused 400
+      ``ORDER_EXPIRY_INVALID`` when its expiry is inside the buffer (by ``now_ms``),
+      and its 202 echoes its terms with ``status`` PENDING. A withdrawal's refusal
+      is ``{error, code}``, as an order's.
 
     ``queue(path, *replies)`` makes ``path`` (without ``/api``) answer with each
     reply in turn before any of that, once its login token is taken: an
@@ -372,12 +375,12 @@ class FakeExchange:
             return None
         bearer = request.headers.get("authorization", "")
         if not bearer.startswith("Bearer "):
-            return httpx.Response(401, json={"error": NO_BEARER})
+            return login_reply(NO_BEARER)
         now_ms = self.now_ms if self.now_ms is not None else loaf._l2.time.time_ns() // 1_000_000
         reason = login_refusal(
             bearer[len("Bearer ") :], self.key_in_force, now_ms, verified=self._verified
         )
-        return None if reason is None else httpx.Response(401, json={"error": reason})
+        return None if reason is None else login_reply(reason)
 
     def _serve(self, request: httpx.Request) -> httpx.Response:
         route = request.method + " " + request.url.path[len("/api") :]
@@ -421,8 +424,10 @@ class FakeExchange:
             body = json.loads(request.content)
             now_ms = self.now_ms if self.now_ms is not None else loaf._l2.time.time_ns() // 1_000_000
             if body["l2ExpiryMs"] - loaf.L2_BUFFER_MS < now_ms:
-                return httpx.Response(400, json={"error": EXPIRY_INSIDE_BUFFER})
-            reply = self._apply(request.content)
+                return httpx.Response(
+                    400, json={"error": EXPIRY_INSIDE_BUFFER, "code": "ORDER_EXPIRY_INVALID"}
+                )
+            reply = self._apply(request.content, nonce_code="ORDER_INDEX_USED")
             if reply.status_code != 202:
                 return reply
             return httpx.Response(
@@ -457,16 +462,20 @@ class FakeExchange:
             )
         return httpx.Response(404, json={"error": "Not found"})
 
-    def _apply(self, content: bytes) -> httpx.Response:
-        """A signed perps op: applied once, at the account's nonce (signatures are not
-        checked here: verify_op does that)."""
+    def _apply(self, content: bytes, nonce_code: str | None = None) -> httpx.Response:
+        """A signed perps op or withdrawal: applied once, at the account's nonce
+        (signatures are not checked here: verify_op does that). One off the nonce is
+        refused 422, with ``nonce_code`` as its code when given."""
         nonce = json.loads(content)["l2Nonce"]
         if nonce in self.applied:
             body, seq = self.applied[nonce]
             if body == content:
                 return httpx.Response(202, json={"journalSeq": seq, "duplicate": True})
         if nonce != self.keys["withdrawalNonce"]:
-            return httpx.Response(422, json={"error": NONCE_REFUSAL})
+            refusal = {"error": NONCE_REFUSAL}
+            return httpx.Response(
+                422, json=refusal if nonce_code is None else {**refusal, "code": nonce_code}
+            )
         self._next_seq += 1
         self.applied[nonce] = (content, self._next_seq)
         self.keys["withdrawalNonce"] = nonce + 1
@@ -632,6 +641,12 @@ def verify_login(token: str, public_key: str = L2_PUBLIC_KEY) -> dict[str, int]:
         bytes.fromhex(signature[80:]),
     )
     return {"l2ChainId": chain_id, "l2AccountIndex": account_index, "l2ExpiryMs": expiry_ms}
+
+
+def login_reply(reason: str) -> httpx.Response:
+    """The backend's 401 refusing a request's login token: its text, and code UNAUTHENTICATED,
+    as it refuses every one."""
+    return httpx.Response(401, json={"error": reason, "code": "UNAUTHENTICATED"})
 
 
 def login_refusal(

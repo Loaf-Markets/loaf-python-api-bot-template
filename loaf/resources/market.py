@@ -79,8 +79,10 @@ class MarketResource(Resource):
         videoUrl, stakeholders, property}``:
         ``property`` is a property's own facts (``None`` for any other kind). A
         spot market and the perp of one asset carry the same ``asset``. The
-        detail has no ``marketPrice``: the reference MARKET orders are priced
-        from is the ``marketList`` entry with the same ``ticker``.
+        detail has no ``marketPrice``: a spot market's MARKET orders are priced
+        from the ``marketList`` entry with the same ``ticker``, a perp's from
+        its live mark (``market.live.markPrice``; that entry while the mark is
+        0 or not served, ``live`` null).
 
         The market trades while its ``status`` is ``LIVE``, it is not
         ``isHalted``, its ``l2`` is not ``None`` and its ``tradingStartsAt``
@@ -108,8 +110,9 @@ class MarketResource(Resource):
         * ``asOfMs``, the engine clock those four are as of: bound their age
           by it;
         * ``markPrice``, what your positions are valued at, margin is checked
-          at and stops and takes fire on (within 2 % of the index; 0 before
-          the first report), and ``indexPrice``, the oracle's accepted index
+          at, stops and takes fire on and the market's band (``l2.band``)
+          centres on (within 2 % of the index; 0 before the first report, when
+          no band applies), and ``indexPrice``, the oracle's accepted index
           (0 before the first report), as of ``observedAtMs``, both in the
           market's price units (dollars x 1000); ``openInterest`` (base units,
           K1's two-sided sum: longs plus shorts, so one side's is half)

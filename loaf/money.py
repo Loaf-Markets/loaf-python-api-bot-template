@@ -181,11 +181,24 @@ def worst_price(reference_price: float | Decimal, side: str, max_slippage_bps: i
     :meth:`~loaf.resources.orders.OrdersResource.market_buy` / ``market_sell``
     sign (off the market reference), what a ``*_MARKET`` conditional books at
     (off its trigger), and the lowest price a TP/SL leg sells at (off its
-    trigger, as a SELL). Refused when it would be above 4,294,967.29, the
-    highest price an order can sign.
+    trigger, as a SELL). On a perp the SDK holds the move to half the market's
+    band first: pass ``min(max_slippage_bps, band // 2)`` (``band``, the
+    market's ``l2.band``; 0 bounds nothing) and, for a MARKET order, the live
+    mark to get what it signs there, unless this price crosses an off-grid mark
+    (a SELL's above it, a BUY's below it) or lies outside the band, as a BUY's
+    0.01 off a mark under one cent can. The SDK then signs the cent on the
+    mark's near side (a SELL's below the mark, a BUY's above it) when this
+    price crossed and that cent is inside the band and within the order's whole
+    max slippage of the mark (not the min passed here), else this price when it
+    is inside the band, else refuses the order (the orders module, **The perps
+    band**). A MARKET order's ``reference_price`` with a max slippage of 0 signs
+    this price whatever the band. Refused when it would be above 4,294,967.29,
+    the highest price an order can sign.
 
-    Use it to size a MARKET BUY: a BUY holds this price x quantity x
-    (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of your cash.
+    Use it to size a MARKET BUY: a BUY holds the price it signs x quantity x
+    (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of your cash:
+    this price, or on a perp the cent above an off-grid mark where the SDK
+    signs that instead.
 
     ``side`` is ``BUY`` or ``SELL``; ``max_slippage_bps`` a whole number from 0
     to 9999, required so your sizing cannot drift from what the client signs:

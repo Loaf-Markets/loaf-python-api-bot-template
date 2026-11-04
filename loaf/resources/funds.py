@@ -30,14 +30,31 @@ ticks; a transfer row's ``amount`` is in USDC's base units.
 an order is, and sent with a login token your trading key signs (the exchange
 checks the account is yours). It spends your account's next nonce, the one
 counter perps allocates and exits spend too: the SDK reads it
-(``GET /l2/keys``) for each one and sends one at a time per client. An op
-sent elsewhere (the web app, another process) between that read and the send
-makes the exchange refuse this one, ``l2 money: the nonce is not the api
-key's nonce …`` (422): send it again, and the SDK reads the new nonce.
+(``GET /l2/keys``) for each one and sends one at a time per client. A
+withdrawal's number is its nonce, so an op sent elsewhere (the web app,
+another process) between that read and the send makes the exchange refuse
+this one as it refuses an order on a used number: 422, ``code``
+``ORDER_INDEX_USED`` (``l2 money: the nonce is not the api key's nonce …``).
+Withdraw again: the SDK reads the new nonce. A signature or key the exchange
+refuses is 401 ``INVALID_SIGNATURE``, as an order's
+(:class:`~loaf.exceptions.LoafAuthError`): your trading key is not the one in
+force on the account.
+
+**Refusals** answer as an order's do: each carries a ``code``
+(:attr:`~loaf.exceptions.LoafAPIError.code`, one of
+:class:`~loaf.enums.OrderErrorCode`), and the exception class follows from the
+status and the code. Branch on them, never on the message.
+:meth:`FundsResource.withdraw` lists them; none journaled anything.
 
 **Retries.** As for orders: a timeout or a 5xx re-sends the same signed body,
 which the exchange journals once at most (it answers a repeat of a journaled
-one ``duplicate: True``). Any error other than
+one ``duplicate: True``). A 503 ``NOT_PROCESSED`` or ``TRADING_PAUSED``, or
+one that says nothing was done, journaled nothing: re-sent like any 5xx, it is
+raised as itself when no earlier attempt may have landed. A re-send refused
+422 ``ORDER_INDEX_USED`` is raised as itself even after an attempt whose answer
+was lost: the exchange answers a re-send of a journaled withdrawal as its
+duplicate before it checks the nonce, so no attempt was journaled, and none
+will be (its nonce went to another op): withdraw again. Any error other than
 :class:`~loaf.exceptions.WithdrawalOutcomeUnknownError` means nothing was
 journaled; on that one, ``resubmit(error.signed_body)``, and never sign the
 same withdrawal afresh while it may have been journaled.
@@ -88,6 +105,10 @@ class FundsResource(Resource):
         """``POST /l2/withdrawals`` — withdraw ``amount`` USDC from your spot
         balance to your own wallet, signed with your trading key.
 
+        Every refusal by the exchange carries ``code``
+        (:class:`~loaf.enums.OrderErrorCode`), as an order's does, and
+        journaled nothing: withdraw again once its cause is gone.
+
         Args:
             amount: USDC (a number; a ``Decimal`` for exact cents): a whole
                 number of the collateral's ticks (see the module's Units),
@@ -108,24 +129,47 @@ class FundsResource(Resource):
 
         Raises:
             LoafConfigError: no trading key.
-            LoafServiceUnavailableError: the exchange could not read the
-                collateral just now: nothing was sent.
-            LoafServerError: your summary has no usable collateral.
+            LoafAPIError: 422, refused by the exchange's rules (this class
+                itself; ``code`` says which): ``INSUFFICIENT_BALANCE``, more
+                than your spot USDC available (your resting orders hold some);
+                ``BELOW_MIN_ORDER_VALUE``, less than the minimum withdrawal;
+                ``RATE_LIMITED``, too many withdrawals not yet settled on
+                chain, yours or everyone's (withdraw again later);
+                ``ORDER_INDEX_USED``, the nonce, spent first by an op sent
+                elsewhere (withdraw again: the SDK reads the next one), also
+                after an attempt whose answer was lost: none was journaled;
+                ``ORDER_EXPIRY_INVALID``, ``INVALID_REQUEST`` or
+                ``UNKNOWN_REASON``, the message says why.
+            LoafRateLimitError: 429 ``RATE_LIMITED``, your account's request
+                rate (the withdrawals not yet settled are the 422 above):
+                withdraw again after ``retry_after`` seconds.
+            LoafAuthError: 401. ``UNAUTHENTICATED``: the exchange refused the
+                login token; the message says why after the exchange's text
+                (this machine's clock, or your trading key not the one in force
+                on its account, a key of another deployment included, refused
+                at the nonce read). ``INVALID_SIGNATURE``: it refused the
+                withdrawal's own signature or key: your trading key is not the
+                one in force on its account, which the message says.
+            LoafForbiddenError: 403 ``ORDER_NOT_OWNED``: the account is not
+                the login's.
             LoafValidationError: refused locally (``status_code`` 0, nothing
-                sent) or by the exchange (400).
-            LoafAPIError: 422, the exchange refused it by its rules, with the
-                reason: less than the minimum withdrawal, more than your spot
-                USDC available (your resting orders hold some), too many of
-                your withdrawals not yet settled, the nonce, and the like.
-                Nothing was journaled.
-            TradingPausedError: 503, the exchange paused: nothing was
-                journaled; send it again once it resumes (``retry_after``).
-            LoafAuthError: the exchange refused the login token or the
-                signature: your trading key is not the one in force on its
-                account (also a key of another deployment, refused at the
-                nonce read).
+                sent) or by the exchange (400): ``ORDER_EXPIRY_INVALID``, its
+                expiry inside the buffer (this machine's clock is behind), or
+                ``INVALID_REQUEST``, another L2 chain or a body the exchange
+                does not take (``details`` names the fields).
+            TradingPausedError: 503 ``TRADING_PAUSED``, the exchange paused:
+                send it again once it resumes (``retry_after``).
+            LoafServiceUnavailableError: 503 ``NOT_PROCESSED``, the exchange
+                did not process it, or ``SERVICE_UNAVAILABLE`` saying nothing
+                was done (your account unread before anything was sent on),
+                after the SDK's re-sends: withdraw again. Or the collateral
+                could not be read just now: nothing was sent.
+            LoafServerError: your summary has no usable collateral.
             WithdrawalOutcomeUnknownError: it may or may not have been
-                journaled; :meth:`resubmit` it, never sign it afresh.
+                journaled (a timeout, a 503 ``SERVICE_UNAVAILABLE`` that the
+                exchange did not decide, or any refusal of a re-send after an
+                attempt whose answer was lost but ``ORDER_INDEX_USED``):
+                :meth:`resubmit` it, never sign it afresh.
         """
         key = self._credentials()
         value = _to_decimal(amount, "amount")
@@ -160,14 +204,18 @@ class FundsResource(Resource):
         a :class:`~loaf.exceptions.WithdrawalOutcomeUnknownError`).
 
         A 202 settles it: ``duplicate: True``, journaled before; otherwise
-        journaled now. Anything else raises ``WithdrawalOutcomeUnknownError``
+        journaled now. A 422 ``ORDER_INDEX_USED`` settles it too, raised as
+        itself (a :class:`~loaf.exceptions.LoafAPIError`): the exchange answers
+        a re-send of a journaled withdrawal as its duplicate first, so this one
+        was never journaled and never will be (its nonce went to another op):
+        withdraw again. Anything else raises ``WithdrawalOutcomeUnknownError``
         again, with the reason in ``last_error``. The exchange takes the body
         until its ``l2ExpiryMs`` less 72 hours, by its own clock; once it
-        refuses a re-send for that (400), your account's next nonce settles it
-        (``GET /l2/keys``' ``withdrawalNonce``): still the body's ``l2Nonce``,
-        it was never journaled and never will be; past it, this withdrawal or
-        another op you signed at that nonce was. Needs your trading key, for
-        the login token: it signs nothing new.
+        refuses a re-send for that (``ORDER_EXPIRY_INVALID``), your account's
+        next nonce settles it (``GET /l2/keys``' ``withdrawalNonce``): still
+        the body's ``l2Nonce``, it was never journaled and never will be; past
+        it, this withdrawal or another op you signed at that nonce was. Needs
+        your trading key, for the login token: it signs nothing new.
         """
         body = signed_body if isinstance(signed_body, Mapping) else {}
         if not (

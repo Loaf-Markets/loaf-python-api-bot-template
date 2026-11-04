@@ -63,7 +63,7 @@ NOT_IN_FORCE = (
     "app, the account's key is not active yet (enable trading on a market's Trade page and wait "
     "for it to take effect), or it is another Loaf deployment's key (check LOAF_API_BASE_URL). Set "
     "LOAF_TRADING_KEY to the web app's Show trading key (README §2) and restart; after a reset, "
-    "also cancel and re-arm your stops and takes."
+    "also place your stops and takes again: the exchange FAILS the ones signed before it."
 )
 CLOCK_OFF = (
     "this machine's clock is off: the exchange takes a login token only before its expiry and at "
@@ -397,6 +397,8 @@ def test_each_attempt_of_a_read_carries_its_own_login_token(
 def test_a_refused_login_token_says_what_to_do(
     exchange, trading_client, l2_clock, setup, reason, meaning
 ):
+    # The exchange codes every refused login token UNAUTHENTICATED: what it means follows its
+    # text, the key or this machine's clock.
     now = freeze(l2_clock)
     exchange.key_in_force = setup.get("key_in_force", L2_PUBLIC_KEY)
     if "clock" in setup:
@@ -407,7 +409,8 @@ def test_a_refused_login_token_says_what_to_do(
             client.history.trades()
         error = info.value
         assert error.message == f"{reason} — {meaning}"
-        assert (error.status_code, error.body) == (401, {"error": reason})
+        assert (error.status_code, error.code) == (401, "UNAUTHENTICATED")
+        assert error.body == {"error": reason, "code": "UNAUTHENTICATED"}
     # Each refused token is dropped: the next request signs a fresh one.
     first, second = bearers(exchange, "/history/trades")
     assert first != second
@@ -430,8 +433,11 @@ def test_after_a_reset_the_next_request_is_refused_though_its_token_was_taken_be
 
 
 def test_another_401_keeps_its_text_and_drops_the_token(exchange, trading_client):
-    # A route that needs a web-app login (requested by hand): nothing about the key to add.
-    exchange.queue("/auth/profile", httpx.Response(401, json={"error": PRIVY_ONLY}))
+    # A route that needs a web-app login (requested by hand): nothing about the key to add, though
+    # its code is a refused login token's.
+    exchange.queue(
+        "/auth/profile", httpx.Response(401, json={"error": PRIVY_ONLY, "code": "UNAUTHENTICATED"})
+    )
     client = trading_client()
     with pytest.raises(loaf.LoafAuthError) as info:
         client.get("/auth/profile")

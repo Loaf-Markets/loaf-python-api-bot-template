@@ -112,7 +112,8 @@ class CandleResolution(_StrEnum):
 class OrderErrorCode(_StrEnum):
     """The stable reason of a refused order request: ``code`` on the
     :class:`~loaf.exceptions.LoafAPIError` of a placement, a cancel,
-    ``cancel_after`` or ``cancel_by_index``.
+    ``cancel_after``, ``cancel_by_index`` or a withdrawal
+    (:meth:`~loaf.resources.funds.FundsResource.withdraw`).
 
     Compare an error's ``code`` with these, never its message: the message is
     for people and may change, a code never is renamed, reused or removed. The
@@ -121,12 +122,14 @@ class OrderErrorCode(_StrEnum):
     """
 
     # The order's terms: the same order is refused again; change it.
-    #: Its free balance or margin cannot cover it.
+    #: Its free balance or margin cannot cover it (a withdrawal: your spot USDC available).
     INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+    #: Below the minimum order value (a withdrawal: below the minimum withdrawal).
     BELOW_MIN_ORDER_VALUE = "BELOW_MIN_ORDER_VALUE"
     #: Above its own maximum order value.
     ABOVE_MAX_ORDER_VALUE = "ABOVE_MAX_ORDER_VALUE"
-    #: Its limit price is outside the market's price band.
+    #: Its price is outside the market's price band: on a perp, the band around its mark, or a
+    #: stop's, take's or TP/SL leg's limit outside the band around its own trigger.
     PRICE_BAND = "PRICE_BAND"
     #: :class:`~loaf.exceptions.PostOnlyWouldTakeError`.
     POST_ONLY_WOULD_TAKE = "POST_ONLY_WOULD_TAKE"
@@ -144,7 +147,8 @@ class OrderErrorCode(_StrEnum):
     # The signed fields: sign again.
     #: The signature, its key or its account does not verify (401).
     INVALID_SIGNATURE = "INVALID_SIGNATURE"
-    #: Its order number is used, by another order or voided by ``cancel_by_index``.
+    #: Its order number is used, by another order or voided by ``cancel_by_index``. A
+    #: withdrawal's number is its nonce: one spent first by another op (withdraw again).
     ORDER_INDEX_USED = "ORDER_INDEX_USED"
     #: Its expiry is inside the buffer or past the longest order life from now.
     ORDER_EXPIRY_INVALID = "ORDER_EXPIRY_INVALID"
@@ -186,6 +190,8 @@ class OrderErrorCode(_StrEnum):
     #: Malformed; ``details`` names the fields when the exchange's validation refused it.
     INVALID_REQUEST = "INVALID_REQUEST"
     UNAUTHENTICATED = "UNAUTHENTICATED"
+    #: Too many requests (429). A withdrawal's 422: too many withdrawals, yours or everyone's, not
+    #: yet settled on chain: withdraw again later.
     RATE_LIMITED = "RATE_LIMITED"
     #: The exchange did not process it, and nothing was placed: send it again (503).
     NOT_PROCESSED = "NOT_PROCESSED"

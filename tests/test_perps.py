@@ -1,6 +1,7 @@
 """Perps against an in-memory exchange: the perps reads, a perps order's signed
-pool and reduce-only bit, allocates and exits (their bodies, signatures and
-nonce), their retries and resubmit, and the market-state refusals.
+pool and reduce-only bit, the prices the SDK derives within a perp's band,
+allocates and exits (their bodies, signatures and nonce), their retries and
+resubmit, and the market-state refusals.
 
 Signatures are checked with ``conftest.verify_order`` and ``conftest.verify_op``,
 which rebuild the signed terms from the posted JSON as the exchange reads it.
@@ -9,8 +10,10 @@ which rebuild the signed terms from the posted JSON as the exchange reads it.
 from __future__ import annotations
 
 import json
+import random
 import re
 import threading
+from collections import Counter
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +25,7 @@ import loaf
 from loaf import PerpsOutcomeUnknownError, k1
 from loaf._l2 import market_of
 from loaf.constants import DEFAULT_PERPS_OP_TTL_MS, MAX_PERPS_OP_TTL_MS, MIN_ORDER_TTL_MS
+from loaf.resources.orders import _Derived
 
 from conftest import (
     ACCOUNT_INDEX,
@@ -39,6 +43,7 @@ from conftest import (
     UNKNOWN_KEY,
     WRONG_CHAIN,
     freeze,
+    js_round,
     market_detail,
     routes,
     secret_locals,
@@ -180,9 +185,21 @@ def test_reads_check_their_arguments_locally(exchange, trading_client, read):
 
 def test_market_of_a_perp():
     assert market_of(PERPS_DETAIL, "OPRA-PERP") == (
-        421614, "0x" + "11" * 20, 4242, 4, 0, 3, "PERP", "ACTIVE"
+        421614, "0x" + "11" * 20, 4242, 4, 0, 3, "PERP", "ACTIVE", 500
     )
-    assert market_of(market_detail(), "OPRA")[3:] == (2050, 6, 3, "SPOT", None)
+    assert market_of(market_detail(), "OPRA")[3:] == (2050, 6, 3, "SPOT", None, 0)
+
+
+@pytest.mark.parametrize("band", [0, -1, "500", 500.0, True, None, ...])
+def test_no_band_and_a_band_not_served_as_one_bound_nothing(band):
+    # 0 is no band. The band is not signed, so one the market does not serve as a positive whole
+    # number of bp (`...`: none served) is no reason to refuse its orders: it bounds nothing, as
+    # in the web app.
+    l2 = {k: v for k, v in PERP_L2.items() if k != "band"}
+    if band is not ...:
+        l2["band"] = band
+    market = market_of(market_detail("OPRA-PERP", market_index=4, l2=l2), "OPRA-PERP")
+    assert market.band == 0
 
 
 @pytest.mark.parametrize(
@@ -827,11 +844,18 @@ def test_an_expired_perp_takes_no_orders(exchange, trading_client):
     assert routes(exchange.requests) == ["GET /trade/OPRA-PERP"]
 
 
-def check_legs_as_the_exchange(body: dict) -> None:
+def within_band(price: int, centre: int, band: int) -> bool:
+    """The exchange's perps band, in its price units (dollars x 1000): ``|price - centre| x
+    10,000 <= band x centre``, both edges in; a band or a centre of 0 bands nothing."""
+    return band == 0 or centre == 0 or abs(price - centre) * 10_000 <= band * centre
+
+
+def check_legs_as_the_exchange(body: dict, band: int = PERP_L2["band"]) -> None:
     """A perps body's legs against the exchange's schemas: each leg strict, its
     six fields in range, and the order body's leg rules (the take-profit beyond the stop-loss
     and, on a LIMIT parent, the parent's price between them, mirrored on a SELL; every order
-    number its own; never on a reduce-only parent)."""
+    number its own; never on a reduce-only parent); and each leg's limit within the market's
+    ``band`` around the leg's trigger, which the exchange checks when the order is placed."""
     legs = [body[leg] for leg in ("tp", "sl") if leg in body]
     for leg in legs:
         assert list(leg) == LEG_KEYS
@@ -839,6 +863,8 @@ def check_legs_as_the_exchange(body: dict) -> None:
         assert 1 <= leg["l2OrderIndex"] <= MAX_ORDER_INDEX
         assert 0 <= leg["l2ExpiryMs"] <= MAX_48
         assert all(re.fullmatch("[0-9a-f]{80}", leg[sig]) for sig in ("l2SigS", "l2SigE"))
+        trigger = js_round(leg["triggerPrice"], 1000)
+        assert within_band(js_round(leg["price"], 1000), trigger, band)
     short = body["side"] == "SELL"
 
     def beyond(a: float, b: float) -> bool:
@@ -898,9 +924,533 @@ def test_a_perps_market_sell_with_legs(perps_exchange, trading_client):
     )
     (body,) = perps_exchange.bodies("/orders")
     check_legs_as_the_exchange(body)
-    assert (body["tp"]["price"], body["sl"]["price"]) == (94.5, 120.75)  # 5% above, buying
+    # 5% asked, but at most half the market's band of 500 bp: 2.5% above each trigger, buying,
+    # rounded down to the cent (117.875).
+    assert (body["tp"]["price"], body["sl"]["price"]) == (92.25, 117.87)
     for leg in ("tp", "sl"):
         verify_order(body, leg)
+
+
+# --------------------------------------------------------------------------- #
+# The perps band: the prices the SDK derives
+# --------------------------------------------------------------------------- #
+
+BAND_AROUND_TRIGGER = "l2 perps: the price is outside the market's band around its trigger price"
+
+
+def serve_perp(exchange: Any, *, band: int = PERP_L2["band"], live: Any = PERPS_LIVE) -> None:
+    """Serve OPRA-PERP with ``band`` in its terms and ``live`` as its live state, its market
+    reference (the ``marketList`` price) 160."""
+    detail = market_detail("OPRA-PERP", market_index=4, l2={**PERP_L2, "band": band})
+    detail["market"]["live"] = live
+    exchange.details["OPRA-PERP"] = detail
+
+
+@pytest.mark.parametrize(
+    "bps, buy, sell",
+    [
+        (None, 103.53, 99.48),  # the client's 2%, inside half the band (2.5%)
+        (1_000, 104.04, 98.97),  # 10% asked: half the band
+        (250, 104.04, 98.97),  # half the band, exactly
+        (0, 101.5, 101.51),  # none: the mark, to the cent (a BUY's down, a SELL's up)
+    ],
+)
+def test_a_perps_market_order_is_priced_off_the_mark_within_half_the_band(
+    exchange, trading_client, bps, buy, sell
+):
+    # The band centres on the mark ($101.505 here), not on the market reference (160): a MARKET
+    # order's worst price is the mark moved at most half the band of 500 bp, read afresh each time.
+    serve_perp(exchange, live={**PERPS_LIVE, "markPrice": 101_505})
+    orders = trading_client().orders
+    terms = {} if bps is None else {"max_slippage_bps": bps}
+    orders.market_buy("OPRA-PERP", 2, **terms)
+    orders.market_sell("OPRA-PERP", 2, **terms)
+    bought, sold = exchange.bodies("/orders")
+    assert (bought["price"], sold["price"]) == (buy, sell)
+    for body in (bought, sold):
+        assert within_band(js_round(body["price"], 1000), 101_505, 500)
+        verify_order(body)
+    assert len(exchange.gets("/trade/OPRA-PERP")) == 2
+
+
+@pytest.mark.parametrize(
+    "live", [{**PERPS_LIVE, "markPrice": 0}, None], ids=["no-report-yet", "no-live-state"]
+)
+def test_a_perps_market_order_without_a_mark_is_priced_off_the_market_reference(
+    exchange, trading_client, live
+):
+    # A mark of 0 (no price report yet) bands nothing: the market reference prices it, as on spot.
+    serve_perp(exchange, live=live)
+    trading_client().orders.market_buy("OPRA-PERP", 2)
+    (body,) = exchange.bodies("/orders")
+    assert body["price"] == 163.2  # 160 x 1.02
+
+
+def test_a_reference_price_moves_at_most_half_the_band_and_an_exact_price_never(
+    perps_exchange, trading_client
+):
+    orders = trading_client().orders
+    orders.market_buy("OPRA-PERP", 2, reference_price=100, max_slippage_bps=1_000)  # 2.5%
+    orders.market_sell("OPRA-PERP", 2, reference_price=100, max_slippage_bps=1_000)
+    orders.market_buy("OPRA-PERP", 2, reference_price=100.01, max_slippage_bps=0)  # exact
+    orders.limit_buy("OPRA-PERP", 2, 150)  # signed as given: the exchange decides
+    prices = [body["price"] for body in perps_exchange.bodies("/orders")]
+    assert prices == [102.5, 97.5, 100.01, 150.0]
+    assert len(perps_exchange.gets("/trade/OPRA-PERP")) == 1  # the band came with the market
+
+
+def test_a_perps_stop_books_within_half_the_band_around_its_trigger(perps_exchange, trading_client):
+    orders = trading_client().orders
+    orders.stop_loss("OPRA-PERP", 2, 95, max_slippage_bps=1_000, reduce_only=True)  # 2.5% below
+    orders.take_profit("OPRA-PERP", 2, 110, reduce_only=True)  # the client's 2%: inside
+    orders.create_conditional(
+        "OPRA-PERP", "BUY", 2, type="STOP_MARKET", trigger_price=110, max_slippage_bps=9_999,
+        reduce_only=True,
+    )
+    orders.create_conditional(  # a *_LIMIT's price is signed as given, outside the band or not
+        "OPRA-PERP", "SELL", 2, type="STOP_LIMIT", trigger_price=95, price=80, reduce_only=True
+    )
+    stop, take, short_stop, limit = perps_exchange.bodies("/orders/conditional")
+    assert [b["price"] for b in (stop, take, short_stop, limit)] == [92.63, 107.8, 112.75, 80.0]
+    for body in (stop, take, short_stop):
+        assert within_band(js_round(body["price"], 1000), js_round(body["triggerPrice"], 1000), 500)
+    assert not within_band(80_000, 95_000, 500)
+    for body in (stop, take, short_stop, limit):
+        verify_order(body)
+
+
+def test_a_band_of_zero_and_a_spot_market_bound_nothing(exchange, trading_client):
+    serve_perp(exchange, band=0)
+    orders = trading_client().orders
+    orders.market_sell("OPRA-PERP", 2, pool=1, tp_price=90, sl_price=115, leg_max_slippage_bps=500)
+    orders.stop_loss("OPRA", 5, 90, max_slippage_bps=1_000)
+    (perp,) = exchange.bodies("/orders")
+    (spot_stop,) = exchange.bodies("/orders/conditional")
+    check_legs_as_the_exchange(perp, band=0)
+    assert (perp["tp"]["price"], perp["sl"]["price"]) == (94.5, 120.75)  # the whole 5%
+    assert spot_stop["price"] == 81.0  # the whole 10%
+
+
+@pytest.mark.parametrize(
+    "mark, place, signed",
+    [
+        # Today's price, rounded toward an off-grid reference, crosses it (a SELL's 1.01 above
+        # $1.009, a BUY's 1.00 below $1.001), and the cent signed off $0.005 is the $0.01 floor:
+        # with no band to hold them to, each is signed as it is, on a perp at its mark or on spot
+        # (mark None) off reference_price.
+        (1_009, lambda o: o.market_sell("OPRA-PERP", 20, max_slippage_bps=5), 1.01),
+        (1_001, lambda o: o.market_buy("OPRA-PERP", 20, max_slippage_bps=5), 1.0),
+        (5, lambda o: o.market_buy("OPRA-PERP", 20), 0.01),
+        (None, lambda o: o.market_sell("OPRA", 20, reference_price=1.009, max_slippage_bps=5), 1.01),
+        (None, lambda o: o.market_buy("OPRA", 20, reference_price=1.001, max_slippage_bps=5), 1.0),
+        (None, lambda o: o.market_buy("OPRA", 20, reference_price=0.005), 0.01),
+    ],
+    ids=["perp-sell", "perp-buy", "perp-sub-cent", "spot-sell", "spot-buy", "spot-sub-cent"],
+)
+def test_a_band_of_zero_signs_todays_price_across_an_off_grid_reference_or_not(
+    exchange, trading_client, mark, place, signed
+):
+    if mark is not None:  # OPRA-PERP, its band 0, at this mark
+        serve_perp(exchange, band=0, live={**PERPS_LIVE, "markPrice": mark, "indexPrice": mark})
+    place(trading_client().orders)
+    (body,) = exchange.bodies("/orders")
+    assert body["price"] == signed
+    verify_order(body)
+
+
+def perp_with_band(band: int) -> Any:
+    """OPRA-PERP's market as the SDK keeps it, with ``band`` in its terms."""
+    detail = market_detail("OPRA-PERP", market_index=4, l2={**PERP_L2, "band": band})
+    return market_of(detail, "OPRA-PERP")
+
+
+SWEEP_BANDS = [
+    0, 1, 2, 5, 10, 15, 20, 21, 30, 35, 36, 40, 99, 100, 333, 500, 1_000, 10_000, 65_535
+]
+SWEEP_SLIPPAGES = [0, 1, 9, 10, 15, 50, 199, 200, 2_500, 9_999]
+
+
+def test_a_derived_perps_price_lies_inside_the_band_by_the_exchanges_rule():
+    # At every mark under one cent and 20,000 drawn from one cent up, at every band (0 to 65,535
+    # bp), slippage and side, the rule: today's price (the reference moved min(slippage,
+    # band // 2) against the order, rounded toward it to the cent, at least one cent); if that
+    # crossed the reference (a SELL's above it, a BUY's below it), the cent on the reference's near
+    # side when that is positive, inside the band and within the whole max slippage; else today's
+    # price, across the reference or not, when it lies inside the band; else a local refusal. A
+    # band of 0 changes nothing: today's price, moved the whole slippage, crossing or not. Whatever
+    # is signed is a cent inside the band around its reference by the exchange's integer rule, and
+    # no farther from it against the order than the max slippage unless it is a BUY's off a mark
+    # under one cent (at least $0.01); a refusal comes only where no cent is both.
+    rng = random.Random(20261104)
+    # Dollars x 1000: each mark under one cent at each band and slippage, then drawn ones, mostly
+    # off the cent grid, from one cent to $10 or $10 to $5,000.
+    draws = [
+        (r, band, bps) for r in range(1, 10) for band in SWEEP_BANDS for bps in SWEEP_SLIPPAGES
+    ]
+    for _ in range(20_000):
+        band, bps = rng.choice(SWEEP_BANDS), rng.choice(SWEEP_SLIPPAGES)
+        reference = rng.choice((rng.randrange(10, 10_000), rng.randrange(10_000, 5_000_000)))
+        draws.append((reference, band, bps))
+    markets: dict[int, Any] = {}
+    branches: Counter[str] = Counter()
+    for reference, band, bps in draws:
+        market = markets.get(band) or markets.setdefault(band, perp_with_band(band))
+        start = Decimal(f"{reference}E-3")
+        for side in ("BUY", "SELL"):
+
+            def admitted(price: int) -> bool:
+                """A cent the order may sign: inside the band, within the max slippage."""
+                against = price - reference if side == "BUY" else reference - price
+                return (
+                    price >= 10
+                    and within_band(price, reference, band)
+                    and against * 10_000 <= bps * reference
+                )
+
+            moved = min(bps, band // 2) if band else bps  # a band of 0 bounds nothing
+            rounded = js_round(loaf.worst_price(start, side, moved), 1000)
+            floor, ceiling = reference // 10 * 10, -(-reference // 10) * 10
+            near = floor if side == "SELL" else ceiling
+            crossed = rounded > reference if side == "SELL" else rounded < reference
+            floored = side == "BUY" and reference < 10  # at least $0.01, whatever the slippage
+            expected: int | None
+            if band == 0:
+                branch, expected = ("no band, crossed" if crossed else "no band"), rounded
+            elif crossed and admitted(near):
+                branch, expected = "near", near
+            elif within_band(rounded, reference, band):
+                branch = "crossed" if crossed else "floored" if floored else "kept"
+                expected = rounded
+            else:
+                branch, expected = ("refused" if crossed else "floored, refused"), None
+            branches[branch] += 1
+            case = (reference, band, bps, side)
+            try:
+                price = _Derived(start, side, bps).on(market, "OPRA-PERP") * 1000
+            except loaf.LoafValidationError:
+                assert expected is None, (*case, branch)
+                # Any admitted cent would make one of the two beside the reference admitted.
+                assert not admitted(floor) and not admitted(ceiling), case
+                continue
+            assert price == expected, (*case, branch, price)
+            assert price % 10 == 0 and within_band(int(price), reference, band), (*case, price)
+            assert admitted(int(price)) or floored, (*case, price)
+    # Each branch of the rule is drawn, by the hundred at least.
+    assert len(branches) == 8 and min(branches.values()) >= 100, branches
+
+
+@pytest.mark.parametrize(
+    "mark, band, side, signed",
+    [
+        (1_002, 30, "SELL", Decimal("1.00")),  # not 1.01: (1.01 - 1.002) x 10,000 > 30 x 1.002
+        (2_003, 20, "SELL", Decimal("2.00")),  # not 2.01
+        (1_008, 30, "BUY", Decimal("1.01")),  # not 1.00
+    ],
+)
+def test_a_price_rounded_across_an_off_grid_mark_out_of_the_band_is_the_near_cent(
+    mark, band, side, signed
+):
+    # Half the band (15 bp of $1.002 is $0.0015) holds no cent, so the price rounded toward the mark
+    # crosses it to the next cent, outside the band. The cent on the mark's near side, against the
+    # order, lies inside the band and within the client's 2%: the SDK signs that.
+    price = _Derived(Decimal(f"{mark}E-3"), side, 200).on(perp_with_band(band), "OPRA-PERP")
+    assert price == signed
+    assert within_band(int(price * 1000), mark, band)
+    rounded = js_round(loaf.worst_price(mark / 1000, side, band // 2), 1000)
+    assert not within_band(rounded, mark, band)
+
+
+@pytest.mark.parametrize(
+    "mark, band, bps, side, signed",
+    [
+        # Today's price, the mark moved min(the slippage, half the band) against the order and
+        # rounded toward it, crosses it (1.01, above a SELL's $1.009). The cent on the mark's near
+        # side, against the order, is positive, inside the band and within the slippage asked: the
+        # SDK signs it.
+        (1_009, 100, 200, "SELL", 1.0),
+        (1_001, 100, 200, "BUY", 1.01),
+        (2_507, 40, 200, "SELL", 2.5),
+        (2_503, 40, 200, "BUY", 2.51),
+        # That cent is 90 bp off the mark: outside a band of 30 bp, or past a slippage of 10 bp. The
+        # crossing price, inside the band, is kept.
+        (1_009, 30, 200, "SELL", 1.01),
+        (1_009, 100, 10, "SELL", 1.01),
+    ],
+    ids=["sell", "buy", "sell-band-40", "buy-band-40", "keep-band-30", "keep-slippage-10"],
+)
+def test_a_market_price_rounded_across_an_off_grid_mark_signs_its_near_cent_when_it_may(
+    exchange, trading_client, mark, band, bps, side, signed
+):
+    serve_perp(exchange, band=band, live={**PERPS_LIVE, "markPrice": mark, "indexPrice": mark})
+    orders = trading_client().orders
+    place = orders.market_sell if side == "SELL" else orders.market_buy
+    place("OPRA-PERP", 20, max_slippage_bps=bps)
+    (body,) = exchange.bodies("/orders")
+    assert body["price"] == signed
+    assert within_band(js_round(body["price"], 1000), mark, band)
+    verify_order(body)
+
+
+@pytest.mark.parametrize(
+    "mark, side, bps, band, signed",
+    [
+        # The near cent exactly at the band's edge ($0.005 off $3.125, 16 bp of it) is signed;
+        # with the mark a tick ($0.001) farther from it, that cent lies a tick beyond the edge,
+        # and the crossing price is kept.
+        ("3.125", "SELL", 200, 16, "3.12"),
+        ("3.126", "SELL", 200, 16, "3.13"),
+        ("3.125", "BUY", 200, 16, "3.13"),
+        ("3.124", "BUY", 200, 16, "3.12"),
+        # The near cent exactly at the slippage's edge (16 bp of $3.125) is signed; a tick
+        # beyond it, inside the band of 20 bp, the crossing price is kept.
+        ("3.125", "SELL", 16, 20, "3.12"),
+        ("3.126", "SELL", 16, 20, "3.13"),
+        ("3.125", "BUY", 16, 20, "3.13"),
+        ("3.124", "BUY", 16, 20, "3.12"),
+        # The near cent past a slippage of 10 bp: the crossing price exactly at the band's edge is
+        # kept; a tick beyond it, the order is refused.
+        ("3.125", "SELL", 10, 16, "3.13"),
+        ("3.124", "SELL", 10, 16, None),
+        ("3.125", "BUY", 10, 16, "3.12"),
+        ("3.126", "BUY", 10, 16, None),
+        # A near cent of $0.01, the lowest price, is positive: it is signed, not the crossing 0.02.
+        ("0.015", "SELL", 5_000, 4_000, "0.01"),
+    ],
+)
+def test_the_band_and_the_slippage_admit_a_price_at_their_edge_and_not_a_tick_beyond(
+    mark, side, bps, band, signed
+):
+    derived = _Derived(Decimal(mark), side, bps)
+    if signed is None:
+        with pytest.raises(loaf.LoafValidationError) as info:
+            derived.on(perp_with_band(band), "OPRA-PERP")
+        assert info.value.status_code == 0
+        return
+    price = derived.on(perp_with_band(band), "OPRA-PERP")
+    assert price == Decimal(signed)
+    assert within_band(int(price * 1000), int(Decimal(mark) * 1000), band)
+
+
+@pytest.mark.parametrize(
+    "mark, side, band, signed",
+    [
+        # Off a mark under one cent a BUY's price is the $0.01 floor, which does not cross the mark
+        # yet lies 10,000 bp above $0.005: signed inside a band of 10,000 bp (its edge, admitted),
+        # refused here inside a narrower one.
+        ("0.005", "BUY", 1_000, None),
+        ("0.005", "BUY", 9_999, None),
+        ("0.005", "BUY", 10_000, "0.01"),
+        # $0.01 is 1,111.1 bp above $0.009: a band of 1,112 bp holds it, one of 1,111 does not.
+        ("0.009", "BUY", 1_111, None),
+        ("0.009", "BUY", 1_112, "0.01"),
+        # A SELL's rounds up across the mark to the same cent, with no cent on its near side: the
+        # two sides alike.
+        ("0.005", "SELL", 9_999, None),
+        ("0.005", "SELL", 10_000, "0.01"),
+    ],
+)
+def test_a_price_off_a_mark_under_one_cent_is_signed_only_inside_the_band(
+    mark, side, band, signed
+):
+    derived = _Derived(Decimal(mark), side, 200)
+    if signed is None:
+        with pytest.raises(loaf.LoafValidationError) as info:
+            derived.on(perp_with_band(band), "OPRA-PERP")
+        assert info.value.status_code == 0
+        return
+    price = derived.on(perp_with_band(band), "OPRA-PERP")
+    assert price == Decimal(signed)
+    assert within_band(int(price * 1000), int(Decimal(mark) * 1000), band)
+
+
+EXACT = {"max_slippage_bps": 0}
+
+
+@pytest.mark.parametrize(
+    "client, place, signed",
+    [
+        # Off the cent grid, to the cent (a SELL's up, a BUY's down), and outside the band of 30 bp
+        # around it: never moved or refused for the band; the exchange decides.
+        ({}, lambda o: o.market_sell("OPRA-PERP", 20, reference_price=1.002, **EXACT), 1.01),
+        ({}, lambda o: o.market_buy("OPRA-PERP", 20, reference_price=1.008, **EXACT), 1.0),
+        # The client's max slippage of 0 makes it as exact.
+        (EXACT, lambda o: o.market_sell("OPRA-PERP", 20, reference_price=1.002), 1.01),
+        # On the cent grid, the price itself.
+        ({}, lambda o: o.market_buy("OPRA-PERP", 20, reference_price=1.05, **EXACT), 1.05),
+    ],
+    ids=["sell-off-grid", "buy-off-grid", "client-zero", "on-grid"],
+)
+def test_an_exact_reference_price_is_signed_as_given_whatever_the_band(
+    exchange, trading_client, client, place, signed
+):
+    serve_perp(exchange, band=30, live={**PERPS_LIVE, "markPrice": 1_002, "indexPrice": 1_002})
+    place(trading_client(**client).orders)
+    (body,) = exchange.bodies("/orders")
+    assert body["price"] == signed
+    verify_order(body)
+
+
+def test_a_market_sell_off_an_off_grid_mark_signs_the_cent_inside_the_band(
+    exchange, trading_client
+):
+    serve_perp(exchange, band=30, live={**PERPS_LIVE, "markPrice": 1_002, "indexPrice": 1_002})
+    trading_client().orders.market_sell("OPRA-PERP", 20)
+    (body,) = exchange.bodies("/orders")
+    assert body["price"] == 1.0  # 1.01, rounded up toward the mark, would be refused PRICE_BAND
+    assert within_band(js_round(body["price"], 1000), 1_002, 30)
+    verify_order(body)
+
+
+@pytest.mark.parametrize(
+    "mark, band, place, refused",
+    [
+        # 1.00, the cent inside the band, is 20 bp below the mark: past the 15 asked.
+        (
+            1_002,
+            30,
+            lambda o: o.market_sell("OPRA-PERP", 20, max_slippage_bps=15),
+            (30, "1.002", 15),
+        ),
+        # A reference_price off the cent grid: 1.01 lies outside its band, and 1.00 is 20 bp off.
+        (
+            1_002,
+            30,
+            lambda o: o.market_sell("OPRA-PERP", 20, reference_price=1.002, max_slippage_bps=15),
+            (30, "1.002", 15),
+        ),
+        (
+            1_002,
+            30,
+            lambda o: o.market_buy("OPRA-PERP", 20, reference_price=1.008, max_slippage_bps=15),
+            (30, "1.008", 15),
+        ),
+        # A band of 1 bp around $1.005 holds no cent at all.
+        (1_005, 1, lambda o: o.market_buy("OPRA-PERP", 20), (1, "1.005", 200)),
+        # Off a mark of $0.005 a BUY's price is the $0.01 floor, 10,000 bp above it: it does not
+        # cross the mark, but lies outside a band of 1,000 bp, which holds no cent.
+        (5, 1_000, lambda o: o.market_buy("OPRA-PERP", 20), (1_000, "0.005", 200)),
+    ],
+    ids=["mark-sell", "reference-sell", "reference-buy", "no-cent-in-band", "sub-cent-buy"],
+)
+def test_no_cent_inside_the_band_and_the_slippage_is_refused_before_anything_is_reserved(
+    exchange, trading_client, mark, band, place, refused
+):
+    serve_perp(exchange, band=band, live={**PERPS_LIVE, "markPrice": mark, "indexPrice": mark})
+    orders = trading_client().orders
+    band_bp, reference, bps = refused
+    text = (
+        f"No price on the $0.01 grid lies within OPRA-PERP's band of {band_bp} bp around "
+        f"{reference} and within max_slippage_bps={bps} of it: place a LIMIT order"
+    )
+    with pytest.raises(loaf.LoafValidationError) as info:
+        place(orders)
+    assert (info.value.status_code, info.value.message) == (0, text)
+    assert routes(exchange.requests) == ["GET /trade/OPRA-PERP"]  # no account read, no numbers
+    # Nothing was reserved or spent: the next order takes the first number of the first block.
+    orders.limit_sell("OPRA-PERP", 20, 1.0)
+    (body,) = exchange.bodies("/orders")
+    assert body["l2OrderIndex"] == 4097
+
+
+def test_a_perps_band_refusal_reads_the_markets_terms_again(perps_exchange, trading_client):
+    # The band is read with the market and kept: one narrowed since refuses a price derived in
+    # the old one (400 PRICE_BAND), and the next order reads the market's terms again. (A spot
+    # market's PRICE_BAND shows nothing stale.)
+    orders = trading_client().orders
+    orders.stop_loss("OPRA-PERP", 2, 95, max_slippage_bps=1_000, reduce_only=True)  # 500: 2.5%
+    serve_perp(perps_exchange, band=200)
+    perps_exchange.queue(
+        "/orders/conditional",
+        httpx.Response(400, json={"error": BAND_AROUND_TRIGGER, "code": "PRICE_BAND"}),
+    )
+    with pytest.raises(loaf.LoafValidationError) as info:
+        orders.stop_loss("OPRA-PERP", 2, 95, max_slippage_bps=1_000, reduce_only=True)
+    assert (info.value.code, info.value.message) == ("PRICE_BAND", BAND_AROUND_TRIGGER)
+    orders.stop_loss("OPRA-PERP", 2, 95, max_slippage_bps=1_000, reduce_only=True)  # 200: 1%
+    prices = [body["price"] for body in perps_exchange.bodies("/orders/conditional")]
+    assert prices == [92.63, 92.63, 94.05]
+    assert len(perps_exchange.gets("/trade/OPRA-PERP")) == 2
+
+
+BAND_AROUND_MARK = "l2 perps: the price is outside the market's band around its mark"
+
+
+@pytest.mark.parametrize(
+    "path, place, refusal, reads",
+    [
+        # A price the SDK derived within the band kept with the market: that band may be stale.
+        (
+            "/orders/conditional",
+            lambda o: o.stop_loss("OPRA-PERP", 2, 95, reduce_only=True),
+            BAND_AROUND_TRIGGER,
+            2,
+        ),
+        (
+            "/orders",
+            lambda o: o.market_buy("OPRA-PERP", 2, reference_price=100),
+            BAND_AROUND_MARK,
+            2,
+        ),
+        (
+            "/orders",
+            lambda o: o.limit_buy("OPRA-PERP", 2, 101.5, tp_price=110, sl_price=95),
+            f"attached_legs[0]: {BAND_AROUND_TRIGGER}",
+            2,
+        ),
+        (
+            "/orders",
+            lambda o: o.market_buy(
+                "OPRA-PERP", 2, reference_price=100, max_slippage_bps=0, tp_price=110, sl_price=95
+            ),
+            f"attached_legs[1]: {BAND_AROUND_TRIGGER}",
+            2,
+        ),
+        # A price signed as given owes the band nothing: the market is kept.
+        ("/orders", lambda o: o.limit_buy("OPRA-PERP", 2, 150), BAND_AROUND_MARK, 1),
+        (
+            "/orders",
+            lambda o: o.market_buy("OPRA-PERP", 2, reference_price=100, max_slippage_bps=0),
+            BAND_AROUND_MARK,
+            1,
+        ),
+        (
+            "/orders",
+            lambda o: o.limit_sell("OPRA-PERP", 2, 80, time_in_force="IOC", reduce_only=True),
+            BAND_AROUND_MARK,
+            1,
+        ),
+        (
+            "/orders/conditional",
+            lambda o: o.create_conditional(
+                "OPRA-PERP", "SELL", 2, type="STOP_LIMIT", trigger_price=95, price=80,
+                reduce_only=True,
+            ),
+            BAND_AROUND_TRIGGER,
+            1,
+        ),
+    ],
+    ids=[
+        "stop-market",
+        "market-reference",
+        "legs",
+        "market-exact-legs",
+        "limit",
+        "market-exact",
+        "ioc-reduce-only",
+        "stop-limit",
+    ],
+)
+def test_only_a_derived_price_refused_for_the_band_reads_the_market_again(
+    perps_exchange, trading_client, path, place, refusal, reads
+):
+    orders = trading_client().orders
+    orders.limit_buy("OPRA-PERP", 2, 101.5)  # reads the market, and keeps it
+    perps_exchange.queue(path, httpx.Response(400, json={"error": refusal, "code": "PRICE_BAND"}))
+    with pytest.raises(loaf.LoafValidationError) as info:
+        place(orders)
+    assert (info.value.code, info.value.message) == ("PRICE_BAND", refusal)
+    orders.limit_buy("OPRA-PERP", 2, 101.5)
+    assert len(perps_exchange.gets("/trade/OPRA-PERP")) == reads
 
 
 @pytest.mark.parametrize(

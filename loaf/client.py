@@ -56,7 +56,10 @@ if TYPE_CHECKING:
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "DELETE"})
 
 # What a 401 refusing a login token means, by its text (the backend's): the trading key is not the
-# one in force on its account here, or this machine's clock is off. Any other 401 keeps its text.
+# one in force on its account here, or this machine's clock is off. A 401 refusing a signed op's
+# signature or key carries code INVALID_SIGNATURE, which means the key whatever its text (a
+# withdrawal's "l2 money: the signing key is not the key the journal set for the api key", say).
+# Any other 401 keeps its text.
 _KEY_REFUSALS = (
     "l2 signature:",
     "l2 key:",
@@ -69,7 +72,7 @@ _KEY_NOT_IN_FORCE = (
     "web app, the account's key is not active yet (enable trading on a market's Trade page and "
     f"wait for it to take effect), or it is another Loaf deployment's key (check {ENV_BASE_URL}). "
     f"Set {ENV_TRADING_KEY} to the web app's Show trading key (README §2) and restart; after a "
-    "reset, also cancel and re-arm your stops and takes."
+    "reset, also place your stops and takes again: the exchange FAILS the ones signed before it."
 )
 _CLOCK_OFF = (
     "this machine's clock is off: the exchange takes a login token only before its expiry and at "
@@ -79,9 +82,9 @@ _CLOCK_OFF = (
 
 
 def _login_refusal(error: LoafAPIError) -> LoafAPIError:
-    """A 401 refusing a login token, with what it means appended to its message (the
-    server's own text stays in ``body``)."""
-    if error.message.startswith(_KEY_REFUSALS):
+    """A 401 refusing a login token, or a signed op's signature or key, with what it
+    means appended to its message (the server's own text stays in ``body``)."""
+    if error.code == "INVALID_SIGNATURE" or error.message.startswith(_KEY_REFUSALS):
         meaning = _KEY_NOT_IN_FORCE
     elif error.message.startswith(_CLOCK_REFUSALS):
         meaning = _CLOCK_OFF
@@ -136,6 +139,18 @@ def _definitely_not_done(error: LoafAPIError, op: str) -> bool:
     return error.code in _NOT_DONE_503_CODES or any(
         text in error.message.lower() for text in _NOT_DONE_503_TEXTS[op]
     )
+
+
+# Refusals of a re-send that speak for every attempt: the exchange answers a re-send of a journaled
+# withdrawal as its duplicate before any other check, so a 422 ORDER_INDEX_USED to one (its nonce
+# spent by another op, or its idempotency key held by another withdrawal) says no attempt was
+# journaled, and none will be: a nonce only moves up. A perps op's spent nonce carries no code.
+_NEVER_JOURNALED_CODES = {"withdrawal": frozenset({"ORDER_INDEX_USED"})}
+
+
+def _never_journaled(error: LoafAPIError, op: str) -> bool:
+    """Whether a refusal of signed ``op`` says no attempt of it was journaled, nor ever will be."""
+    return error.status_code == 422 and error.code in _NEVER_JOURNALED_CODES.get(op, frozenset())
 
 
 # $LOAF_MAX_SLIPPAGE_BPS: a plain whole number from 0 to 9999 (leading zeros allowed).
@@ -506,7 +521,9 @@ class LoafClient:
         :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
 
         ``ambiguous=True`` (resubmit): an earlier attempt may already have
-        landed, so anything but a 2xx raises the op's unknown-outcome error.
+        landed, so anything but a 2xx raises the op's unknown-outcome error,
+        except a withdrawal's 422 ``ORDER_INDEX_USED``, which says none landed
+        (:func:`_never_journaled`): it is raised as itself.
 
         ``op="perps"`` or ``op="withdrawal"``: a signed perps allocate or exit,
         or a withdrawal. It carries a login token too (the exchange checks the
@@ -578,6 +595,8 @@ class LoafClient:
                         retryable = response.status_code >= 500
                         if retryable and not _definitely_not_done(error, op):
                             ambiguous = True
+                        elif _never_journaled(error, op):
+                            ambiguous = False  # it settles every attempt, a resubmit's too
                 if not retryable or attempt >= self.max_retries:
                     break
                 # Jitter only: every reply carries RateLimit-Reset, and a signed price goes stale.

@@ -236,7 +236,7 @@ class LoginTokens:
 
 class Market(NamedTuple):
     """A market's ``marketIndex``, ``type`` and ``l2``: the vault and market every order on it
-    signs."""
+    signs, and a perp's band, which bounds the prices the SDK derives on it."""
 
     chain_id: int
     proxy_address: str
@@ -250,6 +250,11 @@ class Market(NamedTuple):
     #: A perp's ``l2.status``: ``"ACTIVE"``, or ``"EXPIRED"`` (it takes no more orders).
     #: ``None`` on a spot market, whose ``l2`` is served only while it is active.
     l2_status: str | None
+    #: A perp's band, ``l2.band`` basis points as last read: the exchange holds a perps order's
+    #: price within it around the market's mark, and a perps stop's, take's or leg's limit within
+    #: it around its own trigger. 0 (no band) on a spot market, and on a perp whose band is 0 or
+    #: not served as a whole number.
+    band: int = 0
 
 
 class AccountState(NamedTuple):
@@ -281,7 +286,7 @@ class _Block:
 
 def market_of(detail: Any, ticker: str) -> Market:
     """The market an order on ``ticker`` signs, from its ``GET /trade/{ticker}`` answer:
-    its ``marketIndex`` and its ``l2``.
+    its ``marketIndex`` and its ``l2`` (a perp's band among its terms).
 
     Raises:
         LoafConfigError: the server does not run the exchange this SDK trades on.
@@ -312,7 +317,11 @@ def market_of(detail: Any, ticker: str) -> Market:
     l2 = market["l2"]
     custody = (l2["chainId"], l2["proxyAddress"], l2["l2ChainId"], market["marketIndex"])
     if market["type"] == "PERP":
-        return Market(*custody, 0, l2["quoteAssetId"], "PERP", l2["status"])
+        # Not signed, so never refused: a band that is not a whole number bounds nothing, as in the
+        # web app.
+        band = l2.get("band")
+        band = band if _is_int(band) and band > 0 else 0
+        return Market(*custody, 0, l2["quoteAssetId"], "PERP", l2["status"], band)
     return Market(*custody, l2["baseAssetId"], l2["quoteAssetId"], "SPOT", None)
 
 
@@ -554,10 +563,15 @@ class L2State:
         account: AccountState | None,
         block: _Block | None,
         error: LoafAPIError,
+        derived: bool = False,
     ) -> None:
         """Forget what a refusal of an order on ``ticker`` shows stale: the order
         started with ``account`` and took its indices from ``block`` (``None`` until
-        they are reserved: a refusal that comes with one answered the placement)."""
+        they are reserved: a refusal that comes with one answered the placement), and
+        ``derived`` says whether it signed a price the SDK derived within the band kept
+        with the market (its own, a MARKET order's or a ``*_MARKET`` row's, or a TP/SL
+        leg's limit); a MARKET order's ``reference_price`` with no slippage is a price
+        given, not derived."""
         # Texts and codes count on refusals only: the 503s for an unreadable account or an
         # unchecked signature carry the l2 prefixes too, and show nothing stale.
         refusal = error.status_code < 500
@@ -568,11 +582,21 @@ class L2State:
         # reservation never name it, and a refusal of their login token ('l2 key: …', say) shows
         # your trading key not in force. A placement names its market by the signed index alone:
         # refused as no market (404) or as one that does not trade (403: delisted, say), it shows
-        # the market stale, since the ticker may name another market by now. A halt, the market's
-        # own state (closed, reduce-only, its price stale or held) and a start not reached say what
-        # the market takes now, and show nothing.
+        # the market stale, since the ticker may name another market by now. Refused for a perp's
+        # band (PRICE_BAND) with a price the SDK derived within the band kept with the market
+        # (``derived``), it shows that band possibly stale (narrowed since it priced the order), so
+        # the next order reads the market's terms again; a price signed as given (a LIMIT, IOC or
+        # reduce-only order's, a *_LIMIT row's, a MARKET order's reference_price with no slippage)
+        # owes the band nothing, and the market is kept. A halt, the market's own state (closed,
+        # reduce-only, its price stale or held) and a start not reached say what the market takes
+        # now, and show nothing.
+        cached = self._markets.get(ticker)
+        banded = (
+            derived and code == "PRICE_BAND" and cached is not None and cached.type == "PERP"
+        )
         market_stale = block is not None and (
             context
+            or banded
             or error.status_code == 404
             or (
                 error.status_code == 403

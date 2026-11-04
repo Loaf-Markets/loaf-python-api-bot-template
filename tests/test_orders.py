@@ -426,7 +426,8 @@ def test_a_trading_key_not_in_force_is_refused_with_what_to_do(
         with pytest.raises(loaf.LoafAuthError) as info:
             orders.limit_buy("OPRA", 10, 167.49)
         assert info.value.message.startswith(reason + " — LOAF_TRADING_KEY is not the trading key")
-        assert info.value.body == {"error": reason}
+        assert info.value.code == "UNAUTHENTICATED"
+        assert info.value.body == {"error": reason, "code": "UNAUTHENTICATED"}
     # The refusal shows the key stale, not the market: the market is read once.
     assert routes(exchange.requests) == ["GET /trade/OPRA", "GET /l2/keys", "GET /l2/keys"]
     # Each refusal drops its token: the next request signs a fresh one.
@@ -2123,8 +2124,11 @@ def test_resubmit_only_while_the_order_can_rest(exchange, trading_client, l2_clo
     assert f"could rest only until {until}" in refusal.message
     assert "(its l2ExpiryMs minus 72 hours)" in refusal.message  # L2_BUFFER_MS
     assert f"expiryMs {body['l2ExpiryMs']}" in refusal.message
-    # Nothing expires a stop, a take or a leg: one that landed must be cancelled.
-    assert "stays ARMED" in refusal.message
+    # The exchange FAILS a stop, a take or a leg once its life ends, fired or not: nothing is left
+    # to cancel.
+    failed = "still ARMED is FAILED within about a second of that time, fired or not"
+    assert failed in refusal.message
+    assert "cancel it" not in refusal.message
     assert len(exchange.requests) == sent
 
     # Signed six hours ago and still inside its life: sent unchanged.

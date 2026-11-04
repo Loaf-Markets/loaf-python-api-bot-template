@@ -78,7 +78,13 @@ class PerpMarketL2(TypedDict):
     makerFee: int
     risk: int  # the maintenance margin factor per 65,536 (initial margin is twice it)
     maxLeverage: int  # the most leverage it takes: 65,536 // (2 x risk), at least 1
-    band: int  # how far (bp) an order's price may sit from the index; 0: no bound
+    # How far (bp) an order's price may sit from the mark, both edges in (0: no band; a mark of 0
+    # bands nothing). A stop's, take's or TP/SL leg's limit is also held within it around its own
+    # trigger when placed. The prices the SDK derives start at most half of it from their reference
+    # (but a MARKET BUY's off a mark under one cent: $0.01, refused outside it); a MARKET order's,
+    # rounded across an off-grid mark, may give way to the cent on the mark's near side (the orders
+    # module, The perps band).
+    band: int
     flags: int  # PERPS_FLAG_CROSS (pool 0 may trade it) | PERPS_FLAG_REDUCE_ONLY
     minBase: int  # the least signed quantity of an order that adds to a position; 0: none
     minQuote: int  # the least quote (signed quantity x signed price / 10) of one; 0: none
@@ -110,7 +116,7 @@ class PerpsPosition(_PerpsPositionRank):
     qem: str  # its quote extension multiplier, a decimal string
     risk: int  # its maintenance margin factor per 65,536
     maxLeverage: int  # the most leverage it takes
-    band: int  # how far (bp) an order's price may sit from its index; 0: no bound
+    band: int  # its market's band: how far (bp) an order's price may sit from the mark; 0: none
     base: str  # signed, in base units (an order's signed quantity): + long, - short
     fundingIndex: str  # the funding index it last settled at: it owes base x (F - this)
     entryQuote: str  # the quote of the fills that opened and grew it
@@ -168,7 +174,9 @@ class PerpsMarketLive(TypedDict):
 
     marketIndex: int  # 0 to 254
     status: str  # "ACTIVE", or "EXPIRED": no more orders; positions leave by perps.exit()
-    markPrice: int  # what positions are valued at, dollars x 1000 (0 before the first report)
+    # What positions are valued at and the band centres on, dollars x 1000 (0 before the first
+    # report).
+    markPrice: int
     indexPrice: int  # the accepted index (0 before the first report), as of observedAtMs
     observedAtMs: int
     openInterest: str  # base units, a decimal string: longs plus shorts (one side's is half)
