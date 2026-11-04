@@ -28,8 +28,8 @@ perp):
 ==================  ========  ===========================================
 Channel             Auth      What you receive
 ==================  ========  ===========================================
-orderbook:{ticker}  public    full bid/ask book snapshots, on change and again every 5 s, empty books
-                              included (no initial frame)
+orderbook:{ticker}  public    the full bid/ask book, on change (at most one frame per 100 ms) and
+                              again every 5 s unchanged, empty books included (no frame on subscribe)
 trades:{ticker}     public    every trade, at most one frame per 100 ms (the recent ones on subscribe)
 chart:{ticker}      public    OHLCV candle updates (note: singular "chart")
 markprice:{ticker}  public    canonical mark price (1s, on change)
@@ -38,8 +38,8 @@ market:{ticker}     public    halt / resume status for one market
 perps:markets       public    every perp's live state, about once a second, and its terms
                               when they change
 portfolio           PRIVATE   your order transitions, fills, queue places, whole L2 balance book,
-                              perps account, funding payments, holdings, transfers, fees, keys and
-                              saved perps leverage
+                              perps account (and its snapshot about once a second), funding
+                              payments, holdings, transfers, fees, keys and saved perps leverage
 ==================  ========  ===========================================
 
 A market channel's frames name its market as ``ticker``, the channel's own
@@ -48,6 +48,27 @@ string; a trade in a ``trades_batch`` names none.
 Prices and quantities are human units (dollars / tokens); ``balances_update``
 amounts are base-unit decimal strings (see :func:`loaf.from_base_units`);
 timestamps are unix seconds (an order row's ``expiryMs`` is milliseconds).
+
+**Engine stamps.** A frame that relays a change the exchange's engine made
+carries ``engineMs``, the engine's clock (unix ms) when the batch that made it
+committed, and ``batchSeq``, that batch's journal number: the private frames
+(``order_status``, ``order_update``, ``trade_new``, ``balances_update``,
+``holding_update``, ``perps_account_update``, ``funding_payment``,
+``l2_keys_update``) and ``orderbook_update``, whose ``engineMs`` is its book's.
+``timestamp`` stays the server's send time in whole unix seconds, so
+``timestamp * 1000 - engineMs`` is a frame's age when it left, to within a
+second. ``batchSeq`` does not order frames: one batch's frames share it.
+
+**The beat.** While ``portfolio`` is subscribed, the exchange sends your perps
+account as a snapshot (``perps_account_update`` with ``snapshot: True``) about
+once a second, changed or not, as long as its engine runs. The client watches
+it: :attr:`LoafWebSocketClient.fresh` turns ``True`` at a connection's first
+snapshot, and ``False`` once no stamped private frame came for ``stale_after``
+seconds (default 3: two beats missed) or the connection drops;
+:meth:`LoafWebSocketClient.on_stale` and :meth:`LoafWebSocketClient.on_fresh`
+fire at those turns. Pull your quotes on stale. A missing snapshot means no
+news, never no positions. A deployment without perps sends no snapshots, so
+``fresh`` stays ``None`` there.
 
 A client with a trading key authenticates each connection with a login token
 the key signs (the ``auth`` frame), and sends a fresh one on the live
@@ -66,6 +87,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import numbers
 import random
 import ssl
@@ -76,6 +98,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import httpx
 
 from .._object import LoafObject, parse
+from ..constants import DEFAULT_STALE_AFTER
 from ..enums import WSMessageType
 from ..exceptions import LoafConfigError
 
@@ -98,6 +121,24 @@ Handler = Callable[[Any], None]
 # Internal pseudo-types for lifecycle callbacks (never collide with wire types).
 _ON_CONNECT = "__connect__"
 _ON_DISCONNECT = "__disconnect__"
+_ON_STALE = "__stale__"
+_ON_FRESH = "__fresh__"
+
+# The private frames that relay an engine change, and so carry its engineMs: the beat's signs
+# of life. orderbook_update carries one too, but says nothing about your private stream.
+_STAMPED_PRIVATE = frozenset({
+    WSMessageType.ORDER_STATUS.value,
+    WSMessageType.ORDER_UPDATE.value,
+    WSMessageType.TRADE_NEW.value,
+    WSMessageType.BALANCES_UPDATE.value,
+    WSMessageType.HOLDING_UPDATE.value,
+    WSMessageType.PERPS_ACCOUNT_UPDATE.value,
+    WSMessageType.FUNDING_PAYMENT.value,
+    WSMessageType.L2_KEYS_UPDATE.value,
+})
+
+# The shortest stale_after: the beat is about one a second, so a shorter wait always goes stale.
+_MIN_STALE_AFTER = 1.0
 
 # The longest wait before a reconnect attempt, in seconds.
 _MAX_RECONNECT_DELAY = 30.0
@@ -135,6 +176,10 @@ class LoafWebSocketClient:
     key signs, and stays authenticated (see :meth:`on_disconnect`). Without a
     ``client``, or with one that has no trading key, the connection is
     anonymous: the public channels only.
+
+    ``stale_after`` is how many seconds may pass without a stamped private
+    frame before the client calls the feed stale (:attr:`fresh`), at least 1;
+    default 3, two of the exchange's account beats missed.
     """
 
     def __init__(
@@ -145,6 +190,7 @@ class LoafWebSocketClient:
         verify: bool | ssl.SSLContext | None = None,
         auto_reconnect: bool = True,
         reconnect_delay: float = 1.0,
+        stale_after: float = DEFAULT_STALE_AFTER,
     ) -> None:
         #: Signs each connection's login tokens; None for an anonymous connection.
         self._login_tokens: LoginTokens | None = client._login_tokens if client else None
@@ -165,6 +211,19 @@ class LoafWebSocketClient:
                 f"reconnect_delay must be a positive number of seconds, got {reconnect_delay!r}"
             )
         self.reconnect_delay = reconnect_delay
+        real = isinstance(stale_after, numbers.Real) and not isinstance(stale_after, bool)
+        if not real or not math.isfinite(stale_after) or stale_after < _MIN_STALE_AFTER:
+            raise LoafConfigError(
+                f"stale_after must be a number of seconds from {_MIN_STALE_AFTER:g} (the "
+                f"exchange's account beat is about one a second), got {stale_after!r}"
+            )
+        self.stale_after = float(stale_after)
+
+        # The beat, kept on the loop's thread: None until a connection's first snapshot, then
+        # whether a stamped private frame came within stale_after (_note_beat, _watch_beats).
+        self._fresh: bool | None = None
+        self._last_beat: float | None = None  # time.monotonic() of the last stamped private frame
+        self._engine_ms: int | None = None
 
         self._handlers: dict[str, list[Handler]] = {}
         self._channels: set[str] = set()
@@ -196,7 +255,17 @@ class LoafWebSocketClient:
 
     # public market data
     def on_orderbook(self, handler: Handler | None = None) -> Any:
-        """A market's whole book (``orderbook_update``: ``{ticker, bids, asks}``)."""
+        """A market's whole book (``orderbook_update``: ``{ticker, bids, asks,
+        engineMs}``, a :class:`~loaf.models.OrderBook`): replace what you hold
+        for ``ticker``.
+
+        Sent on change, at most one frame per market every 100 ms, and again
+        every 5 s unchanged (an empty book too), so the first frame can take up
+        to 5 s after you subscribe. ``engineMs`` is the engine's clock at the
+        commit whose book it is: a quiet market's frames keep coming with
+        their old ``engineMs``, so frames show the exchange is up and
+        ``engineMs`` how old the book is.
+        """
         return self.on(WSMessageType.ORDERBOOK_UPDATE, handler)
 
     def on_trades(self, handler: Handler | None = None) -> Any:
@@ -277,12 +346,16 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.BALANCES_UPDATE, handler)
 
     def on_order_status(self, handler: Handler | None = None) -> Any:
-        """A booked order's status/quantity changed (``order_status``).
+        """A booked order's status/quantity changed (``order_status``:
+        ``{orderId, status, quantityLeft, l2OrderIndex, orderTag}``).
 
         Booked orders only; a conditional never reaches this frame. One frame
         per fill. ``quantityLeft`` is the unfilled remainder: what is left after
         a fill, and the cancelled quantity on ``CANCELLED``, so filled =
-        quantity - quantityLeft always.
+        quantity - quantityLeft always. ``l2OrderIndex`` is the order number it
+        signed and ``orderTag`` its ``order_tag=`` (absent without one), so a
+        quoting loop can match a frame to an order whose placement has not
+        answered yet.
 
         ``CANCELLED`` also arrives for cancels you did not request: the
         exchange's sweep 72 h before the order's ``expiryMs``, an epoch move (a
@@ -306,7 +379,8 @@ class LoafWebSocketClient:
         frames for orders you never cancelled.
 
         For a booked order it is sent after the exchange commits and carries the
-        committed row, with ``expiryMs`` (unix ms, the signed expiry). For an
+        committed row, with ``expiryMs`` (unix ms, the signed expiry),
+        ``l2OrderIndex`` and its ``orderTag`` (absent without one). For an
         order that trades immediately it can arrive AFTER that order's
         ``order_status`` / ``trade_new`` frames and already show
         ``PARTIALLY_FILLED`` or ``FILLED``, so upsert by id and do not assume
@@ -376,13 +450,19 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.LIFETIME_VOLUME_UPDATE, handler)
 
     def on_perps_account(self, handler: Handler | None = None) -> Any:
-        """Your perps account changed (``perps_account_update``: ``{perps}``,
+        """Your perps account (``perps_account_update``: ``{perps}``,
         ``{l2AccountIndex, pools}`` as
         :meth:`loaf.resources.perps.PerpsResource.positions` serves them),
-        after every engine commit that touches it: replace the pools you hold
-        (a pool it does not list holds nothing). Its values are as of that
-        commit: between pushes recompute them from ``perps:markets`` (README,
-        **Perps**). Delivery is at most once: re-read after a reconnect."""
+        after every engine commit that touches it, and as a snapshot
+        (``snapshot: True``) about once a second, changed or not, flat
+        accounts included: replace the pools you hold (a pool it does not list
+        holds nothing). Its values are as of ``engineMs``: between pushes
+        recompute them from ``perps:markets`` (README, **Perps**). Frames come
+        in order, and a snapshot never goes out after a newer frame, so
+        applying each as it comes never undoes a change. A missing snapshot
+        means no news, never no positions; the client watches them
+        (:attr:`fresh`). Delivery is at most once: the next snapshot brings
+        what a reconnect lost."""
         return self.on(WSMessageType.PERPS_ACCOUNT_UPDATE, handler)
 
     def on_funding_payment(self, handler: Handler | None = None) -> Any:
@@ -509,6 +589,50 @@ class LoafWebSocketClient:
         """
         return self.on(_ON_DISCONNECT, handler)
 
+    def on_stale(self, handler: Handler | None = None) -> Any:
+        """Your private stream went stale: :attr:`fresh` turned ``False``, with
+        ``{reason, engineMs, silentSeconds}``.
+
+        ``reason`` is ``"silent"`` (no stamped private frame for
+        ``stale_after`` seconds: the exchange's engine or its feed stalled),
+        ``"disconnected"`` (the connection dropped; :meth:`on_disconnect`
+        follows) or ``"unsubscribed"`` (you unsubscribed ``portfolio``).
+        ``engineMs`` is the newest engine stamp seen (``None`` if none) and
+        ``silentSeconds`` how long since the last stamped frame. Fires once per
+        turn, only from ``True``. Pull your quotes here (from your own loop, as
+        for every handler: set a flag), and keep
+        :meth:`~loaf.resources.orders.OrdersResource.cancel_after` running as
+        the exchange's side of the same guard.
+        """
+        return self.on(_ON_STALE, handler)
+
+    def on_fresh(self, handler: Handler | None = None) -> Any:
+        """Your private stream is live: :attr:`fresh` turned ``True``, with
+        ``{engineMs}``. Fires at a connection's first account snapshot, and when
+        stamped private frames come again after :meth:`on_stale`. It fires
+        after that frame's own handlers, so the snapshot is applied first."""
+        return self.on(_ON_FRESH, handler)
+
+    @property
+    def fresh(self) -> bool | None:
+        """Whether your private stream is live, by the exchange's account beat.
+
+        ``None`` until this connection's first account snapshot (and on a
+        deployment without perps, which sends none), ``True`` while stamped
+        private frames keep coming within ``stale_after`` seconds, ``False``
+        once they stop or the connection drops. A new connection starts at
+        ``None`` again, and :meth:`stop` leaves it ``None``. Requires
+        ``portfolio`` subscribed. Safe to read from any thread.
+        """
+        return self._fresh
+
+    @property
+    def engine_ms(self) -> int | None:
+        """The newest ``engineMs`` of a private frame this client received:
+        the exchange's engine clock (unix ms) as of your last private news.
+        ``None`` before any."""
+        return self._engine_ms
+
     # ------------------------------------------------------------------ #
     # Subscriptions
     # ------------------------------------------------------------------ #
@@ -524,6 +648,8 @@ class LoafWebSocketClient:
         gone = {str(c) for c in channels}
         self._channels -= gone
         self._send_now({"type": "unsubscribe", "channels": sorted(gone)})
+        if not self._holds_portfolio():
+            self._on_loop(self._portfolio_dropped)
         return self
 
     def subscribe_orderbook(self, ticker: str) -> LoafWebSocketClient:
@@ -674,6 +800,17 @@ class LoafWebSocketClient:
             loop.close()
 
     async def _run(self) -> None:
+        try:
+            await self._connect_until_stopped()
+        finally:
+            # Stopped, however the run ended (stop() cancels it, which skips the loop's own
+            # checks): nothing is watched. A run that ends after start() began the next one (a
+            # close can outlast stop()'s join) finds the stop event cleared and leaves the beat
+            # to that run.
+            if self._stop_event.is_set():
+                self._fresh = self._last_beat = None
+
+    async def _connect_until_stopped(self) -> None:
         connect_kwargs: dict[str, Any] = {} if self._ssl is None else {"ssl": self._ssl}
         ceiling = min(self.reconnect_delay, _MAX_RECONNECT_DELAY)
         while not self._stop_event.is_set():
@@ -682,13 +819,16 @@ class LoafWebSocketClient:
                 async with websockets.connect(self.ws_url, **connect_kwargs) as ws:
                     self._ws = ws
                     self._auth_refused = False
+                    self._fresh = self._last_beat = None  # each connection waits for its own beat
                     keeper = await self._on_open(ws)
+                    watch = asyncio.ensure_future(self._watch_beats())
                     try:
                         async for raw in ws:
                             self._dispatch(raw)
                     finally:
                         if keeper is not None:
                             keeper.cancel()
+                        watch.cancel()
                 # A normal close (1000/1001/1005), read once the context has finished it: the
                 # legacy client (websockets 12) reports close_code only in the CLOSED state.
                 code = ws.close_code if ws.close_code is not None else 1006
@@ -712,12 +852,15 @@ class LoafWebSocketClient:
                 connected = self._connected_event.is_set()
                 # Only this attempt's own state: a stop() that stopped waiting (a close can
                 # outlast its join) lets start() begin the next run before this one ends.
-                if self._ws is ws:
+                owned = self._ws is ws
+                if owned:
                     self._ws = None
                     self._auth_token = None
                     self._connected_event.clear()
             if self._stop_event.is_set():
-                break
+                break  # _run resets the beat
+            if owned:
+                self._beat_lost("disconnected")
             self._emit(_ON_DISCONNECT, LoafObject({"code": code, "reason": reason}))
             if not self.auto_reconnect:
                 break
@@ -765,6 +908,75 @@ class LoafWebSocketClient:
             # The connection stays up until its token expires; the next one signs again.
             logger.exception("Loaf WebSocket could not send a fresh login token")
 
+    async def _watch_beats(self) -> None:
+        """Turn :attr:`fresh` False once no stamped private frame came for ``stale_after``
+        seconds (one task per connection, on the loop's thread)."""
+        while True:
+            last = self._last_beat
+            if self._fresh is not True or last is None:
+                await asyncio.sleep(self.stale_after)  # nothing to time yet
+                continue
+            wait = last + self.stale_after - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            else:
+                self._beat_lost("silent")
+
+    def _note_beat(self, message: dict) -> None:
+        """A stamped private frame: news from the exchange's engine (on the loop's thread). The
+        watch starts at a connection's first account snapshot, which shows the exchange beats."""
+        engine_ms = message.get("engineMs")
+        if not isinstance(engine_ms, int) or isinstance(engine_ms, bool):
+            return  # a bool is an int to isinstance
+        if not self._holds_portfolio():
+            return
+        if self._engine_ms is None or engine_ms > self._engine_ms:
+            self._engine_ms = engine_ms
+        if self._fresh is None and message.get("snapshot") is not True:
+            return
+        self._last_beat = time.monotonic()
+        if self._fresh is not True:
+            self._fresh = True
+            self._emit(_ON_FRESH, LoafObject({"engineMs": self._engine_ms}))
+
+    def _beat_lost(self, reason: str) -> None:
+        """The private stream is no longer known to be live (on the loop's thread)."""
+        if self._fresh is not True:
+            return
+        last = self._last_beat
+        self._fresh = False
+        silent = None if last is None else round(time.monotonic() - last, 3)
+        self._emit(
+            _ON_STALE,
+            LoafObject({"reason": reason, "engineMs": self._engine_ms, "silentSeconds": silent}),
+        )
+
+    def _portfolio_dropped(self) -> None:
+        """After an unsubscribe left no portfolio channel (on the loop's thread): not when one
+        was subscribed again meanwhile, from another thread."""
+        if not self._holds_portfolio():
+            self._beat_lost("unsubscribed")
+
+    def _holds_portfolio(self) -> bool:
+        # A tuple first: another thread may subscribe meanwhile.
+        return any(c == "portfolio" or c.startswith("portfolio:") for c in tuple(self._channels))
+
+    def _on_loop(self, fn: Callable[..., None], *args: Any) -> None:
+        """Run ``fn(*args)`` on the loop's thread: at once from that thread or with no loop
+        running, else as soon as the loop gets to it."""
+        loop = self._loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or running is loop:
+            fn(*args)
+            return
+        try:
+            loop.call_soon_threadsafe(fn, *args)
+        except RuntimeError:  # the run closed its loop after the read above
+            fn(*args)
+
     def _dispatch(self, raw: Any) -> None:
         try:
             message = json.loads(raw)
@@ -784,6 +996,9 @@ class LoafWebSocketClient:
         if mtype is not None:
             self._emit(str(mtype), obj)
         self._emit("*", obj)
+        # After the frame's own handlers, so a snapshot is applied before on_fresh.
+        if isinstance(mtype, str) and mtype in _STAMPED_PRIVATE:
+            self._note_beat(message)
         if mtype == WSMessageType.AUTH_RESULT:
             self._auth_refused = message.get("success") is False
             if self._auth_refused and self._login_tokens is not None and self._auth_token:

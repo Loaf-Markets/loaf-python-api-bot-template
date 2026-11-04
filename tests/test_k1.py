@@ -1,13 +1,13 @@
-"""K1 signing, offline: K1's known answers, the order, allocate and exit checks
-the web app's signer makes, the login message, and the curve's own vectors.
+"""K1 signing, offline: K1's known answers, the order, allocate, exit and withdraw
+checks the web app's signer makes, the login message, and the curve's own vectors.
 
 ``k1-sign.json`` is K1's known-answer file, every line but its ``about`` text (K1's
 names internal documents): keys, signatures, orders, perps allocates and exits,
-the vectors the matching engine and the web app run too, so a match here means a
-signature made by this SDK verifies there. Its withdraws, price reports and order
-batches are messages this SDK does not build (it signs no withdrawal, report or
-batch): they ride along so the file stays K1's line for line, and the reports'
-signatures are checked like the allocates'. To take a new K1 file, copy it and put
+withdraws, the vectors the matching engine and the web app run too, so a match here
+means a signature made by this SDK verifies there. Its price reports and order
+batches are messages this SDK does not build (it signs no report or batch): they
+ride along so the file stays K1's line for line, and the reports' signatures are
+checked like the allocates'. To take a new K1 file, copy it and put
 this file's ``about`` line back. ``k1-login.json`` is the matching engine's for the
 login message (its ``crates/rules/kat/k1-login.json``, byte for byte), whose
 verifier the exchange checks each login token with: a login token this SDK signs
@@ -38,6 +38,7 @@ from loaf.k1 import (
     public_key,
     sign,
     verify,
+    withdraw_message,
 )
 
 KAT_FILE = Path(__file__).with_name("k1-sign.json")
@@ -114,6 +115,23 @@ EXIT_WIDTHS = [
     ("l2_expiry_ms", 0, 2**48 - 1),
     ("l2_chain_id", 0, 2130706432),
 ]
+# A withdraw's wire keys in message order (its api key and route are the message's own: api key 0,
+# route 1, the spot balance, for every withdrawal the SDK signs).
+WITHDRAW_KEYS = (
+    "l2ChainId", "l2AccountIndex", "l2ApiKeyIndex", "l2AssetId", "l2Route", "amount", "l2Nonce",
+    "l2ExpiryMs",
+)
+# The widths of the withdraw fields the SDK signs, in K1's order (the chain id, the account),
+# then the asset and the amount the engine takes, then the nonce and the expiry.
+WITHDRAW_WIDTHS = [
+    ("l2_chain_id", 0, 2130706432),
+    ("l2_account_index", 0, 2**48 - 1),
+    ("l2_asset_id", 1, 62),
+    ("amount", 1, 2**53 - 1),
+    ("l2_nonce", 0, 2**48 - 1),
+    ("l2_expiry_ms", 0, 2**48 - 1),
+]
+WITHDRAW_REFUSALS = [v for v in KAT["message_refusals"] if v["kind"] == "withdraw"]
 SK0, PK0 = bytes.fromhex(KAT["keys"][0]["sk"]), bytes.fromhex(KAT["keys"][0]["pk"])
 
 
@@ -135,9 +153,18 @@ def op_fields(vector: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def withdraw_fields(vector: dict[str, Any]) -> dict[str, Any]:
+    """A withdraw vector's fields as withdraw_message's keywords: its api key and route left out
+    (the message's own), the amount an int."""
+    terms = op_fields(vector)
+    del terms["l2_api_key_index"], terms["l2_route"]
+    return terms
+
+
 ORDER0 = fields(KAT["orders"][0])
 ALLOCATE0 = op_fields(KAT["allocates"][0])
 EXIT0 = op_fields(KAT["exits"][0])
+WITHDRAW0 = withdraw_fields(KAT["withdraws"][0])
 # A login token's signed fields, wire keys in the engine's width order.
 LOGIN_KEYS = ("l2ChainId", "l2AccountIndex", "l2ExpiryMs")
 LOGIN_FIELDS = tuple(map(snake, LOGIN_KEYS))
@@ -274,6 +301,91 @@ def test_kat_allocate_and_exit_message_refusals(v):
 def test_kat_message_refusals_cover_every_allocate_and_exit_limit():
     for kind in ("allocate", "exit"):
         assert {v["code"] for v in OP_REFUSALS if v["kind"] == kind} == set(OP_REFUSED_FIELD)
+
+
+@pytest.mark.parametrize("v", KAT["withdraws"], ids=["typical", "maxima", "zeros"])
+def test_kat_withdraw_messages(v):
+    assert k1._withdraw_message(*(int(v[key]) for key in WITHDRAW_KEYS)).hex() == v["m"]
+
+
+def test_kat_withdraw_is_the_one_a_withdrawal_signs():
+    # The typical vector is a withdrawal the exchange takes: api key 0, route 1 (the spot
+    # balance), the message's own, so the SDK's withdraw message is K1's byte for byte.
+    v = KAT["withdraws"][0]
+    assert (v["l2ApiKeyIndex"], v["l2Route"]) == (0, 1)
+    assert withdraw_message(**WITHDRAW0).hex() == v["m"]
+    # It takes no api key, no route and no recipient: K1 pays the account's own wallet, which the
+    # message does not name.
+    for extra in ("l2_api_key_index", "l2_route", "recipient"):
+        with pytest.raises(TypeError, match=extra):
+            withdraw_message(**WITHDRAW0, **{extra: 0})
+    # The maxima and zeros vectors pin K1's encoding at its edges; the exchange lists assets 1 to
+    # 62, so they are refused first, by name.
+    for v in KAT["withdraws"][1:]:
+        error = refused("Width", withdraw_message, **withdraw_fields(v))
+        assert str(error) == "l2 width: l2_asset_id out of range"
+
+
+@pytest.mark.parametrize("v", WITHDRAW_REFUSALS, ids=lambda v: v["code"])
+def test_kat_withdraw_message_refusals(v):
+    assert (v["l2ApiKeyIndex"], v["l2Route"]) == (0, 1)
+    error = refused("Width", withdraw_message, **withdraw_fields(v))
+    assert str(error) == f"l2 width: {OP_REFUSED_FIELD[v['code']]} out of range"
+
+
+def test_kat_message_refusals_cover_every_withdraw_limit():
+    assert {v["code"] for v in WITHDRAW_REFUSALS} == set(OP_REFUSED_FIELD)
+
+
+def test_a_withdraw_signs_and_verifies_under_its_key():
+    m = withdraw_message(**WITHDRAW0)
+    other = withdraw_message(**{**WITHDRAW0, "l2_nonce": 4})
+    for aux in (bytes(32), bytes([13]) * 32):
+        s, e = sign(SK0, m, aux)
+        verify(PK0, m, s, e)
+        refused("Sig", verify, PK0, other, s, e)  # the signature is the message's alone
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"l2_chain_id": 1819238759}, {"l2_account_index": 6}, {"l2_asset_id": 3},
+        {"amount": 123456789013}, {"l2_nonce": 4}, {"l2_expiry_ms": 1700000001},
+    ],
+    ids=lambda edit: next(iter(edit)),
+)
+def test_every_withdraw_field_moves_the_message(edit):
+    assert withdraw_message(**{**WITHDRAW0, **edit}).hex() != KAT["withdraws"][0]["m"]
+
+
+@pytest.mark.parametrize("field, low, high", WITHDRAW_WIDTHS)
+def test_withdraw_field_widths(field, low, high):
+    for value in (low, high):
+        assert len(withdraw_message(**{**WITHDRAW0, field: value})) == 32
+    for value in (low - 1, high + 1):
+        error = refused("Width", withdraw_message, **{**WITHDRAW0, field: value})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+def test_a_withdraws_first_refusal_is_k1s():
+    # Every field out of range: each is named in turn, in K1's order, as the ones before it are
+    # put right.
+    out = [(field, high + 1) for field, _, high in WITHDRAW_WIDTHS]
+    terms = {**WITHDRAW0, **dict(out)}
+    for field, _ in out:
+        assert str(refused("Width", withdraw_message, **terms)) == f"l2 width: {field} out of range"
+        terms[field] = WITHDRAW0[field]
+    assert withdraw_message(**terms).hex() == KAT["withdraws"][0]["m"]
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [{"amount": "123456789012"}, {"l2_asset_id": True}, {"l2_nonce": 3.0}, {"l2_expiry_ms": None}],
+    ids=lambda edit: next(iter(edit)),
+)
+def test_withdraw_fields_have_their_types(edit):
+    with pytest.raises(TypeError, match=next(iter(edit))):
+        withdraw_message(**{**WITHDRAW0, **edit})
 
 
 # --------------------------------------------------------------------------- #

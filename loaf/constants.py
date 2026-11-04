@@ -2,8 +2,9 @@
 
 These capture the wire-level contract every client must honour: numeric
 precision limits, order limits and defaults, the timing rules of signed
-orders, the perps markets' pools and the life of a signed allocate or exit,
-and the trading key and its login tokens.
+orders, an order's controls and the cancels' bounds, the perps markets' pools
+and the life of a signed allocate or exit, withdrawals, and the trading key
+and its login tokens.
 """
 
 from __future__ import annotations
@@ -108,6 +109,30 @@ L2_ORDER_INDEX_BLOCK = 64
 L2_ORDER_INDEX_BLOCK_MAX = 4096
 
 # --------------------------------------------------------------------------- #
+# Order controls and cancels
+# --------------------------------------------------------------------------- #
+
+#: The highest ``order_tag=``: a tag is a whole number from 1 to 2^32 - 1.
+ORDER_TAG_MAX = 4_294_967_295
+
+#: The latest ``send_by_ms=`` (Unix ms): 2^48 - 1.
+SEND_BY_MS_MAX = 2**48 - 1
+
+#: The highest market index a cancel's scope names.
+MAX_MARKET_INDEX = 4095
+
+#: The shortest ``cancel_after`` timeout other than 0 (off): 10 seconds.
+CANCEL_AFTER_MIN_MS = 10_000
+
+#: The longest ``cancel_after`` timeout: 2 minutes.
+CANCEL_AFTER_MAX_MS = 120_000
+
+#: How long the WebSocket client waits for a stamped frame of your ``portfolio`` channel
+#: before it calls the feed stale (``stale_after=``, seconds): three of the exchange's account
+#: beats, about one a second, so two in a row went missing.
+DEFAULT_STALE_AFTER = 3.0
+
+# --------------------------------------------------------------------------- #
 # Perps
 # --------------------------------------------------------------------------- #
 
@@ -142,6 +167,18 @@ DEFAULT_PERPS_OP_TTL_MS = 600_000
 
 #: The longest ``ttl_ms=`` an allocate or exit accepts: one day.
 MAX_PERPS_OP_TTL_MS = 86_400_000
+
+# --------------------------------------------------------------------------- #
+# Withdrawals
+# --------------------------------------------------------------------------- #
+
+#: How long the exchange takes a signed withdrawal when ``ttl_ms=`` is omitted: one hour. It
+#: signs ``l2ExpiryMs`` = now + :data:`L2_BUFFER_MS` + this, and takes it only until that expiry
+#: less the buffer, so an outcome left unknown is settled within this of the signing.
+DEFAULT_WITHDRAWAL_TTL_MS = 3_600_000
+
+#: The longest ``ttl_ms=`` a withdrawal accepts: one day.
+MAX_WITHDRAWAL_TTL_MS = 86_400_000
 
 # --------------------------------------------------------------------------- #
 # The trading key and its login tokens

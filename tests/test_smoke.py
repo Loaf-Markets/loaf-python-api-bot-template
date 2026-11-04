@@ -64,57 +64,87 @@ def test_derive_ws_url():
 
 def test_error_mapping():
     assert isinstance(error_from_response(401, {"error": "no"}), loaf.LoafAuthError)
-    # The emergency kill switch is a 403 with no machine code — matched on message.
-    assert isinstance(
-        error_from_response(403, {"error": "Trading is currently halted"}),
-        loaf.TradingHaltedError,
+    # The emergency kill switch: 403 TRADING_HALTED.
+    halted = error_from_response(
+        403, {"error": "Trading is currently halted", "code": "TRADING_HALTED"}
     )
+    assert type(halted) is loaf.TradingHaltedError and halted.code == "TRADING_HALTED"
     err = error_from_response(400, {"error": "Validation failed", "details": ["price: bad"]})
     assert isinstance(err, loaf.LoafValidationError) and err.details == ["price: bad"]
     assert isinstance(error_from_response(429, {"error": "slow"}), loaf.LoafRateLimitError)
     assert type(error_from_response(503, {"error": "down"})) is loaf.LoafServiceUnavailableError
 
-    # A market's halt reads the same from the backend's own check and from the engine's refusal: a
-    # MarketHaltedError, its state MARKET_HALTED, and a TradingHaltedError too.
-    halted = error_from_response(403, {"error": "Trading is halted on this market"})
-    assert type(halted) is loaf.MarketHaltedError and halted.state == "MARKET_HALTED"
-    assert isinstance(halted, loaf.TradingHaltedError)
+    # The code decides, never the text: a halt's text without its code is its status's class, and a
+    # code under another status than its own is too.
+    assert type(
+        error_from_response(403, {"error": "Trading is currently halted"})
+    ) is loaf.LoafForbiddenError
+    assert type(
+        error_from_response(400, {"error": "x", "code": "TRADING_HALTED"})
+    ) is loaf.LoafValidationError
+    # A market not live yet, delisted or expired: its own code, no halt.
     delisted = error_from_response(
-        403, {"error": "This market has been delisted and is no longer available for trading"}
-    )
-    assert type(delisted) is loaf.LoafForbiddenError  # not a halt
-    # The daily price band is a 400.
-    band = error_from_response(
-        400,
+        403,
         {
-            "error": "Order price $170 is above upper daily price band limit $160 "
-            "(reference: $150, band: 667bps)"
+            "error": "This market has been delisted and is no longer available for trading",
+            "code": "MARKET_NOT_LIVE",
         },
     )
-    assert isinstance(band, loaf.LoafValidationError)
+    assert type(delisted) is loaf.LoafForbiddenError and delisted.code == "MARKET_NOT_LIVE"
+    # The price band is a 400.
+    band = error_from_response(
+        400, {"error": "Limit price is outside the market's price band", "code": "PRICE_BAND"}
+    )
+    assert type(band) is loaf.LoafValidationError and band.code == loaf.OrderErrorCode.PRICE_BAND
     used = "l2 order_index: already used by the account; re-sign with the next index"
-    assert isinstance(error_from_response(409, {"error": used}), loaf.LoafConflictError)
-    # The exchange engine's own halts arrive as 400s with its text.
-    for message in (
-        "trading halted: …",
-        "L1_RECHECK_PENDING: …",
-        "E_L2_ORDERS_WITHOUT_JOURNAL: …",
-    ):
-        halt = error_from_response(400, {"error": message})
-        assert type(halt) is loaf.TradingHaltedError and halt.status_code == 400
-    # "halted" anywhere else in a 400 is an ordinary refusal.
+    used_error = error_from_response(400, {"error": used, "code": "ORDER_INDEX_USED"})
+    assert type(used_error) is loaf.LoafValidationError and used_error.code == "ORDER_INDEX_USED"
+    # The engine's own pause: 503 TRADING_PAUSED, a halt and a 503 both, with its Retry-After.
+    paused = error_from_response(
+        503,
+        {"error": "Trading is paused. Your order was not placed", "code": "TRADING_PAUSED"},
+        retry_after=7.0,
+    )
+    assert type(paused) is loaf.TradingPausedError and paused.retry_after == 7.0
+    assert isinstance(paused, loaf.TradingHaltedError)
+    assert isinstance(paused, loaf.LoafServiceUnavailableError)
+    # Under another status the code is no pause: that status's refusal.
     assert type(
-        error_from_response(400, {"error": "Order refused: the market was halted earlier"})
-    ) is loaf.LoafValidationError
-    # A post-only order that would have traded at once: its own 400, on the whole text.
+        error_from_response(403, {"error": "x", "code": "TRADING_PAUSED"})
+    ) is loaf.LoafForbiddenError
+    # The engine's old halt texts are no code: an ordinary refusal of their status.
+    for message in ("trading halted: …", "L1_RECHECK_PENDING: …", "E_L2_ORDERS_WITHOUT_JOURNAL: …"):
+        assert type(error_from_response(400, {"error": message})) is loaf.LoafValidationError
+    # A post-only order that would have traded at once: its own 400, by its code.
     would_take = "Post-only order rejected: it would have traded with a resting order at once"
-    error = error_from_response(400, {"error": would_take})
+    error = error_from_response(400, {"error": would_take, "code": "POST_ONLY_WOULD_TAKE"})
     assert type(error) is loaf.PostOnlyWouldTakeError and error.status_code == 400
     assert isinstance(error, loaf.LoafValidationError)
     for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error)):
         assert type(clone) is loaf.PostOnlyWouldTakeError and str(clone) == str(error)
-    assert type(error_from_response(400, {"error": would_take + "."})) is loaf.LoafValidationError
-    assert type(error_from_response(403, {"error": would_take})) is loaf.LoafForbiddenError
+    assert type(error_from_response(400, {"error": would_take})) is loaf.LoafValidationError
+    assert type(
+        error_from_response(403, {"error": would_take, "code": "POST_ONLY_WOULD_TAKE"})
+    ) is loaf.LoafForbiddenError
+    # The send-by time and a replace's target: their own classes, by their codes.
+    passed = error_from_response(400, {"error": "x", "code": "SEND_BY_PASSED"})
+    assert type(passed) is loaf.SendByPassedError and isinstance(passed, loaf.LoafValidationError)
+    gone = error_from_response(409, {"error": "x", "code": "REPLACE_TARGET_GONE"})
+    assert type(gone) is loaf.ReplaceTargetGoneError and isinstance(gone, loaf.LoafConflictError)
+    assert gone.replaced_order_cancelled is False
+    # A replace refused after its batch cancelled the old order says so.
+    refused = error_from_response(
+        400,
+        {"error": "x", "code": "INSUFFICIENT_BALANCE", "replacedOrderCancelled": True},
+    )
+    assert type(refused) is loaf.LoafValidationError and refused.replaced_order_cancelled is True
+    # Only a JSON true says so: read as cancelled, a resting order would be quoted over.
+    for value in ("true", 1, None):
+        body = {"error": "x", "code": "INSUFFICIENT_BALANCE", "replacedOrderCancelled": value}
+        assert error_from_response(400, body).replaced_order_cancelled is False
+    # A code this SDK does not know is its status's class, with the code kept.
+    unknown = error_from_response(400, {"error": "x", "code": "SOMETHING_NEW"})
+    assert type(unknown) is loaf.LoafValidationError and unknown.code == "SOMETHING_NEW"
     # A route that does not exist answers with an HTML page; keep just its message.
     missing = error_from_response(
         404,
@@ -131,19 +161,22 @@ def test_time_in_force_is_shared_types_order_time_in_force():
     assert [member.value for member in loaf.TimeInForce] == ["GTC", "IOC", "FOK", "POST_ONLY"]
 
 
-@pytest.mark.parametrize("message, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])
-def test_market_state_errors(message, cls, state):
-    error = error_from_response(403, {"error": message})
-    assert type(error) is cls and (error.state, error.status_code) == (state, 403)
+@pytest.mark.parametrize("message, code, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])
+def test_market_state_errors(message, code, cls, state):
+    error = error_from_response(403, {"error": message, "code": code})
+    assert type(error) is cls and (error.state, error.status_code, error.code) == (state, 403, code)
     assert isinstance(error, loaf.LoafForbiddenError)
     # Code that backs off on halts catches the market's own halt too.
     assert isinstance(error, loaf.TradingHaltedError) is (state == "MARKET_HALTED")
     for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
         assert type(clone) is cls and (clone.state, clone.status_code) == (state, 403)
         assert str(clone) == str(error)
-    # Only the whole text, and only as a 403.
-    assert not isinstance(error_from_response(403, {"error": message + "."}), loaf.MarketStateError)
-    assert not isinstance(error_from_response(400, {"error": message}), loaf.MarketStateError)
+    # By its code, whatever the text, and only as a 403.
+    assert type(error_from_response(403, {"error": "other words", "code": code})) is cls
+    assert not isinstance(error_from_response(403, {"error": message}), loaf.MarketStateError)
+    assert not isinstance(
+        error_from_response(400, {"error": message, "code": code}), loaf.MarketStateError
+    )
 
 
 def test_errors_survive_pickle_and_copy():
@@ -161,11 +194,13 @@ def test_errors_survive_pickle_and_copy():
     assert str(error) == (
         "Could not confirm whether order 4097 of account 5 was placed after 2 attempt(s) (last "
         "error: HTTP 502: x). It may be live, and may already have filled. Never place it afresh: "
-        "while it can still rest, re-send it unchanged with orders.resubmit(error.signed_body) "
-        "(the same order if it landed; if not, it is placed now at the signed price), or find "
-        "it in history.orders() by its expiryMs 1800000000000 (every status; openOrders shows "
-        "only resting orders). A history miss proves nothing while it can still rest (until its "
-        "expiryMs minus 72 hours)."
+        "while you still want it and it can still rest, re-send it unchanged with "
+        "orders.resubmit(error.signed_body) (the same order if it landed; if not, it is placed "
+        "now at the signed price). Once you no longer want it, settle it with "
+        "orders.cancel_by_index(4097): CANCELLED, ENDED or VOIDED (never placed, and never "
+        "will be). Or find it in history.orders() by its expiryMs 1800000000000 (every status; "
+        "openOrders shows only resting orders), where a miss proves nothing while it can still "
+        "rest (until its expiryMs minus 72 hours)."
     )
     for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
         assert type(clone) is loaf.OrderOutcomeUnknownError
@@ -234,7 +269,8 @@ def test_is_conditional_order():
 
 
 def test_models_list_every_shape():
-    # __all__ names every public TypedDict the module defines.
+    # __all__ names every public TypedDict the module defines; an underscored one is only the
+    # base that holds part of a shape's keys.
     shapes = {
         name for name, value in vars(models).items()
         if isinstance(value, type) and issubclass(value, dict)
@@ -244,7 +280,17 @@ def test_models_list_every_shape():
     assert models.OrderQueueEntry.__required_keys__ == {
         "orderId", "side", "price", "quantity", "quantityAhead", "ordersAhead"
     }
+    # A queue entry names its signed order number when it has one and its tag when it was given
+    # one; a position's ADL rank is absent while it is unranked.
     assert models.OrderQueueEntry.__optional_keys__ == {"l2OrderIndex", "orderTag"}
+    assert models.PerpsPosition.__optional_keys__ == {"adlRank"}
+    assert {"l2OrderIndex", "orderTag"} <= models.OrderHistoryItem.__optional_keys__
+    assert get_type_hints(models.OrderBook)["engineMs"] is int
+    # cancel_after always answers its deadline; cancel_by_index has no order when it voided.
+    assert models.CancelAfterResult.__required_keys__ == {"deadlineMs"}
+    by_index = get_type_hints(models.CancelByIndexResult)
+    assert models.CancelByIndexResult.__required_keys__ == {"outcome", "orderId", "status"}
+    assert (by_index["orderId"], by_index["status"]) == (Optional[int], Optional[str])
     assert {"orderId", "role"} <= models.TradeHistoryItem.__optional_keys__
     # A holding names its spot market; None: the asset has none.
     assert get_type_hints(models.Holding)["marketIndex"] == Optional[int]

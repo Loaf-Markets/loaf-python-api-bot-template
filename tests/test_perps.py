@@ -86,8 +86,10 @@ NOT_CONFIRMED = (
 )
 
 
-def error_reply(status: int, message: str) -> httpx.Response:
-    return httpx.Response(status, json={"error": message})
+def error_reply(status: int, message: str, code: str | None = None) -> httpx.Response:
+    """The exchange's refusal: its text, and its code when it has one."""
+    body = {"error": message} if code is None else {"error": message, "code": code}
+    return httpx.Response(status, json=body)
 
 
 @pytest.fixture
@@ -607,13 +609,21 @@ def test_a_lost_answer_is_resent_and_answered_as_its_duplicate(
     assert exchange.keys["withdrawalNonce"] == 1  # applied once
 
 
-@pytest.mark.parametrize("message", [PAUSED, NOT_TAKEN, ACCOUNT_UNREAD])
-def test_a_503_that_applied_nothing_is_final(exchange, trading_client, message):
+@pytest.mark.parametrize(
+    "message, code, cls",
+    [
+        (PAUSED, "TRADING_PAUSED", loaf.TradingPausedError),
+        (NOT_TAKEN, None, loaf.LoafServiceUnavailableError),
+        (ACCOUNT_UNREAD, None, loaf.LoafServiceUnavailableError),
+    ],
+)
+def test_a_503_that_applied_nothing_is_final(exchange, trading_client, message, code, cls):
     perps = trading_client(max_retries=1).perps
-    exchange.queue("/l2/allocations", error_reply(503, message), error_reply(503, message))
+    replies = [error_reply(503, message, code), error_reply(503, message, code)]
+    exchange.queue("/l2/allocations", *replies)
     with pytest.raises(loaf.LoafServiceUnavailableError) as info:
         perps.add_margin(5)
-    assert info.value.message == message
+    assert type(info.value) is cls and info.value.message == message
     first, second = exchange.posts("/l2/allocations")
     assert first == second
     # Never applied, so its nonce is unspent: the next op signs it.
@@ -927,9 +937,11 @@ def test_a_reduce_only_order_takes_no_legs(perps_exchange, trading_client):
     assert perps_exchange.requests == []
 
 
-@pytest.mark.parametrize("message, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])
-def test_a_market_state_refusal_of_an_order(perps_exchange, trading_client, message, cls, state):
-    perps_exchange.queue("/orders", error_reply(403, message))
+@pytest.mark.parametrize("message, code, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])
+def test_a_market_state_refusal_of_an_order(
+    perps_exchange, trading_client, message, code, cls, state
+):
+    perps_exchange.queue("/orders", error_reply(403, message, code))
     orders = trading_client().orders
     with pytest.raises(cls) as info:
         orders.limit_buy("OPRA-PERP", 2, 101.5)

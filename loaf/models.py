@@ -28,6 +28,9 @@ class OrderBook(TypedDict, total=False):
     ticker: str  # an orderbook_update frame's, its channel's; absent on a detail's orderBook
     bids: list[PriceLevel]
     asks: list[PriceLevel]
+    # An orderbook_update frame's: the engine's clock (unix ms) at the commit whose book it is. A
+    # book is sent again every 5 s unchanged, with its old engineMs: now - engineMs is its age.
+    engineMs: int
 
 
 class Candle(TypedDict):
@@ -92,7 +95,13 @@ class PerpsCollateral(TypedDict):
     extensionMultiplier: str  # the reads' extended units per tick, a decimal string
 
 
-class PerpsPosition(TypedDict):
+class _PerpsPositionRank(TypedDict, total=False):
+    # Its auto-deleverage indicator, 1 to 5: 5 is the fifth of its side deleveraged first, 1 the
+    # last; re-ranked at most once a minute, and absent while it is not ranked.
+    adlRank: int
+
+
+class PerpsPosition(_PerpsPositionRank):
     """One open position of a pool. Amounts are decimal strings in the engine's units, valued
     at the mark."""
 
@@ -188,6 +197,18 @@ class PerpsOpAccepted(TypedDict):
     duplicate: bool  # a re-send of an op applied before: nothing was applied again
 
 
+class WithdrawalAccepted(TypedDict):
+    """The 202 to a withdrawal (``funds.withdraw``): journaled, and taken from your spot balance."""
+
+    journalSeq: int  # its place in the exchange's journal: its transfer row's journalSeq
+    accountIndex: int  # your account
+    assetId: int  # 3, USDC
+    amount: int  # in the asset's ticks: USDC x 10^decimals / tickSize
+    nonce: int  # the nonce it spent
+    duplicate: bool  # a re-send of one journaled before: nothing was journaled again
+    status: dict[str, Any]  # {"status": "PENDING"}: follow it in portfolio.component().transfers
+
+
 class TradeTick(TypedDict, total=False):
     """A public trade, which names no market (its frame or its route does): the detail's
     ``recentTrades`` (no ``txHash``), or a ``trades_batch`` frame (newest first), or a
@@ -210,7 +231,8 @@ class TradeTick(TypedDict, total=False):
 
 
 class OrderResult(TypedDict, total=False):
-    """Response to ``POST /orders`` (``orders.create`` and its wrappers)."""
+    """Response to ``POST /orders`` (``orders.create`` and its wrappers). A replace's
+    (``replaces_order_id=``) 200 means the order it replaced is cancelled."""
 
     success: bool
     orderId: int
@@ -230,9 +252,27 @@ class OrderAck(TypedDict, total=False):
 
 
 class CancelAllResult(TypedDict, total=False):
-    requestedCount: int
-    cancelledOrderIds: list[int]
-    failedOrders: list[dict[str, Any]]  # [{orderId, errorMessage}]
+    """Response to ``POST /orders/cancel-all`` (``orders.cancel_all``)."""
+
+    requestedCount: int  # len(cancelledOrderIds) + len(failedOrders)
+    cancelledOrderIds: list[int]  # conditional rows' ids first, then booked orders'
+    failedOrders: list[dict[str, Any]]  # [{orderId, errorMessage}]: still open; retry is safe
+
+
+class CancelAfterResult(TypedDict):
+    """Response to ``POST /orders/cancel-after`` (``orders.cancel_after``)."""
+
+    # When the scope's orders are cancelled unless you call again first: unix ms of the
+    # engine's clock; 0 when the call turned the scope's timer off.
+    deadlineMs: int
+
+
+class CancelByIndexResult(TypedDict):
+    """Response to ``POST /orders/cancel-by-index`` (``orders.cancel_by_index``)."""
+
+    outcome: str  # CancelByIndexOutcome: CANCELLED, ENDED or VOIDED
+    orderId: Optional[int]  # the order that carries the number; None when VOIDED
+    status: Optional[str]  # OrderStatus: CANCELLED, or how an ENDED order ended; None when VOIDED
 
 
 class OrderHistoryItem(TypedDict, total=False):
@@ -274,6 +314,8 @@ class OrderHistoryItem(TypedDict, total=False):
     parentOrderId: Optional[int]  # conditional only; the BUY a TP/SL leg arms on
     placedOrderId: Optional[int]  # conditional only; the booked order id once PLACED — cancel THIS
     triggeredAt: Optional[int]  # conditional only; unix seconds
+    l2OrderIndex: int  # the order number it signed (orders.cancel_by_index takes it)
+    orderTag: int  # booked orders only: the order_tag= it was placed with; absent without one
 
 
 class _OrderQueueEntryRequired(TypedDict):
@@ -418,10 +460,13 @@ __all__ = [
     "PerpsMarketLive",
     "PerpsMarketsLive",
     "PerpsOpAccepted",
+    "WithdrawalAccepted",
     "TradeTick",
     "OrderResult",
     "OrderAck",
     "CancelAllResult",
+    "CancelAfterResult",
+    "CancelByIndexResult",
     "OrderHistoryItem",
     "OrderQueueEntry",
     "TradeProofStatus",

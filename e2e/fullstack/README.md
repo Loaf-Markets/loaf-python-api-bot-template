@@ -220,24 +220,26 @@ reduce-only sell trade half; its OPEN takes an opening order again. Then the pum
 turns PRICE_STALE, refuses an order adding to A's long (PRICE_STALE) and lets a reduce-only pair trade a quarter;
 the reports resume and the market is OPEN again.
 
-**exit**: A's pool 0 closed and its whole ticks allocated to spot. The driver no longer makes an L2 withdrawal (nor
-its L1 claim): `POST /l2/withdrawals` is Privy-only since the trading-key change, and the driver has no Privy login.
-The run's verdict says so in a NOTE.
+**exit**: A's pool 0 closed and its whole ticks allocated to spot; A withdraws up to 1,000 USDC of its spot balance
+with the SDK's `funds.withdraw` (signed with A's trading key, sent with a login token, naming no recipient):
+journaled, not a duplicate, for exactly the ticks asked; the L2 balance drops by exactly it; once its batch
+executes, L1's pending balance for A's wallet rises by it; the transfer row is CONFIRMED with its batch;
+`withdrawPendingBalance` pays A's wallet exactly that and leaves nothing pending.
 
 **proof**: every trade of the run's users (newer than each user's last trade before the run, read in pages of at
 most 100, the backend's largest) is IN_BATCH and final;
 the newest batch is past L1's committed batch at the start; L1's verified and executed pointers reach it;
 settlesub's last verified batch equals L1's; settled's refusal count is unchanged (the newest refusals are logged
-if not). It proves the run's own batches, so it needs a step that trades in `E2E_STEPS`: exit makes no withdrawal
-any more, and `E2E_STEPS=exit,proof` alone has no batch to prove and fails.
+if not). It proves the run's own batches, so it needs a step in `E2E_STEPS` that trades or withdraws: the exit's
+withdrawal batch counts, so `E2E_STEPS=exit,proof` alone has one to prove.
 
 ## Laptop checks
 
 `test_e2e.py` (pytest) checks the driver's own parts with no stack: the trading key's derivation against the web
 app's vectors (viem's signatures of its `L2Key` typed data, addresses in any case), the setup's account and key
 sent on L1 before any L2 read with the SDK's login refused until the key is in force (a fresh address, a re-run, a
-key changed since, a run stopped between the first deposit and the key change), the exit's allocate-out with no
-withdrawal, `index_for` (below 0 too), the SQL (the users matched without case, no API key), the DSN files, the
+key changed since, a run stopped between the first deposit and the key change), the exit's allocate-out, withdrawal
+and exact L1 claim, `index_for` (below 0 too), the SQL (the users matched without case, no API key), the DSN files, the
 price control's writes and answers, the seed wallets, the L1 reads' decoding, the calls against ZkLoaf's ABI
 (`E2E_ZKLOAF_ABI`, `changePubKey` among them), the step log, the verdict and the exit codes; and `p5-fullstack.sh`'s
 mapping of the phase, its refusals, and its driver lock (a second driver refused while one runs, the lock held

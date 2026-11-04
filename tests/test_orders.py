@@ -43,6 +43,7 @@ from conftest import (
     L2_SECRET,
     MARKET_INDEX,
     MARKET_L2,
+    MARKET_STATES,
     TRADING_KEY,
     UNKNOWN_KEY,
     FakeExchange,
@@ -86,7 +87,6 @@ OPEN_ORDER_CAP = (
     "orders on it before placing a new one."
 )
 DELISTED = "This market has been delisted and is no longer available for trading"
-BALANCE_UNAVAILABLE = "The L2 balance is temporarily unavailable; try again in a moment"
 INDEX_USED = "l2 order_index: already used by the account; re-sign with the next index"
 INDEX_NOT_RESERVED = (
     "l2 order_index: not inside a range reserved to the account; reserve one with "
@@ -109,8 +109,10 @@ HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
 
 
-def error_reply(status: int, message: str, **kwargs: Any) -> httpx.Response:
-    return httpx.Response(status, json={"error": message}, **kwargs)
+def error_reply(status: int, message: str, code: str | None = None, **kwargs: Any) -> httpx.Response:
+    """The exchange's refusal: its text, and on the order routes its code."""
+    body = {"error": message} if code is None else {"error": message, "code": code}
+    return httpx.Response(status, json=body, **kwargs)
 
 
 def duplicate_reply(order_id: int = 7) -> httpx.Response:
@@ -868,9 +870,11 @@ def test_conditional_order_number_conflict_drops_the_block(exchange, trading_cli
     assert indices(exchange, "/orders/conditional") == [4097, 4098, 4099, 4100]
 
 
-def test_conditional_balance_unavailable_is_not_placed(exchange, trading_client):
+def test_conditional_not_processed_is_not_placed(exchange, trading_client):
+    # The code alone makes a 503 definite: this text names no outcome.
     exchange.queue(
-        "/orders/conditional", *(error_reply(503, BALANCE_UNAVAILABLE) for _ in range(4))
+        "/orders/conditional",
+        *(error_reply(503, "Trading service is unavailable", "NOT_PROCESSED") for _ in range(4)),
     )
     orders = trading_client().orders
     with pytest.raises(loaf.LoafServiceUnavailableError) as info:
@@ -1012,7 +1016,7 @@ def test_an_unknown_time_in_force_is_refused_locally(exchange, trading_client, t
 
 def test_a_post_only_order_that_would_take_is_its_own_error(exchange, trading_client):
     orders = trading_client().orders
-    exchange.queue("/orders", error_reply(400, POST_ONLY_WOULD_TAKE))
+    exchange.queue("/orders", error_reply(400, POST_ONLY_WOULD_TAKE, "POST_ONLY_WOULD_TAKE"))
     with pytest.raises(loaf.PostOnlyWouldTakeError) as info:
         orders.limit_buy("OPRA", 10, 167.49, time_in_force="POST_ONLY")
     error = info.value
@@ -1621,15 +1625,21 @@ def test_placement_backoff_ignores_rate_limit_headers(exchange, trading_client, 
     # A signed price goes stale: re-sends wait only the jittered 0.5 / 1 / 2 s.
     assert len(sleeps) == 3 and all(0 <= s <= 2.0 for s in sleeps)
 
-    # Reads still wait out the hint.
+    # Reads wait out a 503's Retry-After and a 429's RateLimit-Reset, but never a 503's
+    # RateLimit-Reset: the time left in the rate-limit window says nothing about the outage.
     del sleeps[:]
     replies = [
+        httpx.Response(
+            503, json={"error": "busy"}, headers={"Retry-After": "7", "RateLimit-Reset": "57"}
+        ),
         httpx.Response(503, json={"error": "busy"}, headers={"RateLimit-Reset": "57"}),
+        httpx.Response(429, json={"error": "slow"}, headers={"RateLimit-Reset": "41"}),
         httpx.Response(200, json={"markets": []}),
     ]
     http = httpx.Client(transport=httpx.MockTransport(lambda r: replies.pop(0)), base_url=BASE)
-    LoafClient(base_url=BASE, http_client=http).market.list()
-    assert sleeps == [57.0]
+    LoafClient(base_url=BASE, http_client=http, max_retries=3).market.list()
+    assert len(sleeps) == 3 and replies == []
+    assert sleeps[0] == 7.0 and 0 <= sleeps[1] <= 1.0 and sleeps[2] == 41.0
 
 
 def test_backoff_stays_capped_through_a_long_outage(exchange, trading_client, monkeypatch):
@@ -1844,18 +1854,25 @@ def test_market_refusal_rereads_the_market(exchange, trading_client, status, mes
 
 
 @pytest.mark.parametrize(
-    "message, error",
+    "message, code, error",
     [
-        ("Trading is halted on this market", loaf.MarketHaltedError),
-        ("Trading is currently halted", loaf.TradingHaltedError),
-        ("Trading on this market has not started yet", loaf.LoafForbiddenError),
+        ("Trading is halted on this market", "MARKET_HALTED", loaf.MarketHaltedError),
+        ("Trading is currently halted", "TRADING_HALTED", loaf.TradingHaltedError),
+        ("Trading on this market has not started yet", "MARKET_NOT_LIVE", loaf.LoafForbiddenError),
+        ("This market is outside its trading hours", "MARKET_CLOSED", loaf.MarketStateError),
+        (MARKET_STATES[2][0], "REDUCE_ONLY", loaf.MarketStateError),
+        (MARKET_STATES[3][0], "PRICE_STALE", loaf.MarketStateError),
+        (MARKET_STATES[4][0], "PRICE_HELD", loaf.PriceHeldError),
     ],
 )
-def test_halt_or_start_not_reached_keeps_the_market(exchange, trading_client, message, error):
+def test_halt_or_start_not_reached_keeps_the_market(
+    exchange, trading_client, message, code, error
+):
     # The market is the ticker's still: an order placed until it trades reads nothing again.
+    # Nor does the market's own state show it stale: it says what the market takes now.
     orders = trading_client().orders
     orders.limit_buy("OPRA", 10, 167.49)
-    exchange.queue("/orders", error_reply(403, message))
+    exchange.queue("/orders", error_reply(403, message, code))
     with pytest.raises(error) as info:
         orders.limit_buy("OPRA", 10, 167.49)
     assert type(info.value) is error

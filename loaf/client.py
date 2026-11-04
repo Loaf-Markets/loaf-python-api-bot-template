@@ -9,6 +9,7 @@ import os
 import random
 import re
 import ssl
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -39,10 +40,12 @@ from .exceptions import (
     LoafServerError,
     OrderOutcomeUnknownError,
     PerpsOutcomeUnknownError,
+    WithdrawalOutcomeUnknownError,
     error_from_response,
 )
 
 if TYPE_CHECKING:
+    from .resources.funds import FundsResource
     from .resources.history import HistoryResource
     from .resources.market import MarketResource
     from .resources.orders import OrdersResource
@@ -98,27 +101,41 @@ def _login_refusal(error: LoafAPIError) -> LoafAPIError:
 # re-sending them is always safe.
 _NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError)
 
-# 503s the exchange sends only when nothing was placed (safe to treat as a definite answer),
-# lowercased: the exchange writes them in both cases.
-_NOT_PLACED_503_TEXTS = (
-    "your order was not placed",
-    "nothing was done",
-    "the l2 balance is temporarily unavailable",
-)
+# 503s the exchange sends only when nothing was done, so as definite an answer as a 4xx: any with
+# one of these codes (the engine paused, or it never took the order), and, of the ones it sends with
+# no code, those carrying one of their op's texts, lowercased (the exchange writes them in both
+# cases): the engine without the order's L2 fields, its answer that it journaled no perps op, or
+# the account (an op's, or a login token's) unread before anything reached the engine. Any other
+# 503 may follow a journaled op.
+_NOT_DONE_503_CODES = frozenset({"TRADING_PAUSED", "NOT_PROCESSED", "MARKET_UNAVAILABLE"})
+_NOT_DONE_503_TEXTS = {
+    "order": ("your order was not placed", "nothing was done"),
+    "perps": ("nothing was journaled", "nothing was done"),
+    "withdrawal": ("nothing was done",),
+}
+
+# Each signed op: what an unexpected answer to it names, and the error an unknown outcome raises
+# (each takes the body sent, the attempts and the last error).
+_SIGNED_OPS: dict[
+    str,
+    tuple[
+        str,
+        type[OrderOutcomeUnknownError | PerpsOutcomeUnknownError | WithdrawalOutcomeUnknownError],
+    ],
+] = {
+    "order": ("an order placement", OrderOutcomeUnknownError),
+    "perps": ("a perps op", PerpsOutcomeUnknownError),
+    "withdrawal": ("a withdrawal", WithdrawalOutcomeUnknownError),
+}
 
 
-# The same for a perps allocate or exit: nothing was journaled, or the login token's account could
-# not be read (so the op never reached the engine), so nothing was applied.
-_NOT_APPLIED_503_TEXTS = (
-    "nothing was journaled",
-    "your perps request was not submitted",
-    "nothing was done",
-)
-
-
-def _definitely_not_placed(error: LoafAPIError, perps: bool = False) -> bool:
-    texts = _NOT_APPLIED_503_TEXTS if perps else _NOT_PLACED_503_TEXTS
-    return error.status_code == 503 and any(t in error.message.lower() for t in texts)
+def _definitely_not_done(error: LoafAPIError, op: str) -> bool:
+    """Whether a 503 answering signed ``op`` says nothing was done."""
+    if error.status_code != 503:
+        return False
+    return error.code in _NOT_DONE_503_CODES or any(
+        text in error.message.lower() for text in _NOT_DONE_503_TEXTS[op]
+    )
 
 
 # $LOAF_MAX_SLIPPAGE_BPS: a plain whole number from 0 to 9999 (leading zeros allowed).
@@ -288,6 +305,9 @@ class LoafClient:
         #: The login tokens the trading key signs for every authenticated request and the
         #: WebSocket; None without a trading key.
         self._login_tokens = LoginTokens(self._l2_key) if self._l2_key is not None else None
+        #: Held from the nonce read to the answer of each perps op and withdrawal: they spend one
+        #: nonce counter, so this client sends them one at a time.
+        self._op_lock = threading.Lock()
 
         self.base_url = (base_url or os.environ.get(ENV_BASE_URL) or DEFAULT_BASE_URL).rstrip("/")
         self._ws_url_override = ws_url or os.environ.get(ENV_WS_URL) or None
@@ -320,6 +340,7 @@ class LoafClient:
         self._owns_http = http_client is None
 
         # Lazily import to avoid an import cycle at module load.
+        from .resources.funds import FundsResource
         from .resources.history import HistoryResource
         from .resources.market import MarketResource
         from .resources.orders import OrdersResource
@@ -334,6 +355,8 @@ class LoafClient:
         self.perps: PerpsResource = PerpsResource(self)
         #: Balances, holdings, and recent activity.
         self.portfolio: PortfolioResource = PortfolioResource(self)
+        #: Withdrawals of USDC to your own wallet (signed like orders).
+        self.funds: FundsResource = FundsResource(self)
         #: Paginated order, trade & funding history.
         self.history: HistoryResource = HistoryResource(self)
 
@@ -470,36 +493,40 @@ class LoafClient:
         return self._l2_key.public_key if self._l2_key is not None else None
 
     def _send_signed(
-        self, path: str, body: dict, *, ambiguous: bool = False, perps: bool = False
+        self, path: str, body: dict, *, ambiguous: bool = False, op: str = "order"
     ) -> Any:
-        """POST a signed placement, re-sending the identical bytes on transient failures.
+        """POST signed ``op``, re-sending the identical bytes on transient failures.
 
-        An order carries no ``Authorization`` header: its signature authenticates. Network errors
-        and 5xx are re-sent up to ``max_retries`` times, after a short jittered
-        pause; the exchange admits one order per account and order number, so a
-        repeat is answered as a duplicate, never a second order. 4xx (429
-        included) is final. If any attempt may have landed and no 200 settled
-        it, raises :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
+        ``op="order"``: an order placement. It carries no ``Authorization``
+        header: its signature authenticates. Network errors and 5xx are re-sent
+        up to ``max_retries`` times, after a short jittered pause; the exchange
+        admits one order per account and order number, so a repeat is answered
+        as a duplicate, never a second order. 4xx (429 included) is final. If
+        any attempt may have landed and no 200 settled it, raises
+        :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
 
         ``ambiguous=True`` (resubmit): an earlier attempt may already have
-        landed, so anything but a 200 raises ``OrderOutcomeUnknownError``.
+        landed, so anything but a 2xx raises the op's unknown-outcome error.
 
-        ``perps=True``: a signed perps allocate or exit. It carries a login token
-        too (the exchange checks the account is yours) and is settled by a 202
-        ``{journalSeq, duplicate}``; the exchange applies one op per account and
-        nonce and answers a repeat of an applied one as its duplicate. It raises
-        :class:`~loaf.exceptions.PerpsOutcomeUnknownError` instead.
+        ``op="perps"`` or ``op="withdrawal"``: a signed perps allocate or exit,
+        or a withdrawal. It carries a login token too (the exchange checks the
+        account is yours) and is settled by a 202 ``{journalSeq, duplicate,
+        ...}``; the exchange journals one op per account and nonce and answers a
+        repeat of a journaled one as its duplicate. It raises
+        :class:`~loaf.exceptions.PerpsOutcomeUnknownError` or
+        :class:`~loaf.exceptions.WithdrawalOutcomeUnknownError` instead.
         """
+        what, unknown = _SIGNED_OPS[op]
         content = _json.dumps(body, separators=(",", ":"), allow_nan=False).encode()
         headers = {"Content-Type": "application/json"}
-        tokens = self._login_tokens if perps else None
-        if perps and tokens is None:
+        tokens = None if op == "order" else self._login_tokens
+        if op != "order" and tokens is None:
             raise LoafConfigError(
                 f"POST {path} needs your trading key, which signs the op and the login token "
                 f"that authenticates it: set ${ENV_TRADING_KEY} to the web app's Show trading "
                 "key (README §2), or pass trading_key=..."
             )
-        settled_by = "journalSeq" if perps else "orderId"
+        settled_by = "orderId" if op == "order" else "journalSeq"
         timeout = self._placement_timeout
         attempt = 0
         token = ""
@@ -538,8 +565,7 @@ class LoafClient:
                         if isinstance(result, dict) and settled_by in result:
                             return result
                         error = LoafServerError(
-                            "Unexpected response to a perps op" if perps
-                            else "Unexpected response to an order placement",
+                            f"Unexpected response to {what}",
                             status_code=response.status_code,
                             body=result,
                         )
@@ -550,7 +576,7 @@ class LoafClient:
                             tokens.forget(token)  # refused: the next request signs a fresh one
                             error = _login_refusal(error)
                         retryable = response.status_code >= 500
-                        if retryable and not _definitely_not_placed(error, perps):
+                        if retryable and not _definitely_not_done(error, op):
                             ambiguous = True
                 if not retryable or attempt >= self.max_retries:
                     break
@@ -564,7 +590,6 @@ class LoafClient:
             headers.pop("Authorization", None)
             response = None
         if ambiguous:
-            unknown = PerpsOutcomeUnknownError if perps else OrderOutcomeUnknownError
             raise unknown(
                 signed_body=copy.deepcopy(body), attempts=attempt + 1, last_error=error
             ) from error
@@ -613,7 +638,14 @@ class LoafClient:
 
     @staticmethod
     def _retry_after_seconds(response: httpx.Response) -> float | None:
-        for header in ("retry-after", "ratelimit-reset"):
+        """The wait an answer asks for, in seconds: its Retry-After, else, for a 429 alone, its
+        RateLimit-Reset (every answer carries one, the time left in the rate-limit window, which
+        says nothing about when a 503's cause clears)."""
+        if response.status_code == 429:
+            headers: tuple[str, ...] = ("retry-after", "ratelimit-reset")
+        else:
+            headers = ("retry-after",)
+        for header in headers:
             value = response.headers.get(header)
             if value is not None:
                 try:

@@ -298,3 +298,29 @@ def test_a_liquidation_row_is_reported_as_a_fill(monkeypatch: pytest.MonkeyPatch
     strategy.on_my_fill(LoafObject({"type": "trade_new", "trade": trade}))
     printed = capsys.readouterr().out
     assert "FILLED (LIQUIDATION): BUY 1.5 MUS-PERP @ 26.1 (fee 0, order #77) #990" in printed
+
+
+def test_the_tick_shows_a_stale_private_stream_until_it_is_live_again(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    detail = LoafObject({"market": {**TRADEABLE, "isHalted": False}, "orderBook": None})
+    strategy = _bot(monkeypatch).Strategy(
+        SimpleNamespace(market=SimpleNamespace(get=lambda t: detail)), "MUS-PERP"
+    )
+
+    def tick() -> str:
+        strategy.on_tick()
+        (line,) = [out for out in capsys.readouterr().out.splitlines() if out.startswith("[MUS")]
+        return line
+
+    quiet = "[MUS-PERP] bid=None ask=None spread=None mark=None"
+    assert strategy.private_fresh is None and tick() == quiet  # no beat yet: nothing claimed
+    strategy.on_fresh(LoafObject({"engineMs": 1_800_000_000_000}))
+    assert strategy.private_fresh is True and capsys.readouterr().out == ""  # the first: quiet
+    strategy.on_stale(LoafObject({"reason": "silent", "engineMs": 1_800_000_000_000,
+                                  "silentSeconds": 3.0}))
+    assert capsys.readouterr().out == "  *** private stream STALE (silent; last news 3.0 s ago)\n"
+    assert strategy.private_fresh is False and tick() == quiet + " [STALE]"
+    strategy.on_fresh(LoafObject({"engineMs": 1_800_000_004_000}))
+    assert capsys.readouterr().out == "  *** private stream live again\n"
+    assert strategy.private_fresh is True and tick() == quiet

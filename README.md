@@ -63,10 +63,11 @@ loaf_tk_<l2ChainId>_<l2AccountIndex>_<80 hex characters>
   key, shared by the web app and all your bots: it is the same at every showing
   until you reset it, and the page does not save it.
 - **What it does.** It signs every order you place, and every perps margin
-  move and exit, on your machine; the key itself is never sent. Everything
-  else the SDK does for you (reads, cancels, the account read and order-number
-  reservations an order needs, perps margin moves and exits and the nonce read
-  before each, and your private WebSocket channel) is authenticated by a
+  move, exit and withdrawal, on your machine; the key itself is never sent.
+  Everything else the SDK does for you (reads, cancels, the account read and
+  order-number reservations an order needs, perps margin moves, exits and
+  withdrawals and the nonce read before each, and your private WebSocket
+  channel) is authenticated by a
   **login token** the SDK signs with it: a short-lived Bearer (`loaf_lt_…`)
   for your account, which lives 10 minutes, and which the SDK signs afresh
   once half of that has passed. The exchange takes one only before its expiry
@@ -75,10 +76,13 @@ loaf_tk_<l2ChainId>_<l2AccountIndex>_<80 hex characters>
 - **What it cannot do.** Whoever holds it can read your account and trade its
   balance on its vault (the ledger the markets settle on) away, against orders
   of their own: keep it, and the `.env` that holds it, as secret as your wallet
-  key. But it cannot move your wallet's funds: withdrawals, deposits and
-  everything else in the web app need a web-app login. **Reset trading key** in
-  the web app (in Account Settings) revokes it, for the web app and every bot
-  alike.
+  key. It can withdraw USDC from your account, but only to your own wallet: a
+  withdrawal it signs names no recipient, and the exchange pays your account's
+  withdrawals to the wallet whose first deposit opened it, and to no other
+  (see **Withdrawals**). It cannot move your wallet's funds: deposits, and
+  everything else in the web app, need your wallet or a web-app login.
+  **Reset trading key** in the web app (in Account Settings) revokes it, for
+  the web app and every bot alike.
 
 ```bash
 cp .env.example .env
@@ -108,10 +112,9 @@ reaches the server, until its token expires (`4001 expired`), at most 10
 minutes later; with `portfolio` subscribed the client then reconnects, and
 every attempt is refused (see **Real-time WebSocket**). An order carries no
 login token, though, and is signed at the account epoch the SDK read before the
-reset, so the bot's next order may be refused with `l2 epoch: …`
-(`LoafValidationError`) or `l2 signature: …` (`LoafAuthError`, the exchange's
-text alone) instead; the order after it reads the account again and gets the
-explained `LoafAuthError`. Also cancel and re-arm every stop, take and TP/SL leg
+reset, so the bot's next order may be refused with code `SETTLE_EPOCH_MISMATCH`
+(`LoafValidationError`) or `INVALID_SIGNATURE` (`LoafAuthError`) instead; the
+order after it reads the account again and gets the explained `LoafAuthError`. Also cancel and re-arm every stop, take and TP/SL leg
 (see **Stop & take orders**): those signed with the old key stay ARMED but FAIL
 when they fire.
 
@@ -175,15 +178,17 @@ read from the working tree, so they stay accurate either way.
 To pin to a release rather than track `main`:
 
 ```bash
-git checkout v0.5.0
+git checkout v0.6.0
 ```
 
 Releases are tagged from `v0.3.0` onward. While the SDK is pre-1.0, a breaking
-change bumps the **minor** version — so `0.4.x` → `0.5.0` is the signal to
-re-read this README before upgrading (0.5.0 replaced the API key and the bare
-80-hex `LOAF_SECRET_KEY` with the one `LOAF_TRADING_KEY`, §2). Expect that
-signal often while Loaf is on testnet; an old pin is the most common reason a
-bot stops matching these docs.
+change bumps the **minor** version — so `0.5.x` → `0.6.0` is the signal to
+re-read this README before upgrading. [CHANGELOG.md](CHANGELOG.md) lists what
+each release changed and what to change in a bot (0.6.0 moved the perps reads
+to the portfolio and the market, and gave every order refusal a `code`; 0.5.0
+replaced the API key and the bare 80-hex `LOAF_SECRET_KEY` with the one
+`LOAF_TRADING_KEY`, §2). Expect that signal often while Loaf is on testnet; an
+old pin is the most common reason a bot stops matching these docs.
 
 ---
 
@@ -194,8 +199,9 @@ Create one `LoafClient` and reach everything through grouped resources:
 | Resource | What it covers |
 | --- | --- |
 | `loaf.market` | markets, market detail (a perp's terms and live state), candle history, trade backfill (all public) |
-| `loaf.orders` | place (signed) / cancel / cancel-all orders, stop & take (conditional) orders |
+| `loaf.orders` | place (signed) and replace orders, stop & take (conditional) orders; cancel one, all, a market's or a tag's, on a timer (`cancel_after`) or by order number |
 | `loaf.perps` | your margin pools and positions, margin moves and exits (signed) |
+| `loaf.funds` | withdraw USDC to your own wallet (signed) |
 | `loaf.portfolio` | balances, holdings, perps and your perps leverage setting; recent activity and fees |
 | `loaf.history` | paginated order, trade & funding history, cancelled & active orders |
 
@@ -223,7 +229,9 @@ orders.resubmit(signed_body)          POST   /orders or /orders/conditional (re-
 orders.cancel(order_id)               POST   /orders/cancel
 orders.cancel_conditional(order_id)   POST   /orders/conditional/cancel
 orders.cancel_row(order)              (routes a row to the right cancel)
-orders.cancel_all()                   POST   /orders/cancel-all
+orders.cancel_all(ticker=, order_tag=) POST  /orders/cancel-all     (every order, one market's, one tag's)
+orders.cancel_after(timeout_ms, ...)  POST   /orders/cancel-after   (the dead man's switch)
+orders.cancel_by_index(order_index)   POST   /orders/cancel-by-index (settle an order by its number)
 
 perps.positions() / pool / position   GET    /portfolio/summary     (its perps: your pools and positions)
 perps.collateral()                    GET    /portfolio/summary     (read once: USDC's decimals and tick size)
@@ -231,6 +239,9 @@ perps.allocate / add_margin / return_margin
                                       POST   /l2/allocations        (signed; with a login token)
 perps.exit(market, pool=)             POST   /l2/exits              (signed; with a login token)
 perps.resubmit(signed_body)           POST   /l2/allocations or /l2/exits (re-send unchanged)
+
+funds.withdraw(amount)                POST   /l2/withdrawals        (signed; with a login token)
+funds.resubmit(signed_body)           POST   /l2/withdrawals        (re-send unchanged)
 
 portfolio.summary()                   GET    /portfolio/summary     (balances, holdings, perps)
 portfolio.component()                 GET    /portfolio/component   (recent activity, fees, lifetime volume, holdings' details, saved leverage)
@@ -249,9 +260,9 @@ Placements are signed with your trading key and carry no login token. Every
 other call above that is not public is authenticated by a login token your
 trading key signs, and so are the two requests the SDK makes for your orders:
 it reads your account's epoch with `GET /l2/keys` and reserves order numbers
-with `POST /l2/order-indices`. A perps allocate or exit is signed with your
-trading key too, and also carries a login token (the SDK reads its nonce with
-`GET /l2/keys` first).
+with `POST /l2/order-indices`. A perps allocate or exit, and a withdrawal, is
+signed with your trading key too, and also carries a login token (the SDK reads
+its nonce with `GET /l2/keys` first).
 
 A market (an order book, spot or perp) is named by its ticker: its asset's
 ticker, with `-PERP` appended for a perp (`MUS`, `H100-PERP`). `market.get`,
@@ -297,6 +308,7 @@ print(res.status, res.quantityLeft)   # FILLED, or CANCELLED with the rest: a MA
 res = loaf.orders.limit_buy("MUS", quantity=10, price=150, time_in_force="POST_ONLY")   # makes, never takes
 
 loaf.orders.cancel_all()      # cancel every open order, stop and take (it sells nothing)
+loaf.orders.cancel_all("MUS") # or one market's (see Cancels)
 ```
 
 **A 200 is sent after the exchange commits the order, so its `status` is
@@ -311,12 +323,11 @@ below).
 
 **Time in force.** `time_in_force=` on `create`, `limit_buy` and `limit_sell`
 (`loaf.TimeInForce`): `GTC` (the default) rests what does not fill at once;
-`IOC` cancels it, and is refused (400 `Order rejected: no resting order could
-fill any of it`) when nothing fills; `FOK` fills the whole quantity at once or
-is refused (400 `Fill-or-kill order rejected: it could not be filled in full`);
+`IOC` cancels it, and is refused (400, code `NOT_FILLED`) when nothing fills;
+`FOK` fills the whole quantity at once or is refused (400, `FOK_NOT_FILLED`);
 `POST_ONLY` (a LIMIT order's alone: the SDK refuses it on a MARKET order) is
-refused with `loaf.PostOnlyWouldTakeError` when it would trade at once, so it
-only ever makes. Order rows show a post-only order as `GTC`, and a MARKET order
+refused with `loaf.PostOnlyWouldTakeError` (`POST_ONLY_WOULD_TAKE`) when it
+would trade at once, so it only ever makes. Order rows show a post-only order as `GTC`, and a MARKET order
 sent as `GTC` as `IOC`. Stops, takes and TP/SL legs book GTC orders.
 
 `duplicate: True` means this exact signed order had already landed (the
@@ -341,7 +352,7 @@ stop means a second sell).
 - The exchange matches a MARKET order against resting orders at their prices,
   never worse than the price you signed, and **never rests it**: what it cannot
   fill at once is cancelled (`CANCELLED`), and one that fills nothing is refused
-  (400 `Order rejected: no resting order could fill any of it`).
+  (400, code `NOT_FILLED`).
 - The reference read is one extra public request; it can lag the live market
   and may not yet show a trade you just made. For price-sensitive orders pass the
   `markprice:{ticker}` value you stream as `reference_price` (once the SDK has
@@ -366,15 +377,21 @@ res = loaf.orders.market_buy("MUS", quantity=qty, reference_price=mark)  # same 
 ```
 
 A few checks run server-side that the SDK cannot pre-validate, so handle their
-rejections rather than trying to avoid them:
+rejections rather than trying to avoid them. Every refusal carries a `code`
+(`e.code`, one of `loaf.OrderErrorCode`): branch on it, never on the message,
+which is for people and may change.
 
-| Rejection | Rule |
-| --- | --- |
-| `LoafValidationError` (400) | **Minimum order value** — `price x quantity` must be at least $10, measured at the price you **sign** (a MARKET order's worst price). A SELL closing your *entire* available holding is exempt, so dust can always be flattened. |
-| `LoafValidationError` (400) | **Limit price deviation** — any order, MARKET included, whose signed price is too far from the market reference is refused. The ceiling is a deployment setting; keep your max slippage small. |
-| `LoafValidationError` (400) | **Daily price band** — a per-market band around the daily reference price, when enabled. The message carries the price, limit, reference and band width. |
-| `LoafValidationError` (400) | **Balance and open-order caps** — `Insufficient available balance for this order`, or too many open orders (resting stops count too). |
-| `LoafValidationError` (400) | **Fee-rate cap** — `l2 fee: the signed fee-rate cap is below the account's fee rate`: your account's fee rate is above the cap every order signs. |
+| Rejection | Code | Rule |
+| --- | --- | --- |
+| `LoafValidationError` (400) | `BELOW_MIN_ORDER_VALUE` | **Minimum order value** — `price x quantity` must be at least $10, measured at the price you **sign** (a MARKET order's worst price). A SELL closing your *entire* available holding is exempt, so dust can always be flattened. |
+| `LoafValidationError` (400) | `PRICE_BAND` | **Limit price deviation** — any order, MARKET included, whose signed price is too far from the market reference is refused. The ceiling is a deployment setting; keep your max slippage small. |
+| `LoafValidationError` (400) | `PRICE_BAND` | **Daily price band** — a per-market band around the daily reference price, when enabled. The message carries the price, limit, reference and band width. |
+| `LoafValidationError` (400) | `INSUFFICIENT_BALANCE`, `OPEN_ORDER_LIMIT` | **Balance and open-order caps** — not enough available balance for the order, or too many open orders (resting stops count too). |
+| `LoafValidationError` (400) | `FEE_RATE_CAP_TOO_LOW` | **Fee-rate cap** — your account's fee rate is above the cap every order signs. |
+
+An order that would trade with a resting order of your own is not refused: the
+exchange cancels the resting one (its `order_status` is `CANCELLED`) and the
+new order goes on matching.
 
 Markets trade around the clock. A market that does not trade (before it is
 listed, before its trading starts at its `tradingStartsAt`, or once it is
@@ -436,6 +453,90 @@ order's life by its lead, and an order is refused (`LoafConfigError`) only when
 the lead takes its expiry past what the exchange accepts: a few hours for the
 longest `ttl_ms`, weeks for the default and shorter.
 
+### Order controls
+
+`create` and its four wrappers (not the stops and takes) take three controls
+that travel with the order but are not signed:
+
+```python
+import time
+
+quote = loaf.orders.limit_buy("MUS", quantity=10, price=150, ttl_ms=600_000,
+                              order_tag=7)                 # your label for the bot's quotes
+now_ms = time.time_ns() // 1_000_000
+loaf.orders.limit_buy("MUS", quantity=10, price=150.5,
+                      order_tag=7,
+                      send_by_ms=now_ms + 2_000,           # decided within 2 s, or not at all
+                      replaces_order_id=quote.orderId)     # the old quote is cancelled first
+```
+
+- **`order_tag=`**, a whole number from 1 to 4,294,967,295: your label for a
+  group of orders. The order keeps it while it rests; `cancel_all` and
+  `cancel_after` can select by it, and its rows and its `order_status` /
+  `order_update` frames carry it as `orderTag`, with its `l2OrderIndex`.
+- **`send_by_ms=`**, unix ms: the latest time the exchange may decide the
+  order, by its own clock. Arriving later, or decided later, it is refused
+  with `loaf.SendByPassedError` (`SEND_BY_PASSED`): nothing is placed and the
+  order number is not spent. A quote delayed in transit never lands late.
+- **`replaces_order_id=`**: your order resting on the same market, which the
+  exchange cancels in the step that decides the new order, before matching
+  it: the two never rest together, the old order's hold is free for the new
+  one's checks, and the open-order cap counts one order less. If the old
+  order no longer rests there (it filled, was cancelled or expired), the new
+  one is refused with `loaf.ReplaceTargetGoneError` (409,
+  `REPLACE_TARGET_GONE`) and nothing changes. If the cancel went through and
+  the new order is then refused for another reason, the old one stays
+  cancelled, and the error's `replaced_order_cancelled` is `True`.
+
+### Cancels
+
+```python
+loaf.orders.cancel(order_id)                       # one order
+loaf.orders.cancel_all()                           # every open order, stop and take
+loaf.orders.cancel_all("MUS")                      # one market's
+loaf.orders.cancel_all(order_tag=7)                # one tag's (orders only: a stop carries no tag)
+loaf.orders.cancel_after(60_000, order_tag=7)      # the dead man's switch: see below
+loaf.orders.cancel_by_index(e.signed_body["l2OrderIndex"])   # settle a lost placement
+```
+
+`cancel_all` cancels the scope's resting orders in one step and answers
+`{requestedCount, cancelledOrderIds, failedOrders}`; an untagged scope also
+cancels its `PENDING` / `ARMED` stops and takes. `failedOrders` lists orders on
+a market where the request did not complete; they stay open, and calling it
+again is safe. `ticker=` costs one public read the first time it names a
+market no order of yours was placed on from this client.
+
+**The dead man's switch.** `cancel_after(timeout_ms, ticker=, order_tag=)` asks
+the exchange to cancel a scope's orders, as `cancel_all` with that scope
+would, unless you call it again within `timeout_ms` (10,000 to 120,000; 0
+turns the scope's timer off). Each scope has its own timer, each call
+replaces its deadline, and the answer is `{deadlineMs}` on the exchange's
+clock. Call it every 15 to 30 s with a timeout of 60,000 to 120,000, **from
+the loop that quotes**, never from a thread of its own: it is there to fire
+when that loop stops. Scope it to your bot's `order_tag` so it never cancels
+the orders you place by hand. The deadline is the exchange's and durable: one
+that passes while its engine is down fires as it starts, before any order.
+It is taken under a platform-wide halt, which blocks the other cancels, and
+the exchange takes at most one call a second per account (`LoafRateLimitError`
+past that); a 503 (`NOT_PROCESSED` or `SERVICE_UNAVAILABLE`) leaves the
+previous deadline standing, so call again.
+
+**Settling an order by its number.** `cancel_by_index(order_index)` settles
+the order that signed `order_index` (`l2OrderIndex`) with no read: `CANCELLED`
+(it was resting, and is cancelled now), `ENDED` (it was placed and no longer
+rests: `status` says how it ended) or `VOIDED` (no order was placed with the
+number, and none ever will be: an attempt still on its way is refused
+`ORDER_INDEX_USED` whenever it arrives). It is how to settle an
+`OrderOutcomeUnknownError` you no longer want (below). A repeat answers
+`ENDED` or `VOIDED`, and the SDK never signs a number you passed it again. A
+stop or take that holds the number is refused there (400 `INVALID_REQUEST`,
+naming its id): cancel it with `cancel_conditional`.
+
+Every cancel but `cancel_conditional` and `cancel_after` is refused under a
+platform-wide halt (`TradingHaltedError`). Cancels are never retried by the
+client: a 503 means the exchange did not process it or could not tell, and a
+repeat is safe.
+
 ### Signing & retries
 
 - The SDK signs every order on your machine with your trading key (K1, the
@@ -469,10 +570,16 @@ longest `ttl_ms`, weeks for the default and shorter.
     or FAILED): read that row's `status` in `loaf.history.orders()` before
     relying on it, and arm a new one if it is `CANCELLED` or `FAILED`. Anyone
     who holds `e.signed_body` can place it the same way, with no key, so keep
-    it out of logs and alerts. Otherwise find it in `loaf.history.orders()` by
+    it out of logs and alerts. Once you no longer want it, settle it in one
+    call with `loaf.orders.cancel_by_index(e.signed_body["l2OrderIndex"])`:
+    `CANCELLED`, `ENDED` (`status` says how) or `VOIDED` (never placed, and
+    never will be; see **Cancels**). Or find it in `loaf.history.orders()` by
     its `expiryMs` (`e.signed_body["l2ExpiryMs"]`): a miss proves nothing while
     it can still rest (until `expiryMs` minus 72 hours, its `ttl_ms` after
-    signing).
+    signing). A body whose `sendByMs` has passed is not re-sent, since the
+    exchange would refuse it before looking for the first attempt: settle it
+    with `cancel_by_index`, or resubmit it with a later `send_by_ms=` to have
+    it placed now if it never was.
 - **The order-number allowance.** Every order signs an order number reserved to
   your account, and the exchange caps how many an account holds reserved but
   unused. Past the cap every reservation is refused (`l2 order_index: the
@@ -518,6 +625,8 @@ try:
 except OrderOutcomeUnknownError as e:
     res = loaf.orders.resubmit(e.signed_body)   # the same order: placed at most once
     # (raises OrderOutcomeUnknownError again if this re-send can't tell either)
+    # No longer wanted? Settle it for good instead:
+    # loaf.orders.cancel_by_index(e.signed_body["l2OrderIndex"])
 ```
 
 ### Stop & take orders
@@ -648,7 +757,11 @@ loaf.perps.return_margin(1_000.25, pool=0)            # pool 0 -> spot
 Orders name a perp by its ticker; the perps ops and a position name it by its
 `marketIndex` (0 to 254), as the exchange's perps API does. A position also
 carries its `ticker`, and `market.list()` rows, or any detail's `marketList`,
-map an index to its ticker for `market.get`.
+map an index to its ticker for `market.get`. A `marketList` row of a perp also
+carries its `live` figures (`markPrice`, `openInterest`, `fundingRateCbp`,
+`fundingPeriodMs`), and an offering's row (`type` `IPO`) stands in for its
+asset's spot market while that is missing or `PENDING`, its `marketIndex`
+then `None` without one.
 
 - **Orders** take `pool=` (0 by default) and `reduce_only=True` (its fills
   may only shrink the pool's position), signed with the order; both are
@@ -731,6 +844,64 @@ map an index to its ticker for `market.get`.
 
 ---
 
+## Withdrawals
+
+`loaf.funds.withdraw(amount)` sends USDC from your spot balance to your own
+wallet: the wallet whose first deposit opened your exchange account. Nothing
+else can receive it. The withdrawal your trading key signs names no recipient,
+and the exchange's contract pays a withdrawal of your account to that wallet
+alone, so a signed withdrawal can only ever pay you, whoever sends it.
+
+```python
+from loaf import WithdrawalOutcomeUnknownError
+
+try:
+    res = loaf.funds.withdraw(250)            # 250 USDC: spot balance -> your wallet
+except WithdrawalOutcomeUnknownError as e:
+    res = loaf.funds.resubmit(e.signed_body)  # the same withdrawal: journaled at most once
+print(res.journalSeq, res.amount, res.duplicate)
+```
+
+- **What happens.** The exchange journals the withdrawal at once and takes it
+  from your spot balance (the 202, `{journalSeq, accountIndex, assetId,
+  amount, nonce, duplicate, status}`), then settles it on chain in a batch,
+  whose transaction makes it payable to your wallet, and pays it there. Follow
+  it in `loaf.portfolio.component().transfers`: a `WITHDRAWAL` row with its
+  `journalSeq`, `PENDING` until its batch is on chain, then `CONFIRMED` with
+  that batch's `blockchainTxHash`, or `REJECTED` if settlement refused it,
+  which leaves the amount in your account. `ws.on_transfer` pushes each change.
+- **Units.** `amount` is in USDC (`12.5` is 12.5 USDC). The exchange moves
+  whole ticks of it: the SDK counts the amount in the collateral your portfolio
+  summary serves (`perps.collateral()`), as an allocate does, and refuses an
+  amount that is not a whole number of ticks (nothing is rounded). The 202's
+  `amount` is that count of ticks; a transfer row's is in USDC's base units.
+- **Life.** `ttl_ms=` (60,000 to 86,400,000; default 3,600,000, an hour) is
+  how long the exchange takes the signed withdrawal. It rests nowhere: the
+  exchange journals it at once or refuses it.
+- **Nonce.** It spends your account's next nonce, the counter perps allocates
+  and exits spend too; the SDK reads it for each one. An op sent elsewhere
+  (the web app, another process) between that read and the send makes the
+  exchange refuse this one (422): send it again.
+- **Refusals.** The exchange's rules refuse with 422 (a plain `LoafAPIError`
+  with the reason): less than the minimum withdrawal, more than your spot USDC
+  available (your resting orders hold some), too many of your withdrawals not
+  yet settled, the nonce. A pause is `TradingPausedError` (503, with
+  `retry_after`). None of these journaled anything.
+- **Retries.** As for orders: a timeout or a 5xx re-sends the same signed
+  body, which the exchange journals once at most (`duplicate: True` on a
+  repeat). Any error other than `WithdrawalOutcomeUnknownError` means nothing
+  was journaled. On that one, `loaf.funds.resubmit(e.signed_body)`, never a
+  fresh withdrawal for the same intent: a fresh one signs the next nonce, so
+  both could be paid. The exchange takes the body until its `l2ExpiryMs`
+  minus 72 hours (its `ttl_ms` after signing); once it refuses a re-send for
+  that (400), your account's next nonce (`GET /l2/keys`, `withdrawalNonce`)
+  settles it: still the body's `l2Nonce`, it was never journaled and never
+  will be.
+- **Deposits** are made in the web app: a deposit is signed by your wallet's
+  own key, which the SDK never holds.
+
+---
+
 ## Money & units
 
 Prices and quantities are plain human units — prices in **dollars**,
@@ -797,7 +968,7 @@ Channels:
 | `volume:{ticker}` | public | `on_volume` | rolling-24h traded volume (replaces `volume24h`) |
 | `market:{ticker}` | public | `on_market_halt` | halt / resume status for that market |
 | `perps:markets` | public | `on_perps_markets_live`, `on_market_terms` | every perp's live state (each row `market.get(ticker).market.live`, with its `markPrice`), once on subscribe, then about once a second — replace what you hold; a perp's terms when they change |
-| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_order_queue`, `on_lifetime_volume`, `on_perps_account`, `on_funding_payment`, `on_holding`, `on_transfer`, `on_fees`, `on_l2_keys`, `on_perps_leverage` | your account deltas, and your resting orders' places in their books; every fill of yours is `on_trade`, a liquidation's, a deleverage's and an exit's too (`trade.source`) |
+| `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_order_queue`, `on_lifetime_volume`, `on_perps_account`, `on_funding_payment`, `on_holding`, `on_transfer`, `on_fees`, `on_l2_keys`, `on_perps_leverage` | your account deltas, and your resting orders' places in their books; every fill of yours is `on_trade`, a liquidation's, a deleverage's and an exit's too (`trade.source`); your perps account as a snapshot about once a second (the beat: `on_stale`, `on_fresh`, below) |
 
 The frames of `orderbook`, `trades`, `chart`, `markprice`, `volume` and `market`
 name their market as `ticker`, the channel's own string, so one handler can
@@ -870,6 +1041,50 @@ frames:
   can arrive before the order's `order_update`.
 - Delivery is at most once, so after a reconnect reconcile from
   `loaf.portfolio.summary()`, `loaf.portfolio.component()` and the `history` reads.
+- `order_status` and `order_update` carry the order's `orderTag` (when you
+  gave it one) and its `l2OrderIndex`, so a bot can match its own quotes
+  without a lookup.
+
+**Engine stamps.** A frame that relays a change the exchange's engine made
+carries `engineMs`, the engine's clock (unix ms) when the batch that made it
+committed, and `batchSeq`, that batch's journal number: the private frames
+(`order_status`, `order_update`, `trade_new`, `balances_update`,
+`holding_update`, `perps_account_update`, `funding_payment`, `l2_keys_update`)
+and `orderbook_update`, whose `engineMs` is its book's. `timestamp` stays the
+server's send time in whole unix seconds, so `timestamp * 1000 - engineMs` is a
+frame's age when it left, to within a second. `batchSeq` does not order frames:
+one batch's frames share it. `ws.engine_ms` is the newest `engineMs` of a
+private frame the client received.
+
+**The beat: is your private stream live?** While `portfolio` is subscribed,
+the exchange sends your perps account as a snapshot (`perps_account_update`
+with `snapshot: True`) about once a second, changed or not, as long as its
+engine runs. The client watches it. `ws.fresh` is `None` until a connection's
+first snapshot, `True` while stamped private frames keep coming, and `False`
+once none came for `stale_after` seconds (`loaf.websocket(stale_after=3)`, the
+default: two beats missed; at least 1) or the connection dropped. `on_stale`
+fires at the turn to `False`, with `{reason, engineMs, silentSeconds}`:
+`reason` is `silent` (the engine or its feed stalled), `disconnected` (before
+`on_disconnect`) or `unsubscribed`. `on_fresh` fires at the turn to `True`,
+`{engineMs}`, after that frame's own handlers. A new connection starts at
+`None` again, and so does a stopped client. A deployment without perps sends
+no snapshot, so `fresh` stays `None` there. A missing snapshot means no news,
+never no positions.
+
+```python
+import threading
+
+pull_quotes = threading.Event()
+ws.on_stale(lambda m: pull_quotes.set())   # act from your own loop, never from a handler
+ws.on_fresh(lambda m: pull_quotes.clear())
+# in the loop that quotes, every tick:
+#   if pull_quotes.is_set(): cancel_all(ticker, order_tag=MY_TAG) and quote nothing
+#   else: quote, and renew cancel_after(60_000, order_tag=MY_TAG)
+```
+
+Pull your quotes on stale, and keep `cancel_after` running as the exchange's
+side of the same guard: `on_stale` covers a feed that stops while your bot
+runs, `cancel_after` a bot that stops.
 
 **Valuing holdings live.** The server does not push portfolio totals: combine
 your balances with the `markprice` channel. A `mark_price` frame is `{ticker,
@@ -969,7 +1184,10 @@ client = LoafClient()
 try:
     client.orders.limit_buy("MUS", quantity=1, price=167.49)
 except loaf.OrderOutcomeUnknownError as e:
-    ...   # may be live or filled: resubmit(e.signed_body) if still wanted, else check history.orders()
+    ...   # may be live or filled: resubmit(e.signed_body) if still wanted, else
+          # cancel_by_index(e.signed_body["l2OrderIndex"]) settles it
+except loaf.TradingPausedError as e:
+    ...   # 503: the exchange paused, nothing was placed — send it again after e.retry_after
 except loaf.TradingHaltedError:
     ...   # halted — back off and retry later
 except loaf.MarketStateError as e:
@@ -985,8 +1203,12 @@ except loaf.LoafAuthError:
           # your stops); or the order's signature or key: the next order re-reads your account
 except loaf.PostOnlyWouldTakeError:
     ...   # 400: a POST_ONLY order would have traded at once; nothing was placed
+except loaf.SendByPassedError:
+    ...   # 400: its send_by_ms passed first; nothing placed, its order number unspent
+except loaf.ReplaceTargetGoneError as e:
+    ...   # 409: the order it replaces no longer rests; nothing changed
 except loaf.LoafValidationError as e:
-    print(e.message, e.details)        # 400 (local ones have status_code 0)
+    print(e.code, e.message, e.details)  # 400 (local ones have status_code 0)
 except loaf.LoafRateLimitError as e:
     time.sleep(e.retry_after or 5)     # 429
 except loaf.LoafAPIError as e:
@@ -1009,8 +1231,21 @@ key is not the one in force on its account (reset, not active yet, another
 deployment's) or this machine's clock is off by more than about 5 minutes,
 which the message names after the server's own text (kept in `e.body`); the
 next request signs a fresh token, but nothing changes until you fix the cause.
-A bad per-order `max_slippage_bps=` / `leg_max_slippage_bps=` / `ttl_ms=` is a
-local `LoafValidationError` (status_code 0).
+A bad per-order `max_slippage_bps=` / `leg_max_slippage_bps=` / `ttl_ms=` /
+`order_tag=` / `send_by_ms=` / `replaces_order_id=` is a local
+`LoafValidationError` (status_code 0).
+
+**Codes.** A refusal of an order request (a placement, a cancel,
+`cancel_after`, `cancel_by_index`) carries `e.code`, one of
+`loaf.OrderErrorCode`, and the exception class follows from the status and the
+code. Branch on the class or the code, never the message: the message is for
+people and may change, while a code is never renamed, reused or removed. The
+exchange may add codes, so treat one this SDK does not name by its class.
+A replace whose cancel went through before the new order was refused has
+`e.replaced_order_cancelled` `True`. `TRADING_PAUSED` is
+`loaf.TradingPausedError`, both a `TradingHaltedError` and a
+`LoafServiceUnavailableError` (503), with `retry_after`: nothing was placed
+(or allocated, exited or withdrawn), and cancels are still taken.
 
 A perps allocate or exit raises the same errors, with
 `PerpsOutcomeUnknownError` in place of `OrderOutcomeUnknownError` (re-send it
@@ -1018,7 +1253,9 @@ with `loaf.perps.resubmit(e.signed_body)`); its refusals by the exchange's
 rules (above your available spot USDC, a pool left under initial margin, or
 under a tenth of its positions' notional or an initial-margin tier's extra
 (`TRANSFER_MARGIN_FLOOR`), the nonce) are plain `LoafAPIError`s with status
-422, and applied nothing.
+422, and applied nothing. A withdrawal raises the same errors too, with
+`WithdrawalOutcomeUnknownError` (re-send it with
+`loaf.funds.resubmit(e.signed_body)`); see **Withdrawals**.
 
 ## Rate limits & retries
 
@@ -1036,8 +1273,9 @@ errors after a short jittered pause, not the rate-limit headers (see **Signing
 & retries**), but never on a 429 — a rate-limited order raises
 `LoafRateLimitError` so you can decide whether to re-issue it at a fresh price.
 (A rate-limited `resubmit` raises `OrderOutcomeUnknownError` instead, since the
-first attempt may be live.) Cancels are never retried. Tune with
-`LoafClient(max_retries=...)`.
+first attempt may be live.) Withdrawals and perps ops are re-sent as orders
+are. Cancels are never retried; `cancel_after` takes one call a second per
+account, across every scope. Tune with `LoafClient(max_retries=...)`.
 
 ---
 
@@ -1064,9 +1302,10 @@ The suite runs fully offline against an in-memory mock transport and a local
 WebSocket server (no live server, no real key). It covers K1 signing and the
 login message (checked against the exchange's known answers), the trading key
 and its login tokens (an in-memory exchange checks each one as the real one
-does), the order flow, order-number reservations, stop & take orders, perps
-orders, reads, margin moves and exits, retries, input validation, pagination,
-error mapping, and the WebSocket client.
+does), the order flow, order controls, cancels (scoped, on a timer, by order
+number), order-number reservations, stop & take orders, perps orders, reads,
+margin moves and exits, withdrawals, retries, input validation, pagination,
+error mapping and codes, and the WebSocket client with its beat.
 
 ## Notes / intentionally excluded
 
@@ -1074,13 +1313,14 @@ error mapping, and the WebSocket client.
   (`/auth/*`), competitions and the leaderboard, IPO offerings and
   subscriptions, the featured-offering home feed (`/home`), fiat on/off-ramps
   (`/portfolio/onramp|offramp`), and the shareable image cards are **not**
-  wrapped, and neither are deposits, withdrawals, or enabling or resetting your
-  trading key (moving USDC between your spot balance and your perps pools is
-  wrapped: `loaf.perps`). Their public reads need no credential:
-  `loaf.get("/leaderboard", auth=False)` works, as do `/competition`,
-  `/offerings` and `/home`. The rest need a web-app login, so do them in the
-  Loaf web app: a login token works on the trading routes only, and the others
-  refuse it (401).
+  wrapped, and neither are deposits (your wallet signs them, and the SDK never
+  holds its key) or enabling or resetting your trading key. Their public reads
+  need no credential: `loaf.get("/leaderboard", auth=False)` works, as do
+  `/competition`, `/offerings` and `/home`. The rest need a web-app login, so
+  do them in the Loaf web app: a login token works on the trading routes only,
+  and the others refuse it (401). Moving USDC between your spot balance and
+  your perps pools is wrapped (`loaf.perps`), and so is withdrawing it to your
+  own wallet (`loaf.funds`).
 - Your trading key is the one credential: its login tokens authenticate the
   private WebSocket channel too, and identify the account it streams.
 - The default base URL is the **production API** (`https://api.loafmarkets.com/api`).

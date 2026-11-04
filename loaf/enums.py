@@ -109,6 +109,107 @@ class CandleResolution(_StrEnum):
     ONE_WEEK = "1w"
 
 
+class OrderErrorCode(_StrEnum):
+    """The stable reason of a refused order request: ``code`` on the
+    :class:`~loaf.exceptions.LoafAPIError` of a placement, a cancel,
+    ``cancel_after`` or ``cancel_by_index`` (Shared-Types ``ORDER_ERROR_CODES``).
+
+    Compare an error's ``code`` with these, never its message: the message is
+    for people and may change, a code never is renamed, reused or removed. The
+    exchange may add codes, so an error can carry one this list does not name:
+    treat it by its status (its exception class).
+    """
+
+    # The order's terms: the same order is refused again; change it.
+    #: Its free balance or margin cannot cover it.
+    INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
+    BELOW_MIN_ORDER_VALUE = "BELOW_MIN_ORDER_VALUE"
+    #: Above its own maximum order value.
+    ABOVE_MAX_ORDER_VALUE = "ABOVE_MAX_ORDER_VALUE"
+    #: Its limit price is outside the market's price band.
+    PRICE_BAND = "PRICE_BAND"
+    #: :class:`~loaf.exceptions.PostOnlyWouldTakeError`.
+    POST_ONLY_WOULD_TAKE = "POST_ONLY_WOULD_TAKE"
+    #: An IOC or MARKET order of which nothing could fill.
+    NOT_FILLED = "NOT_FILLED"
+    FOK_NOT_FILLED = "FOK_NOT_FILLED"
+    #: Self-trade prevention stopped it against your own resting order. Not an SDK order's:
+    #: the SDK's orders cancel the resting one instead, and go on matching.
+    SELF_TRADE = "SELF_TRADE"
+    OPEN_ORDER_LIMIT = "OPEN_ORDER_LIMIT"
+    #: A stop or take whose trigger is already reached.
+    TRIGGER_THROUGH = "TRIGGER_THROUGH"
+    #: Its signed fee-rate cap is below the rate it trades at.
+    FEE_RATE_CAP_TOO_LOW = "FEE_RATE_CAP_TOO_LOW"
+    # The signed fields: sign again.
+    #: The signature, its key or its account does not verify (401).
+    INVALID_SIGNATURE = "INVALID_SIGNATURE"
+    #: Its order number is used, by another order or voided by ``cancel_by_index``.
+    ORDER_INDEX_USED = "ORDER_INDEX_USED"
+    #: Its expiry is inside the buffer or past the longest order life from now.
+    ORDER_EXPIRY_INVALID = "ORDER_EXPIRY_INVALID"
+    #: Its epoch is not the account's: the account was reset or cancelled on chain.
+    SETTLE_EPOCH_MISMATCH = "SETTLE_EPOCH_MISMATCH"
+    # Timing and replace: nothing placed.
+    #: :class:`~loaf.exceptions.SendByPassedError`: its order number is not spent.
+    SEND_BY_PASSED = "SEND_BY_PASSED"
+    #: :class:`~loaf.exceptions.ReplaceTargetGoneError`: nothing changed.
+    REPLACE_TARGET_GONE = "REPLACE_TARGET_GONE"
+    # The market's state: nothing placed; the same order may be taken later.
+    #: No market has its index.
+    MARKET_NOT_FOUND = "MARKET_NOT_FOUND"
+    #: Not live (pending, delisted, expired) or its trading has not started.
+    MARKET_NOT_LIVE = "MARKET_NOT_LIVE"
+    #: Live, but the exchange has no book for it: a fault on Loaf's side (503).
+    MARKET_UNAVAILABLE = "MARKET_UNAVAILABLE"
+    MARKET_HALTED = "MARKET_HALTED"
+    #: Outside its trading hours.
+    MARKET_CLOSED = "MARKET_CLOSED"
+    #: The market takes only orders that reduce a position.
+    REDUCE_ONLY = "REDUCE_ONLY"
+    #: Reduce-only while its latest price waits for review.
+    PRICE_HELD = "PRICE_HELD"
+    #: Reduce-only while its price is stale.
+    PRICE_STALE = "PRICE_STALE"
+    #: The platform's trading halt.
+    TRADING_HALTED = "TRADING_HALTED"
+    #: The exchange paused trading: send it again after ``retry_after`` (503).
+    TRADING_PAUSED = "TRADING_PAUSED"
+    # Cancels.
+    ORDER_NOT_FOUND = "ORDER_NOT_FOUND"
+    ORDER_NOT_OWNED = "ORDER_NOT_OWNED"
+    #: Already filled, cancelled or expired.
+    ORDER_NOT_CANCELLABLE = "ORDER_NOT_CANCELLABLE"
+    #: ``cancel_by_index``: no live range reserved to the account holds the number.
+    ORDER_INDEX_NOT_RESERVED = "ORDER_INDEX_NOT_RESERVED"
+    # The request and the service.
+    #: Malformed; ``details`` names the fields when the exchange's validation refused it.
+    INVALID_REQUEST = "INVALID_REQUEST"
+    UNAUTHENTICATED = "UNAUTHENTICATED"
+    RATE_LIMITED = "RATE_LIMITED"
+    #: The exchange did not process it, and nothing was placed: send it again (503).
+    NOT_PROCESSED = "NOT_PROCESSED"
+    #: Unconfirmed, and no admitted order carries its number: send the same order again (503).
+    UNCONFIRMED = "UNCONFIRMED"
+    #: Refused for a reason the exchange does not classify: the message says it.
+    UNKNOWN_REASON = "UNKNOWN_REASON"
+    SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+
+class CancelByIndexOutcome(_StrEnum):
+    """What :meth:`~loaf.resources.orders.OrdersResource.cancel_by_index` did."""
+
+    #: The order rested on the number and is now cancelled.
+    CANCELLED = "CANCELLED"
+    #: An admitted order carries the number and no longer rests (``status`` says how it
+    #: ended); nothing changed.
+    ENDED = "ENDED"
+    #: No admitted order carried the number, and none ever will: an order still in flight on
+    #: it is refused ``ORDER_INDEX_USED`` whenever it arrives.
+    VOIDED = "VOIDED"
+
+
 class WSMessageType(_StrEnum):
     """`type` discriminator on every WebSocket frame."""
 

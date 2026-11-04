@@ -21,8 +21,8 @@ Steps, in order (README.md has what each asserts):
   halt         the admin halt refuses orders and the API key cannot resume it; the operator's reduce-only takes
                only reducing orders and its reopen opens again; an unreported price turns the market PRICE_STALE,
                which takes only reducing orders until the reports resume
-  exit         pool 0 closed and allocated out to spot; no L2 withdrawal (POST /l2/withdrawals is Privy-only
-               since the trading-key change, and the driver has no Privy login)
+  exit         pool 0 closed and allocated out to spot; an L2 withdrawal through the SDK (funds.withdraw, signed
+               with the trading key, naming no recipient), its L1 claim paid to A's own wallet
   proof        the run's trades in final batches, every batch through the run's last verified and executed on
                L1, settlesub's verified batch equal to L1's, no new settled refusal
 
@@ -434,6 +434,10 @@ class Chain:
 
     def key_nonce(self, proxy: str, owner: str) -> int:
         return int(self.call(proxy, "changePubKeyNonce(address)", ["uint256"], owner)[0])
+
+    def pending_balance(self, proxy: str, owner: str, asset: int) -> int:
+        """What ``owner``'s account may claim of ``asset`` on L1, in ticks: its executed L2 withdrawals."""
+        return int(self.call(proxy, "getPendingBalance(address,uint16)", ["uint128"], owner, asset)[0])
 
     def batch_pointers(self, proxy: str) -> tuple[int, int, int]:
         """(committed, verified, executed)."""
@@ -2103,14 +2107,17 @@ def step_halt(run: Run) -> None:
 
 
 # --------------------------------------------------------------------------------------------- #
-# 7. exit: allocate out
+# 7. exit: allocate out, withdraw on L2, claim on L1
 # --------------------------------------------------------------------------------------------- #
 
 
 def step_exit(run: Run) -> None:
-    """A's pool 0 closed and its whole ticks allocated out to spot. The driver no longer makes an L2 withdrawal:
-    POST /l2/withdrawals is Privy-only since the trading-key change (Loaf-Backend src/routes/l2.ts refuses a login
-    token there), and the driver has no Privy login. The run's verdict says so in a NOTE."""
+    """A's pool 0 closed and its whole ticks allocated out to spot. Then A withdraws up to 1,000 USDC of its spot
+    balance with the SDK's ``funds.withdraw``: signed with A's trading key and sent with a login token, naming no
+    recipient. Once its batch executes, L1's pending balance for A's wallet (the one whose first deposit opened A's
+    account) holds it, and A's claim pays that wallet exactly it."""
+    chain = run.chain
+    assert chain is not None
     a = run.users["A"]
     run.cancel_all()
     for pos in (pool_of(a, 0) or {}).get("positions", []):
@@ -2118,8 +2125,32 @@ def step_exit(run: Run) -> None:
     check(not (pool_of(a, 0) or {}).get("positions"), "A's pool 0 holds no position")
     run.sweep(a, 0)
     check(collateral_of(a, 0) < int(run.collateral["extensionMultiplier"]), "pool 0's whole ticks are back in spot")
-    run.notes.append("exit made no L2 withdrawal and no L1 claim: POST /l2/withdrawals is Privy-only since the "
-                     "trading-key change, and the driver has no Privy login")
+
+    tick, scale = int(run.usdc["tick"]), 10 ** int(run.usdc["decimals"])
+    total0, avail = balance(a, USDC_ASSET)
+    w = min(1_000 * scale // tick, avail // tick)
+    check(w > 0, f"A withdraws {w} ticks")
+    pend0 = chain.pending_balance(run.proxy, a.address, USDC_ASSET)
+    r = a.c.funds.withdraw(Decimal(w * tick) / scale)  # USDC, exact: the SDK signs w ticks
+    seq = int(r.get("journalSeq") or 0)
+    check(seq > 0 and r.get("duplicate") is False and int(r.get("amount") or 0) == w,
+          f"A's L2 withdrawal of {w} ticks journaled at {seq}: {short(r)}")
+    run.until(f"A's L2 USDC debited {w * tick}", lambda: total0 - balance(a, USDC_ASSET)[0] == w * tick)
+    pend = run.until(f"the withdrawal executed on L1 (A's pending balance {pend0} + {w})",
+                     value_once(lambda: chain.pending_balance(run.proxy, a.address, USDC_ASSET), lambda x: x >= pend0 + w),
+                     run.cfg.final_wait_s, 10.0)[0]
+    check(pend == pend0 + w, f"A's L1 pending balance is {pend}")
+    row = run.until("the withdrawal's transfer row CONFIRMED", lambda: next(
+        (x for x in a.c.portfolio.component().get("transfers", []) if int(x.get("journalSeq") or 0) == seq
+         and x.get("status") == "CONFIRMED"), None), run.cfg.wait_s, 5.0)
+    batch = row.get("batch") or {}
+    log(f"  transfer row: {short(row)}")
+    run.last_batch = max(run.last_batch, int(batch.get("batchNumber") or 0))
+    wallet0 = chain.balance_of(run.usdc["token"], a.address)
+    chain.send(a.wallet, run.proxy, "withdrawPendingBalance(address,uint16,uint128)", a.address, USDC_ASSET, pend)
+    paid = chain.balance_of(run.usdc["token"], a.address) - wallet0
+    check(paid == pend * tick and chain.pending_balance(run.proxy, a.address, USDC_ASSET) == 0,
+          f"the L1 claim paid A's wallet {paid} and left nothing pending")
 
 
 # --------------------------------------------------------------------------------------------- #

@@ -297,12 +297,29 @@ def test_run_units(env):
 
 
 class FakeBook:
-    """One account's spot USDC (base units) and pools (extended units), moved by allocates as the exchange
-    moves them: a tick is 10,000 base units ($0.01) and ``ext`` extended units."""
+    """One account's spot USDC (base units) and pools (extended units), moved by allocates and withdrawals as the
+    exchange moves them: a tick is 10,000 base units ($0.01) and ``ext`` extended units. A withdrawal executes on
+    ``l1`` (when set) at once, and its transfer row reads CONFIRMED in batch 40 + its journal seq."""
 
     def __init__(self, spot, ext=1_000_000):
         self.spot, self.pools, self.seq, self.held, self.ext = spot, {}, 0, set(), ext
-        self.perps, self.portfolio = self, self
+        self.perps, self.portfolio, self.funds = self, self, self
+        self.withdrawals, self.l1 = [], None
+
+    def withdraw(self, amount, *, ttl_ms=None):
+        ticks = amount * 100
+        assert isinstance(amount, Decimal) and ticks == int(ticks) and ticks > 0, amount
+        self.spot -= int(ticks) * 10_000
+        self.seq += 1
+        self.withdrawals.append((amount, self.seq))
+        if self.l1 is not None:
+            self.l1.pending += int(ticks)
+        return {"journalSeq": self.seq, "accountIndex": 7, "assetId": e2e.USDC_ASSET, "amount": int(ticks),
+                "nonce": len(self.withdrawals) - 1, "duplicate": False, "status": {"status": "PENDING"}}
+
+    def component(self):
+        return {"transfers": [{"journalSeq": seq, "type": "WITHDRAWAL", "status": "CONFIRMED",
+                               "batch": {"batchNumber": 40 + seq}} for _, seq in self.withdrawals]}
 
     def allocate(self, amount, *, from_side, to_side):
         ticks = amount * 100
@@ -360,20 +377,81 @@ def test_a_sweep_that_empties_the_pool_passes(env):
     assert (book.spot, book.pools, book.seq) == (5_000 * 10**6, {0: 0}, 2)
 
 
-def test_the_exit_step_allocates_out_and_says_why_it_makes_no_withdrawal(env, monkeypatch):
-    """POST /l2/withdrawals is Privy-only since the trading-key change and the driver has no Privy login: the exit
-    step moves A's flat pool 0 back to spot, uses no L1 (the run has no chain here) and notes, for the verdict, why
-    it makes no L2 withdrawal."""
-    cfg = dataclasses.replace(e2e.Config.read(), wait_s=1)
+class FakeL1:
+    """L1 for the exit's claim: the pending balance of A's wallet (ticks, which the book's withdrawals fill) and the
+    wallet's USDC (base units). ``withdrawPendingBalance`` pays ``paid_per_tick`` base units a tick (USDC's tick is
+    10,000) and empties what it paid. ``sent`` is each call."""
+
+    def __init__(self, paid_per_tick=10_000):
+        self.pending, self.wallet, self.paid_per_tick, self.sent = 0, 0, paid_per_tick, []
+
+    def pending_balance(self, proxy, owner, asset):
+        assert asset == e2e.USDC_ASSET
+        return self.pending
+
+    def balance_of(self, token, owner):
+        return self.wallet
+
+    def send(self, account, to, sig, *args):
+        self.sent.append((sig, *args))
+        assert sig == "withdrawPendingBalance(address,uint16,uint128)"
+        _, asset, amount = args
+        assert asset == e2e.USDC_ASSET and 0 < amount <= self.pending
+        self.pending -= amount
+        self.wallet += amount * self.paid_per_tick
+        return {"status": "0x1"}
+
+
+def _exit_run(spot_usdc, l1):
+    """A run whose user A has ``spot_usdc`` USDC, 300 of it in pool 0, against ``l1``."""
+    cfg = dataclasses.replace(e2e.Config.read(), wait_s=1, final_wait_s=1)
     run = e2e.Run(cfg, collateral={"decimals": 6, "tickSize": "10000", "extensionMultiplier": "1000000"})
-    book = FakeBook(5_000 * 10**6)
-    run.users = {"A": e2e.User("A", wallet=None, client=book)}
-    monkeypatch.setattr(e2e.Run, "cancel_all", lambda self: None)
+    book = FakeBook(spot_usdc * 10**6)
+    book.l1 = l1
+    run.chain, run.proxy = l1, "0x" + "11" * 20
+    run.usdc = {"id": e2e.USDC_ASSET, "token": "0x" + "22" * 20, "tick": 10_000, "decimals": 6}
+    run.users = {"A": e2e.User("A", wallet=types.SimpleNamespace(address="0x" + "AA" * 20), client=book)}
     run.fund(run.users["A"], 0, Decimal(300))
+    return run, book
+
+
+@pytest.mark.parametrize(("spot_usdc", "withdrawn"), [(5_000, 1_000), (600, 600)])
+def test_the_exit_step_withdraws_through_the_sdk_and_claims_exactly_on_l1(env, monkeypatch, spot_usdc, withdrawn):
+    """The exit moves A's flat pool 0 back to spot, then withdraws 1,000 USDC of it (all of it when less) with the
+    SDK's funds.withdraw, as an exact Decimal: the L2 debit, L1's pending balance and the CONFIRMED transfer row,
+    whose batch the proof step proves; the claim pays A's own wallet exactly the pending ticks and empties them."""
+    monkeypatch.setattr(e2e.Run, "cancel_all", lambda self: None)
+    l1 = FakeL1()
+    run, book = _exit_run(spot_usdc, l1)
     e2e.step_exit(run)
-    assert (book.spot, book.pools) == (5_000 * 10**6, {0: 0})
-    assert run.notes == ["exit made no L2 withdrawal and no L1 claim: POST /l2/withdrawals is Privy-only since the "
-                         "trading-key change, and the driver has no Privy login"]
+    assert book.pools == {0: 0} and book.spot == (spot_usdc - withdrawn) * 10**6
+    assert book.withdrawals == [(Decimal(withdrawn), 3)]  # after the fund (1) and the sweep (2)
+    assert l1.sent == [("withdrawPendingBalance(address,uint16,uint128)", "0x" + "aa" * 20, e2e.USDC_ASSET,
+                        withdrawn * 100)]
+    assert (l1.pending, l1.wallet) == (0, withdrawn * 10**6)
+    assert run.last_batch == 43 and run.notes == []
+
+
+def test_the_exit_step_fails_a_claim_that_pays_short(env, monkeypatch):
+    """A claim paying less than the pending ticks are worth (a fee taken on the way, say) fails the step."""
+    monkeypatch.setattr(e2e.Run, "cancel_all", lambda self: None)
+    run, _ = _exit_run(5_000, FakeL1(paid_per_tick=9_999))
+    with pytest.raises(e2e.Failed, match="the L1 claim paid A's wallet 999900000"):
+        e2e.step_exit(run)
+
+
+@pytest.mark.parametrize("answer", [{"duplicate": True}, {"amount": 99_999}], ids=["a repeat", "other ticks"])
+def test_the_exit_step_fails_a_withdrawal_the_exchange_answers_otherwise(env, monkeypatch, answer):
+    """A fresh withdrawal answered as a repeat, or journaled for other ticks than were asked, is not the withdrawal
+    the step made: it fails before it waits on L1 or claims."""
+    monkeypatch.setattr(e2e.Run, "cancel_all", lambda self: None)
+    l1 = FakeL1()
+    run, book = _exit_run(5_000, l1)
+    withdraw = book.withdraw
+    book.withdraw = lambda amount, **kw: {**withdraw(amount, **kw), **answer}
+    with pytest.raises(e2e.Failed, match="A's L2 withdrawal of 100000 ticks journaled at 3"):
+        e2e.step_exit(run)
+    assert l1.sent == []
 
 
 MINT, APPROVE, DEPOSIT, CHANGE = ("mint(address,uint256)", "approve(address,uint256)",

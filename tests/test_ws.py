@@ -1,5 +1,6 @@
-"""Offline unit tests for the WebSocket client: the reconnect delays it refuses, channel
-helpers, frame dispatch, and what a refused auth does to the login token.
+"""Offline unit tests for the WebSocket client: the reconnect delays and stale_after values it
+refuses, channel helpers, frame dispatch, the beat (fresh and stale) and its watch, and what a
+refused auth does to the login token.
 
 Frames are fed straight to the dispatcher; the connection lifecycle against a
 real server is covered by test_ws_lifecycle.py.
@@ -10,13 +11,20 @@ from __future__ import annotations
 import asyncio
 import json
 from decimal import Decimal
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from loaf import LoafClient, LoafConfigError, LoafWebSocketClient, from_base_units
+from loaf import (
+    DEFAULT_STALE_AFTER,
+    LoafClient,
+    LoafConfigError,
+    LoafWebSocketClient,
+    from_base_units,
+)
 from loaf._object import parse
 
 from conftest import TRADING_KEY
@@ -293,3 +301,266 @@ def test_a_refresh_that_wakes_early_sends_nothing_until_half_life(
         asyncio.run(ws._keep_authenticated(Connection(), tokens, renew_in))
     assert waits == [300.0, 0.001, 300.0]
     assert len(sent) == 1 and sent[0] != held and ws._auth_token == sent[0]
+
+
+# ---------------------------------------------------------------------------
+# The beat: fresh and stale
+# ---------------------------------------------------------------------------
+
+ENGINE_MS = 1_800_000_000_000
+# The private frames that relay an engine change and so carry its engineMs.
+STAMPED_PRIVATE = [
+    "order_status", "order_update", "trade_new", "balances_update", "holding_update",
+    "perps_account_update", "funding_payment", "l2_keys_update",
+]
+_ABSENT = object()
+
+
+def _stamped(
+    engine_ms: Any = ENGINE_MS, *, snapshot: bool | None = None, type: str = "perps_account_update"
+) -> str:
+    """A stamped private frame as the exchange sends one (a perps account one by default)."""
+    fields: dict[str, Any] = {"type": type, "batchSeq": 7}
+    if engine_ms is not _ABSENT:
+        fields["engineMs"] = engine_ms
+    if snapshot is not None:
+        fields["snapshot"] = snapshot
+    if type == "perps_account_update":
+        fields["perps"] = {"l2AccountIndex": 5, "pools": []}
+    return _frame(**fields)
+
+
+def _beat_log(ws: LoafWebSocketClient) -> list[tuple[str, Any]]:
+    events: list[tuple[str, Any]] = []
+    ws.on_fresh(lambda m: events.append(("fresh", m)))
+    ws.on_stale(lambda m: events.append(("stale", m)))
+    return events
+
+
+def test_the_first_snapshot_makes_the_stream_fresh_after_its_own_handlers():
+    ws = _client().subscribe_portfolio()
+    seen: list[Any] = []
+    ws.on_perps_account(lambda m: seen.append(("account", m.engineMs)))
+    ws.on_message(lambda m: seen.append(("*", m.type)))
+    ws.on_fresh(lambda m: seen.append(("fresh", m)))
+    assert ws.fresh is None and ws.engine_ms is None
+    # Changes before the first snapshot move the engine clock but arm nothing: a deployment
+    # without perps sends no snapshot, and its stream must not go stale for lack of one.
+    ws._dispatch(_stamped(ENGINE_MS + 500, type="order_status"))
+    ws._dispatch(_stamped(ENGINE_MS + 400, snapshot=False))
+    assert ws.fresh is None and ws.engine_ms == ENGINE_MS + 500
+    seen.clear()
+    # An older stamp than the newest seen: engine_ms keeps the newest.
+    ws._dispatch(_stamped(ENGINE_MS + 450, snapshot=True))
+    assert ws.fresh is True and ws.engine_ms == ENGINE_MS + 500
+    # The frame's own handlers first, so the snapshot is applied before on_fresh.
+    assert seen == [
+        ("account", ENGINE_MS + 450), ("*", "perps_account_update"),
+        ("fresh", {"engineMs": ENGINE_MS + 500}),
+    ]
+    seen.clear()
+    ws._dispatch(_stamped(ENGINE_MS + 600, snapshot=True))  # still fresh: no second turn
+    assert seen == [("account", ENGINE_MS + 600), ("*", "perps_account_update")]
+    assert ws.engine_ms == ENGINE_MS + 600
+
+
+@pytest.mark.parametrize(
+    "channel, frame",
+    [
+        ("orderbook:OPRA", _stamped(snapshot=True)),  # portfolio not subscribed
+        # A public frame with a stamp: its book's, nothing about your private stream.
+        ("portfolio", _frame(
+            type="orderbook_update", marketIndex=2050, bids=[], asks=[], engineMs=ENGINE_MS,
+            batchSeq=7,
+        )),
+        ("portfolio", _stamped(True, snapshot=True)),
+        ("portfolio", _stamped(1.8e12, snapshot=True)),
+        ("portfolio", _stamped(str(ENGINE_MS), snapshot=True)),
+        ("portfolio", _stamped(None, snapshot=True)),
+        ("portfolio", _stamped(_ABSENT, snapshot=True)),
+    ],
+)
+def test_only_a_stamped_private_frame_on_a_portfolio_stream_is_a_beat(channel: str, frame: str):
+    ws = _client().subscribe(channel)
+    events = _beat_log(ws)
+    ws._dispatch(frame)
+    assert ws.fresh is None and ws.engine_ms is None and events == []
+
+
+@pytest.mark.parametrize("mtype", STAMPED_PRIVATE)
+def test_after_a_stale_turn_any_stamped_private_frame_is_news_again(mtype: str):
+    # The canonical channel name counts as the "portfolio" alias does.
+    ws = _client().subscribe("portfolio:42")
+    events = _beat_log(ws)
+    ws._dispatch(_stamped(snapshot=True))
+    ws._beat_lost("silent")  # what the watch calls once stale_after passed
+    ws._beat_lost("silent")  # once per turn
+    assert ws.fresh is False
+    # No snapshot needed now: this connection already showed that the exchange beats.
+    ws._dispatch(_stamped(ENGINE_MS + 1, type=mtype))
+    assert ws.fresh is True and ws.engine_ms == ENGINE_MS + 1
+    assert [(kind, dict(m)) for kind, m in events][0::2] == [
+        ("fresh", {"engineMs": ENGINE_MS}), ("fresh", {"engineMs": ENGINE_MS + 1}),
+    ]
+    stale = events[1][1]
+    assert events[1][0] == "stale" and len(events) == 3
+    assert stale["reason"] == "silent" and stale["engineMs"] == ENGINE_MS
+    assert 0 <= stale["silentSeconds"] < 5
+
+
+def test_a_stale_turn_needs_a_fresh_stream():
+    ws = _client().subscribe_portfolio()
+    events = _beat_log(ws)
+    ws._beat_lost("silent")  # before the first snapshot: nothing was known to be live
+    assert ws.fresh is None and events == []
+
+
+def test_unsubscribing_portfolio_turns_the_stream_stale_once():
+    ws = _client().subscribe_portfolio().subscribe_orderbook("OPRA")
+    events = _beat_log(ws)
+    ws._dispatch(_stamped(snapshot=True))
+    ws.unsubscribe("orderbook:OPRA")  # portfolio still held
+    assert ws.fresh is True and len(events) == 1
+    ws.unsubscribe("portfolio")
+    ws.unsubscribe("portfolio")
+    assert ws.fresh is False and [kind for kind, _ in events] == ["fresh", "stale"]
+    stale = events[1][1]
+    assert stale["reason"] == "unsubscribed" and stale["engineMs"] == ENGINE_MS
+    assert 0 <= stale["silentSeconds"] < 5
+    # A frame still in flight is no longer yours to watch.
+    ws._dispatch(_stamped(ENGINE_MS + 1, snapshot=True))
+    assert ws.fresh is False and ws.engine_ms == ENGINE_MS and len(events) == 2
+
+
+def test_an_unsubscribe_the_loop_runs_after_a_new_subscribe_turns_nothing_stale():
+    # unsubscribe() hands the stale turn to the loop's thread. When another thread subscribed
+    # portfolio again before the loop got to it, the stream was never dropped.
+    loop = asyncio.new_event_loop()
+    try:
+        ws = _client().subscribe_portfolio()
+        events = _beat_log(ws)
+        ws._dispatch(_stamped(snapshot=True))
+        ws._loop = loop  # running elsewhere: the turn is queued for it
+        ws.unsubscribe("portfolio")
+        ws.subscribe_portfolio()
+        loop.run_until_complete(asyncio.sleep(0))  # the loop gets to the queued turn
+        assert ws.fresh is True and [kind for kind, _ in events] == ["fresh"]
+        ws.unsubscribe("portfolio")
+        loop.run_until_complete(asyncio.sleep(0))
+        assert ws.fresh is False and [kind for kind, _ in events] == ["fresh", "stale"]
+    finally:
+        loop.close()
+
+
+@pytest.mark.parametrize(
+    "stale_after",
+    [0.999, 0, -1.0, float("nan"), float("inf"), float("-inf"), Decimal("3"), "3", None, True,
+     False],
+)
+def test_stale_after_must_be_a_number_of_seconds_from_1(stale_after: Any):
+    # Below 1 s the client would call a stream stale between two of the exchange's beats.
+    message = (
+        "stale_after must be a number of seconds from 1 (the exchange's account beat is about "
+        f"one a second), got {stale_after!r}"
+    )
+    for make in (
+        lambda: LoafWebSocketClient(ws_url="ws://test/ws", stale_after=stale_after),
+        lambda: LoafClient().websocket(stale_after=stale_after),
+    ):
+        with pytest.raises(LoafConfigError) as info:
+            make()
+        assert str(info.value) == message
+
+
+@pytest.mark.parametrize("stale_after, seconds", [(1, 1.0), (Fraction(3, 2), 1.5), (30, 30.0)])
+def test_stale_after_takes_any_real_number_of_seconds_from_1(stale_after: Any, seconds: float):
+    for ws in (
+        LoafWebSocketClient(ws_url="ws://test/ws", stale_after=stale_after),
+        LoafClient().websocket(stale_after=stale_after),
+    ):
+        assert ws.stale_after == seconds and type(ws.stale_after) is float
+
+
+def test_stale_after_defaults_to_two_missed_beats():
+    assert _client().stale_after == DEFAULT_STALE_AFTER == 3.0
+
+
+class _Clock:
+    """Stands in for ``loaf.ws.client``'s ``time`` and ``asyncio.sleep``: each sleep moves the
+    clock on at once, delivering on the way the stamped frames ``beats`` holds by their time,
+    and the ``limit``-th sleep ends the watch."""
+
+    def __init__(
+        self, ws: LoafWebSocketClient, now: float, beats: dict[float, str] | None = None,
+        limit: int = 4,
+    ) -> None:
+        self.ws, self.now, self.beats, self.limit = ws, now, dict(beats or {}), limit
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        if len(self.sleeps) == self.limit:
+            raise _Stop
+        end = self.now + seconds
+        for at in sorted(self.beats):
+            if self.now < at <= end:
+                self.now = at
+                self.ws._dispatch(self.beats.pop(at))
+        self.now = end
+
+
+def _watch(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> None:
+    monkeypatch.setattr("loaf.ws.client.time", clock)
+    monkeypatch.setattr("loaf.ws.client.asyncio", SimpleNamespace(sleep=clock.sleep))
+    with pytest.raises(_Stop):
+        asyncio.run(clock.ws._watch_beats())
+
+
+def test_the_watch_waits_while_nothing_is_live(monkeypatch: pytest.MonkeyPatch):
+    ws = _client().subscribe_portfolio()
+    events = _beat_log(ws)
+    clock = _Clock(ws, now=100.0)
+    _watch(monkeypatch, clock)
+    assert clock.sleeps == [3.0] * 4 and events == [] and ws.fresh is None
+
+
+@pytest.mark.parametrize("stale_after", [3.0, 5.0])
+def test_the_watch_turns_stale_exactly_stale_after_the_last_beat(
+    monkeypatch: pytest.MonkeyPatch, stale_after: float
+):
+    ws = LoafWebSocketClient(ws_url="ws://test/ws", stale_after=stale_after).subscribe_portfolio()
+    events = _beat_log(ws)
+    clock = _Clock(ws, now=100.0)
+    monkeypatch.setattr("loaf.ws.client.time", clock)
+    ws._dispatch(_stamped(snapshot=True))  # the beat at 100
+    clock.now = 101.0
+    _watch(monkeypatch, clock)
+    # The rest of the wait from the last beat, then stale at exactly stale_after (not one more
+    # sleep), then nothing to time.
+    assert clock.sleeps == [stale_after - 1.0, stale_after, stale_after, stale_after]
+    assert events == [
+        ("fresh", {"engineMs": ENGINE_MS}),
+        ("stale", {"reason": "silent", "engineMs": ENGINE_MS, "silentSeconds": stale_after}),
+    ]
+    assert ws.fresh is False
+
+
+def test_each_beat_restarts_the_wait(monkeypatch: pytest.MonkeyPatch):
+    ws = _client().subscribe_portfolio()
+    events = _beat_log(ws)
+    beats = {
+        102.0: _stamped(ENGINE_MS + 2000, snapshot=True),
+        104.5: _stamped(ENGINE_MS + 4500, type="order_update"),  # any stamped private frame
+    }
+    clock = _Clock(ws, now=100.0, beats=beats, limit=5)
+    monkeypatch.setattr("loaf.ws.client.time", clock)
+    ws._dispatch(_stamped(snapshot=True))
+    _watch(monkeypatch, clock)
+    assert clock.sleeps == [3.0, 2.0, 2.5, 3.0, 3.0]  # stale at 107.5, 3 s after the beat at 104.5
+    assert events == [
+        ("fresh", {"engineMs": ENGINE_MS}),
+        ("stale", {"reason": "silent", "engineMs": ENGINE_MS + 4500, "silentSeconds": 3.0}),
+    ]

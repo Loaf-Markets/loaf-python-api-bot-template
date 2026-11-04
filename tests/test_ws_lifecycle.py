@@ -786,3 +786,145 @@ def test_the_token_refresh_ends_with_its_connection(
         ws.stop()
         server.stop()
     assert running == 1  # the live connection's alone
+
+
+# ---------------------------------------------------------------------------
+# The beat on a live connection: fresh, stale, and what ends a watch
+# ---------------------------------------------------------------------------
+
+ENGINE_MS = 1_800_000_000_000
+
+
+def _snapshot(engine_ms: int) -> Action:
+    """Sends the perps account snapshot the exchange beats with, about once a second."""
+
+    async def send(ws: Any) -> None:
+        await ws.send(json.dumps({
+            "type": "perps_account_update", "snapshot": True, "engineMs": engine_ms,
+            "batchSeq": 7, "perps": {"l2AccountIndex": 5, "pools": []}, "timestamp": 0,
+        }))
+
+    return send
+
+
+def _then(*steps: Action) -> Action:
+    async def run(ws: Any) -> None:
+        for step in steps:
+            await step(ws)
+
+    return run
+
+
+def _beat_client(port: int, log: _Log, **kwargs: Any) -> LoafWebSocketClient:
+    ws = _client(port, log, TRADING_KEY, **kwargs)
+    ws.on_fresh(lambda m: log.add(("fresh", m.engineMs)))
+    ws.on_stale(lambda m: log.add(("stale", m.reason, m.engineMs, m.silentSeconds)))
+    ws.subscribe_portfolio()
+    return ws
+
+
+def _stale_seen(seen: list[Any]) -> bool:
+    return any(isinstance(event, tuple) and event[0] == "stale" for event in seen)
+
+
+def test_a_silent_private_stream_turns_stale_after_stale_after():
+    server = _Server(_snapshot(ENGINE_MS)).start()  # then nothing: the exchange's engine stalled
+    log = _Log()
+    ws = _beat_client(server.port, log, auto_reconnect=False, stale_after=1)
+    ws.start()
+    try:
+        log.wait_for(_stale_seen)
+        assert ws.fresh is False
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events[:2] == ["on_connect", ("fresh", ENGINE_MS)] and len(log.events) == 3
+    _, reason, engine_ms, silent = log.events[2]
+    assert (reason, engine_ms) == ("silent", ENGINE_MS) and 1.0 <= silent < 5
+    assert ws.fresh is None  # stopped: nothing is watched
+
+
+def test_stop_leaves_a_fresh_stream_unwatched_and_fires_nothing():
+    server = _Server(_snapshot(ENGINE_MS)).start()
+    log = _Log()
+    ws = _beat_client(server.port, log)
+    ws.start()
+    try:
+        log.wait_for(lambda seen: ("fresh", ENGINE_MS) in seen)
+        assert ws.fresh is True and ws.engine_ms == ENGINE_MS
+    finally:
+        ws.stop()
+        server.stop()
+    # A stop is yours: no on_stale and no on_disconnect, and nothing left claiming a live stream.
+    assert log.events == ["on_connect", ("fresh", ENGINE_MS)]
+    assert ws.fresh is None and ws.engine_ms == ENGINE_MS
+
+
+def test_a_dropped_connection_turns_the_stream_stale_and_the_next_waits_for_its_own_snapshot():
+    server = _Server(_then(_snapshot(ENGINE_MS), _close_resync), _snapshot(ENGINE_MS + 5000)).start()
+    log = _Log()
+    ws = _beat_client(server.port, log)
+    ws.on_connect(lambda _: log.add(("fresh at connect", ws.fresh)))
+
+    async def watches() -> int:  # run on the client's loop: its beat watches still running
+        name = LoafWebSocketClient._watch_beats.__qualname__
+        return sum(
+            not task.done() and getattr(task.get_coro(), "__qualname__", None) == name
+            for task in asyncio.all_tasks()
+        )
+
+    ws.start()
+    try:
+        log.wait_for(lambda seen: ("fresh", ENGINE_MS + 5000) in seen)
+        assert ws._loop is not None
+        running = asyncio.run_coroutine_threadsafe(watches(), ws._loop).result(5)
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events[:3] == ["on_connect", ("fresh at connect", None), ("fresh", ENGINE_MS)]
+    # Stale before on_disconnect, so a bot pulls its quotes before it hears why.
+    _, reason, engine_ms, silent = log.events[3]
+    assert (reason, engine_ms) == ("disconnected", ENGINE_MS) and 0 <= silent < 5
+    assert log.events[4:] == [
+        (1012, "resync"), "on_connect", ("fresh at connect", None), ("fresh", ENGINE_MS + 5000),
+    ]
+    assert running == 1  # the old connection's watch ended with it
+
+
+def test_a_run_ending_late_leaves_the_next_runs_beat_alone():
+    # As test_a_run_ending_late_leaves_the_next_runs_connection_alone: the on_fresh handler stands
+    # in for the next run, live and fresh by the time the old connection closes. The old run's end
+    # is not news about the next run's stream: no stale turn, and the stream stays fresh.
+    server = _Server(_then(_snapshot(ENGINE_MS), _close_resync)).start()
+    log = _Log()
+    ws = _beat_client(server.port, log, auto_reconnect=False)
+    newer = object()
+    ws.on_fresh(lambda _: setattr(ws, "_ws", newer))
+    ws.start()
+    try:
+        assert ws._thread is not None
+        ws._thread.join(timeout=5)
+        assert not ws._thread.is_alive()
+        assert ws._ws is newer and ws.fresh is True
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events == ["on_connect", ("fresh", ENGINE_MS), (1012, "resync")]
+
+
+def test_unsubscribing_portfolio_from_another_thread_turns_the_stream_stale():
+    server = _Server(_snapshot(ENGINE_MS)).start()
+    log = _Log()
+    ws = _beat_client(server.port, log)
+    ws.start()
+    try:
+        log.wait_for(lambda seen: ("fresh", ENGINE_MS) in seen)
+        ws.unsubscribe("portfolio")  # this thread, while the loop runs
+        log.wait_for(_stale_seen)
+        assert ws.fresh is False
+    finally:
+        ws.stop()
+        server.stop()
+    assert len(log.events) == 3
+    _, reason, engine_ms, silent = log.events[2]
+    assert (reason, engine_ms) == ("unsubscribed", ENGINE_MS) and 0 <= silent < 5
