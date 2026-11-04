@@ -292,8 +292,10 @@ def test_models_list_every_shape():
     assert models.CancelByIndexResult.__required_keys__ == {"outcome", "orderId", "status"}
     assert (by_index["orderId"], by_index["status"]) == (Optional[int], Optional[str])
     assert {"orderId", "role"} <= models.TradeHistoryItem.__optional_keys__
-    # A holding names its spot market; None: the asset has none.
-    assert get_type_hints(models.Holding)["marketIndex"] == Optional[int]
+    # A holding has no index: its ticker names its market, and no mark values an IPO allocation.
+    holding = get_type_hints(models.Holding)
+    assert holding["ticker"] is str and holding["isIpoAllocation"] is bool
+    assert "marketIndex" not in holding
     # A fill always has its tradeId (its journal seq); one that is no trade has no txHash, and
     # only a close has a closed PnL.
     trade = get_type_hints(models.TradeHistoryItem)

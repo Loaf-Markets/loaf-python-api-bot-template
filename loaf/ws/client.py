@@ -294,9 +294,9 @@ class LoafWebSocketClient:
 
         Every ``markprice`` channel you subscribe feeds this one handler: match
         on ``ticker``. A holding's ticker is its spot market's
-        (:meth:`loaf.resources.portfolio.PortfolioResource.summary`); its
-        ``marketIndex`` ``None`` means no spot market, so no frame values it. On
-        a perp this is the engine's mark in dollars, ``markPrice`` of
+        (:meth:`loaf.resources.portfolio.PortfolioResource.summary`); an IPO
+        allocation keeps its unit price until it trades, so no frame values
+        it. On a perp this is the engine's mark in dollars, ``markPrice`` of
         :meth:`on_perps_markets_live`: what positions are valued at and stops
         fire on.
         """

@@ -392,7 +392,6 @@ class Holding(TypedDict, total=False):
     """A held asset's token: facts only. An L2 holding's amounts are its ``balances`` row."""
 
     ticker: str  # the asset's, its spot market's too
-    marketIndex: Optional[int]  # its spot market's; None without one, so no mark streams for it
     averageEntryPrice: Optional[float]  # None when the cost is unknown
     # The mark when read: its spot market's for an L2 holding; an IPO allocation's unit price
     # until it trades.

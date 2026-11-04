@@ -1088,15 +1088,17 @@ runs, `cancel_after` a bot that stops.
 
 **Valuing holdings live.** The server does not push portfolio totals: combine
 your balances with the `markprice` channel. A `mark_price` frame is `{ticker,
-price}`, so match it to the holding with that ticker; a holding whose
-`marketIndex` is `None` has no spot market, so no mark streams for it. An L2
-holding is pushed too: `on_holding` upserts it by its ticker, with its average
-entry (`None` until the exchange has read your fills, and a later push brings
-it: show none meanwhile, never the earlier one), when your fills or a deposit
-change it. Its amounts stay its balances row.
+price}`, so match it to the holding with that ticker; an IPO allocation
+(`isIpoAllocation`) keeps its unit price until it trades, so no mark values it.
+An L2 holding is pushed too: `on_holding` upserts it by its ticker, with its
+average entry (`None` until the exchange has read your fills, and a later push
+brings it: show none meanwhile, never the earlier one), when your fills or a
+deposit change it (an IPO's graduation deposit replaces your allocation by this
+push if the asset's spot market is bound by then; otherwise a later
+`portfolio.summary()` does). Its amounts stay its balances row.
 
 ```python
-held = {h.ticker for h in loaf.portfolio.summary().holdings if h.marketIndex is not None}
+held = {h.ticker for h in loaf.portfolio.summary().holdings if not h.isIpoAllocation}
 
 @ws.on_mark_price
 def on_mark(msg):                       # {ticker, price}, from every markprice channel

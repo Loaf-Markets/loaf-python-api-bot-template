@@ -27,8 +27,8 @@ them.
   `totalTokens` and `imageUrl`; a perp's `sem` and `oiCap` (it gains
   `maxLeverage`, as a position does); a live state's `tickAtMs` and
   `premiumSampleBp`; a pool's `initialMarginOk`; an asset's `assetId` and
-  `tokenAddress`; a market detail's `recentTrades` rows' `marketIndex` and
-  `txHash` (`market.trades()` keeps them); and its `marketList` rows carry
+  `tokenAddress`; a market detail's `recentTrades` rows' `txHash`
+  (`market.trades()` keeps it); and its `marketList` rows carry
   `maxLeverage` in place of `risk` and a perp's `live` figures, with no
   `name`, `kind` or `totalTokens`. An offering's row (`type` `IPO`, its
   `marketIndex` `None` without a spot market) stands in for its asset's spot
@@ -93,3 +93,19 @@ them.
 
 - **Breaking:** the trading key (`LOAF_TRADING_KEY`) replaces the API key and
   the bare 80-hex `LOAF_SECRET_KEY`; the SDK is trimmed to trading (README §2).
+- **A holding has no `marketIndex`.** Its `ticker` names its spot market, and
+  only an IPO allocation's was ever `None`: an allocation keeps its unit price
+  until it trades, so test `isIpoAllocation` where you tested that.
+- **A `portfolio.component()` section is `None` when unread.** Every key is
+  always there, and a section the exchange could not read just now is `None`,
+  which never means empty: read again, and keep what you hold of it meanwhile.
+- **A saved leverage names its ticker.** `portfolio.set_perps_leverage(ticker,
+  leverage)` takes a perp's ticker only, no longer its `marketIndex`, and
+  `perpsLeverage` rows and `perps_leverage_update` frames are `{ticker,
+  leverage}`.
+- **Market-data frames name the ticker.** `orderbook_update`, `trades_batch`,
+  `candle_update`, `mark_price`, `volume_update` and `market_halt` carry
+  `ticker`, the channel's own string, and no `marketIndex`: read `msg.ticker`
+  where you read `msg.marketIndex`. A tape row (`trades_batch`,
+  `market.trades()`, a market detail's `recentTrades`) carries no `marketIndex`
+  either: its frame or its route names the market.

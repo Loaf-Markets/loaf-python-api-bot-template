@@ -96,12 +96,12 @@ def test_a_subscribe_as_the_loop_closes_is_left_to_the_next_connection(
 
 
 def test_mark_price_frames_match_holdings_by_ticker_as_the_readme_shows(capsys):
-    # The README's own code: a frame's ticker finds its holding; marketIndex None subscribes nothing.
+    # The README's own code: a frame's ticker finds its holding; an IPO allocation subscribes nothing.
     code = README.split("**Valuing holdings live.**")[1].split("```python\n")[1].split("```")[0]
     summary = parse({"holdings": [
-        {"ticker": "OPRA", "marketIndex": 2050, "isIpoAllocation": False, "assetId": 6},
-        {"ticker": "MUS", "marketIndex": 2049, "isIpoAllocation": False, "assetId": 4},
-        {"ticker": "EFL", "marketIndex": None, "isIpoAllocation": True, "quantity": 5},
+        {"ticker": "OPRA", "isIpoAllocation": False, "assetId": 6},
+        {"ticker": "MUS", "isIpoAllocation": False, "assetId": 4},
+        {"ticker": "EFL", "isIpoAllocation": True, "quantity": 5},
     ]})
     ws = _client()
     exec(code, {"loaf": SimpleNamespace(portfolio=SimpleNamespace(summary=lambda: summary)), "ws": ws})

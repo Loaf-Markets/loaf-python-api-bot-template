@@ -36,8 +36,7 @@ class PortfolioResource(Resource):
         ``quoteAssetId``; ``available`` is what a new order can use.
 
         ``holdings`` are the tokens you hold, facts only: ``ticker`` (the
-        asset's, its spot market's too), ``marketIndex`` (its spot market's;
-        ``None`` without one),
+        asset's, its spot market's too),
         ``averageEntryPrice`` (``None`` when the cost is unknown),
         ``marketPrice`` (the mark when read: its spot market's for an L2
         holding; an IPO allocation's unit price until it trades) and
