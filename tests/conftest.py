@@ -189,8 +189,7 @@ NONCE_REFUSAL = "l2 money: the nonce is not the api key's nonce (tx_nonce == api
 # The backend's 400 for a withdrawal whose expiry is inside the 72-hour buffer (L2_REASONS).
 EXPIRY_INSIDE_BUFFER = "l2 expiry: the expiry is inside the buffer"
 
-# The backend's 401s to a request whose login token it does not take (Shared-Types'
-# L2_LOGIN_REASONS, and the account's and the key's L2_BACKEND_REASONS).
+# The backend's 401s to a request whose login token it does not take.
 NO_BEARER = "Missing or invalid Authorization header"
 MALFORMED = "l2 login: the token is not a trading-key login token"
 WRONG_CHAIN = "l2 login: the token is for another exchange's L2 chain"
@@ -204,8 +203,7 @@ BAD_SIGNATURE = "l2 signature: the Schnorr signature does not verify"
 LOGIN_TOKEN_RE = re.compile(
     r"loaf_lt_([1-9][0-9]{0,9})_(0|[1-9][0-9]{0,14})_(0|[1-9][0-9]{0,14})_([0-9a-f]{160})"
 )
-# The longest life the backend takes, 15 minutes after its clock (Shared-Types'
-# L2_LOGIN_TOKEN_MAX_LIFE_MS).
+# The longest life the backend takes, 15 minutes after its clock.
 LOGIN_TOKEN_MAX_LIFE_MS = 900_000
 
 _ENV_VARS = ("LOAF_TRADING_KEY", "LOAF_API_BASE_URL", "LOAF_WS_URL", "LOAF_MAX_SLIPPAGE_BPS")
@@ -540,7 +538,7 @@ def verify_order(body: dict, leg: str | None = None) -> None:
     side, at its own price, with its own order index and expiry; a conditional
     signs the order it books (its own side and price). A perps order signs its
     ``l2Pool`` and ``l2ReduceOnly`` as its base-asset field, and a perps leg the
-    parent's ``l2Pool`` with the reduce-only bit (Shared-Types' signedLegSchema).
+    parent's ``l2Pool`` with the reduce-only bit (the exchange's leg schema).
     """
     signed = body if leg is None else body[leg]
     if "l2Pool" in body:

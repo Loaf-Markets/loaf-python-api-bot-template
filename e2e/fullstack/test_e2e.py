@@ -1,5 +1,5 @@
 """Laptop checks of e2e.py's own parts: no stack, no network. E2E_SDK names an SDK tree to import when the venv
-has none installed; E2E_ZKLOAF_ABI, ZkLoaf's ABI (Smart-Contracts abis/ZkLoaf.abi.json), checks the calls."""
+has none installed; E2E_ZKLOAF_ABI, ZkLoaf's ABI file, checks the calls."""
 
 from __future__ import annotations
 

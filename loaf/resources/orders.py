@@ -1412,7 +1412,7 @@ class OrdersResource(Resource):
 
 
 def _time_in_force(time_in_force: Any, otype: str) -> str:
-    """``time_in_force=`` checked against Shared-Types' ORDER_TIMES_IN_FORCE, POST_ONLY on a
+    """``time_in_force=`` checked against the exchange's times in force, POST_ONLY on a
     LIMIT order alone (the exchange's own text for it)."""
     if not isinstance(time_in_force, str) or time_in_force not in _TIMES_IN_FORCE:
         raise _client_validation_error(

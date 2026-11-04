@@ -9,7 +9,7 @@ batches are messages this SDK does not build (it signs no report or batch): they
 ride along so the file stays K1's line for line, and the reports' signatures are
 checked like the allocates'. To take a new K1 file, copy it and put
 this file's ``about`` line back. ``k1-login.json`` is the matching engine's for the
-login message (its ``crates/rules/kat/k1-login.json``, byte for byte), whose
+login message, byte for byte, whose
 verifier the exchange checks each login token with: a login token this SDK signs
 is one the exchange takes.
 """

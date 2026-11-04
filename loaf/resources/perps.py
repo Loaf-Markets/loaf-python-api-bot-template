@@ -404,7 +404,7 @@ def _perps_of(summary: Any) -> Mapping[str, Any]:
 
 
 def _collateral_of(answer: Any) -> _Collateral:
-    """A summary's perps ``collateral``, checked as served (Shared-Types' perpsCollateralSchema),
+    """A summary's perps ``collateral``, checked as served,
     or :class:`LoafServerError`: an amount is never counted in an assumed tick."""
     row = _perps_of(answer).get("collateral")
 

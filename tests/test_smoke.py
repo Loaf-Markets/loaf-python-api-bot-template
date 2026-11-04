@@ -156,8 +156,8 @@ def test_error_mapping():
     assert missing.message == "Cannot GET /trade"
 
 
-def test_time_in_force_is_shared_types_order_time_in_force():
-    # Shared-Types 2.0.90's ORDER_TIMES_IN_FORCE, in its order; GTD is no time in force.
+def test_time_in_force_is_the_exchanges():
+    # The exchange's times in force, in their order; GTD is no time in force.
     assert [member.value for member in loaf.TimeInForce] == ["GTC", "IOC", "FOK", "POST_ONLY"]
 
 

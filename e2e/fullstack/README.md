@@ -133,7 +133,7 @@ route and its Privy auth are not exercised.
   (`getAccountIndexFromAddress`) opens one: its wallet deposits 100 USDC (mint, approve, `deposit`). Its trading key
   is derived from its wallet's signature as the web app derives it (the `L2Key` typed data at the key nonce in
   force); with none yet (L1's key nonce 0) the wallet registers it on L1 itself, ZkLoaf's
-  `changePubKey(account, 0, key)` with no fee, as the P5 kit's traders do. Every key change is sent before the
+  `changePubKey(account, 0, key)` with no fee. Every key change is sent before the
   first wait. The user's client is the SDK's on the web app's trading key, `loaf_tk_<L2 chain>_<account>_<secret>`;
   its login token is refused 401 until the key is in force, then `GET /l2/keys` reads it journaled on the user's L1
   account (pending false), `l2_accounts` binds the account to the upserted user, and L1's key nonce agrees: every
@@ -204,7 +204,7 @@ index, with no bid left on the book)
 - mode 1 (market `liq1`, the backstop funded with `E2E_BACKSTOP_DOLLARS` once the backstop's guard finds no other
   pool waiting for it): the mark brings C's pool 2 to 2/5 of its maintenance; C's close is a BACKSTOP_LIQUIDATION of
   the whole long, and no order of MM's filled it (no trade_new of MM's under its tradeId);
-- mode 0 (market `liq0`, as the P5 kit's mode0_leg): the mark brings C's pool 4 to 17/20 of its maintenance and
+- mode 0 (market `liq0`): the mark brings C's pool 4 to 17/20 of its maintenance and
   nothing is liquidated without a bid; MM bids just under the index and far asks run batches; C's close is a
   LIQUIDATION of the whole long; MM's portfolio holds its row of the take (LIQUIDATION, MAKER, its bid, no fee, no
   txHash, tradeId == the close's tradeId), its WebSocket got the take's `trade_new` frame, and the market's tape

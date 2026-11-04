@@ -57,8 +57,8 @@ PERPS_ORDER_KEYS = (
     "price quantity side type timeInForce l2ChainId l2AccountIndex l2MarketIndex l2OrderIndex "
     "l2Epoch l2FeeRateCap l2ExpiryMs l2Pool l2ReduceOnly l2QuoteAssetId l2SigS l2SigE"
 ).split()
-# Shared-Types' signedLegSchema (0.30.0): a leg's own keys, in the order the SDK sends them, and
-# its l2-constants MAX_ORDER_INDEX and MAX_48.
+# The exchange's leg schema: a leg's own keys, in the order the SDK sends them, and
+# its limits MAX_ORDER_INDEX and MAX_48.
 LEG_KEYS = "triggerPrice price l2OrderIndex l2ExpiryMs l2SigS l2SigE".split()
 MAX_ORDER_INDEX = 1_099_511_627_775
 MAX_48 = 2**48 - 1
@@ -239,7 +239,7 @@ def test_a_leverage_is_saved_by_ticker(perps_exchange, trading_client):
         "GET /portfolio/component",
     ]
     puts = [r for r in perps_exchange.requests if r.method == "PUT"]
-    # Shared-Types' perpsLeverageBodySchema: strict, a perp's ticker and a whole number; sent with a login token.
+    # The exchange's body: strict, a perp's ticker and a whole number; sent with a login token.
     assert [json.loads(r.content) for r in puts] == [
         {"ticker": "OPRA-PERP", "leverage": 5}, {"ticker": "OPRA-PERP", "leverage": 32_768},
         {"ticker": "H100-PERP", "leverage": 1},
@@ -827,9 +827,9 @@ def test_an_expired_perp_takes_no_orders(exchange, trading_client):
     assert routes(exchange.requests) == ["GET /trade/OPRA-PERP"]
 
 
-def check_legs_as_shared_types(body: dict) -> None:
-    """A perps body's legs against Shared-Types 0.30.0: signedLegSchema (each leg strict, its
-    six fields in range) and orderBodySchema's leg rules (the take-profit beyond the stop-loss
+def check_legs_as_the_exchange(body: dict) -> None:
+    """A perps body's legs against the exchange's schemas: each leg strict, its
+    six fields in range, and the order body's leg rules (the take-profit beyond the stop-loss
     and, on a LIMIT parent, the parent's price between them, mirrored on a SELL; every order
     number its own; never on a reduce-only parent)."""
     legs = [body[leg] for leg in ("tp", "sl") if leg in body]
@@ -867,7 +867,7 @@ def test_a_perps_orders_legs_are_reduce_only_on_its_pool_and_side_opposite(
     (body,) = perps_exchange.bodies("/orders")
     assert list(body) == PERPS_ORDER_KEYS + ["tp", "sl"]
     assert (body["l2Pool"], body["l2ReduceOnly"]) == (pool, False)
-    check_legs_as_shared_types(body)
+    check_legs_as_the_exchange(body)
     # Each leg trades the other way, 2% past its trigger (the client's max slippage): a BUY's
     # legs sell below theirs, a SELL's buy above.
     prices = {"BUY": (107.8, 93.1), "SELL": (96.9, 112.2)}[side]
@@ -897,7 +897,7 @@ def test_a_perps_market_sell_with_legs(perps_exchange, trading_client):
         "OPRA-PERP", 2, pool=1, tp_price=90, sl_price=115, leg_max_slippage_bps=500
     )
     (body,) = perps_exchange.bodies("/orders")
-    check_legs_as_shared_types(body)
+    check_legs_as_the_exchange(body)
     assert (body["tp"]["price"], body["sl"]["price"]) == (94.5, 120.75)  # 5% above, buying
     for leg in ("tp", "sl"):
         verify_order(body, leg)

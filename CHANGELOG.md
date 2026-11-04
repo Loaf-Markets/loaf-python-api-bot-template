@@ -8,7 +8,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 For market makers: order controls, scoped and timed cancels, error codes, a
 live-stream watchdog, and withdrawals. It needs the exchange API that serves
-them (Shared-Types 2.0.100).
+them.
 
 ### Breaking
 

@@ -456,8 +456,7 @@ def _login_message(chain_id: int, account: int, expiry: int) -> bytes:
     the length, 6, where every other message K1 signs has 16, so no login message is
     another message."""
     # 14: a login, below the orders' 149, its low byte none of the withdraw's 13, the price
-    # report's 21, the allocate's 23, the exit's 25, the order's 149 or the batch root's 150 (the
-    # engine's crates/rules LOGIN_TAG).
+    # report's 21, the allocate's 23, the exit's 25, the order's 149 or the batch root's 150.
     elements = (chain_id, 14, account & _M24, account >> 24, expiry & _M24, expiry >> 24)
     return _message_bytes(_kb_hash(elements))
 

@@ -79,7 +79,7 @@ STEPS = ("setup", "spot", "perps", "mixed", "funding", "liquidation", "halt", "e
 #: The one-shot restore (E2E_STEPS=restore, alone): step_restore.
 RESTORE = "restore"
 #: E2E_KEEP_BACKSTOP=1: a step's restore leaves the backstop's knob where the step put it, so a position the backstop
-#: took in the step (liquidation's mode 1) stays on the stack for the desk leg that unwinds it (the P5 kit's phase
+#: took in the step (liquidation's mode 1) stays on the stack for the desk leg that unwinds it (the kit's phase
 #: desk); the one-shot restore puts the knob back later. Every other part of the restore runs.
 KEEP_BACKSTOP = (os.environ.get("E2E_KEEP_BACKSTOP") or "").strip() == "1"
 
@@ -94,18 +94,18 @@ USDC_ASSET = 3
 ROUTE_SPOT = 1
 #: ZkLoaf's NIL_ACCOUNT_INDEX: an address that never deposited.
 NIL_ACCOUNT = 2**48 - 1
-#: The backend's texts for the engine's order-term refusals (Loaf-Backend ordersService.ts).
+#: The backend's texts for the engine's order-term refusals.
 NOT_FILLED = "Order rejected: no resting order could fill any of it"
 FOK_NOT_FILLED = "Fill-or-kill order rejected: it could not be filled in full"
-#: The backend's least order value, quote dollars (Loaf-Backend orderPlacementGates.ts MIN_ORDER_VALUE_USDL); the
+#: The backend's least order value, quote dollars; the
 #: spot leg sizes its least order, its bid, to SPOT_VALUE_MARGIN times it.
 SPOT_MIN_VALUE = Decimal(10)
 SPOT_VALUE_MARGIN = Decimal("2.5")
-#: The backend's largest history page (Shared-Types historyPageQuerySchema, MAX_PAGE_SIZE): a larger one is a 400.
+#: The backend's largest history page: a larger one is a 400.
 HISTORY_PAGE_MAX = 100
 #: GET /history/trades' sources that are a position closed by the engine or an exit.
 CLOSE_SOURCES = ("LIQUIDATION", "BACKSTOP_LIQUIDATION", "DELEVERAGE", "EXIT", "SETTLE", "FORCED", "FORCED_DELEVERAGE")
-#: The admin API key's resume refusal (Loaf-Backend adminPerpsController.ts RESUME_OPERATOR_REQUIRED).
+#: The admin API key's resume refusal.
 RESUME_NEEDS_OPERATOR = "A resume (ACTIVE) needs an operator session (Privy): the admin API key halts only"
 # The pools (0 the cross pool, 1-7 isolated, one position each): A trades pool 0, and isolated 1 (limits), 2 (a
 # reduce-only order that must open nothing), 3 (TP/SL), 5 (the halt market), 6 and 7 (the carry markets); B and
@@ -475,10 +475,9 @@ def provision_sql(rows: Sequence[tuple[str, str, str]], now: int) -> str:
     account to the user whose wallet a deposit to it names, when it journals the deposit, and nothing else binds it
     for the driver (POST /l2/keys, which also binds, is Privy-only): the row must exist before the address's first
     deposit (step_setup provisions first). It compares lower(wallet_address) with the deposit's `to` and binds
-    nothing when users in more than one case hold the wallet (loaf-matching-engine
-    src/db/sql/journal_bind_accounts.sql), so the wallet is written lowercase and a user that holds it in any case
+    nothing when users in more than one case hold the wallet, so the wallet is written lowercase and a user that holds it in any case
     is the one upserted (users_wallet_address_lower_idx), never doubled in another case. MARKET_MAKER exempts MM
-    from the backend's per-user rate limiter (Loaf-Backend userRateLimiter.ts). Prints ``E2E|label|user id`` for
+    from the backend's per-user rate limiter. Prints ``E2E|label|user id`` for
     each."""
     values = ",\n".join(
         f"  ({_lit(label)}, {_lit(wallet.lower())}, {_lit(kind)}::user_type_enum)" for label, wallet, kind in rows
@@ -555,7 +554,7 @@ def refusals(cfg: Config) -> tuple[int, list[list[str]]] | None:
 
 
 class Prices:
-    """The kit's price pump (the P5 kit's fullstack phase): each control is written whole to a temporary file
+    """The kit's price pump (its fullstack phase): each control is written whole to a temporary file
     beside ``control`` and renamed onto it, its ``seq`` above every earlier one, and names only what it changes:
     a market's mode (``{"mode": "walk", "index": i}``, a walk inside the move bound, or ``{"mode": "quiet"}``, no
     reports) and the backstop's free collateral (``{"free_ticks": n}``). The pump answers in ``status``
@@ -623,7 +622,7 @@ class Prices:
 # --------------------------------------------------------------------------------------------- #
 
 #: The warning the web app's ``L2Key`` typed data carries, byte for byte: the wallet signs it, so any other text
-#: derives another key. The web app is the source of truth (loafx-frontend shared/l2/keyMessage.ts L2_KEY_WARNING).
+#: derives another key. The web app is the source of truth.
 L2_KEY_WARNING = (
     "This signature is your Loaf L2 trading key. Anyone who holds it can trade for this account. "
     "Sign it only in the Loaf app."
@@ -640,8 +639,7 @@ def l2_key_typed_data(
     key_nonce: int,
 ) -> dict[str, Any]:
     """The EIP-712 typed data whose signature by ``wallet`` seeds the trading key, byte for byte the web app's
-    (loafx-frontend shared/l2/keyMessage.ts L2_KEY_DOMAIN and L2_KEY_TYPES, apps/trade/src/l2/key.ts
-    l2KeyTypedData, the source of truth): domain ``Loaf L2 Key`` version 2 on ``chain_id`` (the vault's chain,
+    (the source of truth): domain ``Loaf L2 Key`` version 2 on ``chain_id`` (the vault's chain,
     ``market.l2.chainId``) with no verifying contract, and an ``L2Key`` message binding the vault
     (``proxy_address``, ``l2_chain_id``), the account, its api key 0, ``key_nonce`` (one per key change the
     wallet made on the vault) and :data:`L2_KEY_WARNING`.
@@ -681,8 +679,8 @@ def l2_key_typed_data(
 
 def index_for(pool: Mapping[str, Any], market: int, p0: int, num: int, den: int) -> int:
     """The index that brings a pool holding one long on ``market`` (notional n0 at price p0, the pool's value v0
-    and maintenance requirement r0 read at p0) to ``num/den`` of its requirement (the P5 kit's flows.rs
-    index_for; a negative ``num`` takes the value below 0): both move with the price, v(p) = v0 - n0 (1 - p/p0)
+    and maintenance requirement r0 read at p0) to ``num/den`` of its requirement (a negative ``num``
+    takes the value below 0): both move with the price, v(p) = v0 - n0 (1 - p/p0)
     and r(p) = r0 p/p0; the mark follows the walked index to it. The pool reads its requirement x 65,536."""
     pos = [p for p in pool["positions"] if int(p["market"]) == market]
     if len(pos) != 1 or int(pos[0]["base"]) <= 0:
@@ -1361,7 +1359,7 @@ def open_account(run: Run, user: User) -> None:
     """``user``'s L2 account, as L1 reads it (getAccountIndexFromAddress). L1 assigns an address its account at the
     first deposit to it, so an address with none first deposits MIN_DEPOSIT of USDC (l1_deposit), with nothing read
     on L2. The engine binds the account to the user when it journals that deposit (provision_sql), before the key
-    change key_in_force awaits (Loaf-Backend l2Journal.ts folds an account's key change only after its deposit), so
+    change key_in_force awaits (the backend folds an account's key change only after its deposit), so
     the setup's balance-checked deposits find it credited."""
     chain = run.chain
     assert chain is not None
@@ -1375,11 +1373,10 @@ def open_account(run: Run, user: User) -> None:
 
 def register_key(run: Run, user: User) -> int:
     """``user``'s trading key, the key in force derived from the wallet as the web app derives it (key nonce n - 1
-    for the vault's nonce n: apps/trade/src/l2/key.ts inForceKeyNonce), and the user's client on it: the web app's
-    Show trading key, ``loaf_tk_<L2 chain>_<account>_<secret hex>`` (Shared-Types src/index.ts formatTradingKey).
+    for the vault's nonce n), and the user's client on it: the web app's
+    Show trading key, ``loaf_tk_<L2 chain>_<account>_<secret hex>``.
     With none yet (n == 0) the wallet sets its account's key 0 to the key of nonce 0 itself, ZkLoaf's
-    changePubKey(accountIndex, 0, pubKey) from the owner with no fee, as the P5 kit's traders do
-    (loaf-matching-engine tests/it/p5/chain.rs change_pub_key): POST /l2/keys, which relays the same change, is
+    changePubKey(accountIndex, 0, pubKey) from the owner with no fee: POST /l2/keys, which relays the same change, is
     Privy-only. Nothing is read on L2 (key_in_force awaits the key). Returns n."""
     chain = run.chain
     assert chain is not None
@@ -1398,7 +1395,7 @@ def register_key(run: Run, user: User) -> int:
 
 def key_in_force(run: Run, user: User, nonce: int) -> None:
     """Waits until ``user``'s trading key is in force. Until then the backend refuses its login token 401 (the
-    account bound to no user, or no key 0 journaled: Loaf-Backend l2LoginTokens.ts), which the wait retries, the SDK
+    account bound to no user, or no key 0 journaled), which the wait retries, the SDK
     signing a fresh token for each try; then GET /l2/keys reads the key journaled on the user's L1 account, not
     pending. The account is bound to the user provision_sql upserted (l2_accounts, through which the login finds the
     account's user, so GET /l2/keys can only name the token's own account), and L1's key nonce is still the one the
@@ -1990,7 +1987,7 @@ def step_liquidation(run: Run) -> None:
               "no order of MM's filled the backstop's take")
         run.walk(m1, p0)
 
-    # mode 0 (the P5 kit's mode0_leg): the index walks C's pool to 17/20 of its maintenance, the maker bids just
+    # mode 0: the index walks C's pool to 17/20 of its maintenance, the maker bids just
     # under the index, and a batch's liquidation step takes C's long into that bid (a far ask runs a batch)
     m0 = run.mkt("liq0")
     t0 = run.ticker(m0)

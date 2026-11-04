@@ -112,7 +112,7 @@ class CandleResolution(_StrEnum):
 class OrderErrorCode(_StrEnum):
     """The stable reason of a refused order request: ``code`` on the
     :class:`~loaf.exceptions.LoafAPIError` of a placement, a cancel,
-    ``cancel_after`` or ``cancel_by_index`` (Shared-Types ``ORDER_ERROR_CODES``).
+    ``cancel_after`` or ``cancel_by_index``.
 
     Compare an error's ``code`` with these, never its message: the message is
     for people and may change, a code never is renamed, reused or removed. The

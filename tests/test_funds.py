@@ -52,7 +52,7 @@ WITHDRAW_KEYS = (
     "l2SigE"
 ).split()
 NOW_MS = 1_800_000_000_000
-# The backend's 503s for a withdrawal (Loaf-Backend l2WithdrawalService.ts): paused, which
+# The backend's 503s for a withdrawal: paused, which
 # journaled nothing; its account unread, before the engine; the engine's answer lost.
 PAUSED = "Trading is paused. Your withdrawal was not submitted — please try again shortly."
 ACCOUNT_UNREAD = (
