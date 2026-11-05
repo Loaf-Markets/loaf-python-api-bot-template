@@ -2,41 +2,211 @@
 
 from __future__ import annotations
 
+import copy
+import json as _json
+import numbers
 import os
 import random
+import re
+import ssl
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ._l2 import LoginTokens, TradingKey
 from ._object import parse
 from ._version import __version__
 from .constants import (
     DEFAULT_BASE_URL,
     DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_SLIPPAGE_BPS,
+    DEFAULT_PLACEMENT_TIMEOUT,
     DEFAULT_TIMEOUT,
-    ENV_API_KEY,
     ENV_BASE_URL,
+    ENV_MAX_SLIPPAGE_BPS,
+    ENV_TRADING_KEY,
     ENV_WS_URL,
+    L2_ORDER_INDEX_BLOCK,
+    L2_ORDER_INDEX_BLOCK_MAX,
     USER_AGENT,
 )
 from .exceptions import (
+    LoafAPIError,
+    LoafAuthError,
     LoafConfigError,
     LoafConnectionError,
+    LoafServerError,
+    OrderOutcomeUnknownError,
+    PerpsOutcomeUnknownError,
+    WithdrawalOutcomeUnknownError,
     error_from_response,
 )
 
 if TYPE_CHECKING:
-    from .resources.competition import CompetitionResource
+    from .resources.funds import FundsResource
     from .resources.history import HistoryResource
-    from .resources.leaderboard import LeaderboardResource
     from .resources.market import MarketResource
-    from .resources.offerings import OfferingsResource
     from .resources.orders import OrdersResource
+    from .resources.perps import PerpsResource
     from .resources.portfolio import PortfolioResource
     from .ws.client import LoafWebSocketClient
 
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "DELETE"})
+
+# What a 401 refusing a login token means, by its text (the backend's): the trading key is not the
+# one in force on its account here, or this machine's clock is off. A 401 refusing a signed op's
+# signature or key carries code INVALID_SIGNATURE, which means the key whatever its text (a
+# withdrawal's "l2 money: the signing key is not the key the journal set for the api key", say).
+# Any other 401 keeps its text.
+_KEY_REFUSALS = (
+    "l2 signature:",
+    "l2 key:",
+    "l2 account:",
+    "l2 login: the token is for another exchange's L2 chain",
+)
+_CLOCK_REFUSALS = ("l2 login: the token has expired", "l2 login: the token expires more than")
+_KEY_NOT_IN_FORCE = (
+    f"{ENV_TRADING_KEY} is not the trading key in force on its account here: it was reset in the "
+    "web app, the account's key is not active yet (enable trading on a market's Trade page and "
+    f"wait for it to take effect), or it is another Loaf deployment's key (check {ENV_BASE_URL}). "
+    f"Set {ENV_TRADING_KEY} to the web app's Show trading key (README §2) and restart; after a "
+    "reset, also place your stops and takes again: the exchange FAILS the ones signed before it."
+)
+_CLOCK_OFF = (
+    "this machine's clock is off: the exchange takes a login token only before its expiry and at "
+    "most 15 minutes ahead of its own clock, and the SDK signs ones that live 10 minutes from this "
+    "machine's, so the two clocks must agree within about 5 minutes. Synchronize the clock (NTP)."
+)
+
+
+def _login_refusal(error: LoafAPIError) -> LoafAPIError:
+    """A 401 refusing a login token, or a signed op's signature or key, with what it
+    means appended to its message (the server's own text stays in ``body``)."""
+    if error.code == "INVALID_SIGNATURE" or error.message.startswith(_KEY_REFUSALS):
+        meaning = _KEY_NOT_IN_FORCE
+    elif error.message.startswith(_CLOCK_REFUSALS):
+        meaning = _CLOCK_OFF
+    else:
+        return error
+    return LoafAuthError(
+        f"{error.message} — {meaning}",
+        status_code=error.status_code,
+        code=error.code,
+        details=error.details,
+        request_id=error.request_id,
+        body=error.body,
+    )
+
+
+# Failures before the request left this machine (a proxy that refused the tunnel included):
+# re-sending them is always safe.
+_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError)
+
+# 503s the exchange sends only when nothing was done, so as definite an answer as a 4xx: any with
+# one of these codes (the engine paused, or it never took the order), and, of the ones it sends with
+# no code, those carrying one of their op's texts, lowercased (the exchange writes them in both
+# cases): the engine without the order's L2 fields, its answer that it journaled no perps op, or
+# the account (an op's, or a login token's) unread before anything reached the engine. Any other
+# 503 may follow a journaled op.
+_NOT_DONE_503_CODES = frozenset({"TRADING_PAUSED", "NOT_PROCESSED", "MARKET_UNAVAILABLE"})
+_NOT_DONE_503_TEXTS = {
+    "order": ("your order was not placed", "nothing was done"),
+    "perps": ("nothing was journaled", "nothing was done"),
+    "withdrawal": ("nothing was done",),
+}
+
+# Each signed op: what an unexpected answer to it names, and the error an unknown outcome raises
+# (each takes the body sent, the attempts and the last error).
+_SIGNED_OPS: dict[
+    str,
+    tuple[
+        str,
+        type[OrderOutcomeUnknownError | PerpsOutcomeUnknownError | WithdrawalOutcomeUnknownError],
+    ],
+] = {
+    "order": ("an order placement", OrderOutcomeUnknownError),
+    "perps": ("a perps op", PerpsOutcomeUnknownError),
+    "withdrawal": ("a withdrawal", WithdrawalOutcomeUnknownError),
+}
+
+
+def _definitely_not_done(error: LoafAPIError, op: str) -> bool:
+    """Whether a 503 answering signed ``op`` says nothing was done."""
+    if error.status_code != 503:
+        return False
+    return error.code in _NOT_DONE_503_CODES or any(
+        text in error.message.lower() for text in _NOT_DONE_503_TEXTS[op]
+    )
+
+
+# Refusals of a re-send that speak for every attempt: the exchange answers a re-send of a journaled
+# withdrawal as its duplicate before any other check, so a 422 ORDER_INDEX_USED to one (its nonce
+# spent by another op, or its idempotency key held by another withdrawal) says no attempt was
+# journaled, and none will be: a nonce only moves up. A perps op's spent nonce carries no code.
+_NEVER_JOURNALED_CODES = {"withdrawal": frozenset({"ORDER_INDEX_USED"})}
+
+
+def _never_journaled(error: LoafAPIError, op: str) -> bool:
+    """Whether a refusal of signed ``op`` says no attempt of it was journaled, nor ever will be."""
+    return error.status_code == 422 and error.code in _NEVER_JOURNALED_CODES.get(op, frozenset())
+
+
+# $LOAF_MAX_SLIPPAGE_BPS: a plain whole number from 0 to 9999 (leading zeros allowed).
+_BPS_TEXT = re.compile(r"0*([0-9]{1,4})")
+_BPS_RULE = "must be a whole number of basis points from 0 to 9999 (100 = 1%)"
+
+
+def _max_slippage_bps(value: Any) -> int:
+    """``max_slippage_bps=``, else ``$LOAF_MAX_SLIPPAGE_BPS``, else the default."""
+    if value is not None:
+        whole = isinstance(value, numbers.Integral) and not isinstance(value, bool)
+        if not whole or not 0 <= int(value) < 10_000:
+            raise LoafConfigError(f"max_slippage_bps {_BPS_RULE}, got {value!r}")
+        return int(value)
+    raw = (os.environ.get(ENV_MAX_SLIPPAGE_BPS) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_SLIPPAGE_BPS
+    match = _BPS_TEXT.fullmatch(raw)
+    if match is None:
+        raise LoafConfigError(f"${ENV_MAX_SLIPPAGE_BPS} {_BPS_RULE}, got {raw!r}")
+    return int(match.group(1))
+
+
+def _placement_timeout(timeout: Any, placement_timeout: float | None) -> httpx.Timeout:
+    """The client's timeout, with its read wait set to ``placement_timeout``, else raised to at
+    least DEFAULT_PLACEMENT_TIMEOUT."""
+    t = httpx.Timeout(timeout)
+    if placement_timeout is None:
+        read = None if t.read is None else max(t.read, DEFAULT_PLACEMENT_TIMEOUT)
+    elif (
+        isinstance(placement_timeout, (int, float))
+        and not isinstance(placement_timeout, bool)
+        and 0 < placement_timeout < float("inf")
+    ):
+        read = placement_timeout
+    else:
+        raise LoafConfigError(
+            f"placement_timeout must be a number of seconds above 0, got {placement_timeout!r}"
+        )
+    return httpx.Timeout(connect=t.connect, read=read, write=t.write, pool=t.pool)
+
+
+def _order_numbers(block: int, start: int) -> tuple[int, int]:
+    """``(order_number_block, order_number_start)`` once each is usable."""
+    for name, value in (("order_number_block", block), ("order_number_start", start)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise LoafConfigError(f"{name} must be a whole number, got {value!r}")
+        if not 1 <= value <= L2_ORDER_INDEX_BLOCK_MAX:
+            raise LoafConfigError(
+                f"{name} must be from 1 to {L2_ORDER_INDEX_BLOCK_MAX}, got {value!r}"
+            )
+    if start > block:
+        raise LoafConfigError(
+            f"order_number_start ({start}) cannot exceed order_number_block ({block})"
+        )
+    return block, start
 
 
 class LoafClient:
@@ -46,43 +216,119 @@ class LoafClient:
 
         from loaf import LoafClient
 
-        with LoafClient(api_key="...") as loaf:
-            print(loaf.portfolio.component().cash)
-            print(loaf.market.properties())
+        with LoafClient() as loaf:   # reads $LOAF_TRADING_KEY
+            print(loaf.portfolio.summary().balances)
+            print(loaf.market.list())
 
     Args:
-        api_key: A Loaf **user API key** (used as the ``Authorization: Bearer``
-            token). Mint one from the Loaf web app (Settings -> API keys). If
-            omitted, read from ``$LOAF_API_KEY``. Public endpoints work without
-            one; authenticated endpoints raise :class:`LoafConfigError`.
+        trading_key: Your trading key, your one credential: the one string the
+            web app's API page gives under Show trading key,
+            ``loaf_tk_<chain>_<account>_<80 hex>`` (README §2). It signs every
+            order and perps allocate and exit locally, and the short-lived
+            login tokens sent as ``Authorization: Bearer`` on reads, cancels,
+            the two account requests an order needs (``GET /l2/keys``,
+            ``POST /l2/order-indices``), perps allocates and exits, and the
+            WebSocket; the key itself is never sent. If omitted, read from
+            ``$LOAF_TRADING_KEY`` (prefer the environment variable: an explicit
+            ``trading_key=`` argument can show up in tools that capture call
+            frames). Without it only the public endpoints work; other calls
+            raise :class:`LoafConfigError`.
         base_url: REST base URL including the ``/api`` suffix. If omitted, read
             from ``$LOAF_API_BASE_URL``, else :data:`~loaf.constants.DEFAULT_BASE_URL`.
         ws_url: Override the WebSocket URL. If omitted it is derived from
             ``base_url`` (``https://host/api`` -> ``wss://host/ws``) or read from
             ``$LOAF_WS_URL``.
-        timeout: Per-request timeout in seconds.
-        max_retries: Automatic retries for transient failures (429 and, for
-            idempotent requests, 503 / network errors).
-        verify: TLS verification, forwarded to httpx. Set ``False`` ONLY for a
-            trusted local dev server using a self-signed certificate — it disables
-            MITM protection, so never use it against a remote host.
-        http_client: Provide your own ``httpx.Client`` (advanced).
+        max_slippage_bps: The most a price the SDK works out for you may move
+            against you, in basis points (100 = 1%), a whole number from 0 to
+            9999. A MARKET order signs the market reference x (1 ± this) as
+            its worst fill price, a ``*_MARKET`` stop / take books at its
+            trigger ± this, and a TP/SL leg sells no lower than its trigger
+            minus this. If omitted, read from ``$LOAF_MAX_SLIPPAGE_BPS``, else
+            :data:`~loaf.constants.DEFAULT_MAX_SLIPPAGE_BPS` (200, 2%). Kept as
+            ``client.max_slippage_bps``; one order overrides it with
+            ``max_slippage_bps=`` / ``leg_max_slippage_bps=``.
+        timeout: Per-request timeout in seconds (or anything httpx accepts).
+            Order placements wait at least
+            :data:`~loaf.constants.DEFAULT_PLACEMENT_TIMEOUT` (45 s) for the
+            answer, and follow this argument even with your own ``http_client``.
+        placement_timeout: Seconds each attempt of a signed placement (and a
+            perps allocate or exit) waits for its answer, in place of that 45 s
+            floor. The exchange answers only once the order is committed, so a
+            shorter wait can give up on an order that then lands: past it the SDK
+            re-sends (``max_retries``), then raises
+            :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
+        max_retries: Automatic retries for transient failures. Reads retry 429,
+            503 and network errors. Signed placements (and perps allocates and
+            exits) retry network errors and 5xx by re-sending the identical
+            signed body after a short pause, which cannot place twice; each
+            attempt can wait out the placement timeout, so lower this (e.g.
+            ``1``) for a latency-sensitive loop.
+            Cancels and other POSTs are never retried.
+        order_number_block: The most order numbers one reservation asks for, 1
+            to :data:`~loaf.constants.L2_ORDER_INDEX_BLOCK_MAX`. The exchange takes
+            one reservation a second per account, so this caps your orders a
+            second. Default :data:`~loaf.constants.L2_ORDER_INDEX_BLOCK` (64). The
+            numbers a process has reserved when it stops stay unused against your
+            allowance (README, "The order-number allowance").
+        order_number_start: The size of the first reservation, from which they
+            double up to ``order_number_block``. Default 1, so a process that
+            stops after a few orders leaves few numbers unused.
+        reserve_ahead: Reserve the next block on a background thread once the
+            current one is half used, so a placement waits on neither that
+            request nor its one-a-second limit. One that outruns the thread still
+            reserves for itself. Default ``False``: no thread.
+        verify: TLS verification for REST and the WebSocket (only the WebSocket
+            with your own ``http_client``): an ``ssl.SSLContext``, such as
+            ``ssl.create_default_context(cafile=...)``, trusts your own CAs. Set
+            ``False`` ONLY for a trusted local dev server using a self-signed
+            certificate — it disables MITM protection, so never use it against a
+            remote host.
+        http_client: Provide your own ``httpx.Client`` (advanced). Its response
+            hooks must not raise (no ``raise_for_status`` hook): the SDK reads
+            every answer itself, and a hook that raises bypasses its error
+            handling, so the order numbers of a refused order are not reused
+            and what the SDK cached is not refreshed.
     """
 
     def __init__(
         self,
-        api_key: str | None = None,
+        trading_key: str | None = None,
         base_url: str | None = None,
         *,
         ws_url: str | None = None,
-        timeout: float = DEFAULT_TIMEOUT,
+        max_slippage_bps: int | None = None,
+        timeout: float | tuple | httpx.Timeout | None = DEFAULT_TIMEOUT,
+        placement_timeout: float | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
-        verify: bool | str = True,
+        order_number_block: int = L2_ORDER_INDEX_BLOCK,
+        order_number_start: int = 1,
+        reserve_ahead: bool = False,
+        verify: bool | ssl.SSLContext = True,
         http_client: httpx.Client | None = None,
     ) -> None:
-        self.api_key = api_key or os.environ.get(ENV_API_KEY) or None
+        try:
+            #: Default max slippage (basis points) for the prices the SDK derives for your orders.
+            self.max_slippage_bps: int = _max_slippage_bps(max_slippage_bps)
+            raw = (trading_key or os.environ.get(ENV_TRADING_KEY) or "").strip()
+            #: Signs placements and login tokens, and keeps the secret to itself; None without a
+            #: trading key.
+            self._l2_key: TradingKey | None = TradingKey(raw) if raw else None
+        finally:
+            # Crash reporters and debuggers record frame locals: whatever fails in __init__, no
+            # trading key is left in them.
+            raw = trading_key = None
+        #: The login tokens the trading key signs for every authenticated request and the
+        #: WebSocket; None without a trading key.
+        self._login_tokens = LoginTokens(self._l2_key) if self._l2_key is not None else None
+        #: Held from the nonce read to the answer of each perps op and withdrawal: they spend one
+        #: nonce counter, so this client sends them one at a time.
+        self._op_lock = threading.Lock()
+
         self.base_url = (base_url or os.environ.get(ENV_BASE_URL) or DEFAULT_BASE_URL).rstrip("/")
         self._ws_url_override = ws_url or os.environ.get(ENV_WS_URL) or None
+        self._placement_timeout = _placement_timeout(timeout, placement_timeout)
+        self._order_numbers = _order_numbers(order_number_block, order_number_start)
+        self._reserve_ahead = bool(reserve_ahead)
         self.max_retries = max(0, int(max_retries))
         self._verify = verify
 
@@ -99,32 +345,35 @@ class LoafClient:
             timeout=timeout,
             headers=headers,
             verify=verify,
+            # httpx's default drops a connection idle for 5 s, so a bot acting every few seconds
+            # would pay a new TCP + TLS handshake on every order. A connection the far end has
+            # closed meanwhile is noticed and replaced before it is reused.
+            limits=httpx.Limits(
+                max_connections=100, max_keepalive_connections=20, keepalive_expiry=30.0
+            ),
         )
         self._owns_http = http_client is None
 
         # Lazily import to avoid an import cycle at module load.
-        from .resources.competition import CompetitionResource
+        from .resources.funds import FundsResource
         from .resources.history import HistoryResource
-        from .resources.leaderboard import LeaderboardResource
         from .resources.market import MarketResource
-        from .resources.offerings import OfferingsResource
         from .resources.orders import OrdersResource
+        from .resources.perps import PerpsResource
         from .resources.portfolio import PortfolioResource
 
-        #: Public market data: properties, candles, info pages.
+        #: Public market data: markets, candles, trades.
         self.market: MarketResource = MarketResource(self)
-        #: Primary market (IPO offerings): list, detail, subscribe, approve.
-        self.offerings: OfferingsResource = OfferingsResource(self)
-        #: Trading: place/cancel orders, pre-approve.
+        #: Trading: place (signed with your trading key) and cancel orders, stop & take orders.
         self.orders: OrdersResource = OrdersResource(self)
-        #: Balances, positions, and PnL.
+        #: Perps: your pools and positions, margin moves and exits (signed like orders).
+        self.perps: PerpsResource = PerpsResource(self)
+        #: Balances, holdings, and recent activity.
         self.portfolio: PortfolioResource = PortfolioResource(self)
-        #: Paginated order & trade history.
+        #: Withdrawals of USDC to your own wallet (signed like orders).
+        self.funds: FundsResource = FundsResource(self)
+        #: Paginated order, trade & funding history.
         self.history: HistoryResource = HistoryResource(self)
-        #: Competition leaderboard.
-        self.leaderboard: LeaderboardResource = LeaderboardResource(self)
-        #: Trading competition: rounds info, queue position, payout details.
-        self.competition: CompetitionResource = CompetitionResource(self)
 
     # ------------------------------------------------------------------ #
     # Public convenience verbs (return parsed bodies)
@@ -137,9 +386,6 @@ class LoafClient:
         self, path: str, *, json: dict | None = None, params: dict | None = None, auth: bool = True
     ) -> Any:
         return self.request("POST", path, json=json, params=params, auth=auth)
-
-    def delete(self, path: str, *, params: dict | None = None, auth: bool = True) -> Any:
-        return self.request("DELETE", path, params=params, auth=auth)
 
     # ------------------------------------------------------------------ #
     # Core request logic
@@ -157,18 +403,34 @@ class LoafClient:
         """Send a request and return the parsed body (a :class:`LoafObject`,
         a list, or ``None``).
 
-        Handles auth headers, JSON (de)serialisation, error mapping, and
-        automatic retries for transient failures. You normally call the typed
-        resource methods rather than this directly.
+        Handles authentication (``auth=True``: a login token your trading key
+        signs), JSON (de)serialisation, error mapping, and automatic retries for
+        transient failures. You normally call the typed resource methods rather
+        than this directly.
         """
-        headers: dict[str, str] = {}
-        if auth:
-            if not self.api_key:
-                raise LoafConfigError(
-                    f"{method} {path} requires authentication but no API key is set. "
-                    f"Pass api_key=... or set ${ENV_API_KEY}."
-                )
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        return self._request(method, path, json=json, params=params, auth=auth)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict | None = None,
+        params: dict | None = None,
+        auth: bool = True,
+        before_order: bool = False,
+    ) -> Any:
+        """:meth:`request`, plus ``before_order``: set for the reads an order
+        placement makes before signing, so a 429 raises at once and a 503 is
+        retried after only a short jittered pause, never the rate-limit hints.
+        """
+        tokens = self._login_tokens if auth else None
+        if auth and tokens is None:
+            raise LoafConfigError(
+                f"{method} {path} needs your trading key, which signs the login token that "
+                f"authenticates it: set ${ENV_TRADING_KEY} to the web app's Show trading key "
+                "(README §2), or pass trading_key=..."
+            )
 
         # Drop params/body keys whose value is None so we never send "null".
         clean_params = {k: v for k, v in (params or {}).items() if v is not None}
@@ -176,41 +438,181 @@ class LoafClient:
 
         idempotent = method.upper() in _IDEMPOTENT_METHODS
         attempt = 0
-        while True:
-            try:
-                response = self._http.request(
-                    method,
-                    path,
-                    params=clean_params or None,
-                    json=clean_json,
-                    headers=headers,
+        token = ""
+        try:
+            while True:
+                # Taken for each attempt: a backoff can outlast the token's half-life.
+                token = tokens.token() if tokens is not None else ""
+                try:
+                    response = self._http.request(
+                        method,
+                        path,
+                        params=clean_params or None,
+                        json=clean_json,
+                        headers={"Authorization": f"Bearer {token}"} if token else None,
+                    )
+                except httpx.RequestError as exc:
+                    if idempotent and attempt < self.max_retries:
+                        self._sleep_backoff(attempt)
+                        attempt += 1
+                        continue
+                    raise LoafConnectionError(f"{method} {path} failed: {exc}") from exc
+
+                self._record_rate_limit(response)
+
+                if response.is_success:
+                    try:
+                        return self._parse_body(response)
+                    except ValueError as exc:  # labelled JSON but not JSON
+                        raise LoafServerError(
+                            f"{method} {path} answered a body that is not JSON",
+                            status_code=response.status_code,
+                            request_id=response.headers.get("x-request-id"),
+                            body=response.text,
+                        ) from exc
+
+                # Error path — decide whether to retry. Only idempotent (read) requests
+                # are retried here. Signed placements go through _send_signed, which
+                # re-sends the identical signed body. Other POSTs (cancels) are never retried.
+                should_retry = (
+                    attempt < self.max_retries
+                    and idempotent
+                    and response.status_code in ((503,) if before_order else (429, 503))
                 )
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                if idempotent and attempt < self.max_retries:
-                    self._sleep_backoff(attempt)
+                if should_retry:
+                    # Before signing an order, never wait out rate-limit hints: a late order is
+                    # stale.
+                    self._sleep_backoff(attempt, None if before_order else response)
                     attempt += 1
                     continue
-                raise LoafConnectionError(f"{method} {path} failed: {exc}") from exc
 
-            self._record_rate_limit(response)
+                error = self._build_error(response)
+                if tokens is not None and response.status_code == 401:
+                    tokens.forget(token)  # refused: the next request signs a fresh one
+                    error = _login_refusal(error)
+                raise error
+        finally:
+            # Crash reporters and debuggers record frame locals: a login token is a credential, and
+            # the response holds the request that carried it.
+            token = ""
+            response = None
 
-            if response.is_success:
-                return self._parse_body(response)
+    # ------------------------------------------------------------------ #
+    # Signed order placement
+    # ------------------------------------------------------------------ #
 
-            # Error path — decide whether to retry. Only idempotent (read) requests
-            # are retried: re-sending a non-idempotent POST (e.g. /orders) could place
-            # the order twice, so we surface the error and let the caller decide.
-            should_retry = (
-                attempt < self.max_retries
-                and idempotent
-                and response.status_code in (429, 503)
+    @property
+    def public_key(self) -> str | None:
+        """The public key of your trading key, ``0x`` + 80 lowercase hex (what ``GET /l2/keys``
+        names ``journaledKey`` while it is in force), or ``None`` when no trading key is set."""
+        return self._l2_key.public_key if self._l2_key is not None else None
+
+    def _send_signed(
+        self, path: str, body: dict, *, ambiguous: bool = False, op: str = "order"
+    ) -> Any:
+        """POST signed ``op``, re-sending the identical bytes on transient failures.
+
+        ``op="order"``: an order placement. It carries no ``Authorization``
+        header: its signature authenticates. Network errors and 5xx are re-sent
+        up to ``max_retries`` times, after a short jittered pause; the exchange
+        admits one order per account and order number, so a repeat is answered
+        as a duplicate, never a second order. 4xx (429 included) is final. If
+        any attempt may have landed and no 200 settled it, raises
+        :class:`~loaf.exceptions.OrderOutcomeUnknownError`.
+
+        ``ambiguous=True`` (resubmit): an earlier attempt may already have
+        landed, so anything but a 2xx raises the op's unknown-outcome error,
+        except a withdrawal's 422 ``ORDER_INDEX_USED``, which says none landed
+        (:func:`_never_journaled`): it is raised as itself.
+
+        ``op="perps"`` or ``op="withdrawal"``: a signed perps allocate or exit,
+        or a withdrawal. It carries a login token too (the exchange checks the
+        account is yours) and is settled by a 202 ``{journalSeq, duplicate,
+        ...}``; the exchange journals one op per account and nonce and answers a
+        repeat of a journaled one as its duplicate. It raises
+        :class:`~loaf.exceptions.PerpsOutcomeUnknownError` or
+        :class:`~loaf.exceptions.WithdrawalOutcomeUnknownError` instead.
+        """
+        what, unknown = _SIGNED_OPS[op]
+        content = _json.dumps(body, separators=(",", ":"), allow_nan=False).encode()
+        headers = {"Content-Type": "application/json"}
+        tokens = None if op == "order" else self._login_tokens
+        if op != "order" and tokens is None:
+            raise LoafConfigError(
+                f"POST {path} needs your trading key, which signs the op and the login token "
+                f"that authenticates it: set ${ENV_TRADING_KEY} to the web app's Show trading "
+                "key (README §2), or pass trading_key=..."
             )
-            if should_retry:
-                self._sleep_backoff(attempt, response)
+        settled_by = "orderId" if op == "order" else "journalSeq"
+        timeout = self._placement_timeout
+        attempt = 0
+        token = ""
+        try:
+            while True:
+                retryable = True
+                try:
+                    if tokens is not None:
+                        # Taken for each attempt, as a read takes it: a re-send carries a live
+                        # token. A failure to sign one is this attempt's error, so an earlier
+                        # attempt that may have landed still ends in an unknown outcome.
+                        token = tokens.token()
+                        headers["Authorization"] = f"Bearer {token}"
+                    response = self._http.post(
+                        path, content=content, headers=headers, timeout=timeout
+                    )
+                except httpx.RequestError as exc:
+                    if not isinstance(exc, _NOT_SENT_ERRORS):  # may have been received
+                        ambiguous = True
+                    error: Exception = LoafConnectionError(f"POST {path} failed: {exc}")
+                    error.__cause__ = exc
+                except Exception as exc:
+                    # E.g. another thread closed the client, or a response hook of your
+                    # http_client raised on a 5xx answer: a body that may have been placed is
+                    # never lost.
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500:
+                        ambiguous = True
+                    error, retryable = exc, False
+                else:
+                    self._record_rate_limit(response)
+                    if response.is_success:
+                        try:
+                            result = self._parse_body(response)
+                        except ValueError:  # labelled JSON but not JSON
+                            result = response.text
+                        if isinstance(result, dict) and settled_by in result:
+                            return result
+                        error = LoafServerError(
+                            f"Unexpected response to {what}",
+                            status_code=response.status_code,
+                            body=result,
+                        )
+                        ambiguous, retryable = True, False
+                    else:
+                        error = self._build_error(response)
+                        if tokens is not None and response.status_code == 401:
+                            tokens.forget(token)  # refused: the next request signs a fresh one
+                            error = _login_refusal(error)
+                        retryable = response.status_code >= 500
+                        if retryable and not _definitely_not_done(error, op):
+                            ambiguous = True
+                        elif _never_journaled(error, op):
+                            ambiguous = False  # it settles every attempt, a resubmit's too
+                if not retryable or attempt >= self.max_retries:
+                    break
+                # Jitter only: every reply carries RateLimit-Reset, and a signed price goes stale.
+                self._sleep_backoff(attempt)
                 attempt += 1
-                continue
-
-            raise self._build_error(response)
+        finally:
+            # Crash reporters and debuggers record frame locals: a login token is a credential, and
+            # the response holds the request that carried it.
+            token = ""
+            headers.pop("Authorization", None)
+            response = None
+        if ambiguous:
+            raise unknown(
+                signed_body=copy.deepcopy(body), attempts=attempt + 1, last_error=error
+            ) from error
+        raise error
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -225,7 +627,7 @@ class LoafClient:
             return parse(response.json())
         return response.text
 
-    def _build_error(self, response: httpx.Response) -> Exception:
+    def _build_error(self, response: httpx.Response) -> LoafAPIError:
         try:
             body: Any = response.json()
         except ValueError:
@@ -255,7 +657,14 @@ class LoafClient:
 
     @staticmethod
     def _retry_after_seconds(response: httpx.Response) -> float | None:
-        for header in ("retry-after", "ratelimit-reset"):
+        """The wait an answer asks for, in seconds: its Retry-After, else, for a 429 alone, its
+        RateLimit-Reset (every answer carries one, the time left in the rate-limit window, which
+        says nothing about when a 503's cause clears)."""
+        if response.status_code == 429:
+            headers: tuple[str, ...] = ("retry-after", "ratelimit-reset")
+        else:
+            headers = ("retry-after",)
+        for header in headers:
             value = response.headers.get(header)
             if value is not None:
                 try:
@@ -267,11 +676,11 @@ class LoafClient:
     def _sleep_backoff(self, attempt: int, response: httpx.Response | None = None) -> None:
         if response is not None:
             hinted = self._retry_after_seconds(response)
-            if hinted is not None:
+            if hinted is not None and hinted > 0:  # a hint of 0 or less would retry at once
                 time.sleep(min(hinted, 60.0))
                 return
-        # Exponential backoff with full jitter, capped at 30s.
-        delay = min(30.0, (2**attempt) * 0.5)
+        # Exponential backoff with full jitter, capped at 30s; a capped exponent never overflows.
+        delay = min(30.0, 0.5 * 2 ** min(attempt, 6))
         time.sleep(random.uniform(0, delay))
 
     # ------------------------------------------------------------------ #
@@ -280,7 +689,7 @@ class LoafClient:
 
     def websocket(self, **kwargs: Any) -> LoafWebSocketClient:
         """Create a :class:`~loaf.ws.client.LoafWebSocketClient` bound to this
-        client's credentials and host. See that class for usage."""
+        client's trading key and host. See that class for usage."""
         from .ws.client import LoafWebSocketClient
 
         return LoafWebSocketClient(self, **kwargs)
@@ -296,6 +705,7 @@ class LoafClient:
     # ------------------------------------------------------------------ #
 
     def close(self) -> None:
+        self.orders._l2.close()
         if self._owns_http:
             self._http.close()
 
@@ -306,5 +716,8 @@ class LoafClient:
         self.close()
 
     def __repr__(self) -> str:
-        authed = "authenticated" if self.api_key else "anonymous"
-        return f"<LoafClient base_url={self.base_url!r} {authed} v{__version__}>"
+        # getattr: crash reporters repr a client whose __init__ raised part-way.
+        key = getattr(self, "_l2_key", None)
+        authed = "anonymous" if key is None else f"authenticated public_key={key.public_key}"
+        base_url = getattr(self, "base_url", None)
+        return f"<LoafClient base_url={base_url!r} {authed} v{__version__}>"

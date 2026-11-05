@@ -1,0 +1,862 @@
+"""K1 signing, offline: K1's known answers, the order, allocate, exit and withdraw
+checks the web app's signer makes, the login message, and the curve's own vectors.
+
+``k1-sign.json`` is K1's known-answer file, every line but its ``about`` text (K1's
+names internal documents): keys, signatures, orders, perps allocates and exits,
+withdraws, the vectors the matching engine and the web app run too, so a match here
+means a signature made by this SDK verifies there. Its price reports and order
+batches are messages this SDK does not build (it signs no report or batch): they
+ride along so the file stays K1's line for line, and the reports' signatures are
+checked like the allocates'. To take a new K1 file, copy it and put
+this file's ``about`` line back. ``k1-login.json`` is the matching engine's for the
+login message, byte for byte, whose
+verifier the exchange checks each login token with: a login token this SDK signs
+is one the exchange takes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import pickle
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from loaf import k1
+from loaf.k1 import (
+    K1Error,
+    allocate_message,
+    exit_message,
+    key_from_seed,
+    login_message,
+    order_message,
+    perps_base_field,
+    public_key,
+    sign,
+    verify,
+    withdraw_message,
+)
+
+KAT_FILE = Path(__file__).with_name("k1-sign.json")
+KAT = json.loads(KAT_FILE.read_text())
+LOGIN_KAT_FILE = Path(__file__).with_name("k1-login.json")
+LOGIN_KAT = json.loads(LOGIN_KAT_FILE.read_text())
+
+# The group order n.
+N = 0x7FFFFFFD80000007_7FFFFFF100000016_7FFFFFE6CFB80639_E8885C39D724A09C_E80FD996948BFFE1
+# An order's wire keys in message order.
+ORDER_KEYS = (
+    "l2ChainId", "l2MarketIndex", "l2BaseAssetId", "l2QuoteAssetId", "isAsk", "price",
+    "l2FeeRateCap", "l2AccountIndex", "l2OrderIndex", "l2Epoch", "quantity", "l2ExpiryMs",
+)
+# The field each message refusal code names, as the engine names it.
+REFUSED_FIELD = {
+    "E_MSG_CHAIN_ID": "l2_chain_id",
+    "E_MSG_MARKET": "l2_market_index",
+    "E_MSG_BASE_ASSET": "l2_base_asset_id",
+    "E_MSG_QUOTE_ASSET": "l2_quote_asset_id",
+    "E_MSG_FEE_CAP": "l2_fee_rate_cap",
+    "E_MSG_ACCOUNT": "l2_account_index",
+    "E_MSG_ORDER_INDEX": "l2_order_index",
+    "E_MSG_EPOCH": "l2_epoch",
+    "E_MSG_BASE_AMOUNT": "quantity",
+    "E_MSG_EXPIRY": "l2_expiry_ms",
+}
+# The engine's widths of an order's fields, in its parse order, and the chain id's, below the
+# KoalaBear modulus, which comes last. KAT order 0 is on market 7, a perps market, whose base-asset
+# field is the order's pool byte (a spot market's is its base asset, 1 to 62).
+WIDTHS = [
+    ("l2_account_index", 0, 2**48 - 1),
+    ("l2_market_index", 0, 4095),
+    ("l2_order_index", 1, 2**40 - 1),
+    ("l2_epoch", 0, 2**48 - 1),
+    ("quantity", 1, 2**48 - 1),
+    ("price", 1, 2**32 - 1),
+    ("l2_fee_rate_cap", 0, 2**20 - 1),
+    ("l2_expiry_ms", 0, 2**48 - 1),
+    ("l2_base_asset_id", 0, 15),
+    ("l2_quote_asset_id", 1, 62),
+    ("l2_chain_id", 0, 2130706432),
+]
+ORDER_REFUSALS = [v for v in KAT["message_refusals"] if v["kind"] == "order"]
+# An allocate's and an exit's wire keys in message order.
+ALLOCATE_KEYS = (
+    "l2ChainId", "l2AccountIndex", "fromSide", "toSide", "amount", "l2Nonce", "l2ExpiryMs",
+)
+EXIT_KEYS = ("l2ChainId", "l2AccountIndex", "pool", "market", "l2Nonce", "l2ExpiryMs")
+# The tag byte each signed kind's KAT signatures repeat as aux: price reports', allocates', exits'.
+SIGNED_TAGS = {"reports": 21, "allocates": 23, "exits": 25}
+# The field each message refusal code of an allocate or an exit names.
+OP_REFUSED_FIELD = {
+    "E_MSG_CHAIN_ID": "l2_chain_id",
+    "E_MSG_ACCOUNT": "l2_account_index",
+    "E_MSG_NONCE": "l2_nonce",
+    "E_MSG_EXPIRY": "l2_expiry_ms",
+}
+OP_REFUSALS = [v for v in KAT["message_refusals"] if v["kind"] in ("allocate", "exit")]
+# The engine's widths of an allocate's fields beside its sides (a pool, 0 to 7, or 255), and of
+# an exit's, in its parse order, the chain id last.
+ALLOCATE_WIDTHS = [
+    ("l2_account_index", 0, 2**48 - 2),
+    ("amount", 1, 2**60 - 1),
+    ("l2_nonce", 0, 2**48 - 1),
+    ("l2_expiry_ms", 0, 2**48 - 1),
+    ("l2_chain_id", 0, 2130706432),
+]
+EXIT_WIDTHS = [
+    ("l2_account_index", 0, 2**48 - 2),
+    ("pool", 0, 7),
+    ("market", 0, 254),
+    ("l2_nonce", 0, 2**48 - 1),
+    ("l2_expiry_ms", 0, 2**48 - 1),
+    ("l2_chain_id", 0, 2130706432),
+]
+# A withdraw's wire keys in message order (its api key and route are the message's own: api key 0,
+# route 1, the spot balance, for every withdrawal the SDK signs).
+WITHDRAW_KEYS = (
+    "l2ChainId", "l2AccountIndex", "l2ApiKeyIndex", "l2AssetId", "l2Route", "amount", "l2Nonce",
+    "l2ExpiryMs",
+)
+# The widths of the withdraw fields the SDK signs, in K1's order (the chain id, the account),
+# then the asset and the amount the engine takes, then the nonce and the expiry.
+WITHDRAW_WIDTHS = [
+    ("l2_chain_id", 0, 2130706432),
+    ("l2_account_index", 0, 2**48 - 1),
+    ("l2_asset_id", 1, 62),
+    ("amount", 1, 2**53 - 1),
+    ("l2_nonce", 0, 2**48 - 1),
+    ("l2_expiry_ms", 0, 2**48 - 1),
+]
+WITHDRAW_REFUSALS = [v for v in KAT["message_refusals"] if v["kind"] == "withdraw"]
+SK0, PK0 = bytes.fromhex(KAT["keys"][0]["sk"]), bytes.fromhex(KAT["keys"][0]["pk"])
+
+
+def snake(key: str) -> str:
+    return re.sub("[A-Z]", lambda c: "_" + c.group().lower(), key)
+
+
+def fields(vector: dict[str, Any]) -> dict[str, Any]:
+    """A vector's order fields as order_message's keywords: its wire keys in snake case."""
+    return {snake(k): v for k, v in vector.items() if k not in ("m", "kind", "code")}
+
+
+def op_fields(vector: dict[str, Any]) -> dict[str, Any]:
+    """An allocate's or exit's fields as its message function's keywords, the amount an int."""
+    return {
+        snake(k): int(v) if k == "amount" else v
+        for k, v in vector.items()
+        if k not in ("m", "pk", "aux", "sig", "kind", "code")
+    }
+
+
+def withdraw_fields(vector: dict[str, Any]) -> dict[str, Any]:
+    """A withdraw vector's fields as withdraw_message's keywords: its api key and route left out
+    (the message's own), the amount an int."""
+    terms = op_fields(vector)
+    del terms["l2_api_key_index"], terms["l2_route"]
+    return terms
+
+
+ORDER0 = fields(KAT["orders"][0])
+ALLOCATE0 = op_fields(KAT["allocates"][0])
+EXIT0 = op_fields(KAT["exits"][0])
+WITHDRAW0 = withdraw_fields(KAT["withdraws"][0])
+# A login token's signed fields, wire keys in the engine's width order.
+LOGIN_KEYS = ("l2ChainId", "l2AccountIndex", "l2ExpiryMs")
+LOGIN_FIELDS = tuple(map(snake, LOGIN_KEYS))
+
+
+def login_fields(vector: dict[str, Any]) -> dict[str, Any]:
+    """A login vector's signed fields as login_message's keywords."""
+    return {snake(key): vector[key] for key in LOGIN_KEYS}
+
+
+LOGIN0 = login_fields(LOGIN_KAT["messages"][0])
+
+
+def refused(code: str, call: Any, *args: Any, **kwargs: Any) -> K1Error:
+    with pytest.raises(K1Error) as info:
+        call(*args, **kwargs)
+    assert info.value.code == code, str(info.value)
+    return info.value
+
+
+# --------------------------------------------------------------------------- #
+# K1's known answers
+# --------------------------------------------------------------------------- #
+
+
+def test_kat_file_is_unchanged():
+    digest = hashlib.sha256(KAT_FILE.read_bytes()).hexdigest()
+    assert digest == "75d479b9b8227acff7e57b34ba96ae8e993d8052361ae583b68eeb855d5289c5"
+
+
+@pytest.mark.parametrize("v", KAT["keys"], ids=lambda v: v["seed"][:8])
+def test_kat_keys(v):
+    sk = key_from_seed(bytes.fromhex(v["seed"]))
+    assert sk.hex() == v["sk"]
+    assert public_key(sk).hex() == v["pk"]
+
+
+@pytest.mark.parametrize("v", KAT["signatures"], ids=lambda v: v["sig"][:8])
+def test_kat_signatures(v):
+    m = bytes.fromhex(v["m"])
+    s, e = sign(bytes.fromhex(v["sk"]), m, bytes.fromhex(v["aux"]))
+    assert (s + e).hex() == v["sig"]
+    verify(bytes.fromhex(v["pk"]), m, s, e)
+
+
+def test_kat_signatures_cover_zero_aux():
+    assert len(KAT["signatures"]) == 9
+    assert any(v["aux"] == "00" * 32 for v in KAT["signatures"])
+
+
+@pytest.mark.parametrize("v", KAT["refusals"], ids=lambda v: v["code"])
+def test_kat_refusals(v):
+    if v["code"] == "MessageNoncanonical":  # sign's own: a message limb >= p is never signed
+        args = (bytes.fromhex(v["sk"]), bytes.fromhex(v["m"]), bytes.fromhex(v["aux"]))
+        refused(v["code"], sign, *args)
+    else:
+        pk, m, sig = (bytes.fromhex(v[key]) for key in ("pk", "m", "sig"))
+        refused(v["code"], verify, pk, m, sig[:40], sig[40:])
+
+
+@pytest.mark.parametrize("v", KAT["orders"], ids=["typical", "maxima", "zeros"])
+def test_kat_order_messages(v):
+    assert k1._order_message(*(v[key] for key in ORDER_KEYS)).hex() == v["m"]
+
+
+def test_kat_orders_outside_the_engines_widths_are_refused_by_name():
+    # Order 0 is one the engine admits; 1 and 2 pin K1's encoding at its edges, which the engine,
+    # and so the web app's signer, refuse first.
+    assert order_message(**ORDER0).hex() == KAT["orders"][0]["m"]
+    for v, field in ((KAT["orders"][1], "l2_market_index"), (KAT["orders"][2], "l2_order_index")):
+        error = refused("Width", order_message, **fields(v))
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+@pytest.mark.parametrize("v", ORDER_REFUSALS, ids=lambda v: v["code"])
+def test_kat_message_refusals(v):
+    if v["code"] == "E_UNKNOWN_KEY":  # a key the wire does not have
+        with pytest.raises(TypeError, match="l2_api_key_index"):
+            order_message(**fields(v))
+    else:
+        error = refused("Width", order_message, **fields(v))
+        assert str(error) == f"l2 width: {REFUSED_FIELD[v['code']]} out of range"
+
+
+def test_kat_message_refusals_cover_every_order_field():
+    assert {v["code"] for v in ORDER_REFUSALS} == {*REFUSED_FIELD, "E_UNKNOWN_KEY"}
+
+
+@pytest.mark.parametrize("v", KAT["allocates"], ids=["typical", "maxima", "zeros"])
+def test_kat_allocate_messages(v):
+    assert k1._allocate_message(*(int(v[key]) for key in ALLOCATE_KEYS)).hex() == v["m"]
+
+
+@pytest.mark.parametrize("v", KAT["exits"], ids=["typical", "maxima", "zeros"])
+def test_kat_exit_messages(v):
+    assert k1._exit_message(*(v[key] for key in EXIT_KEYS)).hex() == v["m"]
+
+
+@pytest.mark.parametrize(
+    "kind, i", [(kind, i) for kind in SIGNED_TAGS for i in range(3)], ids=lambda x: str(x)
+)
+def test_kat_report_allocate_and_exit_signatures(kind, i):
+    # Vector i is signed with key i, aux its kind's tag byte repeated.
+    v, key = KAT[kind][i], KAT["keys"][i]
+    assert v["pk"] == key["pk"] and v["aux"] == f"{SIGNED_TAGS[kind]:02x}" * 32
+    m = bytes.fromhex(v["m"])
+    s, e = sign(bytes.fromhex(key["sk"]), m, bytes.fromhex(v["aux"]))
+    assert (s + e).hex() == v["sig"]
+    verify(bytes.fromhex(v["pk"]), m, s, e)
+
+
+def test_kat_allocates_and_exits_outside_the_engines_widths_are_refused_by_name():
+    # The typical vectors, and the zero exit, are ones the engine parses; the maxima carry an
+    # account past its largest index, and the zero allocate moves nothing.
+    assert allocate_message(**ALLOCATE0).hex() == KAT["allocates"][0]["m"]
+    assert exit_message(**EXIT0).hex() == KAT["exits"][0]["m"]
+    assert exit_message(**op_fields(KAT["exits"][2])).hex() == KAT["exits"][2]["m"]
+    for call, v, field in (
+        (allocate_message, KAT["allocates"][1], "l2_account_index"),
+        (allocate_message, KAT["allocates"][2], "amount"),
+        (exit_message, KAT["exits"][1], "l2_account_index"),
+    ):
+        error = refused("Width", call, **op_fields(v))
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+@pytest.mark.parametrize("v", OP_REFUSALS, ids=lambda v: f"{v['kind']}-{v['code']}")
+def test_kat_allocate_and_exit_message_refusals(v):
+    call = allocate_message if v["kind"] == "allocate" else exit_message
+    error = refused("Width", call, **op_fields(v))
+    assert str(error) == f"l2 width: {OP_REFUSED_FIELD[v['code']]} out of range"
+
+
+def test_kat_message_refusals_cover_every_allocate_and_exit_limit():
+    for kind in ("allocate", "exit"):
+        assert {v["code"] for v in OP_REFUSALS if v["kind"] == kind} == set(OP_REFUSED_FIELD)
+
+
+@pytest.mark.parametrize("v", KAT["withdraws"], ids=["typical", "maxima", "zeros"])
+def test_kat_withdraw_messages(v):
+    assert k1._withdraw_message(*(int(v[key]) for key in WITHDRAW_KEYS)).hex() == v["m"]
+
+
+def test_kat_withdraw_is_the_one_a_withdrawal_signs():
+    # The typical vector is a withdrawal the exchange takes: api key 0, route 1 (the spot
+    # balance), the message's own, so the SDK's withdraw message is K1's byte for byte.
+    v = KAT["withdraws"][0]
+    assert (v["l2ApiKeyIndex"], v["l2Route"]) == (0, 1)
+    assert withdraw_message(**WITHDRAW0).hex() == v["m"]
+    # It takes no api key, no route and no recipient: K1 pays the account's own wallet, which the
+    # message does not name.
+    for extra in ("l2_api_key_index", "l2_route", "recipient"):
+        with pytest.raises(TypeError, match=extra):
+            withdraw_message(**WITHDRAW0, **{extra: 0})
+    # The maxima and zeros vectors pin K1's encoding at its edges; the exchange lists assets 1 to
+    # 62, so they are refused first, by name.
+    for v in KAT["withdraws"][1:]:
+        error = refused("Width", withdraw_message, **withdraw_fields(v))
+        assert str(error) == "l2 width: l2_asset_id out of range"
+
+
+@pytest.mark.parametrize("v", WITHDRAW_REFUSALS, ids=lambda v: v["code"])
+def test_kat_withdraw_message_refusals(v):
+    assert (v["l2ApiKeyIndex"], v["l2Route"]) == (0, 1)
+    error = refused("Width", withdraw_message, **withdraw_fields(v))
+    assert str(error) == f"l2 width: {OP_REFUSED_FIELD[v['code']]} out of range"
+
+
+def test_kat_message_refusals_cover_every_withdraw_limit():
+    assert {v["code"] for v in WITHDRAW_REFUSALS} == set(OP_REFUSED_FIELD)
+
+
+def test_a_withdraw_signs_and_verifies_under_its_key():
+    m = withdraw_message(**WITHDRAW0)
+    other = withdraw_message(**{**WITHDRAW0, "l2_nonce": 4})
+    for aux in (bytes(32), bytes([13]) * 32):
+        s, e = sign(SK0, m, aux)
+        verify(PK0, m, s, e)
+        refused("Sig", verify, PK0, other, s, e)  # the signature is the message's alone
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"l2_chain_id": 1819238759}, {"l2_account_index": 6}, {"l2_asset_id": 3},
+        {"amount": 123456789013}, {"l2_nonce": 4}, {"l2_expiry_ms": 1700000001},
+    ],
+    ids=lambda edit: next(iter(edit)),
+)
+def test_every_withdraw_field_moves_the_message(edit):
+    assert withdraw_message(**{**WITHDRAW0, **edit}).hex() != KAT["withdraws"][0]["m"]
+
+
+@pytest.mark.parametrize("field, low, high", WITHDRAW_WIDTHS)
+def test_withdraw_field_widths(field, low, high):
+    for value in (low, high):
+        assert len(withdraw_message(**{**WITHDRAW0, field: value})) == 32
+    for value in (low - 1, high + 1):
+        error = refused("Width", withdraw_message, **{**WITHDRAW0, field: value})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+def test_a_withdraws_first_refusal_is_k1s():
+    # Every field out of range: each is named in turn, in K1's order, as the ones before it are
+    # put right.
+    out = [(field, high + 1) for field, _, high in WITHDRAW_WIDTHS]
+    terms = {**WITHDRAW0, **dict(out)}
+    for field, _ in out:
+        assert str(refused("Width", withdraw_message, **terms)) == f"l2 width: {field} out of range"
+        terms[field] = WITHDRAW0[field]
+    assert withdraw_message(**terms).hex() == KAT["withdraws"][0]["m"]
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [{"amount": "123456789012"}, {"l2_asset_id": True}, {"l2_nonce": 3.0}, {"l2_expiry_ms": None}],
+    ids=lambda edit: next(iter(edit)),
+)
+def test_withdraw_fields_have_their_types(edit):
+    with pytest.raises(TypeError, match=next(iter(edit))):
+        withdraw_message(**{**WITHDRAW0, **edit})
+
+
+# --------------------------------------------------------------------------- #
+# Orders as the web app signs them
+# --------------------------------------------------------------------------- #
+
+
+def test_kat_order_signs_as_the_web_app_signs_it():
+    # The web app's signer gives these bytes for KAT order 0, key 0, aux 0.
+    m = order_message(**ORDER0)
+    s, e = sign(SK0, m, bytes(32))
+    assert s.hex() + e.hex() == (
+        "ebe0fc1a67c075b88a5db55fb2bce61a7abc9cb127607a1ce99015624578ca923c384694ad02b948"
+        "8f5ae71647b2a5e0f733b5072a26360648ad985b4c72344cb782d6aa5d8eaf81e6813cfaeafa6a73"
+    )
+    verify(PK0, m, s, e)
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"l2_chain_id": 1819238759}, {"l2_market_index": 8}, {"l2_base_asset_id": 2},
+        {"l2_quote_asset_id": 4}, {"is_ask": True}, {"price": 123456788}, {"l2_fee_rate_cap": 1001},
+        {"l2_account_index": 6}, {"l2_order_index": 10}, {"l2_epoch": 3}, {"quantity": 999999},
+        {"l2_expiry_ms": 1700000001},
+    ],
+    ids=lambda edit: next(iter(edit)),
+)
+def test_every_signed_field_moves_the_message(edit):
+    assert order_message(**{**ORDER0, **edit}).hex() != KAT["orders"][0]["m"]
+
+
+@pytest.mark.parametrize("field, low, high", WIDTHS)
+def test_order_field_widths(field, low, high):
+    # The other amount is 1 while one is at its maximum, so that K1's bounds hold.
+    other = {"price": "quantity", "quantity": "price"}.get(field)
+    base = {**ORDER0, **({other: 1} if other else {})}
+    for value in (low, high):
+        assert len(order_message(**{**base, field: value})) == 32
+    for value in (low - 1, high + 1):
+        error = refused("Width", order_message, **{**base, field: value})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+def test_a_spot_orders_base_asset_width():
+    # Markets above 254 are spot markets: the field is the base asset, 1 to 62.
+    for market in (255, 2050, 4095):
+        spot = {**ORDER0, "l2_market_index": market}
+        for value in (1, 62):
+            assert len(order_message(**{**spot, "l2_base_asset_id": value})) == 32
+        for value in (0, 63):
+            error = refused("Width", order_message, **{**spot, "l2_base_asset_id": value})
+            assert str(error) == "l2 width: l2_base_asset_id out of range"
+
+
+@pytest.mark.parametrize(
+    "pool, reduce_only, field",
+    [(0, False, 0), (0, True, 8), (1, False, 1), (3, True, 11), (7, False, 7), (7, True, 15)],
+)
+def test_perps_base_field(pool, reduce_only, field):
+    assert perps_base_field(pool, reduce_only) == field
+    # KAT order 0 is a perps order of pool 1, not reduce-only: the same message.
+    if (pool, reduce_only) == (1, False):
+        message = order_message(**{**ORDER0, "l2_base_asset_id": field})
+        assert message.hex() == KAT["orders"][0]["m"]
+
+
+def test_perps_base_field_refusals():
+    for pool in (-1, 8, 15):
+        error = refused("Width", perps_base_field, pool, False)
+        assert str(error) == "l2 width: l2_pool out of range"
+    with pytest.raises(TypeError, match="l2_pool"):
+        perps_base_field(True, False)
+    with pytest.raises(TypeError, match="reduce_only"):
+        perps_base_field(0, 1)
+
+
+def test_k1_bounds_on_the_orders_largest_fill():
+    # The quote, quantity x price / 10 rounded down: 2^48 - 1 (from 2^48 - 0.8) fits, 2^48 does not.
+    no_fee = {**ORDER0, "l2_fee_rate_cap": 0}
+    assert len(order_message(**{**no_fee, "quantity": 255886342464232, "price": 11})) == 32
+    over = {**no_fee, "quantity": 2**24, "price": 167772160}
+    error = refused("QuoteAboveK1", order_message, **over)
+    assert str(error) == (
+        "l2 k1 bound: quantity x price / 10 is not below 2^48 (K1's 48-bit fill quote)"
+    )
+    # The fee bound, quantity x price x cap / 10^7 rounded up: 2^48 - 1 (from 2^48 - 1.9) fits,
+    # 2^48 (from 2^48 - 0.8) does not.
+    fee = {**ORDER0, "price": 11, "l2_fee_rate_cap": 1000000}
+    assert len(order_message(**{**fee, "quantity": 255886342464231})) == 32
+    error = refused("FeeAboveK1", order_message, **{**fee, "quantity": 255886342464232})
+    assert str(error) == (
+        "l2 k1 bound: the fee-rate cap's fee on quantity x price is not below 2^48 (K1 fees)"
+    )
+
+
+def test_the_first_refusal_is_the_engines():
+    # Every field out of range: each is named in turn, in the engine's order, as the ones before it
+    # are put right.
+    order = {**ORDER0, **{field: high + 1 for field, _, high in WIDTHS}}
+    for field, _, _ in WIDTHS:
+        assert str(refused("Width", order_message, **order)) == f"l2 width: {field} out of range"
+        order[field] = ORDER0[field]
+    # The widths come before K1's bounds, and those before the chain id.
+    big = {**ORDER0, "quantity": 2**24, "price": 167772160}
+    refused("Width", order_message, **{**big, "l2_quote_asset_id": 63})
+    refused("QuoteAboveK1", order_message, **{**big, "l2_chain_id": 2130706433})
+
+
+@pytest.mark.parametrize(
+    "edit", [{"is_ask": 1}, {"price": True}, {"quantity": 10.0}, {"l2_chain_id": "1"}]
+)
+def test_order_fields_have_their_json_types(edit):
+    with pytest.raises(TypeError, match=next(iter(edit))):
+        order_message(**{**ORDER0, **edit})
+
+
+# --------------------------------------------------------------------------- #
+# Allocates and exits as the web app signs them
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"l2_chain_id": 1819238759}, {"l2_account_index": 6}, {"from_side": 0}, {"to_side": 3},
+        {"amount": 123456789013}, {"l2_nonce": 4}, {"l2_expiry_ms": 1700000001},
+    ],
+    ids=lambda edit: next(iter(edit)),
+)
+def test_every_allocate_field_moves_the_message(edit):
+    assert allocate_message(**{**ALLOCATE0, **edit}).hex() != KAT["allocates"][0]["m"]
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"l2_chain_id": 1819238759}, {"l2_account_index": 6}, {"pool": 3}, {"market": 8},
+        {"l2_nonce": 4}, {"l2_expiry_ms": 1700000001},
+    ],
+    ids=lambda edit: next(iter(edit)),
+)
+def test_every_exit_field_moves_the_message(edit):
+    assert exit_message(**{**EXIT0, **edit}).hex() != KAT["exits"][0]["m"]
+
+
+@pytest.mark.parametrize("field, low, high", ALLOCATE_WIDTHS)
+def test_allocate_field_widths(field, low, high):
+    for value in (low, high):
+        assert len(allocate_message(**{**ALLOCATE0, field: value})) == 32
+    for value in (low - 1, high + 1):
+        error = refused("Width", allocate_message, **{**ALLOCATE0, field: value})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+@pytest.mark.parametrize("field", ["from_side", "to_side"])
+def test_allocate_sides(field):
+    # A side is a pool or the spot balance, 255. Two equal sides are the exchange's to refuse.
+    for side in (0, 7, 255):
+        assert len(allocate_message(**{**ALLOCATE0, field: side})) == 32
+    for side in (-1, 8, 254, 256):
+        error = refused("Width", allocate_message, **{**ALLOCATE0, field: side})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+@pytest.mark.parametrize("field, low, high", EXIT_WIDTHS)
+def test_exit_field_widths(field, low, high):
+    for value in (low, high):
+        assert len(exit_message(**{**EXIT0, field: value})) == 32
+    for value in (low - 1, high + 1):
+        error = refused("Width", exit_message, **{**EXIT0, field: value})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+@pytest.mark.parametrize(
+    "call, op, out",
+    [
+        (
+            allocate_message,
+            ALLOCATE0,
+            [
+                ("l2_account_index", 2**48 - 1), ("from_side", 8), ("to_side", 8),
+                ("amount", 2**60), ("l2_nonce", 2**48), ("l2_expiry_ms", 2**48),
+                ("l2_chain_id", 2130706433),
+            ],
+        ),
+        (exit_message, EXIT0, [(field, high + 1) for field, _, high in EXIT_WIDTHS]),
+    ],
+    ids=["allocate", "exit"],
+)
+def test_an_ops_first_refusal_is_the_engines(call, op, out):
+    # Every field out of range: each is named in turn, in the engine's order, as the ones before it
+    # are put right.
+    terms = {**op, **dict(out)}
+    for field, _ in out:
+        assert str(refused("Width", call, **terms)) == f"l2 width: {field} out of range"
+        terms[field] = op[field]
+    assert call(**terms).hex() == (
+        KAT["allocates"][0]["m"] if call is allocate_message else KAT["exits"][0]["m"]
+    )
+
+
+@pytest.mark.parametrize(
+    "call, op, edit",
+    [
+        (allocate_message, ALLOCATE0, {"amount": "123456789012"}),
+        (allocate_message, ALLOCATE0, {"from_side": True}),
+        (allocate_message, ALLOCATE0, {"l2_nonce": 3.0}),
+        (exit_message, EXIT0, {"pool": "2"}),
+        (exit_message, EXIT0, {"market": False}),
+    ],
+)
+def test_allocate_and_exit_fields_have_their_types(call, op, edit):
+    with pytest.raises(TypeError, match=next(iter(edit))):
+        call(**{**op, **edit})
+
+
+# --------------------------------------------------------------------------- #
+# The login message (a login token's), as the engine builds and checks it
+# --------------------------------------------------------------------------- #
+
+
+def test_login_kat_file_is_unchanged():
+    digest = hashlib.sha256(LOGIN_KAT_FILE.read_bytes()).hexdigest()
+    assert digest == "e0c16f47f93d69004c737ae377ea3f953c8d0358a07ecce262208a304b486cb7"
+
+
+@pytest.mark.parametrize(
+    "v", LOGIN_KAT["messages"], ids=["typical", "maxima", "zeros", "carry-account", "carry-expiry"]
+)
+def test_kat_login_messages(v):
+    # The sponge and the packing over the engine's elements, then the elements login_message
+    # lays out itself: the chain id, the tag, and each 48-bit field as its low and high 24 bits.
+    assert v["elements"][1] == LOGIN_KAT["tag"] == 14
+    assert k1._message_bytes(k1._kb_hash(v["elements"])).hex() == v["m"]
+    assert login_message(**login_fields(v)).hex() == v["m"]
+
+
+@pytest.mark.parametrize("v", LOGIN_KAT["signatures"], ids=lambda v: v["aux"][:2])
+def test_kat_login_signatures(v):
+    sk, pk = bytes.fromhex(v["sk"]), bytes.fromhex(v["pk"])
+    assert public_key(sk) == pk
+    m = login_message(**login_fields(v))
+    assert m.hex() == v["m"]
+    s, e = sign(sk, m, bytes.fromhex(v["aux"]))
+    assert (s.hex(), e.hex()) == (v["s"], v["e"])
+    verify(pk, m, s, e)
+
+
+@pytest.mark.parametrize("v", LOGIN_KAT["refusals"], ids=lambda v: v["case"])
+def test_kat_login_refusals(v):
+    # Each a whole check: the message rebuilt from the fields (a width refused before the
+    # signature), then the signature under the key, with the engine's reason.
+    with pytest.raises(K1Error) as info:
+        verify(
+            bytes.fromhex(v["pk"]),
+            login_message(**login_fields(v)),
+            bytes.fromhex(v["s"]),
+            bytes.fromhex(v["e"]),
+        )
+    assert str(info.value) == v["reason"]
+    assert info.value.code == ("Width" if v["reason"].startswith("l2 width:") else "Sig")
+
+
+def test_login_kat_refusals_cover_each_width_and_each_field_after_signing():
+    reasons = [v["reason"] for v in LOGIN_KAT["refusals"]]
+    widths = [f"l2 width: {field} out of range" for field in LOGIN_FIELDS]
+    assert reasons == widths + ["l2 signature: the Schnorr signature does not verify"] * 4
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"l2_chain_id": LOGIN0["l2_chain_id"] + 1},
+        {"l2_account_index": LOGIN0["l2_account_index"] + 1},
+        {"l2_account_index": LOGIN0["l2_account_index"] + 2**24},  # its high 24 bits only
+        {"l2_expiry_ms": LOGIN0["l2_expiry_ms"] + 1},
+        {"l2_expiry_ms": LOGIN0["l2_expiry_ms"] + 2**24},
+    ],
+    ids=["chain", "account-low", "account-high", "expiry-low", "expiry-high"],
+)
+def test_every_login_field_moves_the_message(edit):
+    assert login_message(**{**LOGIN0, **edit}).hex() != LOGIN_KAT["messages"][0]["m"]
+
+
+@pytest.mark.parametrize(
+    "field, high", [("l2_chain_id", 2130706432), ("l2_account_index", 2**48 - 1),
+                    ("l2_expiry_ms", 2**48 - 1)]
+)
+def test_login_field_widths(field, high):
+    # 0 is carried, the chain id's too, as an order's is.
+    for value in (0, high):
+        assert len(login_message(**{**LOGIN0, field: value})) == 32
+    for value in (-1, high + 1):
+        error = refused("Width", login_message, **{**LOGIN0, field: value})
+        assert str(error) == f"l2 width: {field} out of range"
+
+
+def test_the_first_login_refusal_is_the_engines():
+    # Every field out of range: each is named in turn, chain id first, as the ones before it are
+    # put right.
+    terms = {"l2_chain_id": 2130706433, "l2_account_index": 2**48, "l2_expiry_ms": 2**48}
+    for field in LOGIN_FIELDS:
+        assert str(refused("Width", login_message, **terms)) == f"l2 width: {field} out of range"
+        terms[field] = LOGIN0[field]
+    assert login_message(**terms).hex() == LOGIN_KAT["messages"][0]["m"]
+
+
+@pytest.mark.parametrize(
+    "edit", [{"l2_chain_id": True}, {"l2_account_index": 5.0}, {"l2_expiry_ms": "1800000000000"}]
+)
+def test_login_fields_have_their_json_types(edit):
+    with pytest.raises(TypeError, match=next(iter(edit))):
+        login_message(**{**LOGIN0, **edit})
+
+
+def test_a_login_message_is_never_an_order_message():
+    # The sponge's initial state holds the input's length, 6 for a login and 16 for every other
+    # message K1 signs: 6 elements hash otherwise than the same 6 padded to 16...
+    for v in LOGIN_KAT["messages"]:
+        assert k1._kb_hash(v["elements"]) != k1._kb_hash([*v["elements"], *[0] * 10])
+    # ...the tag in lane 1 is below an order's 149 and its low byte none of the withdraw's 13,
+    # the price report's 21, the allocate's 23, the exit's 25, the order's 149 or the batch
+    # root's 150...
+    assert LOGIN_KAT["tag"] < 149 and LOGIN_KAT["tag"] & 0xFF not in (13, 21, 23, 25, 149, 150)
+    # ...and no known login message is a known order's or signed message.
+    logins = {v["m"] for v in LOGIN_KAT["messages"]}
+    kinds = ("orders", "signatures", "withdraws", "reports", "allocates", "exits", "batches")
+    assert not logins & {v["m"] for kind in kinds for v in KAT[kind] if "m" in v}
+
+
+def test_the_sponge_overwrites_only_a_short_chunks_lanes():
+    # k1-sign's kb::hash spelled out over the permutation: the length in lane 8 of the initial
+    # state, each chunk of up to 8 overwriting that many of lanes 0..7 (the rest keep the state,
+    # never zeroed), the digest lanes 0..7, and one permutation for an empty input.
+    xs = [1_000_003 * i + 17 for i in range(10)]
+    state = k1._permute([*xs[:8], 10, 0, 0, 0, 0, 0, 0, 0], k1._KB16)
+    padded = [*xs[8:], 0, 0, 0, 0, 0, 0, *state[8:]]
+    state[:2] = xs[8:]
+    assert k1._kb_hash(xs) == k1._permute(state, k1._KB16)[:8]
+    assert k1._kb_hash(xs) != k1._permute(padded, k1._KB16)[:8]  # what zero padding would give
+    assert k1._kb_hash([]) == k1._permute([0] * 16, k1._KB16)[:8]
+
+
+# --------------------------------------------------------------------------- #
+# The signer's own refusals, and signatures that do not verify
+# --------------------------------------------------------------------------- #
+
+
+def test_signer_refusals():
+    m = order_message(**ORDER0)
+    for seed in (bytes(31), bytes(33)):
+        refused("Seed", key_from_seed, seed)
+    for aux in (bytes(31), bytes(33)):
+        refused("Aux", sign, SK0, m, aux)
+    for sk in (SK0[1:], SK0 + b"\0", bytes(40), N.to_bytes(40, "little"), b"\xff" * 40):
+        refused("SecretKey", public_key, sk)
+        refused("SecretKey", sign, sk, m, bytes(32))
+    assert len(public_key((N - 1).to_bytes(40, "little"))) == 40  # the largest secret key
+    for message in (m[1:], m + b"\0"):
+        refused("MessageNoncanonical", sign, SK0, message, bytes(32))
+    error = refused("SecretKey", public_key, bytes(40))
+    assert str(error) == "l2 signer: the secret key must be 40 bytes of a scalar in [1, n)"
+    copy = pickle.loads(pickle.dumps(error))
+    assert (copy.code, str(copy)) == (error.code, str(error))
+
+
+def test_a_signature_binds_its_key_and_message():
+    m = order_message(**ORDER0)
+    s, e = sign(SK0, m, os.urandom(32))
+    verify(PK0, m, s, e)
+    refused("Sig", verify, bytes.fromhex(KAT["keys"][1]["pk"]), m, s, e)
+    refused("Sig", verify, PK0, order_message(**{**ORDER0, "price": 123456788}), s, e)
+    s_plus_1 = ((int.from_bytes(s, "little") + 1) % N).to_bytes(40, "little")
+    refused("Sig", verify, PK0, m, s_plus_1, e)
+    refused("Noncanonical", verify, PK0, m[1:], s, e)
+    refused("Noncanonical", verify, PK0[1:], m, s, e)
+
+
+def test_aux_reaches_the_nonce():
+    m = order_message(**ORDER0)
+    aux = os.urandom(32)
+    assert sign(SK0, m, aux) == sign(SK0, m, aux)
+    assert sign(SK0, m, aux) != sign(SK0, m, bytes(a ^ 1 for a in aux))
+
+
+def test_fresh_keys_sign_and_verify():
+    for _ in range(3):
+        sk = key_from_seed(os.urandom(32))
+        m = order_message(**{**ORDER0, "l2_order_index": int.from_bytes(os.urandom(4), "big") + 1})
+        verify(public_key(sk), m, *sign(sk, m, os.urandom(32)))
+
+
+# --------------------------------------------------------------------------- #
+# The curve and the challenge's permutation
+# --------------------------------------------------------------------------- #
+
+# Pornin's reference vectors (github.com/pornin/ecgfp5 python/ecGFp5.py) as 40-byte encodings:
+# P1, P2 = E P1, P3 = P1 + P2, P4 = 2 P1, P5 = 2 P2, P6 = 2 P1 + P2 and P7 = P1 + 2 P2; then
+# encodings of no point.
+POINTS = [
+    "599deb76146104ae660d2722c8d670d700a6e2bfa4af71d1d30bba141eed309e17f8d0f7b7061498",
+    "b80dce0616c1ae98729d0cec0f34f7ec961f3ad01e35b1365bd6f6f481ed69d02fce8f992f63004d",
+    "88782ad953116d03a22863891bb80344093be693ccc1ae65bd72fc822ab986c1dd5a098e41797e2a",
+    "62707a003ce4d36fe6ce33cc369f9fde0771bcea957e5e67e866d03e36f52c9ca20b135c3cfe7056",
+    "aaf9948c3eaf09927f59a52e0b2eb89a0ba7a214b226af7df29fde285b7ba4b44adab3b41857e7e4",
+    "b42731cc8e3f2b00c6dd4763928c6a5bf51bb4f4d18e4fec632a719d6f50a0eec286131f5bb2908b",
+    "8d7a7565e49bbd829b62d9f1194f2b41e60e73f78798d6c8a88ff7d46d46e5b9b9ca3cf8d7a207e3",
+]
+E = 0x64E443325F264A5C_F3F132FCACC859C5_170E010D29F34525_DBEACF85F04F49FA_4AF128FC27C028A4
+NOT_POINTS = [
+    "e44b0bc4331927bcbb359652c87774d9dc6f1737312f71762516b2bca4efeeadacdb757780e03146",
+    "1d9fe4f92fbfdf0186bf70eb0e5edaefb9db5b04fc53fbb5b782412d6e7df11636e23bf1c5803707",
+    "23d2e867d9845e5d0c7e7729af7f43efc9a43e1862fae136b051a46f8498ea0d4d65a338b22c9c3b",
+    "5ce2b238e99f8b3fd2bc245dd018aa352de438fcb5d5556a52cc1fec4fe0e383bd4915339439e3a9",
+    "2a1b034a006466ea41edb8eedf439f5557c0f5222f99f986ae202db996bef252737648364882eb9d",
+    "ba63143d191633bf58bd23feb4c736cc81c01bfd777ffff8c0d6c7cac91ee35522ed1cbab62c92d6",
+]
+
+
+def limbs(encoding: str) -> k1._Fp5:
+    w = k1._key_limbs(bytes.fromhex(encoding))
+    assert w is not None
+    return w
+
+
+def decoded(encoding: str) -> k1._Point:
+    p = k1._decode(limbs(encoding))
+    assert p is not None
+    return p
+
+
+def encoded(p: k1._Point) -> str:
+    return k1._to_bytes(k1._encode(p)).hex()
+
+
+def test_pornins_vectors():
+    p1, p2, p3, p4, p5, p6, p7 = (decoded(w) for w in POINTS)
+    assert [encoded(p) for p in (p1, p2, p3, p4, p5, p6, p7)] == POINTS
+    assert encoded(k1._mul_var(p1, E)) == POINTS[1]
+    assert encoded(k1._add_points(p1, p2)) == POINTS[2]
+    assert encoded(k1._double(p1, 1)) == POINTS[3]
+    assert encoded(k1._double(p2, 1)) == POINTS[4]
+    assert encoded(k1._add_points(p4, p2)) == POINTS[5]
+    assert encoded(k1._add_points(p1, p5)) == POINTS[6]
+    assert encoded(k1._NEUTRAL) == "00" * 40
+    assert all(k1._decode(limbs(w)) is None for w in NOT_POINTS)
+
+
+def test_doublings_and_multiplications_agree():
+    q = once = decoded(POINTS[2])
+    for times in range(1, 9):
+        once = k1._double(once, 1)
+        assert encoded(k1._double(q, times)) == encoded(once)
+    g = decoded("04" + "00" * 39)
+    for k in (0, 1, 2, 31, 32, 33, N - 1, N, 2**319, 2**320 - 1, E):
+        assert encoded(k1._mul_g(k)) == encoded(k1._mul_var(g, k)), k
+    assert encoded(k1._mul_g(N)) == "00" * 40
+
+
+def test_poseidon2_goldilocks_upstream_known_answer():
+    # p3-goldilocks 0.8.0's test_default_goldilocks_poseidon2_width_16, which K1 pins.
+    state = [
+        0x4D3F967FAB9D4979, 0x57E1FBA55677697E, 0x57429A86E75A3774, 0x31D379F3A592B5EB,
+        0x497232E1B648E3F1, 0x325A7DB57173C39E, 0xA802252D78BEE916, 0x8920F55E154ADEF8,
+        0xA1225BC9C7913658, 0xD687BE5097FFD038, 0x89F514EF0C913E48, 0x21FD4A9CF548CD84,
+        0x570A1586ADA436FF, 0x46BFBF38CCD740AE, 0x23651B3F3AB26484, 0xE90F3B02127FA552,
+    ]
+    assert k1._permute(state, k1._GL16) == [
+        0xF0F7717837C7032A, 0xF12FBCC838FEB15B, 0xD8661F6FA4165AD8, 0x351CDC546760D1A9,
+        0x99474334BF02445F, 0x46FC4E9CEB376D6A, 0x4601808321FCD920, 0xC58BFD0342DC60DF,
+        0xB7F3ACD43F3C029C, 0x5C7AFA6A6997DFC5, 0xECBEF8B82906C887, 0xD490E3B4E945D87C,
+        0x31866766B83EBE0B, 0xB32D52F6E7A5BEA2, 0x9522431667B3C5F9, 0xEAF5638A69518F65,
+    ]

@@ -1,30 +1,38 @@
 """Offline tests — no network. Run with: pytest
 
 They exercise the client against an in-memory httpx mock transport, plus the
-pure helpers (validation, object wrapping, URL derivation, error mapping).
+pure helpers (basis points, object wrapping, URL derivation, error mapping).
 """
 
 from __future__ import annotations
 
+import copy
+import itertools
 import json
+import pickle
+import typing
+from types import SimpleNamespace
+from typing import Optional, get_type_hints
 
 import httpx
 import pytest
 
 import loaf
-from loaf import LoafClient
+from loaf import LoafClient, models
 from loaf._object import LoafObject, parse
 from loaf.exceptions import error_from_response
-from loaf.money import bps_to_fraction, fraction_to_bps, validate_price, validate_quantity
+from loaf.money import bps_to_fraction, fraction_to_bps
 from loaf.ws.client import derive_ws_url
+
+from conftest import MARKET_STATES, TRADING_KEY, verify_login
 
 BASE = "http://test/api"
 
 
-def make_client(handler, **kwargs) -> LoafClient:
+def make_client(handler, *, trading_key: str | None = TRADING_KEY, **kwargs) -> LoafClient:
     transport = httpx.MockTransport(handler)
     http = httpx.Client(transport=transport, base_url=BASE)
-    return LoafClient(api_key="testkey", base_url=BASE, http_client=http, **kwargs)
+    return LoafClient(trading_key, base_url=BASE, http_client=http, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -35,17 +43,6 @@ def make_client(handler, **kwargs) -> LoafClient:
 def test_bps_helpers():
     assert bps_to_fraction(30) == 0.003
     assert fraction_to_bps(0.003) == 30
-
-
-def test_validate_price_quantity():
-    validate_price(167.49)  # ok
-    validate_quantity(47.3)  # ok
-    with pytest.raises(loaf.LoafValidationError):
-        validate_price(1.234)  # 3 dp
-    with pytest.raises(loaf.LoafValidationError):
-        validate_quantity(1.23)  # 2 dp
-    with pytest.raises(loaf.LoafValidationError):
-        validate_quantity(0)
 
 
 def test_loaf_object_access():
@@ -67,22 +64,199 @@ def test_derive_ws_url():
 
 def test_error_mapping():
     assert isinstance(error_from_response(401, {"error": "no"}), loaf.LoafAuthError)
-    assert isinstance(
-        error_from_response(403, {"error": "x", "code": "NOT_COMPETITION_PARTICIPANT"}),
-        loaf.CompetitionEligibilityError,
+    # The emergency kill switch: 403 TRADING_HALTED.
+    halted = error_from_response(
+        403, {"error": "Trading is currently halted", "code": "TRADING_HALTED"}
     )
-    # The emergency kill switch is a 403 with no machine code — matched on message.
-    assert isinstance(
-        error_from_response(403, {"error": "Trading is currently halted"}),
-        loaf.TradingHaltedError,
-    )
-    assert isinstance(
-        error_from_response(403, {"error": "KYC verification required"}), loaf.KycRequiredError
-    )
+    assert type(halted) is loaf.TradingHaltedError and halted.code == "TRADING_HALTED"
     err = error_from_response(400, {"error": "Validation failed", "details": ["price: bad"]})
     assert isinstance(err, loaf.LoafValidationError) and err.details == ["price: bad"]
     assert isinstance(error_from_response(429, {"error": "slow"}), loaf.LoafRateLimitError)
-    assert isinstance(error_from_response(503, {"error": "down"}), loaf.LoafServiceUnavailableError)
+    assert type(error_from_response(503, {"error": "down"})) is loaf.LoafServiceUnavailableError
+
+    # The code decides, never the text: a halt's text without its code is its status's class, and a
+    # code under another status than its own is too.
+    assert type(
+        error_from_response(403, {"error": "Trading is currently halted"})
+    ) is loaf.LoafForbiddenError
+    assert type(
+        error_from_response(400, {"error": "x", "code": "TRADING_HALTED"})
+    ) is loaf.LoafValidationError
+    # A market not live yet, delisted or expired: its own code, no halt.
+    delisted = error_from_response(
+        403,
+        {
+            "error": "This market has been delisted and is no longer available for trading",
+            "code": "MARKET_NOT_LIVE",
+        },
+    )
+    assert type(delisted) is loaf.LoafForbiddenError and delisted.code == "MARKET_NOT_LIVE"
+    # The price band is a 400.
+    band = error_from_response(
+        400, {"error": "Limit price is outside the market's price band", "code": "PRICE_BAND"}
+    )
+    assert type(band) is loaf.LoafValidationError and band.code == loaf.OrderErrorCode.PRICE_BAND
+    used = "l2 order_index: already used by the account; re-sign with the next index"
+    used_error = error_from_response(400, {"error": used, "code": "ORDER_INDEX_USED"})
+    assert type(used_error) is loaf.LoafValidationError and used_error.code == "ORDER_INDEX_USED"
+    # The engine's own pause: 503 TRADING_PAUSED, a halt and a 503 both, with its Retry-After.
+    paused = error_from_response(
+        503,
+        {"error": "Trading is paused. Your order was not placed", "code": "TRADING_PAUSED"},
+        retry_after=7.0,
+    )
+    assert type(paused) is loaf.TradingPausedError and paused.retry_after == 7.0
+    assert isinstance(paused, loaf.TradingHaltedError)
+    assert isinstance(paused, loaf.LoafServiceUnavailableError)
+    # Under another status the code is no pause: that status's refusal.
+    assert type(
+        error_from_response(403, {"error": "x", "code": "TRADING_PAUSED"})
+    ) is loaf.LoafForbiddenError
+    # The engine's old halt texts are no code: an ordinary refusal of their status.
+    for message in ("trading halted: …", "L1_RECHECK_PENDING: …", "E_L2_ORDERS_WITHOUT_JOURNAL: …"):
+        assert type(error_from_response(400, {"error": message})) is loaf.LoafValidationError
+    # A post-only order that would have traded at once: its own 400, by its code.
+    would_take = "Post-only order rejected: it would have traded with a resting order at once"
+    error = error_from_response(400, {"error": would_take, "code": "POST_ONLY_WOULD_TAKE"})
+    assert type(error) is loaf.PostOnlyWouldTakeError and error.status_code == 400
+    assert isinstance(error, loaf.LoafValidationError)
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error)):
+        assert type(clone) is loaf.PostOnlyWouldTakeError and str(clone) == str(error)
+    assert type(error_from_response(400, {"error": would_take})) is loaf.LoafValidationError
+    assert type(
+        error_from_response(403, {"error": would_take, "code": "POST_ONLY_WOULD_TAKE"})
+    ) is loaf.LoafForbiddenError
+    # The send-by time and a replace's target: their own classes, by their codes.
+    passed = error_from_response(400, {"error": "x", "code": "SEND_BY_PASSED"})
+    assert type(passed) is loaf.SendByPassedError and isinstance(passed, loaf.LoafValidationError)
+    gone = error_from_response(409, {"error": "x", "code": "REPLACE_TARGET_GONE"})
+    assert type(gone) is loaf.ReplaceTargetGoneError and isinstance(gone, loaf.LoafConflictError)
+    assert gone.replaced_order_cancelled is False
+    # A replace refused after its batch cancelled the old order says so.
+    refused = error_from_response(
+        400,
+        {"error": "x", "code": "INSUFFICIENT_BALANCE", "replacedOrderCancelled": True},
+    )
+    assert type(refused) is loaf.LoafValidationError and refused.replaced_order_cancelled is True
+    # Only a JSON true says so: read as cancelled, a resting order would be quoted over.
+    for value in ("true", 1, None):
+        body = {"error": "x", "code": "INSUFFICIENT_BALANCE", "replacedOrderCancelled": value}
+        assert error_from_response(400, body).replaced_order_cancelled is False
+    # A code this SDK does not know is its status's class, with the code kept.
+    unknown = error_from_response(400, {"error": "x", "code": "SOMETHING_NEW"})
+    assert type(unknown) is loaf.LoafValidationError and unknown.code == "SOMETHING_NEW"
+    # A route that does not exist answers with an HTML page; keep just its message.
+    missing = error_from_response(
+        404,
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        "<title>Error</title>\n</head>\n<body>\n<pre>Cannot GET /trade</pre>\n"
+        "</body>\n</html>\n",
+    )
+    assert isinstance(missing, loaf.LoafNotFoundError)
+    assert missing.message == "Cannot GET /trade"
+
+
+def test_time_in_force_is_the_exchanges():
+    # The exchange's times in force, in their order; GTD is no time in force.
+    assert [member.value for member in loaf.TimeInForce] == ["GTC", "IOC", "FOK", "POST_ONLY"]
+
+
+@pytest.mark.parametrize("message, code, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])
+def test_market_state_errors(message, code, cls, state):
+    error = error_from_response(403, {"error": message, "code": code})
+    assert type(error) is cls and (error.state, error.status_code, error.code) == (state, 403, code)
+    assert isinstance(error, loaf.LoafForbiddenError)
+    # Code that backs off on halts catches the market's own halt too.
+    assert isinstance(error, loaf.TradingHaltedError) is (state == "MARKET_HALTED")
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
+        assert type(clone) is cls and (clone.state, clone.status_code) == (state, 403)
+        assert str(clone) == str(error)
+    # By its code, whatever the text, and only as a 403.
+    assert type(error_from_response(403, {"error": "other words", "code": code})) is cls
+    assert not isinstance(error_from_response(403, {"error": message}), loaf.MarketStateError)
+    assert not isinstance(
+        error_from_response(400, {"error": message, "code": code}), loaf.MarketStateError
+    )
+
+
+def test_errors_survive_pickle_and_copy():
+    # A process pool pickles a worker's exception: signed_body must reach the parent.
+    body = {
+        "l2AccountIndex": 5,
+        "l2OrderIndex": 4097,
+        "l2ExpiryMs": 1_800_000_000_000,
+        "l2SigS": "ab" * 40,
+        "l2SigE": "cd" * 40,
+    }
+    error = loaf.OrderOutcomeUnknownError(
+        signed_body=body, attempts=2, last_error=error_from_response(502, {"error": "x"})
+    )
+    assert str(error) == (
+        "Could not confirm whether order 4097 of account 5 was placed after 2 attempt(s) (last "
+        "error: HTTP 502: x). It may be live, and may already have filled. Never place it afresh: "
+        "while you still want it and it can still rest, re-send it unchanged with "
+        "orders.resubmit(error.signed_body) (the same order if it landed; if not, it is placed "
+        "now at the signed price). Once you no longer want it, settle it with "
+        "orders.cancel_by_index(4097): CANCELLED, ENDED or VOIDED (never placed, and never "
+        "will be). Or find it in history.orders() by its expiryMs 1800000000000 (every status; "
+        "openOrders shows only resting orders), where a miss proves nothing while it can still "
+        "rest (until its expiryMs minus 72 hours)."
+    )
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
+        assert type(clone) is loaf.OrderOutcomeUnknownError
+        assert (clone.signed_body, clone.attempts) == (body, 2)
+        assert str(clone) == str(error)
+        assert type(clone.last_error) is loaf.LoafServerError
+        assert (clone.last_error.status_code, clone.last_error.message) == (502, "x")
+    coded = error_from_response(403, {"error": "x", "code": "COMPETITION_NOT_ENABLED"})
+    for clone in (pickle.loads(pickle.dumps(coded)), copy.copy(coded), copy.deepcopy(coded)):
+        assert type(clone) is loaf.LoafForbiddenError
+        assert (clone.status_code, clone.code) == (403, "COMPETITION_NOT_ENABLED")
+        assert str(clone) == str(coded)
+    limited = error_from_response(429, {"error": "slow"}, retry_after=3.0, request_id="r1")
+    clone = pickle.loads(pickle.dumps(limited))
+    assert type(clone) is loaf.LoafRateLimitError
+    assert (clone.retry_after, clone.status_code, clone.request_id) == (3.0, 429, "r1")
+    assert str(clone) == str(limited)
+
+
+def test_perps_outcome_unknown_survives_pickle_and_copy():
+    allocate = {
+        "l2ChainId": 4242,
+        "l2AccountIndex": 5,
+        "fromSide": 255,
+        "toSide": 0,
+        "amount": "5000000",
+        "l2Nonce": 3,
+        "l2ExpiryMs": 1_800_000_000_000,
+        "l2SigS": "ab" * 40,
+        "l2SigE": "cd" * 40,
+    }
+    error = loaf.PerpsOutcomeUnknownError(
+        signed_body=allocate, attempts=4, last_error=error_from_response(502, {"error": "x"})
+    )
+    assert str(error) == (
+        "Could not confirm whether the allocate of account 5 at nonce 3 was applied after 4 "
+        "attempt(s) (last error: HTTP 502: x). It may have been applied. Never sign it afresh: "
+        "re-send it unchanged with perps.resubmit(error.signed_body), whose 202 settles it "
+        "(duplicate: applied before; otherwise applied now). Once its l2ExpiryMs 1800000000000 "
+        "has passed, a 422 to a resubmit means it was never applied."
+    )
+    assert "ab" * 40 not in str(error)  # the signatures stay out of the message
+    for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
+        assert type(clone) is loaf.PerpsOutcomeUnknownError
+        assert (clone.signed_body, clone.attempts) == (allocate, 4)
+        assert str(clone) == str(error)
+        assert type(clone.last_error) is loaf.LoafServerError
+    # Neither a connection error nor an order's unknown outcome.
+    assert not isinstance(error, (loaf.LoafConnectionError, loaf.OrderOutcomeUnknownError))
+    exit_body = {
+        k: v for k, v in allocate.items() if k not in ("fromSide", "toSide", "amount")
+    } | {"pool": 2, "market": 9}
+    unknown = loaf.PerpsOutcomeUnknownError(
+        signed_body=exit_body, attempts=1, last_error=error_from_response(502, {"error": "x"})
+    )
+    assert str(unknown).startswith("Could not confirm whether the exit of account 5 at nonce 3")
 
 
 def test_is_conditional_order():
@@ -94,26 +268,90 @@ def test_is_conditional_order():
     assert loaf.is_conditional_order({}) is False
 
 
+def test_models_list_every_shape():
+    # __all__ names every public TypedDict the module defines; an underscored one is only the
+    # base that holds part of a shape's keys.
+    shapes = {
+        name for name, value in vars(models).items()
+        if isinstance(value, type) and issubclass(value, dict)
+        and value.__module__ == models.__name__ and not name.startswith("_")
+    }
+    assert set(models.__all__) == shapes
+    assert models.OrderQueueEntry.__required_keys__ == {
+        "orderId", "side", "price", "quantity", "quantityAhead", "ordersAhead"
+    }
+    # A queue entry names its signed order number when it has one and its tag when it was given
+    # one; a position's ADL rank is absent while it is unranked.
+    assert models.OrderQueueEntry.__optional_keys__ == {"l2OrderIndex", "orderTag"}
+    assert models.PerpsPosition.__optional_keys__ == {"adlRank"}
+    assert {"l2OrderIndex", "orderTag"} <= models.OrderHistoryItem.__optional_keys__
+    assert get_type_hints(models.OrderBook)["engineMs"] is int
+    # cancel_after always answers its deadline; cancel_by_index has no order when it voided.
+    assert models.CancelAfterResult.__required_keys__ == {"deadlineMs"}
+    by_index = get_type_hints(models.CancelByIndexResult)
+    assert models.CancelByIndexResult.__required_keys__ == {"outcome", "orderId", "status"}
+    assert (by_index["orderId"], by_index["status"]) == (Optional[int], Optional[str])
+    assert {"orderId", "role"} <= models.TradeHistoryItem.__optional_keys__
+    # A holding has no index: its ticker names its market, and no mark values an IPO allocation.
+    holding = get_type_hints(models.Holding)
+    assert holding["ticker"] is str and holding["isIpoAllocation"] is bool
+    assert "marketIndex" not in holding
+    # A fill always has its tradeId (its journal seq); one that is no trade has no txHash, and
+    # only a close has a closed PnL.
+    trade = get_type_hints(models.TradeHistoryItem)
+    assert trade["tradeId"] is int
+    assert (trade["orderId"], trade["txHash"]) == (Optional[int], Optional[str])
+    assert trade["closedPnl"] == Optional[float]
+    # A summary's perps is None when unread, never an empty account; the saved leverage is the component's.
+    summary = get_type_hints(models.PortfolioSummary)
+    assert summary["perps"] == Optional[models.PerpsAccount]
+    assert "perpsLeverage" not in summary
+    # Every section of a component is there, None when its read failed, never empty.
+    component = get_type_hints(models.PortfolioComponent)
+    assert models.PortfolioComponent.__required_keys__ == set(component) == {
+        "lifetimeVolume", "applicableFees", "offeringOrders", "openOrders", "tradeHistory", "orderHistory",
+        "transfers", "fundingHistory", "holdingDetails", "holdingSparklines", "perpsLeverage",
+    }
+    assert all(type(None) in typing.get_args(hint) for hint in component.values())
+    assert component["perpsLeverage"] == Optional[list[models.PerpsLeverage]]
+    assert get_type_hints(models.PerpsLeverage) == {"ticker": str, "leverage": int}
+    assert models.PerpsLeverage.__required_keys__ == {"ticker", "leverage"}
+    # A book frame names its ticker, never the index.
+    assert get_type_hints(models.OrderBook)["ticker"] is str
+    assert "marketIndex" not in get_type_hints(models.OrderBook)
+
+
 # --------------------------------------------------------------------------- #
 # Client behaviour
 # --------------------------------------------------------------------------- #
 
 
 def test_auth_header_and_config_error():
-    seen = {}
+    seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["auth"] = request.headers.get("authorization")
+        seen.append(request.headers.get("authorization"))
         return httpx.Response(200, json={"userId": 7})
 
-    client = make_client(handler)
-    client.portfolio.component()
-    assert seen["auth"] == "Bearer testkey"
+    # The Bearer is a login token the trading key signed for its account, on its chain; the key
+    # itself is never sent. Pasted with surrounding whitespace, it is read stripped.
+    for key in (TRADING_KEY, f" {TRADING_KEY}\n"):
+        make_client(handler, trading_key=key).portfolio.component()
+    for bearer in seen:
+        assert bearer is not None and bearer.startswith("Bearer loaf_lt_4242_5_")
+        assert verify_login(bearer[len("Bearer ") :])["l2AccountIndex"] == 5
+        assert TRADING_KEY[-80:] not in bearer
 
-    # An anonymous client must refuse an authenticated call.
-    anon = LoafClient(base_url=BASE, http_client=httpx.Client(base_url=BASE))
-    with pytest.raises(loaf.LoafConfigError):
-        anon.portfolio.component()
+    # An anonymous client refuses an authenticated call, naming the variable; a blank key counts
+    # as none.
+    for anon in (
+        LoafClient(base_url=BASE, http_client=httpx.Client(base_url=BASE)),
+        LoafClient(" \n", base_url=BASE, http_client=httpx.Client(base_url=BASE)),
+    ):
+        assert anon.public_key is None
+        with pytest.raises(loaf.LoafConfigError, match=r"\$LOAF_TRADING_KEY"):
+            anon.portfolio.component()
+    assert len(seen) == 2
 
 
 def test_public_endpoint_sends_no_auth():
@@ -121,56 +359,10 @@ def test_public_endpoint_sends_no_auth():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["auth"] = request.headers.get("authorization")
-        return httpx.Response(200, json={"properties": []})
+        return httpx.Response(200, json={"markets": []})
 
-    make_client(handler).market.properties()
+    make_client(handler).market.list()
     assert seen["auth"] is None
-
-
-def test_order_create_flow():
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/orders"):
-            captured["body"] = json.loads(request.content)
-            return httpx.Response(200, json={"success": True, "orderId": 99})
-        return httpx.Response(404, json={"error": "nope"})
-
-    client = make_client(handler)
-    res = client.orders.limit_buy("opera", quantity=10, price=167.49)
-    assert res.orderId == 99
-    body = captured["body"]
-    # Sent as plain human units, correct enum strings.
-    assert body == {
-        "tokenName": "opera",
-        "price": 167.49,
-        "quantity": 10,
-        "side": "BUY",
-        "type": "LIMIT",
-        "timeInForce": "GTC",
-        "deadline": 0,
-    }
-
-
-def test_market_order_forces_zero_price():
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"success": True, "orderId": 1})
-
-    client = make_client(handler)
-    client.orders.market_sell("opera", quantity=2.5)
-    assert captured["body"]["type"] == "MARKET"
-    assert captured["body"]["price"] == 0
-
-
-def test_order_validation_local():
-    client = make_client(lambda r: httpx.Response(200, json={}))
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.limit_buy("opera", quantity=1, price=1.234)  # too many price dp
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.create("opera", "BUY", quantity=1, type="LIMIT")  # missing price
 
 
 def test_active_orders_passthrough():
@@ -207,11 +399,11 @@ def test_rate_limit_retry_then_success():
             return httpx.Response(
                 429, json={"error": "slow"}, headers={"RateLimit-Reset": "0"}
             )
-        return httpx.Response(200, json={"properties": []})
+        return httpx.Response(200, json={"markets": []})
 
     client = make_client(handler, max_retries=2)
-    res = client.market.properties()  # GET is idempotent -> 429 is retried
-    assert res["properties"] == []
+    res = client.market.list()  # GET is idempotent -> 429 is retried
+    assert res["markets"] == []
     assert calls["n"] == 2  # retried once
 
 
@@ -229,21 +421,25 @@ def test_rate_limit_not_retried_for_non_idempotent_post():
     assert calls["n"] == 1
 
 
-def test_non_finite_price_quantity_rejected():
-    for bad in (float("nan"), float("inf"), float("-inf")):
-        with pytest.raises(loaf.LoafValidationError):
-            validate_price(bad)
-        with pytest.raises(loaf.LoafValidationError):
-            validate_quantity(bad)
+@pytest.mark.parametrize(
+    "headers",
+    [{"Retry-After": "0"}, {"RateLimit-Reset": "0"}, {"Retry-After": "-3"}, {"Retry-After": "nan"}, {}],
+)
+def test_a_rate_limit_hint_of_zero_or_less_still_backs_off(monkeypatch, headers):
+    slept: list = []
+    monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=slept.append))
+    monkeypatch.setattr("loaf.client.random", SimpleNamespace(uniform=lambda low, high: high))
+    make_client(lambda r: httpx.Response(200, json={}))._sleep_backoff(0, httpx.Response(429, headers=headers))
+    assert slept == [0.5]  # the first exponential step, as with no hint at all
 
 
-def test_error_surfaces_after_retries_exhausted():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, json={"error": "x", "code": "NOT_COMPETITION_PARTICIPANT"})
-
-    client = make_client(handler)
-    with pytest.raises(loaf.CompetitionEligibilityError):
-        client.orders.cancel(1)
+@pytest.mark.parametrize("value, expected", [("3", 3.0), ("120", 60.0)])
+def test_a_positive_rate_limit_hint_is_honoured(monkeypatch, value, expected):
+    slept: list = []
+    monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=slept.append))
+    response = httpx.Response(429, headers={"Retry-After": value})
+    make_client(lambda r: httpx.Response(200, json={}))._sleep_backoff(0, response)
+    assert slept == [expected]
 
 
 def test_candles_params_and_no_auth():
@@ -259,14 +455,106 @@ def test_candles_params_and_no_auth():
         )
 
     client = make_client(handler)
-    res = client.market.candles("opera", "1h", count_back=24)
-    assert seen["path"].endswith("/trade/opera/candles")
+    res = client.market.candles("OPRA", "1h", count_back=24)
+    assert seen["path"].endswith("/trade/OPRA/candles")
     assert seen["params"] == {"resolution": "1h", "countBack": "24"}  # `to` omitted
     assert seen["auth"] is None  # public endpoint
     assert res.hasMore is False
 
-    client.market.candles("opera", loaf.CandleResolution.ONE_DAY, to=1_700_000_000)
+    client.market.candles("OPRA", loaf.CandleResolution.ONE_DAY, to=1_700_000_000)
     assert seen["params"] == {"resolution": "1d", "to": "1700000000"}
+
+
+def test_a_liquidation_take_on_the_tape():
+    # A perps tape row may be a liquidation take: isLiquidation true and, being no trade, no
+    # txHash. It parses like a trade, and the model says so.
+    trade = {
+        "tradeId": 41, "txHash": "0x" + "ab" * 32, "aggressorSide": "BUY",
+        "price": 101.5, "quantity": 2, "timestamp": 1_700_000_000_000,
+    }
+    take = {
+        "tradeId": 42, "aggressorSide": "SELL", "price": 99.25, "quantity": 1,
+        "timestamp": 1_700_000_000_500, "isLiquidation": True,
+    }
+    client = make_client(lambda request: httpx.Response(200, json={"trades": [trade, take]}))
+    first, second = client.market.trades("MUS-PERP").trades
+    assert first == trade and first.get("isLiquidation") is None
+    assert second == take and second.isLiquidation is True and "txHash" not in second
+    hints = typing.get_type_hints(models.TradeTick)
+    assert hints["isLiquidation"] is bool and hints["txHash"] is str
+    assert {"isLiquidation", "txHash"} <= models.TradeTick.__optional_keys__
+    assert "marketIndex" not in hints
+
+
+def test_trades_params_and_no_auth():
+    sent = []
+    tape = [{"tradeId": 41, "price": 160.5}, {"tradeId": 44, "price": 161}]  # oldest first
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(
+            (request.url.path, dict(request.url.params), request.headers.get("authorization"))
+        )
+        return httpx.Response(200, json={"trades": tape})
+
+    client = make_client(handler)
+    assert [t.tradeId for t in client.market.trades("OPRA").trades] == [41, 44]
+    client.market.trades("OPRA", after_trade_id=44, limit=1000)  # the next page
+    assert sent == [
+        ("/api/trade/OPRA/trades", {"afterTradeId": "0", "limit": "100"}, None),  # the defaults
+        ("/api/trade/OPRA/trades", {"afterTradeId": "44", "limit": "1000"}, None),
+    ]
+
+
+# Refused before anything is sent: "" or "OPRA#" would fetch another route, and a control
+# character would raise an httpx error, not a LoafError.
+_MALFORMED_TICKERS = ("opra", "", "OPRA#", "../trade", "OPRA\n", "OPERAHOUSES", None)
+
+
+@pytest.mark.parametrize(
+    "call, route",
+    [
+        (lambda c, t: c.market.get(t), "/api/trade/{}"),
+        (lambda c, t: c.market.candles(t, "1h"), "/api/trade/{}/candles"),
+        (lambda c, t: list(c.market.iter_candles(t, "1h")), "/api/trade/{}/candles"),
+        (lambda c, t: c.market.trades(t), "/api/trade/{}/trades"),
+    ],
+)
+def test_market_routes_take_only_a_market_ticker(call, route):
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, request.headers.get("authorization")))
+        return httpx.Response(200, json={})
+
+    client = make_client(handler)
+    for ticker in ("OPRA", "OPERAHOUSE", "H100-PERP"):
+        call(client, ticker)
+    # Sent as given, and public.
+    assert sent == [(route.format(t), None) for t in ("OPRA", "OPERAHOUSE", "H100-PERP")]
+    # Refused as orders refuse it, before anything is sent.
+    for ticker in (*_MALFORMED_TICKERS, "-PERP", "OPRA-perp", "OPRA-SPOT"):
+        with pytest.raises(loaf.LoafValidationError, match="a market's ticker") as info:
+            call(client, ticker)
+        assert info.value.status_code == 0
+    assert len(sent) == 3
+
+
+def test_candles_busy_503_retried_then_raises():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            503,
+            json={"error": "Candle history is busy. Please try again shortly."},
+            headers={"Retry-After": "1"},
+        )
+
+    client = make_client(handler, max_retries=2)
+    with pytest.raises(loaf.LoafServiceUnavailableError) as info:
+        client.market.candles("OPRA", "1h")
+    assert info.value.message == "Candle history is busy. Please try again shortly."
+    assert calls["n"] == 3  # the first try + 2 retries
 
 
 def test_iter_candles_pages_backwards():
@@ -280,198 +568,118 @@ def test_iter_candles_pages_backwards():
         return httpx.Response(200, json=pages[request.url.params.get("to")])
 
     client = make_client(handler)
-    times = [c.time for c in client.market.iter_candles("x", "1m")]
+    times = [c.time for c in client.market.iter_candles("OPRA", "1m")]
     assert times == [160, 100, 40]  # newest -> oldest across pages
 
 
-def test_competition_endpoints():
-    seen = {}
+@pytest.mark.parametrize(
+    "key, iterate",
+    [
+        ("orders", lambda c: c.history.iter_orders(page_size=2)),
+        ("trades", lambda c: c.history.iter_trades(page_size=2)),
+        ("funding", lambda c: c.history.iter_funding(page_size=2)),
+    ],
+    ids=["orders", "trades", "funding"],
+)
+def test_iter_history_follows_the_cursor(key, iterate):
+    pages = {
+        # First call: no cursor; then each page's nextCursor, until a page has none.
+        None: {key: [{"id": 3}, {"id": 2}], "nextCursor": "MTAwOjI"},
+        "MTAwOjI": {key: [{"id": 1}], "nextCursor": None},
+    }
+    sent = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["path"] = request.url.path
-        seen["auth"] = request.headers.get("authorization")
-        if request.content:
-            seen["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"ok": True})
+        sent.append((request.url.path, dict(request.url.params)))
+        assert len(sent) <= len(pages), "paged past the last page"
+        return httpx.Response(200, json=pages[request.url.params.get("cursor")])
+
+    assert [row.id for row in iterate(make_client(handler))] == [3, 2, 1]
+    assert sent == [
+        (f"/api/history/{key}", {"pageSize": "2"}),
+        (f"/api/history/{key}", {"pageSize": "2", "cursor": "MTAwOjI"}),
+    ]
+
+
+def test_portfolio_and_funding_routes():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, dict(request.url.params)))
+        verify_login(request.headers["authorization"][len("Bearer ") :])  # a login token
+        return httpx.Response(200, json={})
 
     client = make_client(handler)
-
-    client.competition.info()
-    assert seen["path"].endswith("/competition") and seen["auth"] is None
-
-    client.competition.queue_position()
-    assert seen["path"].endswith("/competition/queue-position")
-    assert seen["auth"] == "Bearer testkey"
-
-    client.competition.payout_details()
-    assert seen["path"].endswith("/competition/payout-details")
-    assert seen["auth"] == "Bearer testkey"
-
-    client.competition.submit_payout_details(email="win@example.com")
-    assert seen["path"].endswith("/competition/payout-details")
-    assert seen["body"] == {"email": "win@example.com"}  # None wallet dropped
-
-    # Exactly one destination is enforced locally.
-    with pytest.raises(loaf.LoafValidationError):
-        client.competition.submit_payout_details()
-    with pytest.raises(loaf.LoafValidationError):
-        client.competition.submit_payout_details(wallet_address="0xabc", email="a@b.c")
+    client.portfolio.summary()
+    client.portfolio.component()
+    client.history.funding(page_size=5, cursor="abc")
+    assert sent == [
+        ("/api/portfolio/summary", {}),
+        ("/api/portfolio/component", {}),
+        ("/api/history/funding", {"pageSize": "5", "cursor": "abc"}),
+    ]
 
 
-def test_ws_new_channel_helpers():
-    ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
-    ws.subscribe_volume("opera")
-    ws.subscribe_leaderboard()
-    ws.subscribe_property_status("opera")
-    ws.subscribe_portfolio()
-    assert ws._channels == {"volume:opera", "leaderboard", "property:opera", "portfolio"}
+def test_an_unread_component_section_stays_none_beside_an_empty_one():
+    sections = {"openOrders": None, "holdingDetails": None, "lifetimeVolume": None, "perpsLeverage": [], "transfers": []}
+    component = make_client(lambda request: httpx.Response(200, json=sections)).portfolio.component()
+    assert component == sections
+    assert component.openOrders is None and component.lifetimeVolume is None and component.perpsLeverage == []
 
 
-def test_ws_property_halt_dispatch():
-    ws = loaf.LoafWebSocketClient(ws_url="ws://test/ws")
-    seen = []
-    ws.on_property_halt(seen.append)
-    ws._dispatch(json.dumps({
-        "type": "property_halt", "propertyId": 1, "tokenName": "opera",
-        "isHalted": True, "timestamp": 0,
-    }))
-    assert seen[0].tokenName == "opera" and seen[0].isHalted is True
+@pytest.mark.parametrize(
+    "status, error", [(500, loaf.LoafServerError), (503, loaf.LoafServiceUnavailableError)]
+)
+def test_a_component_with_no_section_read_raises(status, error):
+    client = make_client(lambda request: httpx.Response(status, json={"error": "unread"}), max_retries=0)
+    with pytest.raises(error, match="unread") as info:
+        client.portfolio.component()
+    assert type(info.value) is error and info.value.status_code == status
+
+
+def test_a_repeated_cursor_stops_paging():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.params.get("cursor"))
+        return httpx.Response(200, json={"orders": [{"id": 1}], "nextCursor": "same"})
+
+    pages = make_client(handler).history.iter_orders(page_size=1)
+    assert [next(pages).id, next(pages).id] == [1, 1]
+    with pytest.raises(loaf.LoafError, match="already given"):
+        next(pages)
+    assert sent == [None, "same"]
+
+
+def test_a_candle_page_that_does_not_move_back_stops_paging():
+    pages = {
+        None: {"resolution": "1m", "candles": [{"time": 100}], "oldestTs": 100, "hasMore": True},
+        "100": {"resolution": "1m", "candles": [{"time": 100}], "oldestTs": 100, "hasMore": True},
+    }
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.params.get("to"))
+        return httpx.Response(200, json=pages[request.url.params.get("to")])
+
+    candles = make_client(handler).market.iter_candles("OPRA", "1m")
+    assert [c.time for c in itertools.islice(candles, 2)] == [100, 100]
+    with pytest.raises(loaf.LoafError, match="stopped paging"):
+        next(candles)
+    assert sent == [None, "100"]
 
 
 def test_rate_limit_headers_recorded():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"properties": []},
+            json={"markets": []},
             headers={"RateLimit-Limit": "100", "RateLimit-Remaining": "97", "RateLimit-Reset": "873"},
         )
 
     client = make_client(handler)
-    client.market.properties()
+    client.market.list()
     assert client.last_rate_limit == {"limit": 100.0, "remaining": 97.0, "reset": 873.0}
-
-
-def test_conditional_order_create_flow():
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["path"] = request.url.path
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"success": True, "orderId": 4242})
-
-    client = make_client(handler)
-    res = client.orders.create_conditional(
-        "opera", "SELL", 5, type="STOP_MARKET", trigger_price=90
-    )
-    assert res.orderId == 4242
-    assert captured["path"].endswith("/orders/conditional")
-    # *_MARKET forces price 0; GTC and deadline 0 are the only accepted values.
-    expected = {
-        "tokenName": "opera",
-        "price": 0,
-        "quantity": 5,
-        "side": "SELL",
-        "type": "STOP_MARKET",
-        "timeInForce": "GTC",
-        "deadline": 0,
-        "triggerPrice": 90,
-    }
-    assert captured["body"] == expected
-
-    # The wrapper spells the same call out — same route, same body.
-    client.orders.stop_loss("opera", quantity=5, trigger_price=90)
-    assert captured["path"].endswith("/orders/conditional")
-    assert captured["body"] == expected
-
-    # A *_LIMIT carries its own signed price; the schema is strict, so nothing else.
-    client.orders.create_conditional(
-        "opera", "BUY", 2, type="TAKE_LIMIT", trigger_price=70, price=70.5
-    )
-    assert captured["body"] == {
-        "tokenName": "opera",
-        "price": 70.5,
-        "quantity": 2,
-        "side": "BUY",
-        "type": "TAKE_LIMIT",
-        "timeInForce": "GTC",
-        "deadline": 0,
-        "triggerPrice": 70,
-    }
-
-
-def test_conditional_order_validation_local():
-    client = make_client(lambda r: httpx.Response(200, json={}))
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.create_conditional(
-            "opera", "SELL", 5, type="STOP_LIMIT", trigger_price=90
-        )  # *_LIMIT with no price
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.create_conditional(
-            "opera", "SELL", 5, type="STOP_MARKET", trigger_price=90, price=89.5
-        )  # *_MARKET given a price
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.create_conditional(
-            "opera", "SELL", 5, type="STOP_MARKET", trigger_price=90.123
-        )  # 3 dp trigger
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.create_conditional(
-            "opera", "SELL", 5, type="STOP_MARKET", trigger_price=0
-        )  # non-positive trigger
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.create_conditional(
-            "opera", "SELL", 5, type="LIMIT", trigger_price=90
-        )  # not a conditional type — refused locally, never sent
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.stop_loss(
-            "opera", quantity=5, trigger_price=90, price=89.5
-        )  # the wrapper is *_MARKET only, so a stray price= fails loudly
-
-
-def test_attached_legs():
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["path"] = request.url.path
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"success": True, "orderId": 7})
-
-    client = make_client(handler)
-    client.orders.limit_buy("opera", quantity=10, price=100, sl_price=90.0, tp_price=120.0)
-    assert captured["path"].endswith("/orders")
-    # Legs ride the plain order route as two extra keys — the legs' own ids never come back.
-    assert captured["body"] == {
-        "tokenName": "opera",
-        "price": 100,
-        "quantity": 10,
-        "side": "BUY",
-        "type": "LIMIT",
-        "timeInForce": "GTC",
-        "deadline": 0,
-        "tpPrice": 120.0,
-        "slPrice": 90.0,
-    }
-
-    # Without legs the body is byte-identical to what it has always been: None keys are dropped.
-    client.orders.limit_buy("opera", quantity=10, price=100)
-    assert "tpPrice" not in captured["body"] and "slPrice" not in captured["body"]
-    assert captured["body"] == {
-        "tokenName": "opera",
-        "price": 100,
-        "quantity": 10,
-        "side": "BUY",
-        "type": "LIMIT",
-        "timeInForce": "GTC",
-        "deadline": 0,
-    }
-
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.limit_sell("opera", 5, 120, sl_price=110)  # legs are BUY-only
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.limit_buy("opera", 1, 100, tp_price=90, sl_price=95)  # tp below sl
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.limit_buy("opera", 1, 100, sl_price=110)  # sl above a LIMIT entry
-    with pytest.raises(loaf.LoafValidationError):
-        client.orders.limit_buy("opera", 1, 100, tp_price=90)  # tp below a LIMIT entry
 
 
 def test_conditional_cancel_routing():
@@ -515,3 +723,89 @@ def test_conditional_cancel_routing():
 
     with pytest.raises(loaf.LoafValidationError):
         client.orders.cancel_row({"type": "LIMIT"})  # no id anywhere in the row
+
+
+def test_cancel_all_route_and_auth():
+    answer = {"requestedCount": 2, "cancelledOrderIds": [8, 7], "failedOrders": []}
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json=answer)
+
+    assert make_client(handler).orders.cancel_all() == answer
+    (request,) = sent  # exactly one request
+    assert (request.method, request.url.path) == ("POST", "/api/orders/cancel-all")
+    verify_login(request.headers["authorization"][len("Bearer ") :])  # a login token
+    assert request.content == b""  # no body
+
+
+@pytest.mark.parametrize("order_id", [3.9, True, "7", 0, -1, None])
+@pytest.mark.parametrize(
+    "cancel",
+    [
+        lambda orders, order_id: orders.cancel(order_id),
+        lambda orders, order_id: orders.cancel_conditional(order_id),
+        lambda orders, order_id: orders.cancel_row({"id": order_id, "type": "LIMIT"}),
+    ],
+    ids=["cancel", "cancel_conditional", "cancel_row"],
+)
+def test_cancel_refuses_what_is_not_an_order_id(cancel, order_id):
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"success": True})
+
+    orders = make_client(handler).orders
+    # Never rounded or read from text: 3.9 or True would name another order.
+    with pytest.raises(loaf.LoafValidationError) as info:
+        cancel(orders, order_id)
+    assert info.value.status_code == 0
+    assert sent == []
+
+
+def test_a_signed_body_passed_as_an_order_id_stays_out_of_the_refusal():
+    orders = make_client(lambda request: httpx.Response(200)).orders
+    signed_body = {"l2OrderIndex": 4097, "l2SigS": "ab" * 40, "l2SigE": "cd" * 40}
+    for cancel in (orders.cancel, orders.cancel_conditional):
+        with pytest.raises(loaf.LoafValidationError) as info:
+            cancel(signed_body)  # type: ignore[arg-type]
+        # Anyone holding its signatures can place the order: the refusal only names its type.
+        assert str(info.value).endswith("(got dict)")
+
+
+@pytest.mark.parametrize(
+    "call", [lambda c: c.market.list(), lambda c: c.orders.cancel(1)], ids=["GET", "POST"]
+)
+def test_a_2xx_that_is_not_json_is_a_server_error(call):
+    body = '{"markets": ['
+    client = make_client(
+        lambda request: httpx.Response(
+            200,
+            content=body.encode(),
+            headers={"content-type": "application/json", "x-request-id": "r1"},
+        )
+    )
+    with pytest.raises(loaf.LoafServerError) as info:
+        call(client)
+    assert (info.value.status_code, info.value.request_id, info.value.body) == (200, "r1", body)
+
+
+def test_an_undecodable_body_is_a_connection_error():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(
+            200, stream=httpx.ByteStream(b"this is not gzip"), headers={"content-encoding": "gzip"}
+        )
+
+    with pytest.raises(loaf.LoafConnectionError) as info:
+        make_client(handler, max_retries=1).market.list()
+    assert isinstance(info.value.__cause__, httpx.DecodingError)
+    assert len(sent) == 2  # a read is sent again
+
+
+def test_version():
+    assert loaf.constants.USER_AGENT == f"loaf-python-sdk/{loaf.__version__}"
