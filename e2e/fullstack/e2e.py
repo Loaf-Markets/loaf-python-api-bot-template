@@ -103,6 +103,9 @@ SPOT_MIN_VALUE = Decimal(10)
 SPOT_VALUE_MARGIN = Decimal("2.5")
 #: The backend's largest history page: a larger one is a 400.
 HISTORY_PAGE_MAX = 100
+#: How long, from the commit of an allocate into an isolated pool, the engine leaves a pool that backs nothing to the
+#: order the allocate funds before it sweeps the pool into pool 0 (loaf-matching-engine sweep.rs ALLOCATE_GRACE_MS).
+ALLOCATE_GRACE_S = 10
 #: GET /history/trades' sources that are a position closed by the engine or an exit.
 CLOSE_SOURCES = ("LIQUIDATION", "BACKSTOP_LIQUIDATION", "DELEVERAGE", "EXIT", "SETTLE", "FORCED", "FORCED_DELEVERAGE")
 #: The admin API key's resume refusal.
@@ -800,6 +803,12 @@ def collateral_of(user: User, pool: int) -> int:
     return int((pool_of(user, pool) or {}).get("collateral") or 0)
 
 
+def idle(pool: Mapping[str, Any] | None) -> bool:
+    """Whether ``pool`` (a ``perps.positions()`` pool) holds collateral and no position: an isolated one the engine
+    sweeps into pool 0 once no order holds it."""
+    return pool is not None and not pool.get("positions") and int(pool.get("collateral") or 0) > 0
+
+
 def placed(answer: Mapping[str, Any], what: str) -> Mapping[str, Any]:
     check(answer.get("success") is not False and int(answer.get("orderId") or 0) > 0,
           f"{what}: order {answer.get('orderId')} {answer.get('status')}, {answer.get('quantityLeft')} left")
@@ -1189,7 +1198,8 @@ class Run:
         return self.anon.market.get(self.ticker(market)).get("orderBook")
 
     def flat(self, user: User, market: int, pool: int) -> None:
-        """Closes ``user``'s position on ``market`` in ``pool``: a reduce-only IOC against the maker's quote."""
+        """Closes ``user``'s position on ``market`` in ``pool``: a reduce-only IOC against the maker's quote. An
+        isolated pool it closes is then left to the engine's sweep (:meth:`settled`)."""
         base = base_of(user, market, pool)
         if base == 0:
             return
@@ -1206,6 +1216,16 @@ class Run:
                                     reduce_only=True, time_in_force="IOC")
         self.wait_base(user, market, pool, 0)
         self.mm.c.orders.cancel_all()
+        self.settled(user, pool)
+
+    def settled(self, user: User, pool: int) -> None:
+        """Waits until the engine has nothing left to sweep in ``user``'s ``pool``: an isolated pool holding
+        collateral and no position is swept into pool 0 by ALLOCATE_GRACE_S after the last allocate into it once no
+        order holds it (the callers rest none), which would otherwise land between their next read and allocate. Pool 0
+        is never swept."""
+        if pool != 0:
+            self.until(f"{user.name}'s pool {pool} with nothing left for the engine to sweep",
+                       lambda: not idle(pool_of(user, pool)), ALLOCATE_GRACE_S + self.cfg.wait_s)
 
     def allocate(self, user: User, dollars: Decimal, frm: int, to: int) -> None:
         """``user`` moves ``dollars`` USDC (whole ticks) from ``frm`` to ``to``: the spot balance moves by exactly
@@ -1231,7 +1251,9 @@ class Run:
                    lambda: balance(user, USDC_ASSET)[0] == spot0 - sign * ticks * tick)
 
     def fund(self, user: User, pool: int, dollars: Decimal) -> None:
-        """Tops ``user``'s ``pool`` up to ``dollars`` of collateral."""
+        """Tops ``user``'s ``pool`` up to ``dollars`` of collateral, once the engine has nothing left to sweep in it
+        (:meth:`settled`)."""
+        self.settled(user, pool)
         short_by = dollars * self.ext_per_dollar() - collateral_of(user, pool)
         if short_by > 0:
             self.allocate(user, (short_by / self.ext_per_dollar()).quantize(Decimal(1), rounding=ROUND_CEILING),
@@ -1576,14 +1598,16 @@ def step_perps(run: Run) -> None:
     run.fund(mm, 0, Decimal(100_000))
     run.fund(b, 0, Decimal(10_000))
     for pool in (0, 1, 2, 3):
-        run.fund(a, pool, Decimal(2_000))
-    for pool in (0, 1, 2, 3):
         run.flat(a, m, pool)
     run.flat(b, m, 0)
-    # allocates both ways: into the cross pool and an isolated one, and out of the isolated one
+    # The engine sweeps an isolated pool that backs nothing into pool 0 ALLOCATE_GRACE_S after the last allocate into
+    # it, so each isolated pool is funded right before the orders it backs (pools 1 and 3 below), after any close.
+    run.fund(a, 0, Decimal(2_000))
+    # allocates both ways: into the cross pool and an isolated one, and all of it out of the isolated one again, which
+    # leaves pool 1 nothing for the sweep to take while its funding below runs
     run.allocate(a, Decimal(1_000), PERPS_SPOT_SIDE, 0)
     run.allocate(a, Decimal(1_000), PERPS_SPOT_SIDE, 1)
-    run.allocate(a, Decimal(500), 1, PERPS_SPOT_SIDE)
+    run.allocate(a, Decimal(1_000), 1, PERPS_SPOT_SIDE)
 
     live = run.live(m)
     check(live.get("tradingState") == "OPEN", f"market {m} is OPEN: {live.get('tradingState')} {live.get('stateReason')}")
@@ -1615,6 +1639,7 @@ def step_perps(run: Run) -> None:
     check(abs(int(pos["entryPrice"]) - run.to_index(hi)) <= 1, f"A's entry {pos['entryPrice']} is the ask ${hi}")
 
     # long and short by limit, in isolated pool 1
+    run.fund(a, 1, Decimal(2_000))
     placed(mm.c.orders.limit_sell(t, float(q), float(hi), pool=0), "MM's ask")
     r = placed(a.c.orders.limit_buy(t, float(q), float(hi), pool=1), "A's crossing limit buy from pool 1")
     check(left(r) == 0, "A's limit buy filled whole")
@@ -1664,6 +1689,7 @@ def step_perps(run: Run) -> None:
     run.cancel_all()
 
     # TP/SL legs: armed by the parent's fill; the take-profit fires on the mark's rise and closes the long
+    run.fund(a, 3, Decimal(2_000))
     placed(mm.c.orders.limit_sell(t, float(q), float(hi), pool=0), "MM's ask")
     r = placed(a.c.orders.limit_buy(t, float(q), float(hi), pool=3, tp_price=float(tp), sl_price=float(sl),
                                     leg_max_slippage_bps=100), f"A's buy from pool 3 with TP ${tp} and SL ${sl}")
@@ -1867,8 +1893,8 @@ def step_funding(run: Run) -> None:
     for role, _, pool in legs:
         m = run.mkt(role)
         t = run.ticker(m)
-        run.fund(a, pool, Decimal(1_000))
         run.flat(a, m, pool)
+        run.fund(a, pool, Decimal(1_000))  # after the close: the allocate's grace holds the pool for the long below
         px = run.cents(run.dollars(run.index(m)), True)  # at the index: the leg's own quotes add no impact premium
         q = run.qty(m)
         placed(mm.c.orders.limit_sell(t, float(q), float(px), pool=0), f"MM's ask at market {m}'s index")
@@ -1914,11 +1940,18 @@ def step_funding(run: Run) -> None:
               f"pool {pool}'s value {value} = collateral {p['collateral']} + notional {notional} - owed {owed}")
         px = run.cents(run.dollars(run.index(m)), False)
         q = run.tokens(int(pos["base"]))
+        # A's ask half the band above the index (5 % with no band), not reduce-only, holds the pool through the close:
+        # it reduces the long it meets, so it asks no margin, and once the pool is flat it keeps the engine from
+        # sweeping the collateral read below into pool 0 at its next turn; cancelled once read (the pool is then swept)
+        hold_px = run.cents(px * (1 + Decimal(band_of(run.perps[m]) or 1_000) / 20_000), True)
+        hold = placed(a.c.orders.limit_sell(t, float(q), float(hold_px), pool=pool),
+                      f"A's hold of pool {pool} at ${hold_px}")
         placed(mm.c.orders.limit_buy(t, float(q), float(px), pool=0), f"MM's bid at market {m}'s index")
         placed(a.c.orders.limit_sell(t, float(q), float(px), pool=pool, reduce_only=True, time_in_force="IOC"),
                f"A's close on market {m}")
         run.wait_base(a, m, pool, 0)
         after = collateral_of(a, pool)
+        a.c.orders.cancel(int(hold["orderId"]))
         fee = notional * int(run.perps[m]["takerFee"]) // 1_000_000 + 1
         realised = value - notional + int(pos["base"]) * run.to_index(px) * int(pos["qem"])
         slack = int(q * Decimal("0.01") * run.ext_per_dollar()) + int(run.collateral["extensionMultiplier"])
@@ -2106,10 +2139,10 @@ def step_halt(run: Run) -> None:
     t = run.ticker(m)
     run.cancel_all()
     run.reopen(m)
-    run.fund(a, 5, Decimal(1_000))
     run.fund(b, 0, Decimal(10_000))
     run.flat(a, m, 5)
     run.flat(b, m, 0)
+    run.fund(a, 5, Decimal(1_000))  # after the close: the allocate's grace holds the pool for the orders below
     idx = run.index(m)
     px = run.dollars(idx)
     q = run.qty(m)

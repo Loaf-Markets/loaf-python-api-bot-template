@@ -193,7 +193,8 @@ quotes at the index add no impact premium); two payments of A's that moved money
 `history.funding()` and on its `funding_payment` frames; A's funding owed has it (positive pays) and MM's short the
 other; each pool's value is exactly collateral + notional - funding owed; the close at the index, away from a tick,
 leaves the collateral at the pool's value with the gap from the mark to the close's price realised, less the close's
-fee (within a cent a token): the funding was realised.
+fee (within a cent a token): the funding was realised (A's ask half the band above the index, resting from the pool
+through the close, keeps the engine from sweeping the flat pool into pool 0 before that read).
 
 **liquidation** (C's longs from isolated pools with their initial margin plus 10 %, opened against MM's ask at the
 index, with no bid left on the book)

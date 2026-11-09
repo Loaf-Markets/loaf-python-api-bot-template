@@ -231,8 +231,10 @@ things it adds to the list above:
   signed as given.
 
 Conditional rows hold nothing at placement, and your cash and holding are
-checked only when they fire, but they do occupy an open-order slot, counted
-together with booked orders. The exchange checks a row's price grid, order
+checked only when they fire (except that a perps row that may open a position
+is refused at placement when its pool cannot back it at its trigger: see
+:meth:`OrdersResource.create_conditional`), but they do occupy an open-order
+slot, counted together with booked orders. The exchange checks a row's price grid, order
 number and its range only when the row fires, so those mistakes — and an order
 number made stale if the exchange resets order numbers — FAIL the row then: watch
 ``on_order_update`` for ``status: "FAILED"`` (``order_status`` frames carry
@@ -916,6 +918,15 @@ class OrdersResource(Resource):
             * The minimum order value ($10) is measured at the signed price; a
               SELL of your whole holding is exempt. Your cash and holding are
               checked only when the row fires.
+            * On a perp, a row that is not reduce-only is refused at placement
+              when its pool cannot back it with the row's market valued at its
+              trigger and the pool's other markets at the mark:
+              ``INSUFFICIENT_BALANCE`` for its initial margin (beside the
+              pool's open orders; a unified account's pool-0 row counts its
+              spot USDC), ``INVALID_REQUEST`` (``l2 perps: the pool is full
+              ...``) for a pool with no room for its market (an isolated pool
+              holding another market, or a ninth market in pool 0). Nothing is
+              held, so the row can still fail when it fires.
             * A re-send of the same signed order answers with the same
               ``orderId`` whatever the row's status, but the checks run again
               first.

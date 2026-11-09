@@ -13,14 +13,18 @@ positions and moves your margin, naming a perp by its ``marketIndex`` (0 to
     loaf.orders.limit_buy("MUS-PERP", quantity=2, price=101.5, pool=0)
     loaf.perps.position(market=index, pool=0)
 
-**Pools.** Your perps margin is USDC held in pools: pool 0, the cross pool,
-and the isolated pools 1 to 7. Each holds at most 8 positions, one per market,
-margined by that pool's collateral alone, and an order trades from the pool it
-names (``pool=``, 0 by default). USDC moves between your spot balance and a
-pool, or between two pools, by an allocate (:meth:`PerpsResource.add_margin`,
-:meth:`PerpsResource.return_margin`, :meth:`PerpsResource.allocate`). Once a
-market has expired, a position in it is closed by an exit
-(:meth:`PerpsResource.exit`).
+**Pools.** Your perps margin is USDC held in pools: pool 0, the cross pool
+(up to 8 markets), and the isolated pools 1 to 7 (one market each), each
+margined by its own collateral alone; an order trades from the pool it names
+(``pool=``, 0 by default). USDC moves between your spot balance and a pool, or
+between two pools, by an allocate (:meth:`PerpsResource.add_margin`,
+:meth:`PerpsResource.return_margin`, :meth:`PerpsResource.allocate`). An
+isolated pool with no position and no order that may open one is swept back
+into pool 0, no sooner than 10 s after the last allocate into it (and at
+once, an order or not, while pool 0 holds no position and is in debt: on a
+unified account, once its spot USDC is spent), so fund one right before the
+order it backs. Once a market has expired, a position in it is closed by an
+exit (:meth:`PerpsResource.exit`).
 
 **Signing.** An allocate or an exit is signed on your machine with your
 trading key over the exchange's message, as an order is, and is sent with a

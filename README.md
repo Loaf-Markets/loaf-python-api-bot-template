@@ -692,10 +692,12 @@ Direction comes from the type **and** the side, not the type alone:
 | `TAKE_MARKET` / `TAKE_LIMIT` | **falls** to the trigger | **rises** to the trigger |
 
 **A 200 means the row is ARMED — not that it will ever book.** Your holding and
-cash are not checked until the row fires; a row that fires short of funds or
-tokens FAILS, with the refusal's text as its `rejectionReason`, and cancels
-none of your orders to free them (a resting order holds what it may spend): when
-other orders or trades take what a row needs, cancel or resize the row yourself.
+cash are not checked until the row fires (on a perp, a row that may open a
+position is also held at placement to its pool's margin at its trigger: see the
+table below); a row that fires short of funds or tokens FAILS, with the
+refusal's text as its `rejectionReason`, and cancels none of your orders to
+free them (a resting order holds what it may spend): when other orders or
+trades take what a row needs, cancel or resize the row yourself.
 Every trigger-time failure (holding gone, cash gone, price band, limit deviation,
 minimum value *again*, engine rejection) raises nothing; it arrives as
 `status: "FAILED"` with a `rejectionReason` on your `portfolio` channel. A
@@ -716,6 +718,8 @@ market's band around its trigger price` as its `rejectionReason`.
 | `LoafValidationError` (400) | **Already through the trigger** — refused if the mark has reached your level. Triggering is level-based, so a trigger *equal* to the mark is refused too. Compare your trigger against the mark yourself (`markprice:{ticker}`); if the mark is already there, place a plain order. |
 | `LoafValidationError` (400) | **Open-order caps** — resting conditionals count against the same caps as booked orders. |
 | `LoafValidationError` (400) | **Minimum order value** — the same floor as a plain order, measured at the price the row will *book* at — for a `*_MARKET` type the trigger moved by your max slippage. A SELL for your whole holding is exempt. Re-checked when the row fires. |
+| `LoafValidationError` (400) | **Perps margin at the trigger** — `INSUFFICIENT_BALANCE`, `Insufficient available balance for this order`: on a perp, a row that is not reduce-only whose pool's initial margin, beside the pool's open orders, cannot back it with the row's market valued at its trigger (the pool's other markets at the mark; a unified account's pool-0 row counts its spot USDC). Nothing is held: the row can still FAIL when it fires. |
+| `LoafValidationError` (400) | **Perps pool full** — `INVALID_REQUEST`, `l2 perps: the pool is full (8 positions in the cross pool, 1 in an isolated pool)`: a perps row that is not reduce-only for a market its pool has no room for (an isolated pool holding another market, or a ninth market in pool 0). |
 | `LoafValidationError` (400) | **Perps limit outside the band around its trigger** — `PRICE_BAND`, `l2 perps: the price is outside the market's band around its trigger price`: on a perp, a row whose limit lies outside the market's band around its trigger, `\|limit − trigger\| × 10,000 > band × trigger`. A TP/SL leg is checked so too, and refuses its whole order (the text prefixed `attached_legs[<i>]: `). The SDK keeps the `*_MARKET` and leg prices it derives inside; a `*_LIMIT` row's `price` is signed as given. |
 
 A `*_MARKET` type is a **protected limit, not a market order**. The SDK signs
@@ -777,9 +781,16 @@ Derive triggers with `round(mark * 0.95, 2)`: an unrounded float product carries
 A perp (its ticker is its asset's with `-PERP` appended, its `market.type`
 `"PERP"`) trades a perpetual future settled in USDC: a BUY opens or grows a
 long (or shrinks a short), a SELL the other way round. Your margin is USDC held
-in **pools**: pool 0, the cross pool, and the isolated pools 1 to 7, each
-holding at most 8 positions margined by that pool's collateral alone. Fund a
-pool from your spot USDC, trade from it, and move what is left back:
+in **pools**: pool 0, the cross pool (up to 8 markets), and the isolated pools
+1 to 7 (one market each), each margined by its own collateral alone. Fund a
+pool from your spot USDC, trade from it, and move what is left back. An
+isolated pool hands back what it no longer backs by itself: once it holds no
+position and no order that may open one, the engine moves its collateral into
+pool 0, no sooner than 10 s after your last move into it (and at once, an order
+or not, while your pool 0 holds no position and is in debt: on a unified
+account, once your spot USDC is spent). So fund an isolated pool right before
+the order it backs, and change a resting isolated order with a replace
+(`replaces_order_id=`) rather than a cancel and a new order:
 
 ```python
 perp = loaf.market.get("MUS-PERP").market             # type "PERP", its marketIndex, l2 (terms), live (state)
