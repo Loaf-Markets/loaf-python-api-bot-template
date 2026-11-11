@@ -46,11 +46,17 @@ DEFAULT_MAX_RETRIES = 3
 # Numeric precision
 # --------------------------------------------------------------------------- #
 
-#: Max decimal places accepted for a limit price (cents). Enforced server-side.
-MAX_PRICE_DECIMALS = 2
+#: The exchange counts every price (dollars) and quantity (tokens) in millionths, on every
+#: market, and no price, size or dollar amount it serves has more decimal places. Each
+#: market takes fewer decimal places, set at its listing: its ``priceDecimals`` (a tick of
+#: 10^-priceDecimals dollars) and ``quantityDecimals`` (a lot of 10^-quantityDecimals tokens), the
+#: second at least 1 and the two together at most this.
+ORDER_DECIMALS = 6
 
-#: Max decimal places accepted for a token quantity (0.1 of a token).
-MAX_QUANTITY_DECIMALS = 1
+#: An order on a market signs price x 10^(this - quantityDecimals) and quantity x
+#: 10^quantityDecimals (its ``l2.signedPriceDecimals`` and ``l2.signedQuantityDecimals``), so K1's
+#: quote, signed price x signed quantity / 10, counts millionths of a dollar on every market.
+L2_SIGNED_DECIMALS = 7
 
 # --------------------------------------------------------------------------- #
 # Orders
@@ -61,11 +67,11 @@ MAX_QUANTITY_DECIMALS = 1
 #: order's worst price, a *_MARKET conditional's price and a TP/SL leg's sell price). 200 = 2%.
 DEFAULT_MAX_SLIPPAGE_BPS = 200
 
-#: The highest price (dollars) an order can sign: the largest cent price whose x1000 fits 32 bits.
-ORDER_PRICE_MAX = Decimal("4294967.29")
-
-#: The largest quantity (tokens) an order can sign: (2**48 - 1) / 10, whose x10 fits 48 bits.
-ORDER_QUANTITY_MAX = Decimal("28147497671065.5")
+#: The highest price (dollars) and the largest quantity (tokens) the exchange takes on any market.
+#: A market's highest price is lower: the largest on its tick whose signed price fits 32 bits. Its
+#: largest quantity is lower where its signed quantity would pass 48 bits (quantityDecimals 6).
+ORDER_PRICE_MAX = Decimal(1_000_000_000)
+ORDER_QUANTITY_MAX = Decimal(1_000_000_000)
 
 #: The highest fee rate (per million: 7,000 = 70 bps) every order signs its
 #: consent to. It also sizes a BUY's hold: price x quantity x (1 + L2_FEE_RATE_CAP / 1,000,000)

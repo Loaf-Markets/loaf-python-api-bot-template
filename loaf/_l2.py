@@ -29,6 +29,7 @@ from .constants import (
     L2_LOGIN_TOKEN_PREFIX,
     L2_MAX_ORDER_LIFE_MS,
     L2_ORDER_LIFE_MARGIN_MS,
+    L2_SIGNED_DECIMALS,
     PERPS_QUOTE_ASSET_ID,
     TRADING_KEY_PREFIX,
 )
@@ -41,6 +42,7 @@ from .exceptions import (
     TradingHaltedError,
     _client_validation_error,
 )
+from .money import _decimals_field
 
 if TYPE_CHECKING:
     # typing has it from Python 3.10; type checkers ship typing_extensions, and annotations only
@@ -235,8 +237,9 @@ class LoginTokens:
 
 
 class Market(NamedTuple):
-    """A market's ``marketIndex``, ``type`` and ``l2``: the vault and market every order on it
-    signs, and a perp's band, which bounds the prices the SDK derives on it."""
+    """A market's ``marketIndex``, ``type``, ``l2`` and decimals: the vault and market every order
+    on it signs, the units it signs them in, and a perp's band, which bounds the prices the SDK
+    derives on it."""
 
     chain_id: int
     proxy_address: str
@@ -250,11 +253,23 @@ class Market(NamedTuple):
     #: A perp's ``l2.status``: ``"ACTIVE"``, or ``"EXPIRED"`` (it takes no more orders).
     #: ``None`` on a spot market, whose ``l2`` is served only while it is active.
     l2_status: str | None
+    #: ``priceDecimals``: a price on it has at most this many decimal places, a tick of 10^-this
+    #: dollars.
+    price_decimals: int
+    #: ``quantityDecimals``: a quantity on it has at most this many, a lot of 10^-this tokens,
+    #: and an order signs quantity x 10^this (``l2.signedQuantityDecimals``).
+    quantity_decimals: int
     #: A perp's band, ``l2.band`` basis points as last read: the exchange holds a perps order's
     #: price within it around the market's mark, and a perps stop's, take's or leg's limit within
     #: it around its own trigger. 0 (no band) on a spot market, and on a perp whose band is 0 or
     #: not served as a whole number.
     band: int = 0
+
+    @property
+    def signed_price_decimals(self) -> int:
+        """``l2.signedPriceDecimals``: an order on the market signs price x 10^this, 7 less its
+        quantity decimals."""
+        return L2_SIGNED_DECIMALS - self.quantity_decimals
 
 
 class AccountState(NamedTuple):
@@ -286,7 +301,7 @@ class _Block:
 
 def market_of(detail: Any, ticker: str) -> Market:
     """The market an order on ``ticker`` signs, from its ``GET /trade/{ticker}`` answer:
-    its ``marketIndex`` and its ``l2`` (a perp's band among its terms).
+    its ``marketIndex``, its decimals and its ``l2`` (a perp's band among its terms).
 
     Raises:
         LoafConfigError: the server does not run the exchange this SDK trades on.
@@ -316,13 +331,14 @@ def market_of(detail: Any, ticker: str) -> Market:
         )
     l2 = market["l2"]
     custody = (l2["chainId"], l2["proxyAddress"], l2["l2ChainId"], market["marketIndex"])
+    decimals = (market["priceDecimals"], market["quantityDecimals"])
     if market["type"] == "PERP":
         # Not signed, so never refused: a band that is not a whole number bounds nothing, as in the
         # web app.
         band = l2.get("band")
         band = band if _is_int(band) and band > 0 else 0
-        return Market(*custody, 0, l2["quoteAssetId"], "PERP", l2["status"], band)
-    return Market(*custody, l2["baseAssetId"], l2["quoteAssetId"], "SPOT", None)
+        return Market(*custody, 0, l2["quoteAssetId"], "PERP", l2["status"], *decimals, band)
+    return Market(*custody, l2["baseAssetId"], l2["quoteAssetId"], "SPOT", None, *decimals)
 
 
 def epoch_of(answer: Any, account_index: int) -> int:
@@ -756,14 +772,19 @@ def _whole(value: object, low: int, high: int) -> TypeGuard[int]:
 
 def _unusable_market_field(market: Mapping[str, Any]) -> str | None:
     """The first field of a ``market`` no order can sign, in schema order: its
-    ``marketIndex`` and ``type``, then its ``l2``'s: the custody, then a spot market's
-    assets, or a perp's quote asset (USDC) and status. A perp's other terms are not
-    signed."""
+    ``marketIndex``, ``type``, ``priceDecimals`` and ``quantityDecimals``, then its
+    ``l2``'s: the custody, then a spot market's assets, or a perp's quote asset (USDC)
+    and status, then the decimals an order signs in, which must be the market's (7 less
+    its quantity decimals for the price, its quantity decimals for the quantity). A
+    perp's other terms are not signed."""
     if not _whole(market.get("marketIndex"), 0, 4095):
         return "marketIndex"
     kind = market.get("type")
     if kind not in ("SPOT", "PERP"):
         return "type"
+    decimals = _decimals_field(market.get("priceDecimals"), market.get("quantityDecimals"))
+    if decimals is not None:
+        return decimals
     l2 = market.get("l2")
     if not isinstance(l2, Mapping):
         return "l2"
@@ -785,4 +806,16 @@ def _unusable_market_field(market: Mapping[str, Any]) -> str | None:
             ("baseAssetId", _whole(base, 1, 62)),
             ("quoteAssetId", _whole(quote, 1, 62) and quote != base),
         ]
+    quantity_decimals = market["quantityDecimals"]
+    signed_price, signed_quantity = l2.get("signedPriceDecimals"), l2.get("signedQuantityDecimals")
+    checks += [
+        (
+            "signedPriceDecimals",
+            _is_int(signed_price) and signed_price == L2_SIGNED_DECIMALS - quantity_decimals,
+        ),
+        (
+            "signedQuantityDecimals",
+            _is_int(signed_quantity) and signed_quantity == quantity_decimals,
+        ),
+    ]
     return next((f"l2.{field}" for field, ok in checks if not ok), None)

@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import time
+from decimal import Decimal
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -63,7 +64,7 @@ def test_seed_keeps_frames_newer_than_its_read(monkeypatch: pytest.MonkeyPatch):
     assert state() == (True, 100, 101)
 
     # The feed drops: its book and mark are forgotten, and nothing re-seeds them while it is down.
-    strategy.on_mark_price(LoafObject({"price": 100.5}))
+    strategy.on_mark_price(LoafObject({"price": Decimal("100.5")}))  # as the client reads it
     strategy.on_disconnect(LoafObject({"code": 1006, "reason": ""}))
     strategy.on_tick()
     assert state() == (True, None, None) and strategy.mark_price is None

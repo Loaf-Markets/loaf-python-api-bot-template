@@ -166,14 +166,16 @@ class Strategy:
         self._lock = threading.Lock()
         self.best_bid: float | None = None
         self.best_ask: float | None = None
-        self.mark_price: float | None = None
+        self.mark_price: Decimal | None = None  # a mark_price frame's: exact dollars
         self.last_trade: dict | None = None
         self.is_halted = False
         # What no frame sends: the market's status, whether it has an L2 market (its
-        # `l2`), and its tradingStartsAt.
+        # `l2`), and its tradingStartsAt; and its priceDecimals, which never changes:
+        # its prices have at most that many decimal places (its tick).
         self.status: str | None = None
         self.has_l2_market = False
         self.trading_starts_at: int | None = None
+        self.price_decimals: int | None = None
         # The book, the halt flag and those three are read from REST on the next tick: at
         # startup and each time the feed goes live again (nothing is replayed). Until the
         # market trades, a halt aside (a frame ends it), every tick reads them again.
@@ -306,6 +308,7 @@ class Strategy:
             self.status = detail.market.get("status")
             self.has_l2_market = detail.market.get("l2") is not None
             self.trading_starts_at = detail.market.get("tradingStartsAt")
+            self.price_decimals = detail.market.get("priceDecimals")
             if "halt" not in self.from_feed:
                 self.is_halted = bool(detail.market.isHalted)
             # orderBook None: not known now.
@@ -353,11 +356,11 @@ class Strategy:
         # order each time): gate it, e.g. keep the orderId a placement returns
         # and place again only once that order is gone.
         #
-        #   # Quote a limit buy 1% below the best bid, resting for an hour at
-        #   # most (ttl_ms; the default is 7 days): a bot's quotes should die
-        #   # with it.
+        #   # Quote a limit buy 1% below the best bid, on the market's tick,
+        #   # resting for an hour at most (ttl_ms; the default is 7 days): a
+        #   # bot's quotes should die with it.
         #   if bid:
-        #       price = round(bid * 0.99, 2)
+        #       price = round(bid * 0.99, self.price_decimals)
         #       self.client.orders.limit_buy(self.ticker, quantity=1, price=price,
         #                                    ttl_ms=3_600_000)
         #
@@ -380,7 +383,7 @@ class Strategy:
         #   # moves, never on every tick: each stop holds one of your account's
         #   # order numbers until it fires.
         #   if mark:
-        #       trigger = round(mark * 0.95, 2)
+        #       trigger = round(mark * Decimal("0.95"), self.price_decimals)
         #       self.client.orders.stop_loss(self.ticker, quantity=1, trigger_price=trigger)
         #
         #   # Cancel every open order, stop and take (it sells nothing):
@@ -397,7 +400,8 @@ class Strategy:
         #   self.client.orders.cancel_after(60_000, order_tag=BOT_ORDER_TAG)
         #   if bid:
         #       res = self.client.orders.limit_buy(
-        #           self.ticker, quantity=1, price=round(bid * 0.99, 2), ttl_ms=3_600_000,
+        #           self.ticker, quantity=1, price=round(bid * 0.99, self.price_decimals),
+        #           ttl_ms=3_600_000,
         #           order_tag=BOT_ORDER_TAG,
         #           send_by_ms=time.time_ns() // 1_000_000 + 2_000,
         #           replaces_order_id=self.quote_id)  # set self.quote_id = None in __init__

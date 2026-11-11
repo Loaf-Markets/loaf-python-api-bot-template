@@ -51,6 +51,7 @@ from conftest import (
     market_detail,
     routes,
     secret_locals,
+    signed_decimals,
     verify_login,
     verify_order,
 )
@@ -338,6 +339,17 @@ def test_server_without_the_exchange(exchange, trading_client):
         (MARKET_INDEX, {**MARKET_L2, "quoteAssetId": 0}, "l2.quoteAssetId"),
         (MARKET_INDEX, {**MARKET_L2, "quoteAssetId": 63}, "l2.quoteAssetId"),
         (MARKET_INDEX, {**MARKET_L2, "quoteAssetId": 6}, "l2.quoteAssetId"),  # the base's id
+        # What an order signs in: 7 less the market's quantity decimals, and its quantity decimals.
+        (MARKET_INDEX, {**MARKET_L2, "signedPriceDecimals": 3}, "l2.signedPriceDecimals"),
+        (MARKET_INDEX, {**MARKET_L2, "signedPriceDecimals": "4"}, "l2.signedPriceDecimals"),
+        (MARKET_INDEX, {**MARKET_L2, "signedPriceDecimals": None}, "l2.signedPriceDecimals"),
+        (MARKET_INDEX, {**MARKET_L2, "signedQuantityDecimals": 4}, "l2.signedQuantityDecimals"),
+        (MARKET_INDEX, {**MARKET_L2, "signedQuantityDecimals": True}, "l2.signedQuantityDecimals"),
+        (
+            MARKET_INDEX,
+            {k: v for k, v in MARKET_L2.items() if k != "signedQuantityDecimals"},
+            "l2.signedQuantityDecimals",
+        ),
     ],
 )
 def test_unusable_market(exchange, trading_client, market_index, l2, field):
@@ -361,6 +373,129 @@ def test_unusable_market_type(exchange, trading_client, kind):
     with pytest.raises(loaf.LoafServerError, match=re.escape(message)):
         trading_client().orders.limit_buy("OPRA", 10, 167.49)
     assert routes(exchange.requests) == ["GET /trade/OPRA"]
+
+
+@pytest.mark.parametrize(
+    "decimals, field",
+    [
+        ({"priceDecimals": ...}, "priceDecimals"),
+        ({"priceDecimals": None}, "priceDecimals"),
+        ({"priceDecimals": -1}, "priceDecimals"),
+        ({"priceDecimals": 6, "quantityDecimals": 0}, "priceDecimals"),
+        ({"priceDecimals": 2.0}, "priceDecimals"),
+        ({"priceDecimals": "2"}, "priceDecimals"),
+        ({"quantityDecimals": ...}, "quantityDecimals"),
+        ({"quantityDecimals": 0}, "quantityDecimals"),  # a signed price unit under a millionth
+        ({"quantityDecimals": 5}, "quantityDecimals"),  # 7 in all: a tick under 10 signed units
+        ({"quantityDecimals": False}, "quantityDecimals"),
+    ],
+)
+def test_a_market_without_usable_decimals_is_refused(exchange, trading_client, decimals, field):
+    # Never guessed: the decimals decide what an order signs and which prices it may have.
+    detail = market_detail()
+    for name, value in decimals.items():
+        if value is ...:
+            del detail["market"][name]
+        else:
+            detail["market"][name] = value
+    exchange.details["OPRA"] = detail
+    message = f"GET /trade/OPRA answered an unusable market.{field}"
+    with pytest.raises(loaf.LoafServerError, match=re.escape(message)):
+        trading_client().orders.limit_buy("OPRA", 10, 167.49)
+    assert routes(exchange.requests) == ["GET /trade/OPRA"]
+
+
+# Markets of other listings: BTC near $75,000 (a tick of $1, a lot of 0.00001) and a $0.50 asset
+# (a tick of $0.00001, a lot of 0.1), each signing in its own decimals.
+BTC_L2 = {**MARKET_L2, "baseAssetId": 8, **signed_decimals(5)}
+CHEAP_L2 = {**MARKET_L2, "baseAssetId": 9, **signed_decimals(1)}
+
+
+@pytest.fixture
+def listings(exchange):
+    """The exchange with BTC and CHEAP listed beside OPRA."""
+    exchange.details["BTC"] = market_detail(
+        "BTC", market_index=2051, l2=BTC_L2, market_price=75_000, decimals=(0, 5)
+    )
+    exchange.details["CHEAP"] = market_detail(
+        "CHEAP", market_index=2052, l2=CHEAP_L2, market_price=0.5, decimals=(5, 1)
+    )
+    return exchange
+
+
+def test_each_market_signs_in_its_own_decimals(listings, trading_client):
+    orders = trading_client().orders
+    orders.limit_buy("OPRA", 1.234, 167.49)
+    orders.limit_sell("BTC", 0.00123, 75_001)
+    orders.limit_buy("CHEAP", 20.5, 0.48335)
+    opra, btc, cheap = listings.bodies("/orders")
+    assert [(b["l2MarketIndex"], b["price"], b["quantity"]) for b in (opra, btc, cheap)] == [
+        (2050, 167.49, 1.234),
+        (2051, 75_001, 0.00123),
+        (2052, 0.48335, 20.5),
+    ]
+    # Each verifies at its market's signed decimals alone: OPRA's x 10^4 / 10^3, BTC's x 10^2 /
+    # 10^5, CHEAP's x 10^6 / 10^1.
+    for body, l2 in ((opra, MARKET_L2), (btc, BTC_L2), (cheap, CHEAP_L2)):
+        verify_order(body, l2=l2)
+    for body, other in ((opra, BTC_L2), (btc, CHEAP_L2), (cheap, MARKET_L2)):
+        with pytest.raises(k1.K1Error):
+            verify_order(body, l2=other)
+
+
+@pytest.mark.parametrize(
+    "place, message",
+    [
+        (
+            lambda o: o.limit_buy("BTC", 0.001, 75_000.5),
+            "price must have at most 0 decimal places on BTC (got 75000.5)",
+        ),
+        (
+            lambda o: o.limit_buy("BTC", 0.000001, 75_000),
+            "quantity must have at most 5 decimal places on BTC (got 0.000001)",
+        ),
+        (
+            lambda o: o.limit_buy("CHEAP", 0.25, 0.5),
+            "quantity must have at most 1 decimal places on CHEAP (got 0.25)",
+        ),
+        (
+            lambda o: o.limit_buy("CHEAP", 20, 0.123456),
+            "price must have at most 5 decimal places on CHEAP (got 0.123456)",
+        ),
+        # (2^32 - 1) / 10^6: a market of 1 quantity decimal quotes up to $4,294.96729.
+        (
+            lambda o: o.limit_sell("CHEAP", 1, 4_294.9673),
+            "price must be at most 4,294.96729 on CHEAP (got 4294.9673)",
+        ),
+    ],
+)
+def test_each_markets_grid_is_its_own(listings, trading_client, place, message):
+    with pytest.raises(loaf.LoafValidationError) as info:
+        place(trading_client().orders)
+    assert (info.value.status_code, info.value.message) == (0, message)
+    assert listings.posts("/orders") == []
+
+
+def test_derived_prices_round_to_the_markets_tick(listings, trading_client):
+    orders = trading_client().orders
+    orders.market_buy("BTC", 0.001)  # 75,000 x 1.02, to the dollar
+    orders.market_sell("BTC", 0.001, reference_price=75_000.5, max_slippage_bps=0)  # up, exactly
+    orders.market_buy("BTC", 0.001, reference_price=75_000.5, max_slippage_bps=0)  # down
+    orders.market_sell("CHEAP", 30)  # 0.5 x 0.98
+    orders.limit_buy("CHEAP", 30, 0.5, tp_price=0.6, sl_price=0.45678)  # legs 2% below
+    bodies = listings.bodies("/orders")
+    assert [b["price"] for b in bodies] == [76_500, 75_001, 75_000, 0.49, 0.5]
+    assert (bodies[-1]["tp"]["price"], bodies[-1]["sl"]["price"]) == (0.588, 0.44765)
+    for body in bodies[:3]:
+        verify_order(body, l2=BTC_L2)
+    for body in bodies[3:]:
+        verify_order(body, l2=CHEAP_L2)
+    for leg in ("tp", "sl"):
+        verify_order(bodies[-1], leg, l2=CHEAP_L2)
+    orders.stop_loss("BTC", 0.001, 70_000)  # books 2% below the trigger, to the dollar
+    (stop,) = listings.bodies("/orders/conditional")
+    assert (stop["triggerPrice"], stop["price"]) == (70_000, 68_600)
+    verify_order(stop, l2=BTC_L2)
 
 
 @pytest.mark.parametrize("market_index", [0, 254, 2048, 4094, 4095])
@@ -727,8 +862,8 @@ def test_limit_buy_with_legs(exchange, trading_client):
         ({"sl_price": 110}, "sl_price must be below the order price"),
         ({"tp_price": 100}, "tp_price must be above the order price"),
         ({"tp_price": 90}, "tp_price must be above the order price"),
-        ({"tp_price": 120.001}, "tp_price must have at most 2"),
-        ({"sl_price": 89.999}, "sl_price must have at most 2"),
+        ({"tp_price": 120.0000001}, "tp_price must have at most 6 decimal places"),
+        ({"sl_price": 0}, "sl_price must be positive"),
         ({"leg_max_slippage_bps": 100}, "only applies when tp_price"),
         (
             {"tp_price": 120, "leg_max_slippage_bps": 10_000},
@@ -837,10 +972,13 @@ def test_conditional_limit(exchange, trading_client):
             {"type": "TAKE_LIMIT", "trigger_price": 90, "price": 89.5, "max_slippage_bps": 50},
             "max_slippage_bps only applies to",
         ),
-        ({"type": "STOP_MARKET", "trigger_price": 90.123}, "trigger_price must have at most 2"),
         (
-            {"type": "STOP_LIMIT", "trigger_price": 90, "price": 89.555},
-            ": price must have at most 2",
+            {"type": "STOP_MARKET", "trigger_price": 90.1234567},
+            "trigger_price must have at most 6 decimal places",
+        ),
+        (
+            {"type": "STOP_LIMIT", "trigger_price": 90, "price": 2e9},
+            ": price must be at most 1,000,000,000",
         ),
         ({"type": "STOP_MARKET", "trigger_price": 0}, "trigger_price must be positive"),
         ({"type": "LIMIT", "trigger_price": 90}, "Unknown conditional order type"),
@@ -1099,10 +1237,10 @@ def test_market_reference_price_still_reads_an_unknown_market(exchange, trading_
             "leg_max_slippage_bps must be a whole number",
         ),
         ("create", ("OPRA", "BUY", 1), {"type": "LIMIT"}, "LIMIT orders require a price"),
-        # Off the grid: refused, never rounded (": price" is the order's own price).
-        ("limit_buy", ("OPRA", 10, 167.495), {}, ": price must have at most 2"),
-        ("limit_buy", ("OPRA", 1.24, 100), {}, "quantity must have at most 1"),
-        ("stop_loss", ("OPRA", 1.24, 90), {}, "quantity must have at most 1"),
+        # What no market takes: refused before anything is read (": price" is the order's own).
+        ("limit_buy", ("OPRA", 10, 167.4950001), {}, ": price must have at most 6 decimal places"),
+        ("limit_buy", ("OPRA", 1.0000001, 100), {}, "quantity must have at most 6 decimal places"),
+        ("stop_loss", ("OPRA", 2e9, 90), {}, "quantity must be at most 1,000,000,000"),
         ("create", ("OPRA", "BUY", 1), {"type": "STOP_MARKET", "price": 1}, "Unknown order type"),
     ],
 )
@@ -1111,6 +1249,62 @@ def test_pricing_refusals(exchange, trading_client, method, args, kwargs, messag
         getattr(trading_client().orders, method)(*args, **kwargs)
     assert info.value.status_code == 0
     assert exchange.requests == []
+
+
+@pytest.mark.parametrize(
+    "place, message",
+    [
+        # OPRA's tick is $0.01 and its lot 0.001 tokens: off them, refused, never rounded.
+        (
+            lambda o: o.limit_buy("OPRA", 10, 167.495),
+            "price must have at most 2 decimal places on OPRA (got 167.495)",
+        ),
+        (
+            lambda o: o.limit_sell("OPRA", 1.2345, 170),
+            "quantity must have at most 3 decimal places on OPRA (got 1.2345)",
+        ),
+        (
+            lambda o: o.stop_loss("OPRA", 1.2345, 90),
+            "quantity must have at most 3 decimal places on OPRA (got 1.2345)",
+        ),
+        (
+            lambda o: o.stop_loss("OPRA", 5, 90.005),
+            "trigger_price must have at most 2 decimal places on OPRA (got 90.005)",
+        ),
+        (
+            lambda o: o.create_conditional(
+                "OPRA", "SELL", 5, type="STOP_LIMIT", trigger_price=90, price=89.555
+            ),
+            "price must have at most 2 decimal places on OPRA (got 89.555)",
+        ),
+        (
+            lambda o: o.limit_buy("OPRA", 1, 100, tp_price=120.001),
+            "tp_price must have at most 2 decimal places on OPRA (got 120.001)",
+        ),
+        (
+            lambda o: o.market_buy("OPRA", 1, reference_price=100, sl_price=89.999),
+            "sl_price must have at most 2 decimal places on OPRA (got 89.999)",
+        ),
+        # Its highest price, the largest cent whose x 10,000 fits 32 bits.
+        (
+            lambda o: o.limit_buy("OPRA", 0.001, 429496.73),
+            "price must be at most 429,496.72 on OPRA (got 429496.73)",
+        ),
+        (
+            lambda o: o.stop_loss("OPRA", 1, 429496.73),
+            "trigger_price must be at most 429,496.72 on OPRA (got 429496.73)",
+        ),
+    ],
+)
+def test_the_markets_grid_and_bounds_are_checked_once_it_is_read(
+    exchange, trading_client, place, message
+):
+    orders = trading_client().orders
+    for _ in range(2):  # the market is read once and kept: nothing else is read or reserved
+        with pytest.raises(loaf.LoafValidationError) as info:
+            place(orders)
+        assert (info.value.status_code, info.value.message) == (0, message)
+    assert routes(exchange.requests) == ["GET /trade/OPRA"]
 
 
 @pytest.mark.parametrize(
@@ -1155,7 +1349,7 @@ def test_wire_normalization(exchange, trading_client):
     assert b'"price":167.49,' in content and b'"quantity":2.0,' in content
     verify_order(body)
 
-    # 2.01 * 1000 == 2009.9999999999998 in floating point: the scaling must stay exact.
+    # 2.01 * 10,000 == 20099.999999999996 in floating point: the scaling must stay exact.
     orders.limit_buy("OPRA", 10, 2.01)
     body = exchange.bodies("/orders")[-1]
     assert body["price"] == 2.01
@@ -1164,29 +1358,32 @@ def test_wire_normalization(exchange, trading_client):
 
 def test_largest_price_and_quantity(exchange, trading_client):
     orders = trading_client().orders
-    orders.limit_buy("OPRA", 0.1, 4294967.29)
+    # OPRA's highest price, 429,496.72 (x 10,000 fits 32 bits), at its lot, 0.001.
+    orders.limit_buy("OPRA", 0.001, 429496.72)
     body = exchange.bodies("/orders")[-1]
-    assert (body["price"], body["quantity"]) == (4294967.29, 0.1)
+    assert (body["price"], body["quantity"]) == (429496.72, 0.001)
     verify_order(body)
-    orders.limit_sell("OPRA", 28147497671065.5, 0.01)
+    # Its largest quantity: 1,000,000,000 tokens (x 1,000 fits 48 bits) at its tick.
+    orders.limit_sell("OPRA", 1_000_000_000, 0.01)
     body = exchange.bodies("/orders")[-1]
-    assert (body["price"], body["quantity"]) == (0.01, 28147497671065.5)
+    assert (body["price"], body["quantity"]) == (0.01, 1_000_000_000)
     verify_order(body)
 
     sent = len(exchange.requests)
     with pytest.raises(
-        loaf.LoafValidationError, match="price must be at most 4,294,967.29"
+        loaf.LoafValidationError, match="price must be at most 429,496.72 on OPRA"
     ) as info:
-        orders.limit_buy("OPRA", 0.1, 4294967.3)
+        orders.limit_buy("OPRA", 0.001, 429496.73)
     assert info.value.status_code == 0
     assert len(exchange.requests) == sent
 
 
 def test_k1_bound_refused_locally_and_its_number_given_back(exchange, trading_client):
     orders = trading_client().orders
-    # Each fits its width, but the order's whole value does not fit K1's 48-bit fill quote.
+    # Each fits its width, but the order's whole value, about $281.48 million, does not fit K1's
+    # 48-bit fill quote (in millionths of a dollar: at most about $281.47 million).
     with pytest.raises(loaf.LoafValidationError) as info:
-        orders.limit_sell("OPRA", 28147497671065.5, 1.00)
+        orders.limit_sell("OPRA", 1_000_000, 281.48)
     assert (info.value.status_code, info.value.message) == (0, K1_BOUND)
     assert info.value.__cause__ is None and info.value.__suppress_context__
     assert exchange.posts("/orders") == []
@@ -1200,9 +1397,12 @@ def test_order_math_ignores_callers_decimal_context(exchange, trading_client):
     with localcontext(Context(prec=6, traps=[Inexact, Rounded, InvalidOperation])):
         orders.limit_buy("OPRA", 10, 12345.67)
         orders.market_sell("OPRA", 2, reference_price=100.005, max_slippage_bps=50)
-        assert loaf.worst_price(167.49, "BUY", 200) == 170.83
-        with pytest.raises(loaf.LoafValidationError, match="at most 2 decimal places"):
-            loaf.money.validate_price(1.234)
+        opra = {"price_decimals": 2, "quantity_decimals": 3}
+        assert loaf.worst_price(167.49, "BUY", 200, **opra) == 170.83
+        with pytest.raises(loaf.LoafValidationError, match="at most 6 decimal places"):
+            loaf.money.validate_price(1.2345678)
+        with pytest.raises(loaf.LoafValidationError, match="at most 2 decimal places on OPRA"):
+            orders.limit_buy("OPRA", 10, 1.234)
     limit, market = exchange.bodies("/orders")
     assert (limit["price"], market["price"]) == (12345.67, 99.51)
     verify_order(limit)

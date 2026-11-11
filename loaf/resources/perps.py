@@ -48,9 +48,11 @@ exchange moves whole ticks of it: the SDK turns the amount into ticks with the
 collateral your portfolio summary serves (:meth:`PerpsResource.collateral`:
 ticks = amount x 10^``decimals`` / ``tickSize``), and refuses an amount that is
 not a whole number of ticks, or a summary without a usable collateral (it never
-assumes one; an exit, which moves no amount, never needs it). The reads are the
-engine's units, not dollars: every amount of 64 bits or more is a decimal
-string, and :meth:`PerpsResource.positions` lists their units.
+assumes one; an exit, which moves no amount, never needs it). The reads give
+every price, size and amount its actual value, dollars and tokens, as an exact
+:class:`~decimal.Decimal` (the exchange serves each as an exact decimal
+string, which the SDK reads digit for digit), and
+:meth:`PerpsResource.positions` lists them.
 """
 
 from __future__ import annotations
@@ -61,7 +63,7 @@ from decimal import Context, Decimal, localcontext
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
 
-from .. import k1
+from .. import _served, k1
 from .._l2 import _is_int, _whole, submit_signed_op
 from ..constants import (
     DEFAULT_PERPS_OP_TTL_MS,
@@ -122,8 +124,8 @@ class PerpsResource(Resource):
         (:class:`~loaf.models.PerpsCollateral`): the ``collateral`` of :meth:`positions`,
         read once per client: its ``symbol`` and ``decimals``, ``tickSize`` (its base
         units per tick: an allocate moves whole ticks) and ``extensionMultiplier`` (the
-        reads' extended units per tick), the last two decimal strings. Neither changes
-        once the asset is registered.
+        engine's extended units per tick, which a position's ``fundingIndex`` counts),
+        the last two decimal strings. Neither changes once the asset is registered.
 
         Raises:
             LoafConfigError: no trading key.
@@ -141,36 +143,43 @@ class PerpsResource(Resource):
         that hold anything, ascending, each with its positions ascending by
         market (a perp's ``marketIndex``). Values are the engine's, as of its
         last commit, at each market's mark
-        (``market.get(ticker).market.live.markPrice``), each amount of 64 bits
-        or more a decimal string:
+        (``market.get(ticker).market.live.markPrice``), each price, size and
+        amount its actual value, an exact :class:`~decimal.Decimal`; the money
+        is in dollars to 0.000001, rounded never in your favour (what the pool
+        holds down, what it needs or owes up):
 
-        * a pool's ``collateral``, ``value`` (the collateral plus each
-          position's signed notional less its funding owed) and a position's
-          ``fundingOwed`` (positive pays, negative receives) and ``notional``
-          (|base| x mark x the market's ``qem``) are in the money book's
-          extended units: ticks x the collateral's ``extensionMultiplier``
-          (:meth:`collateral`), so USDC = extended / ``extensionMultiplier``
-          x ``tickSize`` / 10^``decimals``;
-        * a pool's ``requirement`` (its maintenance margin, the sum of each
-          position's ``risk`` x ``notional``) is in those units x 65,536;
-          ``liquidatable`` is ``value < 0`` or ``value x 65,536 <
-          requirement``. Collateral can leave the pool only at K1's initial
-          margin, ``value x 65,536 >= 2 x requirement``, and while the pool
-          also keeps a tenth of its positions' ``notional`` and any
-          initial-margin tier's extra, otherwise the exchange answers 422
-          ``TRANSFER_MARGIN_FLOOR``. The three are
-          ``None`` together when the engine's summary of the pool is past its
-          range;
-        * a position's ``ticker``, ``qem``, ``risk``, ``maxLeverage`` and ``band`` are its
-          market's, so valuing it needs no market read;
-        * a position's ``base`` is signed (positive long, negative short) in
-          the market's base units, an order's signed quantity (tokens x 10);
-          ``entryPrice`` is 10 x ``entryQuote`` / |base|, in the market's price
-          units, as is ``liquidationPrice``: the mark below which (a long) or
-          above which (a short) the pool is liquidatable, every other term of
-          the pool held, ``None`` when it has none; ``fundingIndex`` is the
-          funding index it last settled at: it owes
-          ``base x (F - fundingIndex)``, F the market's live ``fundingIndex``.
+        * a pool's ``collateral`` and ``value`` (the collateral plus each
+          position's signed notional less its funding owed) are rounded down,
+          its ``requirement`` (its maintenance margin, the sum of each
+          position's ``risk`` / 65,536 x ``notional``) up; ``liquidatable`` is
+          the engine's ``value < 0`` or ``value < requirement``, before any
+          rounding. Collateral can leave the pool only at K1's initial margin,
+          a value of at least twice the requirement, and while the pool also
+          keeps a tenth of its positions' ``notional`` and any initial-margin
+          tier's extra, otherwise the exchange answers 422
+          ``TRANSFER_MARGIN_FLOOR``. The three are ``None`` together when the
+          engine's summary of the pool is past its range;
+        * a position's ``ticker``, ``qem``, ``risk``, ``maxLeverage`` and
+          ``band`` are its market's, and so are ``signedPriceDecimals`` and
+          ``signedQuantityDecimals`` (its ``l2``'s), so valuing it needs no
+          market read;
+        * a position's ``base`` is signed (positive long, negative short), in
+          tokens; its lots, the base the engine counts, are base x
+          10^``signedQuantityDecimals``. ``entryQuote`` is the quote of the
+          fills that opened and grew it, dollars, exact; ``entryPrice`` is
+          ``entryQuote / |base|`` rounded down to the market's signed price
+          unit, 10^-``signedPriceDecimals`` dollars, and ``liquidationPrice``
+          is the mark below which (a long) or above which (a short) the pool
+          is liquidatable, every other term of the pool held, ``None`` when it
+          has none: both dollars, and they can fall between ticks;
+          ``notional`` is ``|base| x mark`` rounded up and ``fundingOwed``
+          (positive pays, negative receives) is rounded up too; and
+          ``fundingIndex`` is the funding index it last settled at, the
+          engine's integer of extended USDC units per lot, a decimal string:
+          it owes its lots ``x (F - fundingIndex)`` extended units, F the
+          market's live ``fundingIndex``, and a dollar is
+          ``extensionMultiplier x 10^decimals / tickSize`` extended units
+          (:meth:`collateral`).
 
         Your open orders are ``portfolio.component().openOrders``, each with its
         ``pool`` and ``reduceOnly``. Each call is a whole portfolio read: to
@@ -186,8 +195,11 @@ class PerpsResource(Resource):
                 message names.
             LoafServiceUnavailableError: the exchange could not read your perps
                 just now, which never means you hold none; try again in a moment.
+            LoafServerError: a value that is not an exact decimal string,
+                named, which the SDK never reads in another unit.
         """
-        return _perps_of(self._client.get("/portfolio/summary"))
+        answer = self._client.get("/portfolio/summary")
+        return _perps_of(_served.read(answer, _served.perps, "GET /portfolio/summary"))
 
     def pool(self, pool: int = 0) -> Any:
         """Your margin pool ``pool`` (0, the cross pool, to 7) as :meth:`positions`

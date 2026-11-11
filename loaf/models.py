@@ -8,14 +8,19 @@ preserved at runtime even though they are not listed here.
 
 Every monetary field is in plain dollars and every quantity in plain tokens
 (see :mod:`loaf.money`), except ``balances`` and a transfer's ``amount``:
-decimal strings in the token's base units (:func:`loaf.from_base_units`), and
-the perps shapes, in the exchange engine's units
-(:meth:`loaf.resources.perps.PerpsResource.positions`). Timestamps are unix
-seconds, except ``expiryMs`` (unix milliseconds).
+decimal strings in the token's base units (:func:`loaf.from_base_units`).
+The exchange serves the perps shapes' prices, sizes and dollar amounts, a
+perp's order limits, a fill's quantity, price, fee and closed PnL (on every
+market) and the withdrawable USDC as exact decimal strings of their actual
+values, and the SDK returns each as the :class:`~decimal.Decimal` of exactly
+that value; only a perps funding index stays the engine's integer, a decimal
+string (:meth:`loaf.resources.perps.PerpsResource.positions`). Timestamps are
+unix seconds, except ``expiryMs`` (unix milliseconds).
 """
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any, Optional, TypedDict
 
 
@@ -61,6 +66,10 @@ class MarketL2(TypedDict):
     l2ChainId: int
     baseAssetId: int  # the asset token's balances row
     quoteAssetId: int  # the cash balances row
+    # What an order signs: price x 10^signedPriceDecimals (7 less the market's quantityDecimals)
+    # and quantity x 10^signedQuantityDecimals (its quantityDecimals).
+    signedPriceDecimals: int
+    signedQuantityDecimals: int
 
 
 class PerpMarketL2(TypedDict):
@@ -81,14 +90,16 @@ class PerpMarketL2(TypedDict):
     # How far (bp) an order's price may sit from the mark, both edges in (0: no band; a mark of 0
     # bands nothing). A stop's, take's or TP/SL leg's limit is also held within it around its own
     # trigger when placed. The prices the SDK derives start at most half of it from their reference
-    # (but a MARKET BUY's off a mark under one cent: $0.01, refused outside it); a MARKET order's,
-    # rounded across an off-grid mark, may give way to the cent on the mark's near side (the orders
-    # module, The perps band).
+    # (but a MARKET BUY's off a mark under one tick: one tick, refused outside it); a MARKET order's,
+    # rounded to the tick across an off-grid mark, may give way to the grid price on the mark's near
+    # side (the orders module, The perps band).
     band: int
     flags: int  # PERPS_FLAG_CROSS (pool 0 may trade it) | PERPS_FLAG_REDUCE_ONLY
-    minBase: int  # the least signed quantity of an order that adds to a position; 0: none
-    minQuote: int  # the least quote (signed quantity x signed price / 10) of one; 0: none
-    quoteLimit: int  # the most quote of any order; 0: none
+    minBase: Decimal  # the least quantity of an order that adds to a position, tokens; 0: none
+    minQuote: Decimal  # the least quote (price x quantity) of one, dollars; 0: none
+    quoteLimit: Decimal  # the most quote of any order, dollars; 0: none
+    signedPriceDecimals: int  # as a spot market's (MarketL2)
+    signedQuantityDecimals: int
 
 
 class PerpsCollateral(TypedDict):
@@ -98,7 +109,8 @@ class PerpsCollateral(TypedDict):
     symbol: str
     decimals: int  # the token's: a display amount is base units / 10^decimals
     tickSize: str  # the token's base units per tick, a decimal string: an allocate moves ticks
-    extensionMultiplier: str  # the reads' extended units per tick, a decimal string
+    # The engine's extended units per tick (a funding index counts them), a decimal string.
+    extensionMultiplier: str
 
 
 class _PerpsPositionRank(TypedDict, total=False):
@@ -108,8 +120,9 @@ class _PerpsPositionRank(TypedDict, total=False):
 
 
 class PerpsPosition(_PerpsPositionRank):
-    """One open position of a pool. Amounts are decimal strings in the engine's units, valued
-    at the mark."""
+    """One open position of a pool, valued at the mark: its prices, base and money actual values,
+    exact Decimals (the money rounded never in your favour); its funding index the engine's
+    integer. Its lots, base x 10^signedQuantityDecimals, are the base the engine counts."""
 
     market: int  # the perps market, 0 to 254
     ticker: str  # the market's
@@ -117,23 +130,32 @@ class PerpsPosition(_PerpsPositionRank):
     risk: int  # its maintenance margin factor per 65,536
     maxLeverage: int  # the most leverage it takes
     band: int  # its market's band: how far (bp) an order's price may sit from the mark; 0: none
-    base: str  # signed, in base units (an order's signed quantity): + long, - short
-    fundingIndex: str  # the funding index it last settled at: it owes base x (F - this)
-    entryQuote: str  # the quote of the fills that opened and grew it
-    entryPrice: str  # 10 x entryQuote / |base|, in the market's price units
-    fundingOwed: str  # extended USDC units: positive pays, negative receives
-    notional: str  # |base| x mark x qem, extended USDC units
-    liquidationPrice: Optional[str]  # the mark past which the pool is liquidatable, or None
+    signedPriceDecimals: int  # its market's l2's: the engine's price is the price x 10^this
+    signedQuantityDecimals: int  # its market's quantityDecimals: its lots are base x 10^this
+    base: Decimal  # signed, tokens: + long, - short
+    # The funding index it last settled at, the engine's integer (extended USDC units per lot), a
+    # decimal string: it owes its lots x (F - this) extended units.
+    fundingIndex: str
+    entryQuote: Decimal  # the quote of the fills that opened and grew it, dollars, exact
+    # entryQuote / |base|, dollars, rounded down to the market's signed price unit
+    # (10^-signedPriceDecimals dollars): it can fall between ticks.
+    entryPrice: Decimal
+    fundingOwed: Decimal  # dollars, rounded up: positive pays, negative receives
+    notional: Decimal  # |base| x the mark, dollars, rounded up to 0.000001
+    # The mark past which the pool is liquidatable, dollars (between ticks too), or None.
+    liquidationPrice: Optional[Decimal]
 
 
 class PerpsPool(TypedDict):
-    """One margin pool of yours: its collateral and positions."""
+    """One margin pool of yours: its collateral and positions, its money in dollars, exact Decimals
+    rounded never in your favour (what it holds down, what it needs up)."""
 
     pool: int  # 0, the cross pool, or 1 to 7
-    collateral: str  # signed, extended USDC units
-    value: Optional[str]  # collateral + each position's signed notional - its funding owed
-    requirement: Optional[str]  # maintenance margin, extended USDC units x 65,536
-    liquidatable: Optional[bool]  # value < 0 or value x 65,536 < requirement
+    collateral: Decimal  # signed, dollars, rounded down
+    # Collateral + each position's signed notional - its funding owed, dollars, rounded down.
+    value: Optional[Decimal]
+    requirement: Optional[Decimal]  # its maintenance margin, dollars, rounded up
+    liquidatable: Optional[bool]  # the engine's: value < 0 or value < requirement, unrounded
     positions: list[PerpsPosition]  # ascending by market, at most 8
 
 
@@ -155,8 +177,8 @@ class FundingPayment(TypedDict):
     marketIndex: int
     ticker: str  # the market's
     pool: int
-    base: str  # the position's signed base at the tick, a decimal string: + long, - short
-    payment: str  # extended USDC units, a decimal string: + the position paid, - it received
+    base: Decimal  # the position's signed base at the tick, tokens: + long, - short
+    payment: Decimal  # dollars, rounded up: + the position paid, - it received
     rateCbp: int  # the rate the tick applied, centi-bp of the index per period
     atMs: int  # the tick's clock, unix ms
 
@@ -164,7 +186,7 @@ class FundingPayment(TypedDict):
 class PerpsHeldPrice(TypedDict):
     """A perps market's newest price report held for an operator's answer."""
 
-    price: int
+    price: Decimal  # dollars
     observedAtMs: int
 
 
@@ -174,13 +196,15 @@ class PerpsMarketLive(TypedDict):
 
     marketIndex: int  # 0 to 254
     status: str  # "ACTIVE", or "EXPIRED": no more orders; positions leave by perps.exit()
-    # What positions are valued at and the band centres on, dollars x 1000 (0 before the first
-    # report).
-    markPrice: int
-    indexPrice: int  # the accepted index (0 before the first report), as of observedAtMs
-    observedAtMs: int
-    openInterest: str  # base units, a decimal string: longs plus shorts (one side's is half)
-    fundingIndex: str  # F, extended USDC units per base unit, signed, a decimal string
+    # What positions are valued at and the band centres on, dollars (0 before the first report);
+    # it can fall between ticks.
+    markPrice: Decimal
+    indexPrice: Decimal  # the accepted index, dollars (0 before the first report)
+    observedAtMs: int  # the clock indexPrice is as of
+    openInterest: Decimal  # tokens: longs plus shorts (one side's is half)
+    # F, the engine's integer: extended USDC units per lot (10^-quantityDecimals tokens), signed, a
+    # decimal string.
+    fundingIndex: str
     nextTickAtMs: int  # when the next is due; 0: none (an expired or unpriced market)
     fundingPeriodMs: int  # the period fundingRateCbp is per
     fundingRateCbp: Optional[int]  # what a tick would apply now, centi-bp of the index per period; None: not rated
@@ -372,10 +396,12 @@ class TradeHistoryItem(TypedDict, total=False):
     # pool the row closed and MAKER the other side.
     role: str
     pool: Optional[int]  # a perps fill's margin pool; None on spot
-    quantity: float
-    price: float
-    fee: float  # this user's fee, dollars, to 0.001
-    closedPnl: Optional[float]  # dollars, signed, before fees; None unless it reduced a position
+    quantity: Decimal  # tokens
+    # Dollars: a trade's on its market's tick; a perps fill off the book (a liquidation, a
+    # deleverage, an exit) at the engine's price, which can fall between ticks.
+    price: Decimal
+    fee: Decimal  # this user's fee, dollars, to 0.000001
+    closedPnl: Optional[Decimal]  # dollars, signed, before fees; None unless it reduced a position
     # TRADE (an order matched), or on a perp LIQUIDATION, BACKSTOP_LIQUIDATION, DELEVERAGE, EXIT,
     # SETTLE, FORCED or FORCED_DELEVERAGE.
     source: str
@@ -432,6 +458,9 @@ class PortfolioSummary(TypedDict):
     balances: list[L2AssetBalance]  # the whole L2 book; a missing row is 0
     holdings: list[Holding]
     perps: Optional[PerpsAccount]  # None: not read just now, which never means you hold none
+    accountMode: Optional[str]  # "MANUAL" or "UNIFIED" (pool 0 draws on your spot USDC); None: unread
+    # The USDC a withdrawal can take now, dollars, rounded down (README, Withdrawals); None: unread.
+    withdrawable: Optional[Decimal]
 
 
 class PortfolioComponent(TypedDict):

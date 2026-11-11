@@ -27,7 +27,15 @@ from loaf import (
 )
 from loaf._object import parse
 
-from conftest import TRADING_KEY
+from conftest import (
+    PERPS_ACCOUNT,
+    PERPS_ACCOUNT_READ,
+    PERPS_LIVE,
+    PERPS_LIVE_READ,
+    PERP_L2,
+    TRADING_KEY,
+    as_decimals,
+)
 
 README = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
 
@@ -106,9 +114,9 @@ def test_mark_price_frames_match_holdings_by_ticker_as_the_readme_shows(capsys):
     ws = _client()
     exec(code, {"loaf": SimpleNamespace(portfolio=SimpleNamespace(summary=lambda: summary)), "ws": ws})
     assert ws._channels == {"markprice:OPRA", "markprice:MUS"}
-    ws._dispatch(_frame(type="mark_price", ticker="MUS", price=50.5))
-    ws._dispatch(_frame(type="mark_price", ticker="OPRA", price=101.25))
-    ws._dispatch(_frame(type="mark_price", ticker="H100", price=7))  # a market none is held on
+    ws._dispatch(_frame(type="mark_price", ticker="MUS", price="50.5"))
+    ws._dispatch(_frame(type="mark_price", ticker="OPRA", price="101.25"))
+    ws._dispatch(_frame(type="mark_price", ticker="H100", price="7"))  # a market none is held on
     assert capsys.readouterr().out == "MUS marked at 50.5\nOPRA marked at 101.25\n"
 
 
@@ -120,11 +128,11 @@ def test_trade_new_dispatch():
     tx_hash = "0x" + "3f" * 32
     ws._dispatch(_frame(type="trade_new", trade={
         "tradeId": 1, "orderId": 991, "marketIndex": 2050, "ticker": "OPRA", "txHash": tx_hash,
-        "side": "BUY", "role": "TAKER", "pool": None, "quantity": 1, "price": 100,
-        "executedAt": 0, "fee": 0.173, "closedPnl": None, "source": "TRADE", "direction": "BUY",
+        "side": "BUY", "role": "TAKER", "pool": None, "quantity": "1", "price": "100",
+        "executedAt": 0, "fee": "0.173", "closedPnl": None, "source": "TRADE", "direction": "BUY",
     }))
     trade = seen[0].trade
-    assert (trade.tradeId, trade.txHash, trade.fee) == (1, tx_hash, 0.173)
+    assert (trade.tradeId, trade.txHash, trade.fee) == (1, tx_hash, Decimal("0.173"))
     assert (trade.orderId, trade.role) == (991, "TAKER")  # the user's own order, which aggressed
     assert (trade.source, trade.direction, trade.pool) == ("TRADE", "BUY", None)
 
@@ -149,30 +157,27 @@ def test_a_liquidation_row_reaches_on_trade():
     ws.on_trade(seen.append)
     trade = {
         "tradeId": 990, "orderId": 77, "marketIndex": 4, "ticker": "MUS-PERP", "txHash": None,
-        "side": "BUY", "role": "MAKER", "pool": 0, "quantity": 1.5, "price": 26.1, "fee": 0,
+        "side": "BUY", "role": "MAKER", "pool": 0, "quantity": "1.5", "price": "26.1", "fee": "0",
         "closedPnl": None, "source": "LIQUIDATION", "direction": "OPEN_LONG",
         "executedAt": 1_800_000_002,
     }
     ws._dispatch(_frame(type="trade_new", trade=trade))
     (frame,) = seen
-    assert frame.trade == trade and frame.trade.txHash is None
+    assert frame.trade == as_decimals(trade, FILL_DECIMALS) and frame.trade.txHash is None
 
 
 @pytest.mark.parametrize(
     "register, fields",
     [
         ("on_perps_account", {"type": "perps_account_update", "perps": {"l2AccountIndex": 5, "pools": []}}),
-        ("on_funding_payment", {"type": "funding_payment", "funding": {"journalSeq": 7, "payment": "-12"}}),
         ("on_holding", {"type": "holding_update", "holding": {"ticker": "MUS", "averageEntryPrice": 12.5}}),
         ("on_transfer", {"type": "transfer_update", "transfer": {"journalSeq": 9}}),
         ("on_fees", {"type": "fees_update", "applicableFees": {"takerFeeBps": 30, "makerFeeBps": 10}}),
         ("on_l2_keys", {"type": "l2_keys_update", "apiKeyIndices": [0]}),
         ("on_perps_leverage", {"type": "perps_leverage_update", "ticker": "OPRA-PERP", "leverage": 5}),
-        ("on_market_terms", {"type": "market_terms_update", "marketIndex": 4, "l2": {"status": "EXPIRED"}}),
         ("on_orderbook", {"type": "orderbook_update", "ticker": "H100-PERP", "bids": [], "asks": []}),
         ("on_candle", {"type": "candle_update", "ticker": "H100-PERP", "candle": {"time": 60, "close": 101.5}}),
         ("on_trades", {"type": "trades_batch", "ticker": "H100-PERP", "trades": [{"tradeId": 7}]}),
-        ("on_mark_price", {"type": "mark_price", "ticker": "H100-PERP", "price": 101.25}),
         ("on_volume", {"type": "volume_update", "ticker": "H100-PERP", "volume24h": 12.5}),
         ("on_market_halt", {"type": "market_halt", "ticker": "H100-PERP", "isHalted": True}),
     ],
@@ -189,14 +194,87 @@ def test_perps_markets_live_reaches_its_handler():
     ws = _client()
     seen = []
     ws.on_perps_markets_live(seen.append)
-    live = {
-        "marketIndex": 4, "markPrice": 2510, "riskOnly": True, "asOfMs": 1_800_000_001_250,
-        "tradingState": "OPEN",
-    }
-    ws._dispatch(_frame(type="perps_markets_live", markets=[live], timestamp=0))
+    ws._dispatch(_frame(type="perps_markets_live", markets=[PERPS_LIVE], timestamp=0))
     (frame,) = seen
-    assert frame.markets == [live]
+    assert frame.markets == [PERPS_LIVE_READ]
     assert frame.markets[0].riskOnly is True
+
+
+# A fill's served decimals, and a funding payment's: the SDK reads each as a Decimal.
+FILL_DECIMALS = ("quantity", "price", "fee", "closedPnl")
+FUNDING_DECIMALS = ("base", "payment")
+FUNDING = {"journalSeq": 7, "marketIndex": 4, "ticker": "OPRA-PERP", "pool": 0, "base": "2.004",
+           "payment": "-0.000012", "rateCbp": -250, "atMs": 1_800_000_000_000}
+CLOSE = {"tradeId": 990, "orderId": None, "marketIndex": 4, "ticker": "OPRA-PERP", "txHash": None,
+         "side": "SELL", "role": "TAKER", "pool": 0, "quantity": "2.004", "price": "98.7654",
+         "fee": "0.098978", "closedPnl": "-5.483937", "source": "LIQUIDATION",
+         "direction": "CLOSE_LONG", "executedAt": 1_800_000_002}
+
+
+@pytest.mark.parametrize(
+    "register, fields, read",
+    [
+        ("on_mark_price", {"type": "mark_price", "ticker": "H100-PERP", "price": "101.2501"},
+         {"price": Decimal("101.2501")}),
+        ("on_market_terms", {"type": "market_terms_update", "marketIndex": 4, "ticker": "OPRA-PERP",
+                             "l2": {**PERP_L2, "minBase": "0.01", "minQuote": "10", "quoteLimit": "281474.976711"}},
+         {"l2": {**PERP_L2, "minBase": Decimal("0.01"), "minQuote": Decimal(10),
+                 "quoteLimit": Decimal("281474.976711")}}),
+        ("on_market_terms", {"type": "market_terms_update", "marketIndex": 4, "l2": {"status": "EXPIRED"}},
+         {}),
+        ("on_perps_account", {"type": "perps_account_update", "perps": {
+            "l2AccountIndex": 5, "pools": PERPS_ACCOUNT["pools"]}, "snapshot": True,
+            "accountMode": "UNIFIED", "withdrawable": "4990.000001"},
+         {"perps": {"l2AccountIndex": 5, "pools": PERPS_ACCOUNT_READ["pools"]},
+          "withdrawable": Decimal("4990.000001")}),
+        ("on_perps_account", {"type": "perps_account_update", "perps": {"l2AccountIndex": 5, "pools": []},
+                              "accountMode": "MANUAL", "withdrawable": None},
+         {}),
+        ("on_funding_payment", {"type": "funding_payment", "funding": FUNDING},
+         {"funding": as_decimals(FUNDING, FUNDING_DECIMALS)}),
+        ("on_trade", {"type": "trade_new", "trade": CLOSE}, {"trade": as_decimals(CLOSE, FILL_DECIMALS)}),
+    ],
+    ids=["mark", "terms", "terms-expired", "account", "account-unread", "funding", "fill"],
+)
+def test_a_frames_served_decimals_reach_its_handler_as_decimals(register, fields, read):
+    # Each price, size and dollar amount is the Decimal of its served string, exactly; nothing
+    # else of the frame changes, and a null (no withdrawable now) stays null.
+    ws = _client()
+    seen, every = [], []
+    getattr(ws, register)(seen.append)
+    ws.on_message(every.append)
+    ws._dispatch(_frame(**fields))
+    assert seen == every == [{**fields, "timestamp": 0, **read}]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"type": "mark_price", "ticker": "MUS", "price": 50.5},  # a number: never read as dollars
+        {"type": "mark_price", "ticker": "MUS", "price": "50.50"},
+        {"type": "perps_markets_live", "markets": [PERPS_LIVE, {**PERPS_LIVE, "markPrice": 2_510_000}]},
+        {"type": "perps_markets_live", "markets": [{**PERPS_LIVE, "heldPrice": {"price": "2.6e0"}}]},
+        {"type": "market_terms_update", "marketIndex": 4, "l2": {**PERP_L2, "minBase": 0}},
+        {"type": "perps_account_update", "perps": {"l2AccountIndex": 5, "pools": []},
+         "withdrawable": "1.0000001"},
+        {"type": "funding_payment", "funding": {**FUNDING, "payment": "-0"}},
+        {"type": "trade_new", "trade": {**CLOSE, "closedPnl": "+5"}},
+    ],
+    ids=["number", "trailing-zero", "old-unit", "exponent", "terms", "places", "negative-zero", "plus"],
+)
+def test_a_frame_with_a_malformed_served_decimal_is_dropped_and_logged(fields, caplog):
+    ws = _client().subscribe_portfolio()
+    seen = []
+    ws.on_message(seen.append)
+    for kind in ("mark_price", "perps_markets_live", "market_terms_update", "perps_account_update",
+                 "funding_payment", "trade_new"):
+        ws.on(kind, seen.append)
+    with caplog.at_level("ERROR", logger="loaf.ws"):
+        ws._dispatch(_frame(**fields, engineMs=ENGINE_MS, snapshot=True))
+    assert seen == []
+    (record,) = caplog.records
+    assert record.getMessage().startswith(f"Loaf WebSocket dropped a {fields['type']} frame with a malformed ")
+    assert ws.fresh is None and ws.engine_ms is None  # no news: the beat noted nothing
 
 
 def test_balances_update_keeps_base_unit_strings():

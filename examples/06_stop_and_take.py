@@ -12,6 +12,7 @@ login tokens that read your trading account, read the row back and cancel it.
 from __future__ import annotations
 
 import time
+from decimal import ROUND_CEILING, Decimal
 
 import loaf
 from loaf import LoafClient
@@ -50,20 +51,27 @@ def main() -> None:
 
     # A STOP BUY fires when the mark RISES to the trigger, so a trigger 50%
     # above the market just rests. (A stop SELL would need tokens to sell when it
-    # fires.)
-    trigger = round(mark * 1.50, 2)
+    # fires.) The trigger is on the market's tick: at most priceDecimals decimals.
+    decimals = detail.market.priceDecimals, detail.market.quantityDecimals
+    trigger = round(mark * 1.50, decimals[0])
     # When it fires it books a LIMIT BUY at the trigger plus the client's max
-    # slippage ($LOAF_MAX_SLIPPAGE_BPS, default 2%). That price x quantity must be
-    # at least $10; your cash is checked only when it fires.
-    books_at = loaf.worst_price(trigger, "BUY", client.max_slippage_bps)
-    print(f"Arming STOP_MARKET BUY 1 {market.ticker} @ trigger {trigger} "
+    # slippage ($LOAF_MAX_SLIPPAGE_BPS, default 2%), on the tick. That price x
+    # quantity must be at least the market's minOrderValue ($10), so the quantity
+    # is that over the price, rounded up to the market's lot (10^-quantityDecimals
+    # tokens) in Decimal; your cash is checked only when it fires.
+    books_at = loaf.worst_price(trigger, "BUY", client.max_slippage_bps,
+                                price_decimals=decimals[0], quantity_decimals=decimals[1])
+    lot = Decimal(1).scaleb(-decimals[1])
+    tokens = Decimal(str(detail.market.minOrderValue)) / Decimal(str(books_at))
+    quantity = tokens.quantize(lot, rounding=ROUND_CEILING)  # at least one lot
+    print(f"Arming STOP_MARKET BUY {quantity} {market.ticker} @ trigger {trigger} "
           f"(books at up to {books_at}; rounded toward the trigger; mark {mark})")
 
     try:
         result = client.orders.create_conditional(
             market.ticker,
             "BUY",
-            quantity=1,
+            quantity=float(quantity),  # a float on the lot is sent as exactly its decimal
             type="STOP_MARKET",
             trigger_price=trigger,
         )

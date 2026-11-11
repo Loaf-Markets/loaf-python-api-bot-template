@@ -47,7 +47,12 @@ string; a trade in a ``trades_batch`` names none.
 
 Prices and quantities are human units (dollars / tokens); ``balances_update``
 amounts are base-unit decimal strings (see :func:`loaf.from_base_units`);
-timestamps are unix seconds (an order row's ``expiryMs`` is milliseconds).
+timestamps are unix seconds (an order row's ``expiryMs`` is milliseconds). The
+perps frames' prices, sizes and amounts, a ``mark_price`` frame's price and a
+fill's quantity, price, fee and closed PnL are exact
+:class:`~decimal.Decimal` values, as the REST reads give them: the exchange
+serves each as an exact decimal string, and a frame with one in any other form
+is dropped and logged, never read in another unit.
 
 **Engine stamps.** A frame that relays a change the exchange's engine made
 carries ``engineMs``, the engine's clock (unix ms) when the batch that made it
@@ -97,6 +102,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
 
+from .. import _served
 from .._object import LoafObject, parse
 from ..constants import DEFAULT_STALE_AFTER
 from ..enums import WSMessageType
@@ -296,9 +302,10 @@ class LoafWebSocketClient:
         on ``ticker``. A holding's ticker is its spot market's
         (:meth:`loaf.resources.portfolio.PortfolioResource.summary`); an IPO
         allocation keeps its unit price until it trades, so no frame values
-        it. On a perp this is the engine's mark in dollars, ``markPrice`` of
-        :meth:`on_perps_markets_live`: what positions are valued at and stops
-        fire on.
+        it. ``price`` is dollars, an exact :class:`~decimal.Decimal`, on every
+        market; on a perp it is the engine's mark, the ``markPrice`` of
+        :meth:`on_perps_markets_live` (it can fall between ticks): what
+        positions are valued at and stops fire on.
         """
         return self.on(WSMessageType.MARK_PRICE, handler)
 
@@ -406,7 +413,8 @@ class LoafWebSocketClient:
         ``orderId`` your order, ``fee`` 0, and its public print
         (:meth:`on_trades`, ``isLiquidation: True``) has the same ``tradeId``.
         ``trade.direction`` and ``trade.closedPnl`` say what it did to the
-        position; ``trade.fee`` is dollars to 0.001. Each engine update's burst
+        position; ``trade.quantity``, ``price``, ``fee`` (dollars to 0.000001)
+        and ``closedPnl`` are exact Decimals. Each engine update's burst
         carries its ``order_status`` frames, then its ``trade_new`` frames,
         then ``balances_update``; an update with more than 200 statuses or
         trades comes as several such bursts, ``balances_update`` in the last
@@ -451,10 +459,11 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.LIFETIME_VOLUME_UPDATE, handler)
 
     def on_perps_account(self, handler: Handler | None = None) -> Any:
-        """Your perps account (``perps_account_update``: ``{perps}``,
-        ``{l2AccountIndex, pools}`` as
-        :meth:`loaf.resources.perps.PerpsResource.positions` serves them),
-        after every engine commit that touches it, and as a snapshot
+        """Your perps account (``perps_account_update``: ``{perps,
+        accountMode, withdrawable}``, ``perps`` ``{l2AccountIndex, pools}`` as
+        :meth:`loaf.resources.perps.PerpsResource.positions` serves them, the
+        other two as :meth:`loaf.resources.portfolio.PortfolioResource.summary`
+        does), after every engine commit that touches it, and as a snapshot
         (``snapshot: True``) about once a second, changed or not, flat
         accounts included: replace the pools you hold (a pool it does not list
         holds nothing). Its values are as of ``engineMs``: between pushes
@@ -986,6 +995,12 @@ class LoafWebSocketClient:
             return
         obj = parse(message)
         mtype = message.get("type") if isinstance(message, dict) else None
+        try:
+            _served.frame(obj)
+        except _served.Malformed as exc:
+            # Never a value in another unit: the frame is dropped, as one that is not JSON is.
+            logger.error("Loaf WebSocket dropped a %s frame with %s", mtype, exc)
+            return
         if (
             mtype == WSMessageType.ECHO
             and not self._connected_event.is_set()

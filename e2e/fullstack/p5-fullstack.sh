@@ -67,7 +67,7 @@ export E2E_SETTLESUB_METRICS=${E2E_SETTLESUB_METRICS:-${P5_SETTLESUB_METRICS:-ht
 export E2E_ENGINE_METRICS=${E2E_ENGINE_METRICS:-${P5_ENGINE_METRICS:-http://127.0.0.1:49091/metrics}}
 export E2E_ADMIN_API_KEY_FILE=${E2E_ADMIN_API_KEY_FILE:-$run/lb-admin.key}
 export E2E_OPERATOR=${E2E_OPERATOR:-sql}
-export E2E_HOME_INDEX=${E2E_HOME_INDEX:-1500000}
+export E2E_HOME_PRICE=${E2E_HOME_PRICE:-1500}
 export E2E_TAG=${E2E_TAG:-p5fs}
 if [ -z "${E2E_PSQL:-}" ] && [ -z "${E2E_PSQL_DSN_FILE:-}" ]; then
     if [ -x "$run/psql" ]; then

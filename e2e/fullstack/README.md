@@ -38,13 +38,13 @@ Every wait has a deadline (E2E_WAIT_S and the longer ones below). Nothing secret
 
 Whatever its verdict, each step then puts back what it moved (`restore: ...`): the run's orders are cancelled, each
 market whose state it controlled (the admin halt, the operator's controls, a silenced price) is reopened, each market
-it walked or silenced walks home (`E2E_HOME_INDEX`, else its index before the step's first move), and the backstop's
+it walked or silenced walks home (`E2E_HOME_PRICE`, else its index before the step's first move), and the backstop's
 knob goes back to 0 if the step raised it. Each part is tried whatever the others did; one that fails is logged
 `ERROR <step>: not restored: ...` and makes a passing step an error (2). A stop (SIGTERM) runs the running step's
 restore on the way out, logs `STOPPED (exit 143)`, the verdict FAIL, and exits 143.
 
 `E2E_STEPS=restore`, alone, runs no setup and no other step: every role market reopened if it is not OPEN and
-walked home to `E2E_HOME_INDEX`, the knob at 0, then each checked OPEN at home; the backstop's free collateral and
+walked home to `E2E_HOME_PRICE`, the knob at 0, then each checked OPEN at home; the backstop's free collateral and
 positions are logged. Its positions stay: the kit's `backstop_flatten` closes them, and the liquidation step
 refuses a stack whose backstop holds one on `liq1`.
 
@@ -66,14 +66,13 @@ refuses a stack whose backstop holds one on `liq1`.
 | `E2E_ADMIN_API_KEY` | | else the key itself |
 | `E2E_PRICE_CONTROL` / `E2E_PRICE_STATUS` | none | the pump's control and status files (below); without them every price leg is INCOMPLETE |
 | `E2E_OPERATOR` | none | `sql`: the operator's controls emulated (below); none: those legs are INCOMPLETE |
-| `E2E_HOME_INDEX` | none | setup walks every role market to this index first |
+| `E2E_HOME_PRICE` | none | setup walks every role market's index to this price (dollars) first |
 | `E2E_SETTLESUB_METRICS` | none | settlesub's Prometheus URL (`settlesub_last_verified_batch`) |
 | `E2E_ENGINE_METRICS` | none | the engine's Prometheus URL (`matching_engine_perps_liq_pending`), for the backstop's guard |
 | `E2E_MARKETS` | `trade=0,liq1=6,liq0=2,halt=3,carry_pos=8,carry_neg=9` | the perps market each role uses (liq1: the deleverage and mode 1; liq0: mode 0; carry_pos/carry_neg: the markets with a positive / negative funding carry) |
 | `E2E_BACKSTOP_DOLLARS` | 50000 | the backstop's free collateral for the mode 1 leg |
 | `E2E_SPOT` | the first LIVE spot market with an L2 | the spot market; none listed: the spot step is INCOMPLETE (so the verdict is FAIL); its deposits failing in setup FAIL the spot step |
 | `E2E_SPOT_PRICE` | 10 | the spot reference when the market has no price yet |
-| `E2E_PRICE_DECIMALS` / `E2E_SIZE_DECIMALS` | 3 / 1 | an index's decimals (dollars x 1000) and a size's (tokens x 10) |
 | `E2E_NOTIONAL` | 1500 | dollars per position |
 | `E2E_MIXED_SECS` | 30 | the mixed step's length: spot and perps IOC fills at once for that long |
 | `E2E_STEPS` | all | a comma list of steps (setup always runs), or `restore` alone (no setup) |
@@ -81,11 +80,23 @@ refuses a stack whose backstop holds one on `liq1`.
 | `E2E_TAG` | e2e | the run's users' display-name prefix |
 | `E2E_WAIT_S` / `E2E_FINAL_WAIT_S` / `E2E_PROOF_WAIT_S` | 180 / 2400 / 5400 | a wait's deadline; a wait on the mark or a funding tick; the proofs' |
 
+### Units
+
+Each market has its own tick and lot, set at its listing: the `priceDecimals` and `quantityDecimals` of its
+`GET /api/trade` row, which setup reads for every market. The driver prices an order on its market's tick
+(10^-priceDecimals dollars) and sizes it in its lots (10^-quantityDecimals tokens). The backend serves every price,
+size and dollar amount of the perps reads as its actual value (an index, a mark, a position's base, entry and
+liquidation prices, open interest, a pool's collateral, value and requirement, a funding payment), which the SDK
+reads as an exact `Decimal` of dollars or tokens, and the driver counts in them; the pump and the engine count a
+market's prices in its signed units, an index in dollars x 10^(7 - quantityDecimals), which the driver converts to
+when it writes a walk (rounded down). The backend rounds each dollar amount to $0.000001 against the account (what it
+holds down, what it needs or owes up), so a check that sums served amounts allows a millionth for each rounding.
+
 ### The price pump's control
 
 The driver writes each control whole to a temporary file beside `E2E_PRICE_CONTROL` and renames it onto it:
 `{"seq": n, "markets": {"<m>": {"mode": "walk", "index": i} | {"mode": "quiet"}}, "backstop": {"free_ticks": t}}`,
-`n` above the file's last `seq` and the status's `applied_seq`. A control names only what it changes: a market it
+`i` in the market's signed price units (**Units**), `n` above the file's last `seq` and the status's `applied_seq`. A control names only what it changes: a market it
 does not name keeps its mode, and a control without `backstop` leaves the backstop as it is. The driver waits until
 `E2E_PRICE_STATUS` reads `applied_seq` >= `n` (an `error` there fails the step; a control the pump cannot read
 leaves `applied_seq` and sets `file_error`, which the timeout names), then, for a walk, until the backend's live
@@ -117,10 +128,11 @@ route and its Privy auth are not exercised.
 ## What each step asserts
 
 **setup**
-- every role's market is listed ACTIVE with a ticker; spot and perps share one vault and L2 chain; the RPC serves
+- every role's market is listed ACTIVE with a ticker and its decimals, and so is the spot market; spot and perps
+  share one vault and L2 chain; the RPC serves
   that chain; ZkLoaf has code; the collateral is asset 3 (USDC), read with the first login, and L1's USDC tick and
   extension are the backend's;
-- with `E2E_HOME_INDEX`, every role market's index walks there (a market left unreported is reported again);
+- with `E2E_HOME_PRICE`, every role market's index walks there (a market left unreported is reported again);
 - A, B, C (INVESTOR) and MM (MARKET_MAKER, which the backend's per-user rate limiter exempts) are upserted (the users
   id sequence moved past the largest id first) before any deposit to them: the engine binds an address's L2 account
   to the user whose wallet the deposit names when it journals the deposit, and nothing else binds it for the driver
@@ -191,10 +203,11 @@ go in the verdict's notes, and the proof step then finds every one of these trad
 **funding** (markets `carry_pos` and `carry_neg`): A opens a long at the index from isolated pools 6 and 7 (its own
 quotes at the index add no impact premium); two payments of A's that moved money carry the carry's sign, in
 `history.funding()` and on its `funding_payment` frames; A's funding owed has it (positive pays) and MM's short the
-other; each pool's value is exactly collateral + notional - funding owed; the close at the index, away from a tick,
-leaves the collateral at the pool's value with the gap from the mark to the close's price realised, less the close's
-fee (within a cent a token): the funding was realised (A's ask half the band above the index, resting from the pool
-through the close, keeps the engine from sweeping the flat pool into pool 0 before that read).
+other; each pool's value is collateral + notional - funding owed, to the backend's rounding ($0.000001); the close
+at the index, away from a tick, leaves the collateral at the pool's value with the gap from the mark to the close's
+price realised, less the close's fee (within a tick a token and the roundings): the funding was realised (A's ask
+half the band above the index, resting from the pool through the close, keeps the engine from sweeping the flat
+pool into pool 0 before that read).
 
 **liquidation** (C's longs from isolated pools with their initial margin plus 10 %, opened against MM's ask at the
 index, with no bid left on the book)
@@ -263,5 +276,6 @@ check (the exchange's rule, both edges in; each quote a band refuses named, MM's
 under 110 bp at $100; a band of 100 bp fails the step before it touches a user); the
 deleverage SQL on `l2_perps_fills`; each step's
 restore (a failing step's markets reopened and walked home and the knob put at 0, with and without
-`E2E_HOME_INDEX`; a restore that fails named, a passing step then an error; a stop's restore) and the one-shot
-restore (alone, no setup). `E2E_SDK` names an SDK tree when the venv has none installed.
+`E2E_HOME_PRICE`, each walk in the market's signed units; a restore that fails named, a passing step then an error; a
+stop's restore) and the one-shot restore (alone, no setup); the units (a market's tick and lot, its signed price
+decimals, the pump's signed index, the collateral's tick) and the perps step's prices on its market's tick. `E2E_SDK` names an SDK tree when the venv has none installed.

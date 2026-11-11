@@ -7,7 +7,7 @@ Steps, in order (README.md has what each asserts):
   setup        users A, B, C and the market maker MM (rows in the backend's database), gas, each user's L2
                account (opened by a first L1 deposit) and trading key (derived from its wallet, which registers
                it on L1), every trading key's login, L1 deposits credited on L2; the role markets walked to
-               E2E_HOME_INDEX
+               E2E_HOME_PRICE
   spot         a limit order rests and is cancelled, post-only rests and refuses to take, IOC, FOK, a crossing
                fill between two users
   perps        allocates into pool 0 and isolated pools; long and short by limit and market; post-only, IOC, FOK,
@@ -44,6 +44,7 @@ admin key and the database DSNs are read from their files when a request needs t
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import signal
@@ -55,7 +56,8 @@ import traceback
 import urllib.parse
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Any, Callable, Mapping, Sequence
+from fractions import Fraction
+from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 import httpx
 from eth_abi import decode as abi_decode
@@ -65,7 +67,7 @@ from eth_account.messages import encode_typed_data
 from eth_utils import keccak, to_checksum_address
 from loaf import k1, worst_price
 from loaf.client import LoafClient
-from loaf.constants import PERPS_SPOT_SIDE, TRADING_KEY_PREFIX
+from loaf.constants import L2_SIGNED_DECIMALS, PERPS_SPOT_SIDE, TRADING_KEY_PREFIX
 from loaf.exceptions import (
     LoafAPIError,
     LoafConnectionError,
@@ -103,6 +105,11 @@ SPOT_MIN_VALUE = Decimal(10)
 SPOT_VALUE_MARGIN = Decimal("2.5")
 #: The backend's largest history page: a larger one is a 400.
 HISTORY_PAGE_MAX = 100
+#: The backend serves every perps price, size and dollar amount as its actual value, which the SDK reads as an exact
+#: Decimal (dollars, tokens); the engine and the pump count a market's prices in its signed units, price x
+#: 10^(7 - quantityDecimals). Each dollar amount is to US$0.000001, rounded against the account (what it holds down,
+#: what it needs or owes up): a check that sums served amounts allows this for each rounding.
+QUOTE_UNIT = Decimal("0.000001")
 #: How long, from the commit of an allocate into an isolated pool, the engine leaves a pool that backs nothing to the
 #: order the allocate funds before it sweeps the pool into pool 0 (loaf-matching-engine sweep.rs ALLOCATE_GRACE_MS).
 ALLOCATE_GRACE_S = 10
@@ -226,11 +233,9 @@ class Config:
     settlesub_metrics: str | None
     engine_metrics: str | None
     markets: dict[str, int]
-    home_index: int | None
+    home_price: Decimal | None
     spot: str | None
     spot_price: Decimal
-    price_decimals: int
-    size_decimals: int
     notional: Decimal
     mixed_s: float
     backstop_dollars: Decimal
@@ -259,7 +264,7 @@ class Config:
         operator = _env("E2E_OPERATOR", "none")
         if operator not in ("none", "sql"):
             raise SystemExit(f"E2E_OPERATOR is none or sql, not {operator!r}")
-        home = os.environ.get("E2E_HOME_INDEX") or None
+        home = os.environ.get("E2E_HOME_PRICE") or None
         return cls(
             api=_env("E2E_API").rstrip("/"),
             ws=os.environ.get("E2E_WS") or None,
@@ -277,11 +282,9 @@ class Config:
             settlesub_metrics=os.environ.get("E2E_SETTLESUB_METRICS") or None,
             engine_metrics=os.environ.get("E2E_ENGINE_METRICS") or None,
             markets=parse_markets(_env("E2E_MARKETS", "trade=0,liq1=6,liq0=2,halt=3,carry_pos=8,carry_neg=9")),
-            home_index=int(home) if home else None,
+            home_price=Decimal(home) if home else None,
             spot=os.environ.get("E2E_SPOT") or None,
             spot_price=Decimal(_env("E2E_SPOT_PRICE", "10")),
-            price_decimals=int(_env("E2E_PRICE_DECIMALS", "3")),
-            size_decimals=int(_env("E2E_SIZE_DECIMALS", "1")),
             notional=Decimal(_env("E2E_NOTIONAL", "1500")),
             mixed_s=float(_env("E2E_MIXED_SECS", "30")),
             backstop_dollars=Decimal(_env("E2E_BACKSTOP_DOLLARS", "50000")),
@@ -324,11 +327,15 @@ def wait_for(what: str, probe: Callable[[], Any], timeout: float, every: float =
         time.sleep(every)
 
 
-def value_once(read: Callable[[], int], done: Callable[[int], bool]) -> Callable[[], tuple[int] | None]:
+#: A numeric wait's number: a balance in base units, or a pool's collateral in dollars.
+Number = TypeVar("Number", int, Decimal)
+
+
+def value_once(read: Callable[[], Number], done: Callable[[Number], bool]) -> Callable[[], tuple[Number] | None]:
     """A numeric wait's probe: what ``read`` answers, in a tuple, once ``done`` holds for it, so 0 ends the wait as
     any other number does (a pool swept empty reads 0); the wait returns the tuple."""
 
-    def probe() -> tuple[int] | None:
+    def probe() -> tuple[Number] | None:
         value = read()
         return (value,) if done(value) else None
 
@@ -559,8 +566,9 @@ def refusals(cfg: Config) -> tuple[int, list[list[str]]] | None:
 class Prices:
     """The kit's price pump (its fullstack phase): each control is written whole to a temporary file
     beside ``control`` and renamed onto it, its ``seq`` above every earlier one, and names only what it changes:
-    a market's mode (``{"mode": "walk", "index": i}``, a walk inside the move bound, or ``{"mode": "quiet"}``, no
-    reports) and the backstop's free collateral (``{"free_ticks": n}``). The pump answers in ``status``
+    a market's mode (``{"mode": "walk", "index": i}``, a walk inside the move bound, ``i`` the engine's index in the
+    market's signed price units, or ``{"mode": "quiet"}``, no reports) and the backstop's free collateral
+    (``{"free_ticks": n}``). The pump answers in ``status``
     (``applied_seq``, ``error``, ``markets`` and ``backstop``); a control it cannot read, with ``file_error`` and
     ``applied_seq`` unchanged."""
 
@@ -680,18 +688,20 @@ def l2_key_typed_data(
     }
 
 
-def index_for(pool: Mapping[str, Any], market: int, p0: int, num: int, den: int) -> int:
-    """The index that brings a pool holding one long on ``market`` (notional n0 at price p0, the pool's value v0
-    and maintenance requirement r0 read at p0) to ``num/den`` of its requirement (a negative ``num``
-    takes the value below 0): both move with the price, v(p) = v0 - n0 (1 - p/p0)
-    and r(p) = r0 p/p0; the mark follows the walked index to it. The pool reads its requirement x 65,536."""
+def index_for(pool: Mapping[str, Any], market: int, p0: Decimal, num: int, den: int) -> Decimal:
+    """The index (dollars) that brings a pool holding one long on ``market`` (notional n0 at the price p0, the pool's
+    value v0 and maintenance requirement r0 read at p0, all dollars) to ``num/den`` of its requirement (a negative
+    ``num`` takes the value below 0): both move with the price, v(p) = v0 - n0 (1 - p/p0) and r(p) = r0 p/p0; the
+    mark follows the walked index to it. Exact, then rounded down to the millionth."""
     pos = [p for p in pool["positions"] if int(p["market"]) == market]
-    if len(pos) != 1 or int(pos[0]["base"]) <= 0:
+    if len(pos) != 1 or pos[0]["base"] <= 0:
         raise Failed(f"pool {pool.get('pool')} holds no single long on {market}: {short(pool)}")
-    n0, v0, r0 = int(pos[0]["notional"]), int(pool["value"]), int(pool["requirement"]) // 65_536
+    n0, v0, r0 = (Fraction(x) for x in (pos[0]["notional"], pool["value"], pool["requirement"]))
     if not 0 < r0 < v0:
-        raise Failed(f"pool {pool.get('pool')}: value {v0} against requirement {r0} is not a healthy pool")
-    return p0 * den * (n0 - v0) // (den * n0 - num * r0)
+        raise Failed(f"pool {pool.get('pool')}: value {pool['value']} against requirement {pool['requirement']} is "
+                     "not a healthy pool")
+    index = Fraction(p0) * den * (n0 - v0) / (den * n0 - num * r0)
+    return Decimal(math.floor(index * 10**6)) / 10**6
 
 
 #: The engine's gauge of the pools its liquidation step found below maintenance and has not found healthy since.
@@ -794,19 +804,22 @@ def position_of(user: User, market: int, pool: int) -> Mapping[str, Any] | None:
     return None
 
 
-def base_of(user: User, market: int, pool: int) -> int:
+def base_of(user: User, market: int, pool: int) -> Decimal:
+    """``user``'s base on ``market`` in ``pool``, tokens (signed); 0 with no position."""
     pos = position_of(user, market, pool)
-    return 0 if pos is None else int(pos["base"])
+    return Decimal(0) if pos is None else pos["base"]
 
 
-def collateral_of(user: User, pool: int) -> int:
-    return int((pool_of(user, pool) or {}).get("collateral") or 0)
+def collateral_of(user: User, pool: int) -> Decimal:
+    """``user``'s collateral in ``pool``, dollars; 0 for a pool that holds nothing."""
+    held = pool_of(user, pool)
+    return Decimal(0) if held is None else held["collateral"]
 
 
 def idle(pool: Mapping[str, Any] | None) -> bool:
     """Whether ``pool`` (a ``perps.positions()`` pool) holds collateral and no position: an isolated one the engine
     sweeps into pool 0 once no order holds it."""
-    return pool is not None and not pool.get("positions") and int(pool.get("collateral") or 0) > 0
+    return pool is not None and not pool.get("positions") and pool["collateral"] > 0
 
 
 def placed(answer: Mapping[str, Any], what: str) -> Mapping[str, Any]:
@@ -839,18 +852,21 @@ def band_of(l2: Mapping[str, Any]) -> int:
     return band if isinstance(band, int) and not isinstance(band, bool) and band > 0 else 0
 
 
-def in_band(price: int, centre: int, band: int) -> bool:
-    """The exchange's perps band, both in one price unit: ``|price - centre| x 10,000 <= band x centre``, both edges
-    in; a band or a centre of 0 bands nothing."""
+def in_band(price: Decimal, centre: Decimal, band: int) -> bool:
+    """The exchange's perps band, both in dollars: ``|price - centre| x 10,000 <= band x centre``, both edges in; a
+    band or a centre of 0 bands nothing."""
     return band == 0 or centre == 0 or abs(price - centre) * 10_000 <= band * centre
 
 
-def leg_limit(l2: Mapping[str, Any], trigger: Decimal, side: str, bps: int) -> Decimal:
+def leg_limit(l2: Mapping[str, Any], decimals: tuple[int, int], trigger: Decimal, side: str, bps: int) -> Decimal:
     """The limit a perps TP/SL leg of ``side`` signs off ``trigger`` with ``leg_max_slippage_bps=bps``, as the SDK
-    derives it: moved at most half the market's band (its ``l2``'s ``band`` bp; 0 bounds nothing), to the cent toward
-    the trigger."""
+    derives it: moved at most half the market's band (its ``l2``'s ``band`` bp; 0 bounds nothing), to the market's
+    tick toward the trigger (``decimals``: its priceDecimals and quantityDecimals)."""
     band = band_of(l2)
-    return Decimal(str(worst_price(trigger, side, min(bps, band // 2) if band else bps)))
+    moved = min(bps, band // 2) if band else bps
+    price_decimals, quantity_decimals = decimals
+    return Decimal(str(worst_price(trigger, side, moved, price_decimals=price_decimals,
+                                   quantity_decimals=quantity_decimals)))
 
 
 # Where the perps step's walk takes the index past its take-profit's trigger.
@@ -863,29 +879,30 @@ PERPS_BAND_NEEDED = (
 )
 
 
-def perps_prices(run: Run, l2: Mapping[str, Any], px: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal]:
-    """The perps step's prices off the index ``px`` (dollars): MM's bid and ask, 0.1 % either side of it; the
-    take-profit's and the stop-loss's triggers, 2 % above and 3 % below it; and the take-profit's limit, its trigger
-    less the leg's 1 % as the SDK signs it (leg_limit)."""
-    lo, hi = run.cents(px * Decimal("0.999"), False), run.cents(px * Decimal("1.001"), True)
-    tp, sl = run.cents(px * Decimal("1.02"), True), run.cents(px * Decimal("0.97"), False)
-    return lo, hi, tp, sl, leg_limit(l2, tp, "SELL", 100)
+def perps_prices(run: Run, market: int, px: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal]:
+    """The perps step's prices on ``market`` off the index ``px`` (dollars), each on the market's tick: MM's bid and
+    ask, 0.1 % either side of it; the take-profit's and the stop-loss's triggers, 2 % above and 3 % below it; and the
+    take-profit's limit, its trigger less the leg's 1 % as the SDK signs it (leg_limit)."""
+    t = run.ticker(market)
+    lo, hi = run.to_tick(t, px * Decimal("0.999"), False), run.to_tick(t, px * Decimal("1.001"), True)
+    tp, sl = run.to_tick(t, px * Decimal("1.02"), True), run.to_tick(t, px * Decimal("0.97"), False)
+    return lo, hi, tp, sl, leg_limit(run.perps[market], run.decimals[t], tp, "SELL", 100)
 
 
-def perps_band_misses(run: Run, l2: Mapping[str, Any], px: Decimal, mark: int) -> list[str]:
-    """The perps step's quotes that its market's band (``l2``'s) refuses by the exchange's rule (in_band), named, with
-    the index at ``px`` dollars and the mark at ``mark`` (index units): B's IOC at the ask + $1 and MM's bid at the
-    take-profit's limit, placed while the mark is there, and the fired take-profit's sell at that limit once the walk
-    has taken the mark up to PAST_TAKE_PROFIT x its trigger. Empty when the band admits them all."""
-    band = band_of(l2)
-    _, hi, tp, _, limit = perps_prices(run, l2, px)
+def perps_band_misses(run: Run, market: int, px: Decimal, mark: Decimal) -> list[str]:
+    """The perps step's quotes that ``market``'s band refuses by the exchange's rule (in_band), named, with the index
+    at ``px`` and the mark at ``mark`` (dollars): B's IOC at the ask + $1 and MM's bid at the take-profit's limit,
+    placed while the mark is there, and the fired take-profit's sell at that limit once the walk has taken the mark up
+    to PAST_TAKE_PROFIT x its trigger. Empty when the band admits them all."""
+    band = band_of(run.perps[market])
+    _, hi, tp, _, limit = perps_prices(run, market, px)
     quotes = (
         ("B's IOC at the ask + $1", hi + 1, mark),
         ("MM's bid at the take-profit's limit", limit, mark),
-        ("the take-profit's sell at its limit", limit, run.to_index(tp * PAST_TAKE_PROFIT)),
+        ("the take-profit's sell at its limit", limit, tp * PAST_TAKE_PROFIT),
     )
-    return [f"{what}, ${price}, lies outside {band} bp of ${run.dollars(centre)}" for what, price, centre in quotes
-            if not in_band(run.to_index(price), centre, band)]
+    return [f"{what}, ${price}, lies outside {band} bp of ${centre}" for what, price, centre in quotes
+            if not in_band(price, centre, band)]
 
 
 def newest_trade(user: User) -> int:
@@ -893,23 +910,23 @@ def newest_trade(user: User) -> int:
     return int(rows[0]["tradeId"]) if rows else 0
 
 
-def pushed_base(frame: Mapping[str, Any], market: int, pool: int) -> int:
-    """The base a perps_account_update reads on ``market`` in ``pool``; 0 with none."""
+def pushed_base(frame: Mapping[str, Any], market: int, pool: int) -> Decimal:
+    """The base a perps_account_update reads on ``market`` in ``pool``, tokens; 0 with none."""
     for held in frame["perps"]["pools"]:
         if int(held["pool"]) == pool:
             for pos in held["positions"]:
                 if int(pos["market"]) == market:
-                    return int(pos["base"])
-    return 0
+                    return pos["base"]
+    return Decimal(0)
 
 
 @dataclass
 class Touched:
     """What a step moved on the stack, for its restore (Run.restore): each market it walked or silenced with the
-    index it goes home to (E2E_HOME_INDEX, else the index before the step's first move), the markets whose state it
-    controlled (a halt, the operator's controls, a silence), and whether it raised the backstop's knob."""
+    index it goes home to (dollars: E2E_HOME_PRICE, else the index before the step's first move), the markets whose
+    state it controlled (a halt, the operator's controls, a silence), and whether it raised the backstop's knob."""
 
-    homes: dict[int, int] = field(default_factory=dict)
+    homes: dict[int, Decimal] = field(default_factory=dict)
     states: set[int] = field(default_factory=set)
     knob: bool = False
 
@@ -928,6 +945,8 @@ class Run:
     users: dict[str, User] = field(default_factory=dict)
     perps: dict[int, Mapping[str, Any]] = field(default_factory=dict)
     tickers: dict[int, str] = field(default_factory=dict)
+    #: Each listed market's (priceDecimals, quantityDecimals), by ticker: its tick and its lot.
+    decimals: dict[str, tuple[int, int]] = field(default_factory=dict)
     collateral: Mapping[str, Any] = field(default_factory=dict)
     spot: str | None = None
     spot_l2: Mapping[str, Any] = field(default_factory=dict)
@@ -955,27 +974,29 @@ class Run:
         """The ``kind`` frames ``user``'s private channel has received, oldest first."""
         return [f for f in list(self.frames[user.name]) if f.get("type") == kind]
 
-    # An index is in E2E_PRICE_DECIMALS units, an order's price in dollars (cents); a size in tokens
-    # (E2E_SIZE_DECIMALS), a position's base in base units; collateral in extended units.
-    def dollars(self, index: int) -> Decimal:
-        return Decimal(index) / (Decimal(10) ** self.cfg.price_decimals)
+    # An index, a mark and a position's prices are dollars, its base tokens and the pools' money dollars, as the SDK
+    # reads them (exact Decimals); an order's price is in dollars on its market's tick, a size in tokens on its lot.
+    def tick(self, ticker: str) -> Decimal:
+        """``ticker``'s price step: 10^-priceDecimals dollars."""
+        return Decimal(1).scaleb(-self.decimals[ticker][0])
 
-    def to_index(self, dollars: Decimal) -> int:
-        return int(dollars * (Decimal(10) ** self.cfg.price_decimals))
+    def lot(self, ticker: str) -> Decimal:
+        """``ticker``'s quantity step: 10^-quantityDecimals tokens."""
+        return Decimal(1).scaleb(-self.decimals[ticker][1])
 
-    def units(self, tokens: Decimal) -> int:
-        return int(tokens * (Decimal(10) ** self.cfg.size_decimals))
+    def to_tick(self, ticker: str, price: Decimal, up: bool) -> Decimal:
+        """``price`` on ``ticker``'s tick, rounded up or down."""
+        return price.quantize(self.tick(ticker), rounding=ROUND_CEILING if up else ROUND_FLOOR)
 
-    def tokens(self, units: int) -> Decimal:
-        return Decimal(units) / (Decimal(10) ** self.cfg.size_decimals)
+    def signed_decimals(self, market: int) -> int:
+        """A perp's signed price decimals, 7 - quantityDecimals: the engine's price is dollars x 10^this, and a mark, an
+        index or an entry price can fall between ticks on its signed price unit, 10^-this dollars."""
+        return L2_SIGNED_DECIMALS - self.decimals[self.ticker(market)][1]
 
-    @staticmethod
-    def cents(price: Decimal, up: bool) -> Decimal:
-        return price.quantize(Decimal("0.01"), rounding=ROUND_CEILING if up else ROUND_FLOOR)
-
-    def ext_per_dollar(self) -> Decimal:
-        c = self.collateral
-        return Decimal(10) ** int(c["decimals"]) / int(c["tickSize"]) * int(c["extensionMultiplier"])
+    def pump_index(self, market: int, price: Decimal) -> int:
+        """``price`` (dollars) as the pump takes an index: in the market's signed price units, the engine's, rounded
+        down."""
+        return int(price.scaleb(self.signed_decimals(market)).to_integral_value(rounding=ROUND_FLOOR))
 
     def live(self, market: int) -> Mapping[str, Any]:
         """market.get's live state: None only until the backend has read one, so it is read again."""
@@ -984,34 +1005,35 @@ class Run:
         return wait_for(f"market {market}'s live state",
                         lambda: anon.market.get(self.ticker(market))["market"].get("live"), self.cfg.wait_s, 1.0)
 
-    def index(self, market: int) -> int:
-        return int(self.live(market)["indexPrice"])
+    def index(self, market: int) -> Decimal:
+        return self.live(market)["indexPrice"]
 
-    def mark(self, market: int) -> int:
-        return int(self.live(market)["markPrice"])
+    def mark(self, market: int) -> Decimal:
+        return self.live(market)["markPrice"]
 
     def mark_near(self, market: int, within_bp: int = 25) -> None:
         """Waits until the mark has followed the index to within ``within_bp``: 9 minutes from 5 %, with no two-sided
         book. Two-sided off the index, the mark stays off it, so the wait fails naming it."""
         def near() -> bool:
             live = self.live(market)
-            index = int(live["indexPrice"])
-            return abs(int(live["markPrice"]) - index) * 10_000 <= index * within_bp
+            index = live["indexPrice"]
+            return abs(live["markPrice"] - index) * 10_000 <= index * within_bp
 
         self.until(f"market {market}'s mark within {within_bp} bp of its index", near, self.cfg.final_wait_s, 5.0)
 
     def qty(self, market: int) -> Decimal:
-        """A position's size on ``market``: tokens worth about E2E_NOTIONAL dollars, at least its minimum base."""
-        step = Decimal(1) / (Decimal(10) ** self.cfg.size_decimals)
-        q = (self.cfg.notional / self.dollars(self.index(market))).quantize(step, rounding=ROUND_CEILING)
-        return max(q, self.tokens(int(self.perps[market].get("minBase") or 1)), step)
+        """A position's size on ``market``: tokens worth about E2E_NOTIONAL dollars, on its lot, at least its minimum
+        base (tokens) and one lot."""
+        step = self.lot(self.ticker(market))
+        q = (self.cfg.notional / self.index(market)).quantize(step, rounding=ROUND_CEILING)
+        return max(q, self.perps[market].get("minBase") or Decimal(0), step)
 
     def until(self, what: str, probe: Callable[[], Any], timeout: float | None = None, every: float = 1.0) -> Any:
         got = wait_for(what, probe, self.cfg.wait_s if timeout is None else timeout, every)
         log(f"  ok {what}")
         return got
 
-    def wait_base(self, user: User, market: int, pool: int, base: int, timeout: float | None = None) -> None:
+    def wait_base(self, user: User, market: int, pool: int, base: Decimal | int, timeout: float | None = None) -> None:
         self.until(f"{user.name}'s base {base} on market {market} in pool {pool}",
                    lambda: base_of(user, market, pool) == base, timeout)
 
@@ -1027,15 +1049,15 @@ class Run:
     def touch(self, market: int) -> None:
         """Records ``market`` as moved by the step, with its home (Touched), before its first move."""
         if market not in self.touched.homes:
-            self.touched.homes[market] = self.cfg.home_index or self.index(market)
+            self.touched.homes[market] = self.cfg.home_price or self.index(market)
 
-    def walk(self, market: int, index: int) -> None:
-        """The pump walks ``market`` to ``index`` inside the move bound (every report accepted); waits until the
-        engine's index is within 1 bp of it."""
+    def walk(self, market: int, price: Decimal) -> None:
+        """The pump walks ``market``'s index to ``price`` (dollars; pump_index) inside the move bound (every report
+        accepted); waits until the backend's index is within 1 bp of it."""
         prices = self.prices()
         self.touch(market)
-        prices.send({market: {"mode": "walk", "index": index}})
-        self.until(f"market {market}'s index at {index}", lambda: abs(self.index(market) - index) * 10_000 <= index)
+        prices.send({market: {"mode": "walk", "index": self.pump_index(market, price)}})
+        self.until(f"market {market}'s index at ${price}", lambda: abs(self.index(market) - price) * 10_000 <= price)
 
     def silence(self, market: int) -> None:
         """The pump stops reporting ``market``: once its stale window passes, the market is PRICE_STALE."""
@@ -1149,7 +1171,7 @@ class Run:
         if live.get("tradingState") == "OPEN":
             return
         log(f"  market {market} is {live.get('tradingState')} ({live.get('stateReason')}): reopening it")
-        self.walk(market, int(live["indexPrice"]) or (self.cfg.home_index or 0))
+        self.walk(market, live["indexPrice"] or self.cfg.home_price or Decimal(0))
         state = self.until(f"market {market} reported", lambda: (lambda s: s if s and s != "PRICE_STALE" else None)(
             self.live(market).get("tradingState")))
         if state != "OPEN":
@@ -1167,7 +1189,7 @@ class Run:
         for m in sorted(touched.states):
             parts.append((f"market {m} OPEN", lambda m=m: self.reopen(m)))
         for m, home in sorted(touched.homes.items()):
-            parts.append((f"market {m}'s index home at {home}", lambda m=m, home=home: self.walk(m, home)))
+            parts.append((f"market {m}'s index home at ${home}", lambda m=m, home=home: self.walk(m, home)))
         if touched.knob and KEEP_BACKSTOP:
             log("  restore: the backstop's knob kept (E2E_KEEP_BACKSTOP=1): its position stays for the desk leg")
         elif touched.knob:
@@ -1204,15 +1226,15 @@ class Run:
         if base == 0:
             return
         t = self.ticker(market)
-        px = self.dollars(self.index(market))
-        q = float(self.tokens(abs(base)))
+        px = self.index(market)
+        q = float(abs(base))
         if base > 0:
-            self.mm.c.orders.limit_buy(t, q, float(self.cents(px * Decimal("0.995"), False)), pool=0)
-            user.c.orders.limit_sell(t, q, float(self.cents(px * Decimal("0.99"), False)), pool=pool,
+            self.mm.c.orders.limit_buy(t, q, float(self.to_tick(t, px * Decimal("0.995"), False)), pool=0)
+            user.c.orders.limit_sell(t, q, float(self.to_tick(t, px * Decimal("0.99"), False)), pool=pool,
                                      reduce_only=True, time_in_force="IOC")
         else:
-            self.mm.c.orders.limit_sell(t, q, float(self.cents(px * Decimal("1.005"), True)), pool=0)
-            user.c.orders.limit_buy(t, q, float(self.cents(px * Decimal("1.01"), True)), pool=pool,
+            self.mm.c.orders.limit_sell(t, q, float(self.to_tick(t, px * Decimal("1.005"), True)), pool=0)
+            user.c.orders.limit_buy(t, q, float(self.to_tick(t, px * Decimal("1.01"), True)), pool=pool,
                                     reduce_only=True, time_in_force="IOC")
         self.wait_base(user, market, pool, 0)
         self.mm.c.orders.cancel_all()
@@ -1229,24 +1251,26 @@ class Run:
 
     def allocate(self, user: User, dollars: Decimal, frm: int, to: int) -> None:
         """``user`` moves ``dollars`` USDC (whole ticks) from ``frm`` to ``to``: the spot balance moves by exactly
-        that, and so does the pool's collateral when the pool holds no position (funding settles with it)."""
+        that, and so does the pool's collateral (dollars, the exchange's rounding cancelling out: a move of whole
+        millionths) when the pool holds no position (funding settles with it)."""
         c = self.collateral
-        tick, ext, dec = int(c["tickSize"]), int(c["extensionMultiplier"]), int(c["decimals"])
+        tick, dec = int(c["tickSize"]), int(c["decimals"])
         ticks = int(dollars * (Decimal(10) ** dec)) // tick
+        moved = Decimal(ticks * tick) / (Decimal(10) ** dec)
         pool = frm if to == PERPS_SPOT_SIDE else to
         sign = 1 if to == pool else -1
         held = pool_of(user, pool)
         flat = not (held or {}).get("positions")
-        before = int((held or {}).get("collateral") or 0)
+        before = Decimal(0) if held is None else held["collateral"]
         spot0, _ = balance(user, USDC_ASSET)
-        r = user.c.perps.allocate(Decimal(ticks * tick) / (Decimal(10) ** dec), from_side=frm, to_side=to)
+        r = user.c.perps.allocate(moved, from_side=frm, to_side=to)
         check(int(r["journalSeq"]) > 0, f"{user.name} allocates {ticks} ticks {frm} -> {to} (journal {r['journalSeq']})")
         after = wait_for(f"{user.name}'s pool {pool} collateral moved",
                          value_once(lambda: collateral_of(user, pool), lambda x: x != before), self.cfg.wait_s)[0]
         if flat:
-            check(after - before == sign * ticks * ext, f"pool {pool}'s collateral {before} -> {after}")
+            check(after - before == sign * moved, f"pool {pool}'s collateral ${before} -> ${after}")
         else:
-            check((after - before) * sign > 0, f"pool {pool}'s collateral {before} -> {after} (it holds positions)")
+            check((after - before) * sign > 0, f"pool {pool}'s collateral ${before} -> ${after} (it holds positions)")
         self.until(f"{user.name}'s spot USDC {spot0} -> {spot0 - sign * ticks * tick}",
                    lambda: balance(user, USDC_ASSET)[0] == spot0 - sign * ticks * tick)
 
@@ -1254,21 +1278,23 @@ class Run:
         """Tops ``user``'s ``pool`` up to ``dollars`` of collateral, once the engine has nothing left to sweep in it
         (:meth:`settled`)."""
         self.settled(user, pool)
-        short_by = dollars * self.ext_per_dollar() - collateral_of(user, pool)
+        short_by = dollars - collateral_of(user, pool)
         if short_by > 0:
-            self.allocate(user, (short_by / self.ext_per_dollar()).quantize(Decimal(1), rounding=ROUND_CEILING),
-                          PERPS_SPOT_SIDE, pool)
+            self.allocate(user, short_by.quantize(Decimal(1), rounding=ROUND_CEILING), PERPS_SPOT_SIDE, pool)
 
     def sweep(self, user: User, pool: int) -> None:
-        """Moves a flat pool's whole ticks back to spot."""
+        """Moves a flat pool's whole ticks back to spot: those of its collateral as served (rounded down), so never
+        more than it holds; a pool of less than a tick keeps it."""
         held = pool_of(user, pool)
         if not held or held.get("positions"):
             return
+        if held["collateral"] >= self.usdc_tick():
+            self.allocate(user, held["collateral"], pool, PERPS_SPOT_SIDE)  # its whole ticks (allocate)
+
+    def usdc_tick(self) -> Decimal:
+        """One tick of the perps collateral, dollars: what an allocate moves whole numbers of."""
         c = self.collateral
-        ticks = int(held["collateral"]) // int(c["extensionMultiplier"])
-        if ticks > 0:
-            self.allocate(user, Decimal(ticks * int(c["tickSize"])) / (Decimal(10) ** int(c["decimals"])), pool,
-                          PERPS_SPOT_SIDE)
+        return Decimal(int(c["tickSize"])) / (Decimal(10) ** int(c["decimals"]))
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -1278,6 +1304,13 @@ class Run:
 
 def perp_tickers(rows: Sequence[Mapping[str, Any]]) -> dict[int, str]:
     return {int(r["marketIndex"]): r["ticker"] for r in rows if r["type"] == "PERP"}
+
+
+def decimals_of(rows: Sequence[Mapping[str, Any]]) -> dict[str, tuple[int, int]]:
+    """Each listed market's (priceDecimals, quantityDecimals), by ticker; one served without them (no L2 market yet)
+    is left out."""
+    return {r["ticker"]: (r["priceDecimals"], r["quantityDecimals"]) for r in rows
+            if all(isinstance(r.get(k), int) for k in ("priceDecimals", "quantityDecimals"))}
 
 
 def listen(run: Run, user: User) -> None:
@@ -1299,13 +1332,14 @@ def step_setup(run: Run) -> None:
                          "POST /admin/perps/markets/:m/control and its Privy auth are not exercised")
     anon = run.anon = LoafClient(base_url=cfg.api, ws_url=cfg.ws, max_retries=2)
     rows = anon.market.list()["markets"]
-    run.tickers = perp_tickers(rows)
+    run.tickers, run.decimals = perp_tickers(rows), decimals_of(rows)
     details = {m: anon.market.get(t)["market"]["l2"] for m, t in run.tickers.items()}
     run.perps = {m: l2 for m, l2 in details.items() if l2 is not None}
     for role, index in sorted(cfg.markets.items()):
-        m = run.perps.get(index)
-        check(m is not None and m["status"] == "ACTIVE" and index in run.tickers,
-              f"the {role} market {index} ({run.tickers.get(index)}) is listed ACTIVE")
+        m, t = run.perps.get(index), run.tickers.get(index)
+        check(m is not None and m["status"] == "ACTIVE" and t in run.decimals,
+              f"the {role} market {index} ({t}) is listed ACTIVE, its price and quantity decimals "
+              f"{run.decimals.get(t or '')}")
     spots = [r for r in rows if r["type"] == "SPOT" and r["status"] == "LIVE" and not r["isHalted"] and r.get("hasL2Market")]
     run.spot = cfg.spot or (spots[0]["ticker"] if spots else None)
     perp = run.perps[cfg.markets["trade"]]
@@ -1315,6 +1349,7 @@ def step_setup(run: Run) -> None:
         run.spot_l2 = anon.market.get(run.spot)["market"]["l2"]
         check(str(run.spot_l2["proxyAddress"]).lower() == run.proxy and int(run.spot_l2["l2ChainId"]) == run.l2_chain,
               f"spot {run.spot} and the perps share the vault {run.proxy}, L2 chain {run.l2_chain}")
+        check(run.spot in run.decimals, f"spot {run.spot}'s price and quantity decimals {run.decimals.get(run.spot)}")
     else:
         run.notes.append("no LIVE spot market with an L2 is listed")
 
@@ -1327,17 +1362,18 @@ def step_setup(run: Run) -> None:
         f"executed {run.start_pointers[2]}")
     run.funder = (cfg.funder or chain.accounts()[5]).lower()
 
-    # The pump: every role market walked home (E2E_HOME_INDEX), so a run starts where the last one did whatever it
+    # The pump: every role market walked home (E2E_HOME_PRICE), so a run starts where the last one did whatever it
     # left; a market an earlier run left unreported is reported again.
     if cfg.price_control and cfg.price_status:
         pump = run.pump = Prices(cfg.price_control, cfg.price_status, cfg.wait_s)
         log(f"  the pump's status: applied control {pump.status().get('applied_seq')}")
-        if cfg.home_index:
-            home = cfg.home_index
+        home = cfg.home_price
+        if home:
             roles = sorted(set(cfg.markets.values()))
-            pump.send({m: {"mode": "walk", "index": home} for m in roles})
+            pump.send({m: {"mode": "walk", "index": run.pump_index(m, home)} for m in roles})
             for m in roles:
-                run.until(f"market {m}'s index home at {home}", lambda m=m: abs(run.index(m) - home) * 10_000 <= home)
+                run.until(f"market {m}'s index home at ${home}",
+                          lambda m=m: abs(run.index(m) - home) * 10_000 <= home)
     else:
         run.notes.append("no price control (E2E_PRICE_CONTROL, E2E_PRICE_STATUS): every price leg is INCOMPLETE")
 
@@ -1526,7 +1562,7 @@ def step_spot(run: Run) -> None:
     qscale, bscale = 10 ** chain.asset(run.proxy, quote)["decimals"], 10 ** chain.asset(run.proxy, base)["decimals"]
     row = next((r for r in a.c.market.list()["markets"] if r["ticker"] == t), {})
     ref = Decimal(str(row.get("marketPrice") or 0)) or run.cfg.spot_price
-    bid, ask = run.cents(ref * Decimal("0.98"), False), run.cents(ref * Decimal("1.02"), True)
+    bid, ask = run.to_tick(t, ref * Decimal("0.98"), False), run.to_tick(t, ref * Decimal("1.02"), True)
     q = spot_size(bid)
     log(f"  spot {t}: reference ${ref}, bid ${bid}, ask ${ask}, size {q}")
     run.cancel_all()
@@ -1591,7 +1627,7 @@ def step_perps(run: Run) -> None:
     # Before anything moves: a band too narrow for the step's quotes would refuse them PRICE_BAND (or leave the fired
     # take-profit ARMED until the wait for its fill times out).
     live = run.live(m)
-    misses = perps_band_misses(run, run.perps[m], run.dollars(int(live["indexPrice"])), int(live["markPrice"]))
+    misses = perps_band_misses(run, m, live["indexPrice"], live["markPrice"])
     if misses:
         raise Failed(f"market {m}'s band is too narrow for this step: {'; '.join(misses)}. {PERPS_BAND_NEEDED}")
     run.cancel_all()
@@ -1611,12 +1647,10 @@ def step_perps(run: Run) -> None:
 
     live = run.live(m)
     check(live.get("tradingState") == "OPEN", f"market {m} is OPEN: {live.get('tradingState')} {live.get('stateReason')}")
-    idx = int(live["indexPrice"])
-    px = run.dollars(idx)
+    px = live["indexPrice"]
     q = run.qty(m)
-    units = run.units(q)
-    lo, hi, tp, sl, limit = perps_prices(run, run.perps[m], px)
-    log(f"  market {m} ({t}): index {idx} = ${px}, size {q}, bid ${lo}, ask ${hi}")
+    lo, hi, tp, sl, limit = perps_prices(run, m, px)
+    log(f"  market {m} ({t}): index ${px}, size {q}, bid ${lo}, ask ${hi}")
 
     # long by market (A takes MM's ask), short by market (B hits MM's bid)
     placed(mm.c.orders.limit_sell(t, float(q), float(hi), pool=0), "MM's ask")
@@ -1624,26 +1658,27 @@ def step_perps(run: Run) -> None:
     pushes0 = len(run.sent(a, "perps_account_update"))
     r = a.c.orders.market_buy(t, float(q), reference_price=float(px), max_slippage_bps=50, pool=0)
     check(left(r) == 0, f"A's market buy filled: order {r.get('orderId')}")
-    run.wait_base(a, m, 0, units)
+    run.wait_base(a, m, 0, q)
     run.until("A's long in its perps_account_update",
-              lambda: any(pushed_base(f, m, 0) == units for f in run.sent(a, "perps_account_update")[pushes0:]))
+              lambda: any(pushed_base(f, m, 0) == q for f in run.sent(a, "perps_account_update")[pushes0:]))
     row = run.until("A's trade_new for its market buy", lambda: next(
         (f["trade"] for f in run.sent(a, "trade_new") if int(f["trade"].get("orderId") or 0) == int(r["orderId"])), None))
     check(row["source"] == "TRADE" and row["direction"] == "OPEN_LONG" and row["pool"] == 0 and row.get("closedPnl") is None,
           f"A's fill opens a long from pool 0: {short(row)}")
     r = b.c.orders.market_sell(t, float(q), reference_price=float(px), max_slippage_bps=50, pool=0)
     check(left(r) == 0, f"B's market sell filled: order {r.get('orderId')}")
-    run.wait_base(b, m, 0, -units)
+    run.wait_base(b, m, 0, -q)
     pos = position_of(a, m, 0)
     assert pos is not None
-    check(abs(int(pos["entryPrice"]) - run.to_index(hi)) <= 1, f"A's entry {pos['entryPrice']} is the ask ${hi}")
+    check(abs(pos["entryPrice"] - hi) <= Decimal(1).scaleb(-run.signed_decimals(m)),
+          f"A's entry ${pos['entryPrice']} is the ask ${hi}, to its signed price unit")
 
     # long and short by limit, in isolated pool 1
     run.fund(a, 1, Decimal(2_000))
     placed(mm.c.orders.limit_sell(t, float(q), float(hi), pool=0), "MM's ask")
     r = placed(a.c.orders.limit_buy(t, float(q), float(hi), pool=1), "A's crossing limit buy from pool 1")
     check(left(r) == 0, "A's limit buy filled whole")
-    run.wait_base(a, m, 1, units)
+    run.wait_base(a, m, 1, q)
     placed(mm.c.orders.limit_buy(t, float(q), float(lo), pool=0), "MM's bid")
     r = placed(a.c.orders.limit_sell(t, float(q), float(lo), pool=1), "A's crossing limit sell from pool 1")
     check(left(r) == 0, "A's limit sell filled whole")
@@ -1651,7 +1686,7 @@ def step_perps(run: Run) -> None:
     # the close's PnL, exact: bought at the ask, sold at the bid, fees apart
     rows = run.until("A's close from pool 1 in its history", lambda: [
         x for x in a.c.history.trades(page_size=20)["trades"] if int(x.get("orderId") or 0) == int(r["orderId"])])
-    closed = sum(Decimal(str(x.get("closedPnl") or 0)) for x in rows)
+    closed = sum((x["closedPnl"] or Decimal(0) for x in rows), Decimal(0))
     check(all(x["direction"] == "CLOSE_LONG" for x in rows) and abs(closed - (lo - hi) * q) <= Decimal("0.01"),
           f"A's close reads CLOSE_LONG, closed PnL {closed} = (${lo} - ${hi}) x {q}")
 
@@ -1672,13 +1707,13 @@ def step_perps(run: Run) -> None:
     e = refused(lambda: a.c.orders.limit_buy(t, float(2 * q), float(hi), pool=0, time_in_force="FOK"),
                 LoafValidationError)
     check(FOK_NOT_FILLED in str(e), f"A's FOK for twice the ask: {e}")
-    check(base_of(a, m, 0) == units, "the refused FOK filled nothing")
+    check(base_of(a, m, 0) == q, "the refused FOK filled nothing")
 
     # reduce-only: a sell of half A's long fills; a reduce-only buy in a flat pool opens nothing
     placed(mm.c.orders.limit_buy(t, float(q), float(lo), pool=0), "MM's bid")
-    half = (q / 2).quantize(Decimal(1) / (Decimal(10) ** run.cfg.size_decimals), rounding=ROUND_FLOOR)
+    half = (q / 2).quantize(run.lot(t), rounding=ROUND_FLOOR)
     placed(a.c.orders.limit_sell(t, float(half), float(lo), pool=0, reduce_only=True), "A's reduce-only sell of half")
-    run.wait_base(a, m, 0, units - run.units(half))
+    run.wait_base(a, m, 0, q - half)
     try:
         r = a.c.orders.limit_buy(t, float(q), float(hi), pool=2, reduce_only=True)
         log(f"  A's reduce-only buy in flat pool 2 was taken: {short(r)}")
@@ -1695,7 +1730,7 @@ def step_perps(run: Run) -> None:
                                     leg_max_slippage_bps=100), f"A's buy from pool 3 with TP ${tp} and SL ${sl}")
     parent = int(r["orderId"])
     check(len(r.get("attachedLegIds") or []) == 2, f"two legs attached: {r.get('attachedLegIds')}")
-    run.wait_base(a, m, 3, units)
+    run.wait_base(a, m, 3, q)
     rows = run.until("both legs ARMED by the parent's fill", lambda: (lambda x: x if len(x) == 2 and all(
         o.get("status") == "ARMED" for o in x) else None)(legs_of(a, parent)))
     log(f"  legs: {[(o.get('id'), o.get('type'), o.get('triggerPrice'), o.get('status')) for o in rows]}")
@@ -1707,10 +1742,10 @@ def step_perps(run: Run) -> None:
     check(take is not None and Decimal(str(take.get("price"))) == limit,
           f"the take-profit sells no lower than ${limit}: {short(take)}")
     placed(mm.c.orders.limit_buy(t, float(q), float(limit), pool=0), "MM's bid for the take-profit")
-    run.walk(m, run.to_index(tp * PAST_TAKE_PROFIT))
+    run.walk(m, tp * PAST_TAKE_PROFIT)
     live = run.live(m)
-    index, mark = int(live["indexPrice"]), int(live["markPrice"])
-    check(mark != index and abs(mark - index) * 50 <= index, f"the mark {mark} lags the index {index}, within 2 %")
+    index, mark = live["indexPrice"], live["markPrice"]
+    check(mark != index and abs(mark - index) * 50 <= index, f"the mark ${mark} lags the index ${index}, within 2 %")
     run.wait_base(a, m, 3, 0, run.cfg.final_wait_s)
     rows = legs_of(a, parent)
     log(f"  legs after the trigger: {[(o.get('id'), o.get('type'), o.get('status')) for o in rows]}")
@@ -1718,7 +1753,7 @@ def step_perps(run: Run) -> None:
         if o.get("status") in ("PENDING", "ARMED"):
             a.c.orders.cancel_conditional(int(o["id"]))
     run.cancel_all()
-    run.walk(m, idx)
+    run.walk(m, px)
 
     # the reads: A's long and B's short, their pools, the market's live state
     for user, sign in ((a, 1), (b, -1)):
@@ -1728,19 +1763,19 @@ def step_perps(run: Run) -> None:
                   "liquidationPrice"):
             check(k in pos, f"{user.name}'s position reads {k} = {pos.get(k)}")
         check("adlRank" not in pos and "openOrders" not in pool, f"{user.name}'s read carries no ADL rank and no pool orders")
-        upnl = (run.mark(m) - int(pos["entryPrice"])) * int(pos["base"])
-        log(f"  {user.name}'s pool 0: collateral {pool['collateral']}, value {pool['value']}, requirement "
-            f"{pool['requirement']}; uPnL ${run.dollars(upnl) / 10 ** run.cfg.size_decimals:.2f}")
+        upnl = (run.mark(m) - pos["entryPrice"]) * pos["base"]  # dollars
+        log(f"  {user.name}'s pool 0: collateral ${pool['collateral']}, value ${pool['value']}, requirement "
+            f"${pool['requirement']}; uPnL ${upnl:.2f}")
         liq = pos.get("liquidationPrice")
         if liq is not None:
-            check((int(liq) - int(pos["entryPrice"])) * sign < 0,
+            check((liq - pos["entryPrice"]) * sign < 0,
                   f"{user.name}'s liquidation price {liq} is on the losing side of its entry {pos['entryPrice']}")
         check(pool["liquidatable"] is False, f"{user.name}'s pool 0 is healthy")
     live = run.live(m)
     for k in ("indexPrice", "markPrice", "openInterest", "fundingIndex", "nextTickAtMs", "fundingPeriodMs",
               "tradingState"):
         check(live.get(k) is not None, f"market {m}'s live state reads {k} = {live.get(k)}")
-    check(int(live["openInterest"]) >= units, "the open interest counts the run's positions")
+    check(live["openInterest"] >= q, "the open interest counts the run's positions")
 
     # the leverage setting: saved by the market's ticker, read back from the answer, the component and the push
     save_leverage(run, a, m)
@@ -1784,12 +1819,11 @@ def step_mixed(run: Run) -> None:
         run.flat(u, m, 0)
     live = run.live(m)
     check(live.get("tradingState") == "OPEN", f"market {m} is OPEN: {live.get('tradingState')} {live.get('stateReason')}")
-    px, pq = run.dollars(int(live["indexPrice"])), run.qty(m)
-    punits = run.units(pq)
-    lo, hi = run.cents(px * Decimal("0.999"), False), run.cents(px * Decimal("1.001"), True)
+    px, pq = live["indexPrice"], run.qty(m)
+    lo, hi = run.to_tick(t, px * Decimal("0.999"), False), run.to_tick(t, px * Decimal("1.001"), True)
     row = next((r for r in c.c.market.list()["markets"] if r["ticker"] == st), {})
     ref = Decimal(str(row.get("marketPrice") or 0)) or run.cfg.spot_price
-    bid, ask = run.cents(ref * Decimal("0.98"), False), run.cents(ref * Decimal("1.02"), True)
+    bid, ask = run.to_tick(st, ref * Decimal("0.98"), False), run.to_tick(st, ref * Decimal("1.02"), True)
     sq = spot_size(bid)
     # MM holds the spot base and USDC; a quote that is not USDC was deposited to A and C only (setup), so then C
     # only buys from MM's asks.
@@ -1876,9 +1910,9 @@ def step_mixed(run: Run) -> None:
     paid = quote_c0 - balance(c, quote)[0]
     check(net <= paid <= net + gross // 100, f"C paid the net notional {net} plus fees: {paid} (gross {gross})")
     # the perps book: B long and A short by exactly the open fills, then both flat again
-    net_units = (tally["perps_buy"] - tally["perps_sell"]) * punits
-    run.wait_base(b, m, 0, net_units)
-    run.wait_base(a, m, 0, -net_units)
+    net = (tally["perps_buy"] - tally["perps_sell"]) * pq
+    run.wait_base(b, m, 0, net)
+    run.wait_base(a, m, 0, -net)
     run.flat(b, m, 0)
     run.flat(a, m, 0)
     run.notes.append(f"mixed {took:.0f} s: spot {spot_fills / took:.1f} fills/s, perps {perps_fills / took:.1f} fills/s")
@@ -1895,11 +1929,11 @@ def step_funding(run: Run) -> None:
         t = run.ticker(m)
         run.flat(a, m, pool)
         run.fund(a, pool, Decimal(1_000))  # after the close: the allocate's grace holds the pool for the long below
-        px = run.cents(run.dollars(run.index(m)), True)  # at the index: the leg's own quotes add no impact premium
+        px = run.to_tick(t, run.index(m), True)  # at the index: its own quotes add no impact premium
         q = run.qty(m)
         placed(mm.c.orders.limit_sell(t, float(q), float(px), pool=0), f"MM's ask at market {m}'s index")
         placed(a.c.orders.limit_buy(t, float(q), float(px), pool=pool), f"A's long on carry market {m}")
-        run.wait_base(a, m, pool, run.units(q))
+        run.wait_base(a, m, pool, q)
 
     period_s = int(run.live(run.mkt("carry_pos"))["fundingPeriodMs"]) / 1000
     for role, sign, pool in legs:
@@ -1909,17 +1943,17 @@ def step_funding(run: Run) -> None:
         got = run.until(f"two funding payments of A's on market {m}",
                         lambda m=m, pool=pool: (lambda x: x if len(x) >= 2 else None)(payments_of(a, m, pool, since)),
                         min(3 * period_s + run.cfg.wait_s, run.cfg.final_wait_s), 5.0)
-        check(all(int(x["payment"]) * sign > 0 and int(x["rateCbp"]) * sign > 0 and int(x["base"]) > 0 for x in got),
+        check(all(x["payment"] * sign > 0 and int(x["rateCbp"]) * sign > 0 and x["base"] > 0 for x in got),
               f"market {m}'s payments carry the sign {sign:+d}: {short(got)}")
         run.until(f"A's funding_payment frame on market {m}", lambda seq=int(got[0]["journalSeq"]): any(
             int(f["funding"]["journalSeq"]) == seq for f in run.sent(a, "funding_payment")))
         pos = position_of(a, m, pool)
         assert pos is not None
-        owed = int(pos["fundingOwed"])
-        check(owed * sign > 0, f"A's long {'pays' if sign > 0 else 'receives'} on market {m}: funding owed {owed}")
+        owed = pos["fundingOwed"]
+        check(owed * sign > 0, f"A's long {'pays' if sign > 0 else 'receives'} on market {m}: funding owed ${owed}")
         held = position_of(mm, m, 0)
-        if held is not None and int(held["base"]) < 0:
-            check(int(held["fundingOwed"]) * sign < 0, f"MM's short on market {m} the other way: {held['fundingOwed']}")
+        if held is not None and held["base"] < 0:
+            check(held["fundingOwed"] * sign < 0, f"MM's short on market {m} the other way: ${held['fundingOwed']}")
 
     # The closes, once every leg's owed is read: a close fills against MM's pool 0, whose first touch after a tick
     # settles the whole pool's funding (K1's rule), the other carry market's short with it.
@@ -1935,15 +1969,18 @@ def step_funding(run: Run) -> None:
         p = pool_of(a, pool)
         assert p is not None
         pos = next(x for x in p["positions"] if int(x["market"]) == m)
-        value, owed, notional = int(p["value"]), int(pos["fundingOwed"]), int(pos["notional"])
-        check(value == int(p["collateral"]) + notional - owed,
-              f"pool {pool}'s value {value} = collateral {p['collateral']} + notional {notional} - owed {owed}")
-        px = run.cents(run.dollars(run.index(m)), False)
-        q = run.tokens(int(pos["base"]))
+        value, owed, notional = p["value"], pos["fundingOwed"], pos["notional"]
+        # Exactly K1's in its integers; served, collateral and value rounded down and notional and owed up, so within
+        # one millionth.
+        check(abs(value - (p["collateral"] + notional - owed)) <= QUOTE_UNIT,
+              f"pool {pool}'s value ${value} = collateral ${p['collateral']} + notional ${notional} - owed ${owed}, "
+              f"to ${QUOTE_UNIT}")
+        px = run.to_tick(t, run.index(m), False)
+        q = pos["base"]
         # A's ask half the band above the index (5 % with no band), not reduce-only, holds the pool through the close:
         # it reduces the long it meets, so it asks no margin, and once the pool is flat it keeps the engine from
         # sweeping the collateral read below into pool 0 at its next turn; cancelled once read (the pool is then swept)
-        hold_px = run.cents(px * (1 + Decimal(band_of(run.perps[m]) or 1_000) / 20_000), True)
+        hold_px = run.to_tick(t, px * (1 + Decimal(band_of(run.perps[m]) or 1_000) / 20_000), True)
         hold = placed(a.c.orders.limit_sell(t, float(q), float(hold_px), pool=pool),
                       f"A's hold of pool {pool} at ${hold_px}")
         placed(mm.c.orders.limit_buy(t, float(q), float(px), pool=0), f"MM's bid at market {m}'s index")
@@ -1952,19 +1989,22 @@ def step_funding(run: Run) -> None:
         run.wait_base(a, m, pool, 0)
         after = collateral_of(a, pool)
         a.c.orders.cancel(int(hold["orderId"]))
-        fee = notional * int(run.perps[m]["takerFee"]) // 1_000_000 + 1
-        realised = value - notional + int(pos["base"]) * run.to_index(px) * int(pos["qem"])
-        slack = int(q * Decimal("0.01") * run.ext_per_dollar()) + int(run.collateral["extensionMultiplier"])
+        # The long sold at px: the collateral is its value at the mark less the notional, plus base x px (K1's lots x
+        # price x qem, in its integers, is exactly that many dollars), less the fee; within a tick a token, and the
+        # served roundings (value down, notional up, the collateral down).
+        fee = notional * int(run.perps[m]["takerFee"]) / 1_000_000 + QUOTE_UNIT
+        realised = value - notional + q * px
+        slack = q * run.tick(t) + 2 * QUOTE_UNIT
         check(realised - fee - slack <= after <= realised + slack,
-              f"the close realised the funding: pool {pool}'s collateral {after} = {realised} less the fee "
-              f"(<= {fee}), within {slack}")
+              f"the close realised the funding: pool {pool}'s collateral ${after} = ${realised} less the fee "
+              f"(<= ${fee}), within ${slack}")
 
 
 def payments_of(user: User, market: int, pool: int, after: int) -> list[Mapping[str, Any]]:
     """``user``'s funding payments that moved money on ``market`` in ``pool`` past journal ``after``, newest first."""
     return [x for x in user.c.history.funding(page_size=HISTORY_PAGE_MAX)["funding"]
             if int(x["marketIndex"]) == market and int(x["pool"]) == pool and int(x["journalSeq"]) > after
-            and int(x["payment"]) != 0]
+            and x["payment"] != 0]
 
 
 # --------------------------------------------------------------------------------------------- #
@@ -1972,7 +2012,7 @@ def payments_of(user: User, market: int, pool: int, after: int) -> list[Mapping[
 # --------------------------------------------------------------------------------------------- #
 
 
-def open_victim(run: Run, market: int, pool: int) -> tuple[int, Mapping[str, Any]]:
+def open_victim(run: Run, market: int, pool: int) -> tuple[Decimal, Mapping[str, Any]]:
     """C opens a long on ``market`` from isolated ``pool`` holding its initial margin plus 10 %, against the
     maker's ask at the index, with no bid left on the book; returns the mark C's pool was read at and the pool."""
     c, mm = run.users["C"], run.mm
@@ -1980,14 +2020,13 @@ def open_victim(run: Run, market: int, pool: int) -> tuple[int, Mapping[str, Any
     run.flat(c, market, pool)
     run.sweep(c, pool)
     run.mark_near(market)  # its margin is checked at the mark
-    idx = run.index(market)
-    px = run.cents(run.dollars(idx), True)
+    px = run.to_tick(t, run.index(market), True)
     q = run.qty(market)
     im = Decimal(2 * int(run.perps[market]["risk"])) / 65_536 * q * px
     run.allocate(c, (im * Decimal("1.10") + 2).quantize(Decimal(1), rounding=ROUND_CEILING), PERPS_SPOT_SIDE, pool)
     placed(mm.c.orders.limit_sell(t, float(q), float(px), pool=0), "MM's ask at the index")
     placed(c.c.orders.limit_buy(t, float(q), float(px), pool=pool), f"C's long on market {market}")
-    run.wait_base(c, market, pool, run.units(q))
+    run.wait_base(c, market, pool, q)
     run.cancel_all()
     run.until(f"market {market}'s book with no bid", lambda: (lambda b: b is not None and not b.get("bids"))(run.book(market)))
     p = pool_of(c, pool)
@@ -2097,17 +2136,17 @@ def step_liquidation(run: Run) -> None:
     run.walk(m0, target)
     run.mark_near(m0)
     check(close_of(c, m0, 4, after) is None, "no liquidation with no bid on the book above 2/3 of maintenance")
-    q = run.tokens(base_of(c, m0, 4))
+    q = base_of(c, m0, 4)
     fills0 = len(run.sent(mm, "trade_new"))
-    bid = placed(mm.c.orders.limit_buy(t0, float(q), float(run.cents(run.dollars(target) * Decimal("0.999"), False)),
-                                       pool=0), "MM's bid just under the index")
-    far = float(run.cents(run.dollars(target) * Decimal("1.05"), True))
-    tick = float(run.tokens(1))
+    bid = placed(mm.c.orders.limit_buy(t0, float(q), float(run.to_tick(t0, target * Decimal("0.999"), False)), pool=0),
+                 "MM's bid just under the index")
+    far = float(run.to_tick(t0, target * Decimal("1.05"), True))
+    lot = float(run.lot(t0))
 
     def taken() -> Mapping[str, Any] | None:
         got = close_of(c, m0, 4, after)
         if got is None:
-            mm.c.orders.limit_sell(t0, tick, far, pool=0)
+            mm.c.orders.limit_sell(t0, lot, far, pool=0)
         return got
 
     row = run.until("C's close on the mode 0 market", taken, every=2.0)
@@ -2117,7 +2156,7 @@ def step_liquidation(run: Run) -> None:
     fill = run.until("MM's liquidation row in its portfolio", lambda: next(
         (f for f in section(mm, "tradeHistory")
          if int(f["tradeId"]) == seq and f.get("source") == "LIQUIDATION" and f.get("role") == "MAKER"), None))
-    check(int(fill["orderId"]) == int(bid["orderId"]) and Decimal(str(fill.get("fee") or 0)) == 0,
+    check(int(fill["orderId"]) == int(bid["orderId"]) and fill["fee"] == 0,
           f"MM's bid {bid['orderId']} filled by take {seq} as MAKER, no fee: {short(fill)}")
     check(fill.get("txHash") is None, "the fill carries no txHash")
     frame = run.until("MM's trade_new frame of the take", lambda: next(
@@ -2143,19 +2182,17 @@ def step_halt(run: Run) -> None:
     run.flat(a, m, 5)
     run.flat(b, m, 0)
     run.fund(a, 5, Decimal(1_000))  # after the close: the allocate's grace holds the pool for the orders below
-    idx = run.index(m)
-    px = run.dollars(idx)
+    px = run.index(m)
     q = run.qty(m)
-    units = run.units(q)
-    step = Decimal(1) / (Decimal(10) ** run.cfg.size_decimals)
+    step = run.lot(t)
     half, quarter = (q / 2).quantize(step, rounding=ROUND_FLOOR), (q / 4).quantize(step, rounding=ROUND_FLOOR)
     check(quarter > 0, f"a quarter of the size {q} is an order ({quarter})")
-    lo, hi = run.cents(px * Decimal("0.999"), False), run.cents(px * Decimal("1.001"), True)
+    lo, hi = run.to_tick(t, px * Decimal("0.999"), False), run.to_tick(t, px * Decimal("1.001"), True)
     placed(b.c.orders.limit_sell(t, float(q), float(hi), pool=0), "B's ask")
     placed(a.c.orders.limit_buy(t, float(q), float(hi), pool=5), "A's long on the halt market")
-    run.wait_base(a, m, 5, units)
-    run.wait_base(b, m, 0, -units)
-    resting = placed(mm.c.orders.limit_sell(t, float(q), float(run.cents(px * Decimal("1.05"), True)), pool=0),
+    run.wait_base(a, m, 5, q)
+    run.wait_base(b, m, 0, -q)
+    resting = placed(mm.c.orders.limit_sell(t, float(q), float(run.to_tick(t, px * Decimal("1.05"), True)), pool=0),
                      "MM's far ask, resting through the halt")
 
     # the admin API key halts: no order is taken, a cancel is; its resume is refused
@@ -2181,8 +2218,8 @@ def step_halt(run: Run) -> None:
     check(e.state == "REDUCE_ONLY", f"an order adding to A's long is refused REDUCE_ONLY: {e}")
     placed(b.c.orders.limit_buy(t, float(half), float(lo), pool=0, reduce_only=True), "B's reduce-only bid")
     placed(a.c.orders.limit_sell(t, float(half), float(lo), pool=5, reduce_only=True), "A's reduce-only sell")
-    run.wait_base(a, m, 5, units - run.units(half))
-    run.wait_base(b, m, 0, -units + run.units(half))
+    run.wait_base(a, m, 5, q - half)
+    run.wait_base(b, m, 0, -q + half)
     run.operator(m, "OPEN")
     run.state_is(m, "OPEN")
     r = placed(a.c.orders.limit_buy(t, float(q), float(lo), pool=5, time_in_force="POST_ONLY"),
@@ -2197,9 +2234,9 @@ def step_halt(run: Run) -> None:
     check(e.state == "PRICE_STALE", f"an order adding to A's long is refused PRICE_STALE: {e}")
     placed(b.c.orders.limit_buy(t, float(quarter), float(lo), pool=0, reduce_only=True), "B's reduce-only bid")
     placed(a.c.orders.limit_sell(t, float(quarter), float(lo), pool=5, reduce_only=True), "A's reduce-only sell")
-    run.wait_base(a, m, 5, units - run.units(half) - run.units(quarter))
-    run.wait_base(b, m, 0, -units + run.units(half) + run.units(quarter))
-    run.walk(m, idx)
+    run.wait_base(a, m, 5, q - half - quarter)
+    run.wait_base(b, m, 0, -q + half + quarter)
+    run.walk(m, px)
     run.state_is(m, "OPEN")
 
 
@@ -2221,7 +2258,7 @@ def step_exit(run: Run) -> None:
         run.flat(a, int(pos["market"]), 0)
     check(not (pool_of(a, 0) or {}).get("positions"), "A's pool 0 holds no position")
     run.sweep(a, 0)
-    check(collateral_of(a, 0) < int(run.collateral["extensionMultiplier"]), "pool 0's whole ticks are back in spot")
+    check(collateral_of(a, 0) < run.usdc_tick(), "pool 0's whole ticks are back in spot")
 
     tick, scale = int(run.usdc["tick"]), 10 ** int(run.usdc["decimals"])
     total0, avail = balance(a, USDC_ASSET)
@@ -2312,24 +2349,26 @@ def step_proof(run: Run) -> None:
 
 
 def step_restore(run: Run) -> None:
-    """E2E_STEPS=restore, with no setup and no users: every role market OPEN and walked home to E2E_HOME_INDEX, and
+    """E2E_STEPS=restore, with no setup and no users: every role market OPEN and walked home to E2E_HOME_PRICE, and
     the backstop's knob at 0 (Run.restore), as a run's steps leave the stack; for one a run left otherwise. The
     backstop's positions stay (the kit's backstop_flatten closes them) and are logged."""
     cfg = run.cfg
     if not (cfg.price_control and cfg.price_status):
         raise Incomplete("the restore needs the kit's price control (E2E_PRICE_CONTROL, E2E_PRICE_STATUS)")
-    if not cfg.home_index:
-        raise Incomplete("the restore walks the role markets home to E2E_HOME_INDEX, which is unset")
+    home = cfg.home_price
+    if not home:
+        raise Incomplete("the restore walks the role markets home to E2E_HOME_PRICE, which is unset")
     run.anon = LoafClient(base_url=cfg.api, ws_url=cfg.ws, max_retries=2)
-    run.tickers = perp_tickers(run.anon.market.list()["markets"])
+    rows = run.anon.market.list()["markets"]
+    run.tickers, run.decimals = perp_tickers(rows), decimals_of(rows)
     pump = run.pump = Prices(cfg.price_control, cfg.price_status, cfg.wait_s)
-    home, roles = cfg.home_index, sorted(set(cfg.markets.values()))
+    roles = sorted(set(cfg.markets.values()))
     failed = run.restore(Touched(homes={m: home for m in roles}, states=set(roles), knob=True))
     check(not failed, "every part of the restore: " + ("; ".join(failed) or "done"))
     for m in roles:
         live = run.live(m)
-        check(live.get("tradingState") == "OPEN" and abs(int(live["indexPrice"]) - home) * 10_000 <= home,
-              f"market {m} is OPEN at its home index {home}: {live.get('tradingState')} {live.get('indexPrice')}")
+        check(live.get("tradingState") == "OPEN" and abs(live["indexPrice"] - home) * 10_000 <= home,
+              f"market {m} is OPEN at its home index ${home}: {live.get('tradingState')} ${live.get('indexPrice')}")
     backstop = pump.status().get("backstop") or {}
     log(f"  the backstop: free {backstop.get('free_ticks')} ticks, positions {backstop.get('positions')}")
 

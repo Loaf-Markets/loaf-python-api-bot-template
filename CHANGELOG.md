@@ -4,10 +4,90 @@ What each release changed, and what to change in a bot. While the SDK is
 pre-1.0, a breaking change bumps the minor version (README §4). The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.7.0 (unreleased)
 
-For the exchange's perps band around the mark and its coded withdrawal
-refusals.
+For each market's own tick and lot, the perps reads as actual values, the
+exchange's perps band around the mark and its coded withdrawal refusals. It
+needs the exchange API that serves each market's decimals and its perps values
+as exact decimal strings; an older SDK's orders are refused there
+(`INVALID_SIGNATURE`: it signs at the old scale).
+
+### Breaking
+
+- **Each market has its own tick and lot.** A market's `priceDecimals` and
+  `quantityDecimals` (`market.get(ticker).market`, and each `market.list()`
+  row and `marketList` entry), set at its listing, replace the global 2 and 1
+  decimal places: a price has at most `priceDecimals` (a tick of
+  10^-priceDecimals dollars: $1 on a listing near $75,000, $0.0001 on one near
+  $3) and a quantity at most `quantityDecimals` (a lot of 10^-quantityDecimals
+  tokens). An order signs price x 10^(7 - quantityDecimals) and quantity x
+  10^quantityDecimals, the market's `l2.signedPriceDecimals` and
+  `l2.signedQuantityDecimals`, and the SDK refuses a market that serves other
+  signed decimals, or none (`LoafServerError`, `unusable market.<field>`). A
+  market's highest price is the largest on its tick whose signed price fits
+  32 bits, (2^32 - 1) / 10^(7 - quantityDecimals) dollars ($429,496.72 at 3
+  quantity and 2 price decimals); its largest quantity 1,000,000,000 tokens
+  and 2^48 - 1 lots; and K1's 48-bit fill quote now caps an order's price x
+  quantity at about $281.47 million (it was $281 billion). A price or quantity
+  that no market takes (not a positive number, more than 6 decimal places,
+  above 1,000,000,000) is still refused before any request; one off its
+  market's tick or lot, or past its bounds, is refused once the market is read
+  (status 0, nothing reserved or sent), so on a market no order of yours has
+  named yet it costs one public read. What to change: round prices with the
+  market's `priceDecimals` (`round(x, market.priceDecimals)`) and size
+  quantities in its lots; a price you derived on the cent grid is off the
+  tick of a market with fewer price decimals.
+- **`MAX_PRICE_DECIMALS` and `MAX_QUANTITY_DECIMALS` are gone**, with the
+  global grid. `loaf.constants.ORDER_PRICE_MAX` and `ORDER_QUANTITY_MAX` are
+  the exchange's bounds on any market, 1,000,000,000 each, and
+  `loaf.money.validate_price` and `validate_quantity` check only what no
+  market takes. What to change: read the market's decimals.
+- **`worst_price` takes the market's decimals.** `loaf.worst_price(reference_price,
+  side, max_slippage_bps, *, price_decimals, quantity_decimals)` rounds toward
+  the reference to the market's tick (at least one tick) and refuses a price
+  above the market's highest. Every price the SDK derives (a MARKET order's
+  worst price, a `*_MARKET` stop's or take's booked price, a TP/SL leg's
+  limit, a `reference_price` with no slippage) is on the market's tick, and on
+  a perp the price on the near side of an off-grid mark is the tick's, not the
+  cent's. What to change: pass `price_decimals=market.priceDecimals,
+  quantity_decimals=market.quantityDecimals` (by name: swapped, two markets'
+  decimals can both be valid).
+- **The perps reads are actual values, exact `Decimal`s.** Every price, size
+  and dollar amount of a perp's live state (`markPrice`, `indexPrice`,
+  `heldPrice.price`, `openInterest`), its order limits (`l2.minBase` in
+  tokens, `l2.minQuote` and `l2.quoteLimit` in dollars), a position (`base` in
+  tokens; `entryQuote`, `entryPrice`, `liquidationPrice`, `notional` and
+  `fundingOwed` in dollars), a pool (`collateral`, `value`, `requirement`) and
+  a funding payment (`base`, `payment`) is the `decimal.Decimal` of its actual
+  value, read digit for digit from the exchange's exact decimal string, from
+  `market.get`, `perps.positions`, `portfolio.summary`,
+  `portfolio.component`, `history.funding` and their WebSocket frames
+  (`perps_markets_live`, `market_terms_update`, `perps_account_update`,
+  `funding_payment`). They were the engine's integers: prices dollars x 1000,
+  sizes its lots, quotes dollars x 1000, money extended USDC units, and a
+  pool's `requirement` those x 65,536 (now its maintenance margin in dollars).
+  The money is in dollars to $0.000001, rounded never in your favour: what you
+  hold down, what you need or owe up. A price can have more places than the
+  tick (a mark, an index, an entry or a liquidation price falls between ticks,
+  to `l2.signedPriceDecimals` places). A position carries its market's
+  `signedPriceDecimals` and `signedQuantityDecimals`, and the summary and the
+  `perps_account_update` frame its account's `accountMode` and
+  `withdrawable` (dollars, rounded down). A perps `fundingIndex` stays the
+  engine's integer, a decimal string of extended USDC units per lot. A value
+  served in any other form (a number, an exponent) raises `LoafServerError`
+  naming it, and the WebSocket client drops and logs its frame: it is never
+  read in another unit. What to change: drop every scaling of these reads and
+  value a position in dollars, `notional = |base| x markPrice`; only funding
+  owed takes the engine's integers, a position's lots, `base x
+  10^signedQuantityDecimals`, x the move of `fundingIndex` (README,
+  **Perps**). A MARKET order on a perp prices off the mark read so.
+- **A fill's `quantity`, `price`, `fee` and `closedPnl` are exact
+  `Decimal`s**, on every market (`history.trades()`,
+  `portfolio.component().tradeHistory`, `trade_new` frames; they were
+  floats), the fee to $0.000001 (it was to $0.001); a perps fill off the book
+  can be priced between ticks. A `mark_price` frame's `price` is a `Decimal`
+  too (a perp's is its mark). What to change: compare and sum them as
+  `Decimal`s.
 
 ### Changed
 
@@ -22,17 +102,17 @@ refusals.
   worst price, a `*_MARKET` stop's or take's booked price, a TP/SL leg's
   limit) starts at most half the band from its reference, `min(max
   slippage, band // 2)` basis points, as the web app prices, rounded toward
-  the reference to the cent. A MARKET order's price that this rounding takes
-  across a reference off the cent grid (a mark is in tenths of a cent; a
-  SELL's price above it, a BUY's below it) gives way to the cent on the
-  reference's near side (a SELL's below it, a BUY's above it) when that cent
-  is positive, inside the band and within your whole max slippage; else the
-  crossing price is kept if it is inside the band; else the order is refused
-  locally (`LoafValidationError`, status 0: nothing reserved, signed or sent).
-  A MARKET BUY off a reference under one cent starts at $0.01, the lowest
-  price, and is refused so too unless that cent is inside the band (off a mark
-  of $0.005, a band of 10,000 bp or more). A trigger is on the cent grid, so a
-  stop's or a leg's price never crosses.
+  the reference to the market's tick. A MARKET order's price that this
+  rounding takes across a reference off the tick grid (a mark is finer than
+  the tick; a SELL's price above it, a BUY's below it) gives way to the grid
+  price on the reference's near side (a SELL's below it, a BUY's above it)
+  when that price is positive, inside the band and within your whole max
+  slippage; else the crossing price is kept if it is inside the band; else the
+  order is refused locally (`LoafValidationError`, status 0: nothing reserved,
+  signed or sent). A MARKET BUY off a reference under one tick starts at one
+  tick, the lowest price, and is refused so too unless that price is inside
+  the band (off a mark of half a tick, a band of 10,000 bp or more). A trigger
+  is on the tick, so a stop's or a leg's price never crosses.
   A price you give exactly (a LIMIT order's, a `*_LIMIT` row's, or
   `reference_price` with `max_slippage_bps=0`) is signed as given, never moved
   or refused for the band, and spot markets are unchanged. A perps order
@@ -40,10 +120,11 @@ refusals.
   TP/SL leg's limit) makes the next one read the market's terms again; one
   whose prices you all gave keeps them. What to change: a bot that sizes a
   perps MARKET BUY's hold itself takes `loaf.worst_price(mark, "BUY",
-  min(max_slippage_bps, band // 2))`, or the cent above the mark where that
-  price falls below an off-grid mark and the band and the max slippage admit
-  that cent (see `worst_price`); one that wants a perps price farther than
-  half the band from its reference gives the price exactly.
+  min(max_slippage_bps, band // 2), price_decimals=..., quantity_decimals=...)`,
+  or the tick above the mark where that price falls below an off-grid mark
+  and the band and the max slippage admit it (see `worst_price`); one that
+  wants a perps price farther than half the band from its reference gives the
+  price exactly.
 - **Withdrawal refusals answer as an order's.** Each carries `e.code`
   (`loaf.OrderErrorCode`): 422 `INSUFFICIENT_BALANCE`, `BELOW_MIN_ORDER_VALUE`,
   `RATE_LIMITED` (too many withdrawals not yet settled), `ORDER_INDEX_USED`

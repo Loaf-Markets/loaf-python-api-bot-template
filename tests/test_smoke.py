@@ -11,6 +11,7 @@ import itertools
 import json
 import pickle
 import typing
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Optional, get_type_hints
 
@@ -301,10 +302,23 @@ def test_models_list_every_shape():
     trade = get_type_hints(models.TradeHistoryItem)
     assert trade["tradeId"] is int
     assert (trade["orderId"], trade["txHash"]) == (Optional[int], Optional[str])
-    assert trade["closedPnl"] == Optional[float]
+    assert trade["closedPnl"] == Optional[Decimal]
+    # Every perps price, size and amount, a perp's order limits and a fill's are exact Decimals; a
+    # funding index stays the engine's integer string.
+    assert all(trade[k] is Decimal for k in ("quantity", "price", "fee"))
+    position, pool = get_type_hints(models.PerpsPosition), get_type_hints(models.PerpsPool)
+    assert all(position[k] is Decimal for k in ("base", "entryQuote", "entryPrice", "fundingOwed", "notional"))
+    assert position["liquidationPrice"] == Optional[Decimal] and position["fundingIndex"] is str
+    assert pool["collateral"] is Decimal and pool["value"] == pool["requirement"] == Optional[Decimal]
+    live = get_type_hints(models.PerpsMarketLive)
+    assert all(live[k] is Decimal for k in ("markPrice", "indexPrice", "openInterest"))
+    assert live["fundingIndex"] is str and get_type_hints(models.PerpsHeldPrice)["price"] is Decimal
+    assert all(get_type_hints(models.PerpMarketL2)[k] is Decimal for k in ("minBase", "minQuote", "quoteLimit"))
+    assert all(get_type_hints(models.FundingPayment)[k] is Decimal for k in ("base", "payment"))
     # A summary's perps is None when unread, never an empty account; the saved leverage is the component's.
     summary = get_type_hints(models.PortfolioSummary)
     assert summary["perps"] == Optional[models.PerpsAccount]
+    assert summary["withdrawable"] == Optional[Decimal]
     assert "perpsLeverage" not in summary
     # Every section of a component is there, None when its read failed, never empty.
     component = get_type_hints(models.PortfolioComponent)

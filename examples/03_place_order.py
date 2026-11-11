@@ -12,6 +12,7 @@ login tokens that read your trading account and cancel the order again.
 from __future__ import annotations
 
 import time
+from decimal import ROUND_CEILING, Decimal
 
 import loaf
 from loaf import LoafClient
@@ -48,12 +49,20 @@ def main() -> None:
     book = detail.get("orderBook")
     best_bid = book.bids[0].price if book and book.get("bids") else (market.marketPrice or 1.0)
 
-    # A passive limit BUY well below the best bid (unlikely to fill immediately).
-    price = round(best_bid * 0.80, 2)
-    print(f"Placing LIMIT BUY 1 {market.ticker} @ {price} (best bid {best_bid})")
+    # A passive limit BUY well below the best bid (unlikely to fill immediately), on the
+    # market's tick (its priceDecimals), and worth its minimum order value (minOrderValue
+    # dollars): that over the price, rounded up to the market's lot (10^-quantityDecimals
+    # tokens), in Decimal so the rounding is exact.
+    places = detail.market.priceDecimals
+    price = max(round(best_bid * 0.80, places), 10**-places)  # at least one tick
+    lot = Decimal(1).scaleb(-detail.market.quantityDecimals)
+    tokens = Decimal(str(detail.market.minOrderValue)) / Decimal(str(price))
+    quantity = tokens.quantize(lot, rounding=ROUND_CEILING)  # at least one lot
+    print(f"Placing LIMIT BUY {quantity} {market.ticker} @ {price} (best bid {best_bid})")
 
     try:
-        result = client.orders.limit_buy(market.ticker, quantity=1, price=price)
+        # The order methods take floats; one on the lot is sent as exactly its decimal.
+        result = client.orders.limit_buy(market.ticker, quantity=float(quantity), price=price)
     except loaf.LoafConfigError as exc:  # your trading key or account: the message says what to do
         raise SystemExit(str(exc))
     except loaf.LoafAPIError as exc:  # halted, order refused, rate limited

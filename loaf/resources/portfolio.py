@@ -14,6 +14,7 @@ from __future__ import annotations
 import numbers
 from typing import Any
 
+from .. import _served
 from ..constants import MAX_PERPS_LEVERAGE
 from ..exceptions import _client_validation_error
 from .base import Resource, _check_market_ticker
@@ -23,7 +24,7 @@ class PortfolioResource(Resource):
     def summary(self) -> Any:
         """``GET /portfolio/summary`` — what you hold.
 
-        Returns ``{balances, holdings, perps}``
+        Returns ``{balances, holdings, perps, accountMode, withdrawable}``
         (:class:`~loaf.models.PortfolioSummary`).
 
         ``balances`` is your whole L2 book, one row per asset with a balance or
@@ -49,13 +50,21 @@ class PortfolioResource(Resource):
 
         ``perps`` is :meth:`loaf.resources.perps.PerpsResource.positions`'
         answer, ``None`` when the exchange could not read it just now, which
-        never means you hold none.
+        never means you hold none. ``accountMode`` is your account's mode,
+        ``"MANUAL"`` or ``"UNIFIED"`` (pool 0 draws on your spot USDC), and
+        ``withdrawable`` the USDC a withdrawal can take now, dollars, an exact
+        :class:`~decimal.Decimal` rounded down (README, **Withdrawals**); each
+        ``None`` while the exchange cannot read it.
 
         Raises :class:`~loaf.exceptions.LoafServiceUnavailableError` (503
         ``The L2 balance is temporarily unavailable; try again in a moment``)
-        while the exchange's balances cannot be read — transient, so retry.
+        while the exchange's balances cannot be read — transient, so retry;
+        :class:`~loaf.exceptions.LoafServerError` naming a perps value or the
+        withdrawable served as no exact decimal string, never read in another
+        unit.
         """
-        return self._client.get("/portfolio/summary")
+        answer = self._client.get("/portfolio/summary")
+        return _served.read(answer, _served.summary, "GET /portfolio/summary")
 
     def set_perps_leverage(self, ticker: str, leverage: int) -> Any:
         """``PUT /portfolio/perps-leverage`` — save your leverage on a perp,
@@ -145,8 +154,11 @@ class PortfolioResource(Resource):
 
         Raises:
             LoafServerError: no section could be read (500 ``Failed to fetch
-                portfolio component``).
+                portfolio component``); or a fill's or funding payment's value
+                was served as no exact decimal string (named; never read in
+                another unit).
             LoafServiceUnavailableError: no section could be read, the
                 exchange's engine among the causes (503) — transient, so retry.
         """
-        return self._client.get("/portfolio/component")
+        answer = self._client.get("/portfolio/component")
+        return _served.read(answer, _served.component, "GET /portfolio/component")

@@ -25,6 +25,20 @@ of an order that was definitely not placed are reused by later orders; a
 restart leaves the unused rest of a block unused. An order on a market of
 another L2 chain than your trading key's is refused before anything is signed.
 
+**Prices and quantities.** Each market has its own tick and lot, set at its
+listing: the ``priceDecimals`` and ``quantityDecimals`` of
+``market.get(ticker).market`` (a tick of 10^-priceDecimals dollars, a lot of
+10^-quantityDecimals tokens). An order's price and trigger prices have at
+most the market's price decimals, its quantity at most its quantity decimals,
+each within the market's bounds (:mod:`loaf.money`): checked once the market
+is read, before anything is reserved or signed, and refused, never rounded.
+What no market takes (not a positive number, more than 6 decimal places,
+above 1,000,000,000) is refused before anything is read. An order signs its
+price x 10^(7 - quantityDecimals) and its quantity x 10^quantityDecimals, the
+market's ``l2.signedPriceDecimals`` and ``l2.signedQuantityDecimals``, which
+the exchange rebuilds from the body's numbers: a market that serves other
+signed decimals is refused before anything is signed.
+
 **Order life.** Every order expires. ``ttl_ms=`` sets how long it may rest
 (default 7 days, from one minute to about 45.9 days): the SDK signs the expiry
 ``l2ExpiryMs`` = now + 72 hours + ``ttl_ms`` (``expiryMs`` on order rows), and
@@ -53,10 +67,11 @@ private ``portfolio`` WebSocket channel.
 reference (a perp's live mark) moved against you by the max slippage
 (``max_slippage_bps=``, default ``client.max_slippage_bps``; on a perp held
 within its band, see **The perps band**), rounded toward the reference to the
-cent. The engine matches it up to that price and **never rests it**: what it
-cannot fill at once is cancelled, and one that fills nothing is refused. A BUY
-holds worst price x quantity x (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` /
-1,000,000) of your cash while it matches.
+market's tick. The engine matches it up to that price and **never rests it**:
+what it cannot fill at once is cancelled, and one that fills nothing is
+refused. A BUY holds worst price x quantity x (1 +
+:data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of your cash while it
+matches.
 
 **Time in force.** ``time_in_force=`` (:class:`~loaf.enums.TimeInForce`) on
 :meth:`OrdersResource.create`, :meth:`OrdersResource.limit_buy` and
@@ -89,29 +104,31 @@ whose limit lies outside the band around its own trigger (``|limit - trigger|
 x 10,000 > band x trigger``), each with 400 ``PRICE_BAND``. So on a perp a
 price the SDK derives starts from its reference moved
 ``min(max slippage, band // 2)`` basis points against you, as the web app
-prices, rounded toward the reference to the cent: a MARKET order's worst price
-(off the live mark, unless you pass ``reference_price``), a ``*_MARKET``
-stop's or take's booked price and a TP/SL leg's limit (off their trigger). The
-other half of the band is left for the mark to move before the order is
-admitted. That price is signed if it did not cross the reference and lies
-inside the band, which it does unless the $0.01 floor lifted it: a MARKET
-BUY's off a reference under one cent is $0.01, inside the band only from
-``10,000 x (0.01 - reference) / reference`` bp (10,000 off a mark of $0.005).
-Rounding toward a reference off the cent grid can cross it (a SELL's price
-above it, a BUY's below it): a mark is in tenths of a cent, while a trigger is
-on the grid, so a stop's or a leg's price never crosses. A MARKET order whose
-price crossed signs instead the cent on the reference's near side (a SELL's
-below it, a BUY's above it: against you) when that cent is positive, inside
-the band (``|cent - reference| x 10,000 <= band x reference``) and within your
-max slippage of the reference (all of it, not half the band); else the
-crossing price, when it lies inside the band. An order left with no such price
-is refused locally (:class:`~loaf.exceptions.LoafValidationError`,
-``status_code`` 0: nothing is reserved, signed or sent). At a mark of $1.009
-and a band of 100 bp, say, a MARKET SELL at the default 2% signs 1.00, not the
-crossing 1.01. A band of 0 changes nothing. A price you give exactly is signed
-as given, never moved or refused for the band: a LIMIT order's, a ``*_LIMIT``
+prices, rounded toward the reference to the market's tick: a MARKET order's
+worst price (off the live mark, unless you pass ``reference_price``), a
+``*_MARKET`` stop's or take's booked price and a TP/SL leg's limit (off their
+trigger). The other half of the band is left for the mark to move before the
+order is admitted. That price is signed if it did not cross the reference and
+lies inside the band, which it does unless the one-tick floor lifted it: a
+MARKET BUY's off a reference under one tick is one tick, inside the band only
+from ``10,000 x (tick - reference) / reference`` bp (10,000 off a mark of half
+a tick). Rounding toward a reference off the tick grid can cross it (a SELL's
+price above it, a BUY's below it): a mark is finer than the tick (it is in the
+market's signed price units, 10^-(7 - quantityDecimals) dollars), while a
+trigger is on the grid, so a stop's or a leg's price never crosses. A MARKET
+order whose price crossed signs instead the grid price on the reference's near
+side (a SELL's below it, a BUY's above it: against you) when that price is
+positive, inside the band (``|near - reference| x 10,000 <= band x
+reference``) and within your max slippage of the reference (all of it, not
+half the band); else the crossing price, when it lies inside the band. An
+order left with no such price is refused locally
+(:class:`~loaf.exceptions.LoafValidationError`, ``status_code`` 0: nothing is
+reserved, signed or sent). At a mark of $1.009, a tick of $0.01 and a band of
+100 bp, say, a MARKET SELL at the default 2% signs 1.00, not the crossing
+1.01. A band of 0 changes nothing. A price you give exactly is signed as
+given, never moved or refused for the band: a LIMIT order's, a ``*_LIMIT``
 stop's or take's, and a MARKET order's ``reference_price`` with a max slippage
-of 0 (to the cent: off the grid, a BUY's rounds down and a SELL's up). The band
+of 0 (to the tick: off the grid, a BUY's rounds down and a SELL's up). The band
 is read with the market and kept, and read again once an order that signed a
 price the SDK derived on it (its own, or a TP/SL leg's limit) is refused
 ``PRICE_BAND``; an order whose prices were all given keeps it.
@@ -141,9 +158,10 @@ Server-side checks reject an order the SDK cannot pre-validate for you (all 400,
 :class:`~loaf.exceptions.LoafValidationError`):
 
 * **Minimum order value** (``BELOW_MIN_ORDER_VALUE``) — price x quantity must
-  be at least $10, measured at the price you **sign** (a MARKET order's worst
-  price). A SELL closing your ENTIRE available holding of the asset is exempt,
-  so a dust holding can always be flattened.
+  be at least the market's ``minOrderValue`` ($10), measured at the price you
+  **sign** (a MARKET order's worst price). A SELL closing your ENTIRE
+  available holding of the asset is exempt, so a dust holding can always be
+  flattened.
 * **Price band** (``PRICE_BAND``) — an order of **any** type, MARKET included,
   whose signed price is too far from the market reference, or outside the
   market's daily band around its daily reference price (deployment and market
@@ -234,7 +252,7 @@ Conditional rows hold nothing at placement, and your cash and holding are
 checked only when they fire (except that a perps row that may open a position
 is refused at placement when its pool cannot back it at its trigger: see
 :meth:`OrdersResource.create_conditional`), but they do occupy an open-order
-slot, counted together with booked orders. The exchange checks a row's price grid, order
+slot, counted together with booked orders. The exchange checks a row's order
 number and its range only when the row fires, so those mistakes — and an order
 number made stale if the exchange resets order numbers — FAIL the row then: watch
 ``on_order_update`` for ``status: "FAILED"`` (``order_status`` frames carry
@@ -274,7 +292,7 @@ from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from typing import TYPE_CHECKING, Any, Mapping, NamedTuple, Sequence
 
-from .. import k1
+from .. import _served, k1
 from .._l2 import (
     _MAX_ORDER_INDEX,
     _MAX_SAFE_INT,
@@ -321,8 +339,12 @@ from ..exceptions import (
 )
 from ..money import (
     _DECIMAL_CONTEXT,
-    _PRICE_TICK,
     _check_side,
+    _market_price,
+    _market_quantity,
+    _price_max,
+    _reference,
+    _tick,
     _to_decimal,
     _worst_price,
     validate_price,
@@ -403,12 +425,14 @@ class OrdersResource(Resource):
                 :meth:`loaf.resources.market.MarketResource.list` (not every
                 listed row is tradeable; see its docstring).
             side: ``BUY`` or ``SELL`` (:class:`~loaf.enums.OrderSide`).
-            quantity: tokens, at most 1 decimal place, up to
-                28,147,497,671,065.5.
+            quantity: tokens, at most the market's ``quantityDecimals``
+                decimal places (its lot), up to its largest quantity
+                (:mod:`loaf.money`).
             type: ``LIMIT`` (default) or ``MARKET`` (:class:`~loaf.enums.OrderType`).
-            price: ``LIMIT`` only: dollars, at most 2 decimals, up to
-                4,294,967.29. Refused for ``MARKET``, which signs a worst price
-                derived from ``reference_price`` instead.
+            price: ``LIMIT`` only: dollars, at most the market's
+                ``priceDecimals`` decimal places (its tick), up to its highest
+                price (:mod:`loaf.money`). Refused for ``MARKET``, which signs
+                a worst price derived from ``reference_price`` instead.
             reference_price: ``MARKET`` only: the price your max slippage is
                 measured from. Default, read with one extra public request
                 that can lag the live market: on a perp, its live mark
@@ -428,17 +452,17 @@ class OrdersResource(Resource):
                 BUY, - for a SELL) as your worst fill price, see
                 :func:`loaf.worst_price`. On a perp the SDK first moves it at
                 most half the market's band, ``min(max_slippage_bps,
-                band // 2)``; where rounding that to the cent crosses an
-                off-grid reference (a SELL's above it, a BUY's below it), it
-                signs the cent on the reference's near side if the band and
-                ``max_slippage_bps`` admit it, else the crossing price if the
-                band admits that, else refuses the order locally (the module
-                docs, **The perps band**). A BUY off a reference under one
-                cent starts at $0.01, the lowest price, and is refused so too
-                unless the band admits that cent. For an exact worst price pass
-                ``reference_price=X, max_slippage_bps=0``: ``X``, to the cent (a
-                BUY's down, a SELL's up), is signed as given, never moved or
-                refused for the band.
+                band // 2)``; where rounding that to the market's tick
+                crosses an off-grid reference (a SELL's above it, a BUY's below
+                it), it signs the grid price on the reference's near side if
+                the band and ``max_slippage_bps`` admit it, else the crossing
+                price if the band admits that, else refuses the order locally
+                (the module docs, **The perps band**). A BUY off a reference
+                under one tick starts at one tick, the lowest price, and is
+                refused so too unless the band admits it. For an exact worst
+                price pass ``reference_price=X, max_slippage_bps=0``: ``X``, to
+                the market's tick (a BUY's down, a SELL's up), is signed as
+                given, never moved or refused for the band.
             tp_price: the TRIGGER level of an attached take-profit leg for this
                 order's FULL quantity, on the other side. A BUY's on a spot
                 market; a BUY's or a SELL's on a perp (not a
@@ -634,10 +658,11 @@ class OrdersResource(Resource):
         else:
             bps = self._tolerance(max_slippage_bps)
             if reference_price is not None and bps == 0:
-                # A price you give exactly: reference_price to the cent (a BUY's down, a SELL's
-                # up), signed as given, never moved or refused for a perp's band; a PRICE_BAND
-                # refusal of it shows no band stale (_place's derived, L2State.after_refusal).
-                order_price = _worst_price(reference_price, side, 0)
+                # A price you give exactly: reference_price to the market's tick (a BUY's down, a
+                # SELL's up), signed as given, never moved or refused for a perp's band; a
+                # PRICE_BAND refusal of it shows no band stale (_place's derived,
+                # L2State.after_refusal).
+                order_price = _derived(reference_price, side, 0, exact=True)
             else:
                 # Off reference_price, or without one off the market's (a perp's mark), read with
                 # the market.
@@ -847,26 +872,30 @@ class OrdersResource(Resource):
                 :meth:`loaf.resources.market.MarketResource.list` (not every
                 listed row is tradeable; see its docstring).
             side: ``BUY`` or ``SELL`` (:class:`~loaf.enums.OrderSide`).
-            quantity: token quantity in human units, at most 1 decimal place.
-                Fixed for the life of the row — it is never clamped at trigger
-                time, so a SELL whose holding shrank below it FAILS rather than
-                selling what is left.
+            quantity: tokens, at most the market's ``quantityDecimals``
+                decimal places, as in :meth:`create`. Fixed for the life of the
+                row — it is never clamped at trigger time, so a SELL whose
+                holding shrank below it FAILS rather than selling what is left.
             type: one of :class:`~loaf.enums.ConditionalOrderType`. Direction
                 comes from ``type`` AND ``side``: a stop SELL and a take BUY
                 fire on a FALL to the trigger, a stop BUY and a take SELL fire
                 on a RISE. :meth:`stop_loss` and :meth:`take_profit` spell the
                 two common cases out for you.
             trigger_price: the mark level that fires the row, dollars, at most
-                2 decimals. The mark is the order book mid, else the last trade,
-                else the last candle close. On a perp it is
-                ``market.get(ticker).market.live.markPrice`` (dollars x 1000),
-                which the ``perps:markets`` channel pushes. Refused (400) if the
-                mark is already at or through it — triggering is level-based, so
-                a trigger EQUAL to the mark is refused too. Round it yourself
-                (``round(mark * 0.95, 2)``): a raw float product carries 17
-                decimals and fails the 2-decimal check.
-            price: ``*_LIMIT`` types only (required): dollars, at most 2
-                decimals. Refused for a ``*_MARKET`` type. On a perp it must
+                the market's ``priceDecimals`` decimal places (on its tick). The
+                mark is the order book mid, else the last trade, else the last
+                candle close. On a perp it is
+                ``market.get(ticker).market.live.markPrice`` (dollars), which
+                the ``perps:markets`` channel pushes. Refused
+                (400) if the mark is already at or through it — triggering is
+                level-based, so a trigger EQUAL to the mark is refused too.
+                Round it yourself (``round(mark * Decimal("0.95"),
+                market.priceDecimals)``, a mark an exact ``Decimal``): a raw
+                product has more decimals than the tick and fails the market's
+                check.
+            price: ``*_LIMIT`` types only (required): dollars, on the
+                market's tick, as in :meth:`create`. Refused for a ``*_MARKET``
+                type. On a perp it must
                 lie within the market's band around ``trigger_price`` (400
                 ``PRICE_BAND`` otherwise); the SDK signs it as given.
             max_slippage_bps: ``*_MARKET`` types only. The SDK signs
@@ -915,8 +944,9 @@ class OrdersResource(Resource):
               trigger (the market's band was narrowed since it was placed) is
               ``FAILED``, with ``l2 perps: the price is outside the market's
               band around its trigger price`` as its ``rejectionReason``.
-            * The minimum order value ($10) is measured at the signed price; a
-              SELL of your whole holding is exempt. Your cash and holding are
+            * The minimum order value (the market's ``minOrderValue``, $10) is
+              measured at the signed price; a SELL of your whole holding is
+              exempt. Your cash and holding are
               checked only when the row fires.
             * On a perp, a row that is not reduce-only is refused at placement
               when its pool cannot back it with the row's market valued at its
@@ -1453,14 +1483,18 @@ class OrdersResource(Resource):
     ) -> Any:
         """Read what the order signs, take its order numbers, sign it and send it.
 
+        ``qty_d``, a given ``price`` and ``trigger_d`` are as checked before
+        anything is read (:func:`~loaf.money.validate_quantity`,
+        :func:`~loaf.money.validate_price`), and are checked on the market's grid
+        and within its bounds once it is known, before any order number is taken.
         ``price`` is the order's price as given (a LIMIT order's, a ``*_LIMIT``
-        conditional's, a MARKET order's ``reference_price`` with no slippage), or
-        the one the SDK derives (:class:`_Derived`: a MARKET order's worst price,
-        off its ``reference_price`` or, without one, off the market's reference,
-        read here; a ``*_MARKET`` conditional's, off its trigger), priced once
-        the market is known (and refused then, before any order number is
-        taken, when no cent fits a perp's band and the max slippage:
-        :meth:`_Derived.on`);
+        conditional's), or one the SDK prices once the market is known
+        (:class:`_Derived`: a MARKET order's worst price, off its
+        ``reference_price`` or, without one, off the market's reference, read
+        here; a MARKET order's ``reference_price`` with no slippage, to the tick;
+        a ``*_MARKET`` conditional's, off its trigger), and refused then, before
+        any order number is taken, when no price on the tick fits a perp's band
+        and the max slippage (:meth:`_Derived.on`);
         ``perps`` its ``(pool, reduce_only)`` as passed; ``trigger_d`` makes
         it a conditional (always GTC); ``legs`` are its TP/SL legs as
         ``("tp" | "sl", limit)``, each limit derived off the leg's trigger;
@@ -1475,7 +1509,7 @@ class OrdersResource(Resource):
         # or a leg's): a PRICE_BAND refusal shows that band possibly stale (L2State.after_refusal).
         # A price given exactly, a MARKET order's reference_price with no slippage among them, owes
         # the band nothing.
-        derived = isinstance(price, _Derived) or bool(legs)
+        derived = (isinstance(price, _Derived) and not price.exact) or bool(legs)
         try:
             market = l2.market(ticker)
             reference = None  # the market's, for a MARKET order without reference_price
@@ -1489,8 +1523,20 @@ class OrdersResource(Resource):
                 l2.remember(ticker, market)
                 if unpriced:
                     reference = _reference_from(detail, ticker, market)
+            # On the market's lot and tick, within its bounds: refused before anything is reserved.
+            decimals = market.price_decimals, market.quantity_decimals
+            qty_d = _market_quantity(qty_d, market.quantity_decimals, ticker)
+            if trigger_d is not None:
+                trigger_d = _market_price(trigger_d, "trigger_price", *decimals, ticker)
             if isinstance(price, _Derived):
                 price = price.on(market, ticker, reference)
+            else:
+                price = _market_price(price, "price", *decimals, ticker)
+            # Each leg's trigger, as given, and its limit, derived off it.
+            priced_legs: list[tuple[str, Decimal, Decimal]] = []
+            for leg, limit in legs:
+                leg_trigger = _market_price(limit.reference, f"{leg}_price", *decimals, ticker)
+                priced_legs.append((leg, leg_trigger, limit.on(market, ticker)))
             self._check_chain(market, key, ticker)
             market_keys, base_field, leg_field = _market_keys(market, ticker, side, perps, legs)
             account = l2.account(key.l2_account_index)
@@ -1522,10 +1568,9 @@ class OrdersResource(Resource):
             # with the parent's expiry and the next order number (tp, then sl), and its own
             # base-asset field (a perps leg's is reduce-only, see _market_keys).
             leg_side = OrderSide.BUY if side == OrderSide.SELL else OrderSide.SELL
-            for index, (leg, limit) in enumerate(legs, first + 1):
-                leg_price = limit.on(market, ticker)
+            for index, (leg, leg_trigger, leg_price) in enumerate(priced_legs, first + 1):
                 body[leg] = {
-                    "triggerPrice": float(limit.reference),  # a leg's reference is its trigger
+                    "triggerPrice": float(leg_trigger),
                     "price": float(leg_price),
                     "l2OrderIndex": index,
                     "l2ExpiryMs": expiry_ms,
@@ -1682,67 +1727,78 @@ class _Derived(NamedTuple):
     """A price the SDK derives rather than signs as given: a MARKET order's worst price, a
     ``*_MARKET`` stop's or take's booked price, a TP/SL leg's limit. ``reference`` (a MARKET order's
     ``reference_price``, or the trigger of a stop, take or leg; ``None``: the market's reference,
-    read with its market) moved ``bps`` against an order of ``side``, the move held within half a
-    perp's band (:func:`_band_bps`) once the market is known, a price rounded across an off-grid
-    reference given way to the cent on its near side where that may be signed, and an order left
-    with no price inside the band refused (:meth:`on`)."""
+    read with its market) moved ``bps`` against an order of ``side`` and rounded to the market's
+    tick once the market is known, the move held within half a perp's band (:func:`_band_bps`), a
+    price rounded across an off-grid reference given way to the grid price on its near side where
+    that may be signed, and an order left with no price inside the band refused (:meth:`on`).
+    ``exact``: a MARKET order's ``reference_price`` with no slippage, a price given, only rounded
+    to the market's tick (a BUY's down, a SELL's up) and never moved or refused for the band."""
 
     reference: Any
     side: str
     bps: int
+    exact: bool = False
 
     def on(self, market: Market, ticker: str, reference: Any = None) -> Decimal:
         """The price on ``market`` (``ticker``'s), off ``reference`` when this one has none.
 
         Today's price first: the reference moved ``bps`` against the order, at most half a perp's
-        band (:func:`_band_bps`), rounded toward the reference to the cent, and at least $0.01. On
-        a perp with a band, a price that crossed the reference (a SELL's above it, a BUY's below
-        it), which only rounding toward a reference off the cent grid does (a mark is in tenths of
-        a cent; a trigger is on the grid, so a stop's or a leg's price never crosses), gives way to
-        the cent on the reference's near side (a SELL's floor, a BUY's ceiling: against the order)
-        when that cent is positive, inside the band (``|cent - reference| x 10,000 <= band x
+        band (:func:`_band_bps`), rounded toward the reference to the market's tick, and at least
+        one tick. On a perp with a band, a price that crossed the reference (a SELL's above it, a
+        BUY's below it), which only rounding toward a reference off the tick grid does (a mark is
+        in the market's signed price units, finer than its tick; a trigger is on the grid, so a
+        stop's or a leg's price never crosses), gives way to the grid price on the reference's
+        near side (a SELL's floor, a BUY's ceiling: against the order) when that price is positive,
+        at most the market's highest, inside the band (``|near - reference| x 10,000 <= band x
         reference``, the exchange's rule, both edges in) and within ``bps`` of the reference (the
         whole max slippage, not the half-band cap). Else today's price, across the reference or
         not, is kept while it lies inside the band, which one that did not cross always does
-        unless the $0.01 floor lifted it: a BUY off a reference under one cent signs $0.01 only
-        where the band is at least ``10,000 x (0.01 - reference) / reference`` bp (10,000 off
-        $0.005). Else no cent lies inside the band and within ``bps`` against the order, and the
-        order is refused here, before an order number is taken or anything is signed or sent. A
-        band of 0 changes nothing.
+        unless the one-tick floor lifted it: a BUY off a reference under one tick signs one tick
+        only where the band is at least ``10,000 x (tick - reference) / reference`` bp (10,000 off
+        half a tick). Else no price on the tick lies inside the band and within ``bps`` against
+        the order, and the order is refused here, before an order number is taken or anything is
+        signed or sent. A band of 0 changes nothing, and neither band nor slippage moves an
+        ``exact`` price.
         """
         start = reference if self.reference is None else self.reference
-        price = _worst_price(start, self.side, _band_bps(self.bps, market))
+        decimals = market.price_decimals, market.quantity_decimals
+        where = f" on {ticker}"
+        if self.exact:
+            return _worst_price(start, self.side, 0, *decimals, where)
+        price = _worst_price(start, self.side, _band_bps(self.bps, market), *decimals, where)
         band = market.band if market.type == "PERP" else 0
         if band <= 0:
             return price
         sell = self.side == OrderSide.SELL
+        tick, most = _tick(market.price_decimals), _price_max(*decimals)
         with localcontext(_DECIMAL_CONTEXT):
             ref = _to_decimal(start, "reference_price")  # exact: what the band is measured from
             if (price > ref) if sell else (price < ref):
-                # Across an off-grid reference: the cent on its near side, against the order.
-                near = ref.quantize(_PRICE_TICK, rounding=ROUND_FLOOR if sell else ROUND_CEILING)
+                # Across an off-grid reference: the grid price on its near side, against the order.
+                near = ref.quantize(tick, rounding=ROUND_FLOOR if sell else ROUND_CEILING)
                 reach = abs(near - ref) * 10_000
                 # The exchange's rule and the max slippage, both edges in.
-                if near >= _PRICE_TICK and reach <= band * ref and reach <= self.bps * ref:
+                if tick <= near <= most and reach <= band * ref and reach <= self.bps * ref:
                     return near
             # Today's price, across the reference or not, while it lies inside the band (the
             # exchange's rule, both edges in): one that did not cross lies outside it only when the
-            # $0.01 floor lifted it, a BUY's off a reference under one cent.
+            # one-tick floor lifted it, a BUY's off a reference under one tick.
             if abs(price - ref) * 10_000 <= band * ref:
                 return price
+            shown = format(ref.normalize(), "f")  # the reference without trailing zeros
         raise _client_validation_error(
-            f"No price on the $0.01 grid lies within {ticker}'s band of {band} bp around {ref} and "
-            f"within max_slippage_bps={self.bps} of it: place a LIMIT order"
+            f"No price on {ticker}'s tick of {tick} lies within its band of {band} bp around "
+            f"{shown} and within max_slippage_bps={self.bps} of it: place a LIMIT order"
         )
 
 
-def _derived(reference: Any, side: str, bps: int) -> _Derived:
-    """A derived price (:class:`_Derived`), checked now when its reference is given, so that one no
-    order could sign is refused before anything is read: a band only brings it nearer (the near
-    cent :meth:`_Derived.on` may sign lies within ``bps`` of the reference too)."""
+def _derived(reference: Any, side: str, bps: int, exact: bool = False) -> _Derived:
+    """A price the SDK derives (:class:`_Derived`), its reference checked now when it is given, a
+    positive number, so that one no market could price is refused before anything is read; the
+    market's tick and highest price once it is known (:meth:`_Derived.on`)."""
     if reference is not None:
-        _worst_price(reference, side, bps)
-    return _Derived(reference, side, bps)
+        _reference(reference)
+    return _Derived(reference, side, bps, exact)
 
 
 def _band_bps(bps: int, market: Market) -> int:
@@ -1751,25 +1807,27 @@ def _band_bps(bps: int, market: Market) -> int:
     refuses a perps order whose price lies outside the band around the mark, and a perps stop, take
     or leg whose limit lies outside it around its own trigger: within half of it, the price is
     inside, with the other half left for the mark to move before the order is admitted. Rounded to
-    the cent across an off-grid reference, it may give way to the cent on the reference's near side;
-    lifted to the $0.01 floor (a BUY's off a reference under one cent), it may lie outside the band,
-    which refuses it (:meth:`_Derived.on`)."""
+    the market's tick across an off-grid reference, it may give way to the grid price on the
+    reference's near side; lifted to the one-tick floor (a BUY's off a reference under one tick), it
+    may lie outside the band, which refuses it (:meth:`_Derived.on`)."""
     if market.type == "PERP" and market.band > 0:
         return min(bps, market.band // 2)
     return bps
 
 
 def _reference_from(detail: Any, ticker: str, market: Market) -> Any:
-    """A MARKET order's default reference: on a perp, its live mark (``market.live.markPrice``,
-    dollars x 1000), the centre of its band; else, and on a perp whose mark is 0 (no price report
-    yet, so no band either) or not served (``market.live`` null: the exchange may still band the
-    order around its mark), the ``marketPrice`` of ``ticker``'s ``marketList`` entry (the book
-    mid, else the last trade, else the last candle close, else the IPO price)."""
+    """A MARKET order's default reference: on a perp, its live mark (``market.live.markPrice``, in
+    dollars, read as :meth:`~loaf.resources.market.MarketResource.get` reads it), the centre of its
+    band; else, and on a perp whose mark is 0 (no price report yet, so no band either) or not served
+    (``market.live`` null: the exchange may still band the order around its mark), the
+    ``marketPrice`` of ``ticker``'s ``marketList`` entry (the book mid, else the last trade, else
+    the last candle close, else the IPO price)."""
     if market.type == "PERP":
+        _served.read(detail, _served.market_detail, f"GET /trade/{ticker}")
         live = detail["market"].get("live")  # market_of checked that "market" is an object
         mark = live.get("markPrice") if isinstance(live, Mapping) else None
-        if _whole(mark, 1, _MAX_SAFE_INT):
-            return Decimal(f"{mark}E-3")  # exact, whatever the decimal context
+        if isinstance(mark, Decimal) and mark > 0:
+            return mark
     for item in detail.get("marketList") or []:
         if item.get("ticker") == ticker:
             price = item.get("marketPrice")
@@ -1797,7 +1855,10 @@ def _signed(
     conditional (the order it books). ``base_field`` is its signed base-asset field
     (:func:`_market_keys`)."""
     with localcontext(_DECIMAL_CONTEXT):
-        price_scaled, quantity_scaled = int(price * 1000), int(quantity * 10)  # exact on the grid
+        # The market's signed units, exact: on its grid, a price has fewer decimal places than its
+        # signed price, and a quantity as many as its signed quantity.
+        price_scaled = int(price.scaleb(market.signed_price_decimals))
+        quantity_scaled = int(quantity.scaleb(market.quantity_decimals))
     try:
         message = k1.order_message(
             l2_chain_id=market.l2_chain_id,

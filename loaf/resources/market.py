@@ -2,7 +2,8 @@
 
 None of these require authentication — they work with an anonymous client.
 All currency values are plain dollars and quantities plain tokens (see
-:mod:`loaf.money`).
+:mod:`loaf.money`); a perp's live state and order limits are exact
+:class:`~decimal.Decimal` values (:meth:`MarketResource.get`).
 
 A market is one order book, spot or perp, named by its ticker: its asset's
 ticker, ``-PERP`` appended for a perp (``"MUS"``, ``"H100-PERP"``). Every call
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Iterator
 
+from .. import _served
 from ..exceptions import LoafError
 from .base import Resource, _check_market_ticker
 
@@ -34,10 +36,11 @@ class MarketResource(Resource):
         ``tradingStartsAt``, ``name`` (the asset's display name), ``kind``
         (the asset's, :class:`~loaf.enums.AssetKind`), ``tokenAddress``,
         ``marketPrice``, ``dailyReferencePrice``, ``volume24h``,
-        ``hasL2Market``, ``candlesticks`` (trailing-24h hourly OHLCV sparkline
-        only — use :meth:`candles` for real chart history), ``property`` (a
-        property's address, type, supply and yield; ``None`` for any other
-        kind), etc.
+        ``hasL2Market``, ``priceDecimals``, ``quantityDecimals`` and
+        ``minOrderValue`` (as :meth:`get`'s ``market``), ``candlesticks``
+        (trailing-24h hourly OHLCV sparkline only — use :meth:`candles` for
+        real chart history), ``property`` (a property's address, type, supply
+        and yield; ``None`` for any other kind), etc.
 
         ``isHalted`` is the effective trading-halt flag when read, as
         :meth:`get`'s ``market.isHalted``; ``market_halt`` frames carry each
@@ -55,8 +58,9 @@ class MarketResource(Resource):
         """``GET /trade/{ticker}`` — full detail for one market.
 
         Returns the ``market``, its ``asset``, a ``marketList`` selector (each
-        row's ``marketIndex``, ``ticker``, ``type``, ``status`` and
-        ``marketPrice``, and a perp's ``maxLeverage`` and ``live`` figures,
+        row's ``marketIndex``, ``ticker``, ``type``, ``status``,
+        ``marketPrice``, ``priceDecimals`` and ``quantityDecimals``, and a
+        perp's ``maxLeverage`` and ``live`` figures,
         ``{markPrice, openInterest, fundingRateCbp, fundingPeriodMs}`` as in
         :class:`~loaf.models.PerpsMarketLive`, both ``None`` on spot: it maps
         a market index to its ticker. An offering's row, ``type`` ``IPO``,
@@ -68,12 +72,24 @@ class MarketResource(Resource):
         dedicated :meth:`candles` endpoint.
 
         ``market`` is ``{marketIndex, ticker, type, status, isHalted,
-        tradingStartsAt, l2}``, and a perp's ``live``.
+        tradingStartsAt, priceDecimals, quantityDecimals, minOrderValue,
+        l2}``, and a perp's ``live``. ``priceDecimals`` and
+        ``quantityDecimals``, set at the market's listing, are its tick and
+        lot: a price on it has at most ``priceDecimals`` decimal places (a
+        tick of 10^-priceDecimals dollars), a quantity at most
+        ``quantityDecimals`` (a lot of 10^-quantityDecimals tokens), and the
+        SDK refuses an order off them (:mod:`loaf.money`). ``minOrderValue``
+        is the least price x quantity of an order, dollars (10), which a full
+        close (a SELL of your whole holding) need not reach.
         ``market.l2`` is, by ``type``, a spot market's ``{chainId,
-        proxyAddress, l2ChainId, baseAssetId, quoteAssetId}``
-        (:class:`~loaf.models.MarketL2`), or a perp's, with its ``status`` and
-        terms and no base asset (:class:`~loaf.models.PerpMarketL2`): with
-        ``marketIndex``, what every order
+        proxyAddress, l2ChainId, baseAssetId, quoteAssetId,
+        signedPriceDecimals, signedQuantityDecimals}``
+        (:class:`~loaf.models.MarketL2`: an order signs price x
+        10^signedPriceDecimals and quantity x 10^signedQuantityDecimals), or a
+        perp's, with its ``status`` and
+        terms and no base asset (:class:`~loaf.models.PerpMarketL2`, its order
+        limits ``minBase``, tokens, and ``minQuote`` and ``quoteLimit``,
+        dollars, exact Decimals): with ``marketIndex``, what every order
         on the market signs (the SDK reads both for you), or ``None``: the
         market cannot be traded now. ``asset`` is ``{ticker, name, kind,
         videoUrl, stakeholders, property}``:
@@ -113,19 +129,21 @@ class MarketResource(Resource):
           at, stops and takes fire on and the market's band (``l2.band``)
           centres on (within 2 % of the index; 0 before the first report, when
           no band applies), and ``indexPrice``, the oracle's accepted index
-          (0 before the first report), as of ``observedAtMs``, both in the
-          market's price units (dollars x 1000); ``openInterest`` (base units,
-          K1's two-sided sum: longs plus shorts, so one side's is half)
-          and ``fundingIndex`` (F: a position owes base x (F - its
-          ``fundingIndex``), signed), decimal strings;
+          (0 before the first report), as of ``observedAtMs``, both dollars,
+          exact Decimals that can fall between ticks (to
+          ``l2.signedPriceDecimals`` places); ``openInterest``, tokens, a
+          Decimal (K1's two-sided sum: longs plus shorts, so one side's is
+          half); and ``fundingIndex``, F, the engine's integer of extended USDC
+          units per lot, a decimal string: a position owes its lots, base x
+          10^``quantityDecimals``, x (F - its ``fundingIndex``), signed;
         * ``nextTickAtMs``, when the next funding tick is due (0: none, an
           expired or unpriced market), and ``fundingPeriodMs``, the period
           ``fundingRateCbp`` (centi-bp of the index: funding is paid on the
           index) is per; it is what a tick would apply now, ``None`` when the
           market is not rated;
-        * ``heldPrice``, ``{price, observedAtMs}``: the newest price report,
-          held for an operator's answer, while no order that can add to a
-          position is admitted; ``None`` when there is none.
+        * ``heldPrice``, ``{price, observedAtMs}``: the newest price report
+          (dollars, a Decimal), held for an operator's answer, while no order
+          that can add to a position is admitted; ``None`` when there is none.
 
         The ``perps:markets`` channel pushes every perp's row about once a
         second (:meth:`~loaf.ws.client.LoafWebSocketClient.on_perps_markets_live`),
@@ -144,9 +162,15 @@ class MarketResource(Resource):
         row's ``isHalted``. Seed from it, then keep it live with the
         ``market:{ticker}`` WebSocket channel
         (:meth:`loaf.ws.client.LoafWebSocketClient.subscribe_market_status`).
+
+        The exchange serves each of the Decimals above as an exact decimal
+        string; one in any other form raises
+        :class:`~loaf.exceptions.LoafServerError` naming it, never read in
+        another unit.
         """
         _check_market_ticker(ticker)
-        return self._client.get(f"/trade/{ticker}", auth=False)
+        detail = self._client.get(f"/trade/{ticker}", auth=False)
+        return _served.read(detail, _served.market_detail, f"GET /trade/{ticker}")
 
     # -- Candles (chart history) -------------------------------------------- #
 

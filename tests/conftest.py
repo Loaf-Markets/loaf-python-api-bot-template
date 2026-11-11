@@ -12,9 +12,10 @@ import math
 import re
 import threading
 import time
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
 import pytest
@@ -36,16 +37,30 @@ EPOCH = 2
 L2_CHAIN_ID = 4242
 # The one string the web app's Show trading key gives for it: the account's on that L2 chain.
 TRADING_KEY = f"loaf_tk_{L2_CHAIN_ID}_{ACCOUNT_INDEX}_{L2_SECRET}"
-# OPRA's market index and its market.l2, as the exchange serves them.
+# OPRA's market index, its (priceDecimals, quantityDecimals), set at a listing near $160 (a tick of
+# $0.01, a lot of 0.001 tokens; OPRA-PERP's, listed near $100, are the same), and its market.l2, as
+# the exchange serves them.
 MARKET_INDEX = 2050
+DECIMALS = (2, 3)
+
+
+def signed_decimals(quantity_decimals: int) -> dict[str, int]:
+    """A market's ``l2.signedPriceDecimals`` and ``l2.signedQuantityDecimals``: an order on a market
+    of ``quantity_decimals`` signs price x 10^(7 - quantity_decimals) and quantity x
+    10^quantity_decimals."""
+    return {"signedPriceDecimals": 7 - quantity_decimals, "signedQuantityDecimals": quantity_decimals}
+
+
 MARKET_L2 = {
     "chainId": 421614,
     "proxyAddress": "0x" + "11" * 20,
     "l2ChainId": L2_CHAIN_ID,
     "baseAssetId": 6,
     "quoteAssetId": 3,
+    **signed_decimals(DECIMALS[1]),
 }
-# Perp 4 (OPRA-PERP)'s market.l2.
+# Perp 4 (OPRA-PERP)'s market.l2: its order limits actual values, exact decimal strings, as the
+# exchange serves them.
 PERP_L2 = {
     "chainId": 421614,
     "proxyAddress": "0x" + "11" * 20,
@@ -59,9 +74,10 @@ PERP_L2 = {
     "maxLeverage": 9,
     "band": 500,
     "flags": 1,
-    "minBase": 0,
-    "minQuote": 0,
-    "quoteLimit": 0,
+    "minBase": "0",
+    "minQuote": "0",
+    "quoteLimit": "0",
+    **signed_decimals(DECIMALS[1]),
 }
 # The perps collateral: USDC of 6 decimals, a tick of 10,000 base units (0.01 USDC), and 100
 # extended units a tick.
@@ -72,35 +88,40 @@ PERPS_COLLATERAL = {
     "tickSize": "10000",
     "extensionMultiplier": "100",
 }
-# A perp's market.live: open, rated, risk-only, its mark off its index.
+# A perp's market.live: open, rated, risk-only, its mark off its index. Its prices and open interest
+# are actual values, exact decimal strings (the open interest past a float's precision), its funding
+# index K1's integer.
 PERPS_LIVE = {
     "marketIndex": 4,
     "status": "ACTIVE",
-    "markPrice": 2510,
-    "indexPrice": 2500,
+    "markPrice": "2.51",
+    "indexPrice": "2.5",
     "observedAtMs": 1_800_000_000_000,
-    "openInterest": "18446744073709551615",
+    "openInterest": "18446744073709551.615",
     "fundingIndex": "-4294967296",
     "nextTickAtMs": 1_800_003_600_000,
     "fundingPeriodMs": 3_600_000,
     "fundingRateCbp": -250,
-    "heldPrice": {"price": 2600, "observedAtMs": 1_800_000_001_000},
+    "heldPrice": {"price": "2.6", "observedAtMs": 1_800_000_001_000},
     "halted": False,
     "riskOnly": True,
     "asOfMs": 1_800_000_001_250,
     "tradingState": "OPEN",
     "stateReason": None,
 }
-# GET /portfolio/summary's perps: pool 0 holds a long in perp 4, pool 2 a short in perp 9.
+# GET /portfolio/summary's perps: pool 0 holds a long in perp 4 (3 quantity decimals), pool 2 a
+# short in perp 9 (2). Its prices, sizes and dollar amounts are actual values, exact decimal
+# strings (a price can fall between ticks, to its signed price decimals), its funding indexes K1's
+# integers.
 PERPS_ACCOUNT = {
     "collateral": PERPS_COLLATERAL,
     "l2AccountIndex": ACCOUNT_INDEX,
     "pools": [
         {
             "pool": 0,
-            "collateral": "5000000000000",
-            "value": "5100000000000",
-            "requirement": "16384000000000000",
+            "collateral": "5000.123456",
+            "value": "5007.143455",
+            "requirement": "10.252014",
             "liquidatable": False,
             "positions": [
                 {
@@ -110,19 +131,20 @@ PERPS_ACCOUNT = {
                     "risk": 3277,
                     "maxLeverage": 9,
                     "band": 500,
-                    "base": "20",
+                    **signed_decimals(3),
+                    "base": "2.004",
                     "fundingIndex": "4294967296",
-                    "entryQuote": "203000",
-                    "entryPrice": "101500",
-                    "fundingOwed": "-1200",
-                    "notional": "2050000000000",
-                    "liquidationPrice": "52000",
+                    "entryQuote": "203.406",
+                    "entryPrice": "101.5",
+                    "fundingOwed": "-0.0012",
+                    "notional": "205.0272",
+                    "liquidationPrice": "52.0049",
                 }
             ],
         },
         {
             "pool": 2,
-            "collateral": "300000000000",
+            "collateral": "-0.000001",
             "value": None,
             "requirement": None,
             "liquidatable": None,
@@ -134,18 +156,56 @@ PERPS_ACCOUNT = {
                     "risk": 3277,
                     "maxLeverage": 9,
                     "band": 500,
-                    "base": "-5",
+                    **signed_decimals(2),
+                    "base": "-0.5",
                     "fundingIndex": "-12",
-                    "entryQuote": "50000",
-                    "entryPrice": "100000",
-                    "fundingOwed": "35",
-                    "notional": "490000000000",
+                    "entryQuote": "50",
+                    "entryPrice": "100",
+                    "fundingOwed": "0.000035",
+                    "notional": "49",
                     "liquidationPrice": None,
                 }
             ],
         },
     ],
 }
+
+
+def as_decimals(row: dict[str, Any], fields: Iterable[str]) -> dict[str, Any]:
+    """``row`` as the SDK reads it: each of ``fields`` the Decimal of its served string (``None``
+    kept)."""
+    return {**row, **{f: None if row[f] is None else Decimal(row[f]) for f in fields}}
+
+
+def served(value: Decimal) -> str:
+    """``value`` as the exchange serves an actual value: an exact decimal string, no exponent, no
+    trailing zero, ``"0"`` for zero."""
+    text = format(value, "f")  # every digit, never rounded
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text == "-0" else text
+
+
+# The served decimals of each perps shape (the SDK reads every one as a Decimal; the funding indexes
+# stay K1's integer strings), and the fixtures above as the SDK returns them.
+POOL_DECIMALS = ("collateral", "value", "requirement")
+POSITION_DECIMALS = ("base", "entryQuote", "entryPrice", "fundingOwed", "notional", "liquidationPrice")
+LIVE_DECIMALS = ("markPrice", "indexPrice", "openInterest")
+PERPS_ACCOUNT_READ = {
+    **PERPS_ACCOUNT,
+    "pools": [
+        {
+            **as_decimals(pool, POOL_DECIMALS),
+            "positions": [as_decimals(p, POSITION_DECIMALS) for p in pool["positions"]],
+        }
+        for pool in PERPS_ACCOUNT["pools"]
+    ],
+}
+PERPS_LIVE_READ = {
+    **as_decimals(PERPS_LIVE, LIVE_DECIMALS),
+    "heldPrice": as_decimals(PERPS_LIVE["heldPrice"], ("price",)),
+}
+
 # A market's state refusals: the exchange's 403 body (its text and code), the error it raises, and
 # its state.
 MARKET_STATES = [
@@ -259,16 +319,20 @@ def market_detail(
     market_index: Any = MARKET_INDEX,
     l2: Any = _TYPES_L2,
     market_price: float = 160,
+    decimals: tuple[int, int] = DECIMALS,
 ) -> dict:
     """A ``GET /trade/{ticker}`` body with the fields order placement reads, and a perp's
     ``live``.
 
-    ``market_index=...`` or ``l2=...`` leaves that field out. ``l2`` defaults to its
-    type's: ``PERP_L2`` for a perp (its ticker ends in -PERP), else ``MARKET_L2``.
+    ``market_index=...`` or ``l2=...`` leaves that field out. ``decimals`` is the
+    market's ``(priceDecimals, quantityDecimals)``. ``l2`` defaults to its type's, signing
+    in those decimals: ``PERP_L2`` for a perp (its ticker ends in -PERP), else
+    ``MARKET_L2``; one given is served as given.
     """
     perp = ticker.endswith("-PERP")
+    price_decimals, quantity_decimals = decimals
     if l2 is _TYPES_L2:
-        l2 = PERP_L2 if perp else MARKET_L2
+        l2 = {**(PERP_L2 if perp else MARKET_L2), **signed_decimals(quantity_decimals)}
     market: dict[str, Any] = {
         "marketIndex": market_index,
         "ticker": ticker,
@@ -276,6 +340,9 @@ def market_detail(
         "status": "LIVE",
         "isHalted": False,
         "tradingStartsAt": None,
+        "priceDecimals": price_decimals,
+        "quantityDecimals": quantity_decimals,
+        "minOrderValue": 10,
         "l2": l2,
     }
     market = {k: v for k, v in market.items() if v is not ...}
@@ -286,11 +353,18 @@ def market_detail(
         "type": "PERP" if perp else "SPOT",
         "maxLeverage": PERP_L2["maxLeverage"] if perp else None,
         "marketPrice": market_price,
+        "priceDecimals": price_decimals,
+        "quantityDecimals": quantity_decimals,
     }]
     if ticker != "MUS":  # another market ahead of it: the reference is found by its ticker
-        listed.insert(
-            0, {"ticker": "MUS", "type": "SPOT", "maxLeverage": None, "marketPrice": 50}
-        )
+        listed.insert(0, {
+            "ticker": "MUS",
+            "type": "SPOT",
+            "maxLeverage": None,
+            "marketPrice": 50,
+            "priceDecimals": 3,
+            "quantityDecimals": 2,
+        })
     return {"market": market, "marketList": listed}
 
 
@@ -491,6 +565,9 @@ class FakeExchange:
                 "isHalted": market["isHalted"],
                 "tradingStartsAt": market.get("tradingStartsAt"),
                 "hasL2Market": market.get("l2") is not None,
+                "priceDecimals": market.get("priceDecimals"),
+                "quantityDecimals": market.get("quantityDecimals"),
+                "minOrderValue": market.get("minOrderValue"),
             })
         return {"markets": rows}
 
@@ -537,19 +614,23 @@ def js_round(value: float, scale: int) -> int:
     return math.floor(value * scale + 0.5)
 
 
-def verify_order(body: dict, leg: str | None = None) -> None:
+def verify_order(body: dict, leg: str | None = None, *, l2: dict = MARKET_L2) -> None:
     """Check the signature of a posted ``body`` (or of its ``leg``, ``"tp"`` / ``"sl"``)
     under ``L2_PUBLIC_KEY``, or raise :class:`loaf.k1.K1Error`.
 
     The 12 signed terms are rebuilt from the JSON as the exchange reads it, not
-    from the SDK's own values: price x 1000 and quantity x 10 rounded like
-    ``Math.round``; a leg signs an order of the parent's quantity on the other
-    side, at its own price, with its own order index and expiry; a conditional
-    signs the order it books (its own side and price). A perps order signs its
+    from the SDK's own values: price x 10^signedPriceDecimals and quantity x
+    10^signedQuantityDecimals of the market's ``l2`` (OPRA's by default, and
+    OPRA-PERP's are the same), rounded like ``Math.round``; a leg signs an order
+    of the parent's quantity on the other side, at its own price, with its own
+    order index and expiry; a conditional signs the order it books (its own side
+    and price). A perps order signs its
     ``l2Pool`` and ``l2ReduceOnly`` as its base-asset field, and a perps leg the
     parent's ``l2Pool`` with the reduce-only bit (the exchange's leg schema).
     """
     signed = body if leg is None else body[leg]
+    price_scale = 10 ** l2["signedPriceDecimals"]
+    quantity_scale = 10 ** l2["signedQuantityDecimals"]
     if "l2Pool" in body:
         # The pool byte, built here and not by the SDK: the pool in bits 0-2, reduce-only bit 3.
         reduce_only = leg is not None or body["l2ReduceOnly"] is True
@@ -562,12 +643,12 @@ def verify_order(body: dict, leg: str | None = None) -> None:
         l2_base_asset_id=base_field,
         l2_quote_asset_id=body["l2QuoteAssetId"],
         is_ask=(body["side"] == "SELL") != (leg is not None),
-        price=js_round(signed["price"], 1000),
+        price=js_round(signed["price"], price_scale),
         l2_fee_rate_cap=body["l2FeeRateCap"],
         l2_account_index=body["l2AccountIndex"],
         l2_order_index=signed["l2OrderIndex"],
         l2_epoch=body["l2Epoch"],
-        quantity=js_round(body["quantity"], 10),
+        quantity=js_round(body["quantity"], quantity_scale),
         l2_expiry_ms=signed["l2ExpiryMs"],
     )
     k1.verify(

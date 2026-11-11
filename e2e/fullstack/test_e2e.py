@@ -79,21 +79,26 @@ def test_the_trading_key_derives_as_the_web_app_derives_it(v):
 
 
 def test_index_for_brings_the_pool_to_the_fraction():
-    p0, n0, r0 = 1_500_000, 1_500_000_000, 46_875_000  # maintenance 1/32 of the notional
-    v0 = r0 * 22 // 10  # initial margin (2 r0) plus 10 %
-    pool = {"pool": 2, "value": str(v0), "requirement": str(r0 * 65_536),
-            "positions": [{"market": 1, "base": "10", "notional": str(n0)}]}
-    def ratio(p):  # the pool's value over its requirement at index p
-        return Fraction(v0 * p0 - n0 * (p0 - p), r0 * p)
+    # A long of one token at $1,500, its maintenance 1/32 of its notional and its value its initial margin plus 10 %,
+    # in dollars as the SDK reads a pool (its requirement the maintenance margin itself).
+    p0, n0, r0 = Decimal(1500), Decimal(1500), Decimal("46.875")
+    v0 = r0 * Decimal("2.2")
+    pool = {"pool": 2, "value": v0, "requirement": r0,
+            "positions": [{"market": 1, "base": Decimal(1), "notional": n0}]}
+    millionth = Decimal("0.000001")
+
+    def ratio(p):  # the pool's value over its requirement at index p, exactly
+        return (Fraction(v0) * Fraction(p0) - Fraction(n0) * (Fraction(p0) - Fraction(p))) / (Fraction(r0) * Fraction(p))
 
     for num, den in ((2, 5), (17, 20), (-1, 5)):
         p = e2e.index_for(pool, 1, p0, num, den)
-        assert p < p0 and ratio(p) <= Fraction(num, den) < ratio(p + 1)
+        assert p < p0 and p == p.quantize(millionth)  # rounded down to the millionth
+        assert ratio(p) <= Fraction(num, den) < ratio(p + millionth)
     assert v0 * p0 - n0 * (p0 - e2e.index_for(pool, 1, p0, -1, 5)) < 0  # the value below 0
     with pytest.raises(e2e.Failed):
         e2e.index_for({**pool, "positions": []}, 1, p0, 2, 5)
     with pytest.raises(e2e.Failed):
-        e2e.index_for({**pool, "value": str(r0 // 2)}, 1, p0, 2, 5)
+        e2e.index_for({**pool, "value": r0 / 2}, 1, p0, 2, 5)
 
 
 def test_provision_sql_upserts_each_wallets_user_whatever_its_case_and_quotes_labels():
@@ -185,18 +190,34 @@ def test_the_spot_side_is_the_sdks():
     assert e2e.PERPS_SPOT_SIDE == 255
 
 
+# The role markets of the laptop checks: each a $1,500 listing, a tick of $0.10 and a lot of 0.0001 tokens, so its
+# signed price unit is $0.001: the pump's index 1,500,000 is $1,500.
+ROLE_TICKERS = {m: f"R{m}-PERP" for m in (0, 2, 3, 6, 8, 9)}
+ROLE_DECIMALS = {t: (1, 4) for t in ROLE_TICKERS.values()}
+
+
+def dollars_of(index):
+    """A role market's pump index (its signed price, the engine's) in dollars, as the SDK reads a price."""
+    return Decimal(index) / 1_000
+
+
+@pytest.mark.parametrize("decimals", [(2, 3), (1, 4), (4, 1)])
 @pytest.mark.parametrize("band", [0, 30, 99, 100, 150, 199, 200, 500, None, "50"])
-def test_the_take_profits_bid_is_the_limit_the_sdk_signs_its_leg(band):
-    # MM's bid for the perps step's take-profit is the leg's limit as the SDK derives it, at any band: one under 200 bp
-    # holds the leg's 1 % to half of it, which moves the limit above its trigger x 0.99 (an old bid at trigger x 0.995
-    # sat below it under 100 bp). Whether the band admits that bid is the step's band check (below).
+def test_the_take_profits_bid_is_the_limit_the_sdk_signs_its_leg(band, decimals):
+    # MM's bid for the perps step's take-profit is the leg's limit as the SDK derives it, at any band and on any tick:
+    # one under 200 bp holds the leg's 1 % to half of it, which moves the limit above its trigger x 0.99 (an old bid at
+    # trigger x 0.995 sat below it under 100 bp). Whether the band admits that bid is the step's band check (below).
+    price_decimals, quantity_decimals = decimals
     l2 = {"chainId": 421614, "proxyAddress": "0x" + "11" * 20, "l2ChainId": 4242, "quoteAssetId": 3,
-          "status": "ACTIVE", "band": band}
-    market = market_of({"market": {"marketIndex": 4, "type": "PERP", "l2": l2}}, "MUS-PERP")
+          "status": "ACTIVE", "band": band, "signedPriceDecimals": 7 - quantity_decimals,
+          "signedQuantityDecimals": quantity_decimals}
+    market = market_of({"market": {"marketIndex": 4, "type": "PERP", "priceDecimals": price_decimals,
+                                   "quantityDecimals": quantity_decimals, "l2": l2}}, "MUS-PERP")
     tp = Decimal("102.35")
-    limit = e2e.leg_limit(l2, tp, "SELL", 100)
+    limit = e2e.leg_limit(l2, decimals, tp, "SELL", 100)
     assert limit == _Derived(tp, "SELL", 100).on(market, "MUS-PERP")
     assert limit < tp and (tp - limit) * 10_000 <= 100 * tp
+    assert limit == limit.quantize(Decimal(1).scaleb(-price_decimals))
 
 
 def test_in_band_is_the_exchanges_rule_and_band_of_reads_the_band_as_the_sdk_does():
@@ -229,13 +250,23 @@ def test_in_band_is_the_exchanges_rule_and_band_of_reads_the_band_as_the_sdk_doe
     ],
 )
 def test_the_perps_steps_band_check_names_each_quote_its_band_refuses(env, px, band, missed):
-    run = e2e.Run(e2e.Config.read())
+    # On a market whose tick is a cent.
+    run = e2e.Run(e2e.Config.read(), tickers={0: "MUS-PERP"}, perps={0: {"band": band}},
+                  decimals={"MUS-PERP": (2, 3)})
     price = Decimal(px)
-    misses = e2e.perps_band_misses(run, {"band": band}, price, run.to_index(price))
+    misses = e2e.perps_band_misses(run, 0, price, price)
     assert [m.split(",")[0] for m in misses] == missed
     # The limit it checks is the one the step bids at and the SDK signs the leg at.
-    _, _, tp, _, limit = e2e.perps_prices(run, {"band": band}, price)
-    assert limit == e2e.leg_limit({"band": band}, tp, "SELL", 100)
+    _, _, tp, _, limit = e2e.perps_prices(run, 0, price)
+    assert limit == e2e.leg_limit({"band": band}, (2, 3), tp, "SELL", 100)
+
+
+def test_the_perps_steps_prices_are_on_the_markets_tick(env):
+    # A $1,500 listing's tick is $0.10: the step's quotes and triggers round to it, its take-profit's limit too.
+    run = e2e.Run(e2e.Config.read(), tickers={0: "R0-PERP"}, perps={0: {"band": 1_000}},
+                  decimals={"R0-PERP": (1, 4)})
+    prices = e2e.perps_prices(run, 0, Decimal("1500.04"))
+    assert prices == (Decimal("1498.5"), Decimal("1501.6"), Decimal("1530.1"), Decimal("1455.0"), Decimal("1514.8"))
 
 
 def test_the_perps_step_fails_at_once_on_a_band_too_narrow_for_its_quotes(env):
@@ -243,9 +274,9 @@ def test_the_perps_step_fails_at_once_on_a_band_too_narrow_for_its_quotes(env):
     at the take-profit's limit would be refused PRICE_BAND, so the step fails naming it and what it needs, and no user
     is touched (each would raise AttributeError)."""
     run = e2e.Run(e2e.Config.read(), tickers={0: "MUS-PERP"}, perps={0: {"band": 100}},
-                  users={name: types.SimpleNamespace() for name in ("A", "B", "MM")})
+                  decimals={"MUS-PERP": (2, 3)}, users={name: types.SimpleNamespace() for name in ("A", "B", "MM")})
     run.anon = types.SimpleNamespace(market=types.SimpleNamespace(
-        get=lambda t: {"market": {"live": {"indexPrice": 1_500_000, "markPrice": 1_500_000}}}))
+        get=lambda t: {"market": {"live": {"indexPrice": Decimal(1500), "markPrice": Decimal(1500)}}}))
     with pytest.raises(e2e.Failed) as info:
         e2e.step_perps(run)
     assert str(info.value) == (
@@ -362,20 +393,27 @@ def test_a_numeric_wait_ends_on_0_as_on_any_number():
 
 def test_run_units(env):
     cfg = e2e.Config.read()
-    run = e2e.Run(cfg, collateral={"decimals": 6, "tickSize": "10000", "extensionMultiplier": "1000000"})
-    assert run.dollars(1_500_123) == Decimal("1500.123") and run.to_index(Decimal("1500.12")) == 1_500_120
-    assert run.units(Decimal("1.5")) == 15 and run.tokens(15) == Decimal("1.5")
-    assert run.cents(Decimal("1500.123"), True) == Decimal("1500.13") and run.cents(Decimal("1500.129"), False) == Decimal("1500.12")
-    assert run.ext_per_dollar() == 100 * 10**6
+    run = e2e.Run(cfg, collateral={"decimals": 6, "tickSize": "10000", "extensionMultiplier": "1000000"},
+                  tickers={4: "R4-PERP"}, decimals={"R4-PERP": (1, 4), "EBS": (3, 2)})
+    # A market's tick and lot: R4-PERP's $0.10 and 0.0001, EBS's $0.001 and 0.01.
+    assert run.to_tick("R4-PERP", Decimal("1500.123"), True) == Decimal("1500.2")
+    assert run.to_tick("R4-PERP", Decimal("1500.199"), False) == Decimal("1500.1")
+    assert run.to_tick("EBS", Decimal("9.8765"), True) == Decimal("9.877") and run.tick("EBS") == Decimal("0.001")
+    assert (run.lot("R4-PERP"), run.lot("EBS")) == (Decimal("0.0001"), Decimal("0.01"))
+    # The pump's index, the engine's: R4-PERP's signed price unit is $0.001 (3 signed price decimals).
+    assert run.signed_decimals(4) == 3 and run.pump_index(4, Decimal("1500.12")) == 1_500_120
+    assert run.pump_index(4, Decimal("1500.120999")) == 1_500_120  # rounded down
+    # One tick of the collateral: 10,000 base units of a 6-decimal token.
+    assert run.usdc_tick() == Decimal("0.01")
 
 
 class FakeBook:
-    """One account's spot USDC (base units) and pools (extended units), moved by allocates and withdrawals as the
-    exchange moves them: a tick is 10,000 base units ($0.01) and ``ext`` extended units. A withdrawal executes on
-    ``l1`` (when set) at once, and its transfer row reads CONFIRMED in batch 40 + its journal seq."""
+    """One account's spot USDC (base units) and pools (dollars, as the SDK reads them), moved by allocates and
+    withdrawals as the exchange moves them: a tick is 10,000 base units ($0.01). A withdrawal executes on ``l1`` (when
+    set) at once, and its transfer row reads CONFIRMED in batch 40 + its journal seq."""
 
-    def __init__(self, spot, ext=1_000_000):
-        self.spot, self.pools, self.seq, self.held, self.ext = spot, {}, 0, set(), ext
+    def __init__(self, spot):
+        self.spot, self.pools, self.seq, self.held = spot, {}, 0, set()
         self.perps, self.portfolio, self.funds = self, self, self
         self.withdrawals, self.l1 = [], None
 
@@ -396,17 +434,17 @@ class FakeBook:
 
     def allocate(self, amount, *, from_side, to_side):
         ticks = amount * 100
-        assert ticks == int(ticks) and ticks > 0, amount
+        assert isinstance(amount, Decimal) and ticks == int(ticks) and ticks > 0, amount
         for side, sign in ((from_side, -1), (to_side, 1)):
             if side == e2e.PERPS_SPOT_SIDE:
                 self.spot += sign * int(ticks) * 10_000
             else:
-                self.pools[side] = self.pools.get(side, 0) + sign * int(ticks) * self.ext
+                self.pools[side] = self.pools.get(side, Decimal(0)) + sign * amount
         self.seq += 1
         return {"journalSeq": self.seq}
 
     def positions(self):
-        return {"pools": [{"pool": p, "collateral": str(c), "positions": [{"market": 0}] if p in self.held else []}
+        return {"pools": [{"pool": p, "collateral": c, "positions": [{"market": 0}] if p in self.held else []}
                           for p, c in sorted(self.pools.items())]}
 
     def summary(self):
@@ -414,40 +452,44 @@ class FakeBook:
 
 
 def test_fund_allocate_and_sweep_move_exact_ticks(env):
+    # In pool 0, which the engine never sweeps (an isolated pool that backs nothing it does: Run.settled waits).
     cfg = dataclasses.replace(e2e.Config.read(), wait_s=1)
     run = e2e.Run(cfg, collateral={"decimals": 6, "tickSize": "10000", "extensionMultiplier": "1000000"})
     book = FakeBook(5_000 * 10**6)
     user = e2e.User("A", wallet=None, client=book)
-    run.fund(user, 1, Decimal(2_000))
-    assert (book.spot, book.pools) == (3_000 * 10**6, {1: 200_000 * 10**6})
-    run.fund(user, 1, Decimal(1_500))
+    run.fund(user, 0, Decimal(2_000))
+    assert (book.spot, book.pools) == (3_000 * 10**6, {0: Decimal(2_000)})
+    run.fund(user, 0, Decimal(1_500))
     assert book.seq == 1
-    run.fund(user, 1, Decimal("2000.005"))
-    assert book.seq == 2 and book.pools[1] == 200_100 * 10**6
-    book.held.add(1)
-    run.allocate(user, Decimal(100), 1, e2e.PERPS_SPOT_SIDE)
-    run.sweep(user, 1)
-    assert book.seq == 3 and book.pools[1] == 190_100 * 10**6
+    run.fund(user, 0, Decimal("2000.005"))  # up to whole dollars
+    assert book.seq == 2 and book.pools[0] == Decimal(2_001)
+    book.held.add(0)
+    run.allocate(user, Decimal(100), 0, e2e.PERPS_SPOT_SIDE)
+    run.sweep(user, 0)
+    assert book.seq == 3 and book.pools[0] == Decimal(1_901)
     book.held.clear()
-    book.pools[1] += 999_999  # less than a tick stays
-    run.sweep(user, 1)
-    assert book.pools[1] == 999_999 and book.spot == 5_000 * 10**6
+    book.pools[0] += Decimal("0.009999")  # less than a tick stays
+    run.sweep(user, 0)
+    assert book.pools[0] == Decimal("0.009999") and book.spot == 5_000 * 10**6 and book.seq == 4
+    run.sweep(user, 0)  # nothing to move
+    assert book.seq == 4
     with pytest.raises(e2e.Failed):  # an allocate the exchange books wrong fails its check
-        book.allocate = lambda amount, *, from_side, to_side: (book.pools.__setitem__(2, 1), {"journalSeq": 9})[1]
+        book.allocate = lambda amount, *, from_side, to_side: (
+            book.pools.__setitem__(2, Decimal("0.99")), {"journalSeq": 9})[1]
         run.allocate(user, Decimal(1), e2e.PERPS_SPOT_SIDE, 2)
 
 
 def test_a_sweep_that_empties_the_pool_passes(env):
-    """With an extension multiplier of 1 (the stack's USDC), a sweep moves the pool's whole collateral and the pool
-    reads 0: that 0 is the allocate's answer, not a wait that runs out (run-1's exit step)."""
+    """A pool of whole ticks: a sweep moves all of its collateral and the pool reads 0, which is the allocate's
+    answer, not a wait that runs out (run-1's exit step)."""
     cfg = dataclasses.replace(e2e.Config.read(), wait_s=1)
-    run = e2e.Run(cfg, collateral={"decimals": 6, "tickSize": "10000", "extensionMultiplier": "1"})
-    book = FakeBook(5_000 * 10**6, ext=1)
+    run = e2e.Run(cfg, collateral={"decimals": 6, "tickSize": "10000", "extensionMultiplier": "1000000"})
+    book = FakeBook(5_000 * 10**6)
     user = e2e.User("A", wallet=None, client=book)
     run.fund(user, 0, Decimal(300))
-    assert (book.spot, book.pools) == (4_700 * 10**6, {0: 30_000})
+    assert (book.spot, book.pools) == (4_700 * 10**6, {0: Decimal(300)})
     run.sweep(user, 0)
-    assert (book.spot, book.pools, book.seq) == (5_000 * 10**6, {0: 0}, 2)
+    assert (book.spot, book.pools, book.seq) == (5_000 * 10**6, {0: Decimal(0)}, 2)
 
 
 class FakeL1:
@@ -497,7 +539,7 @@ def test_the_exit_step_withdraws_through_the_sdk_and_claims_exactly_on_l1(env, m
     l1 = FakeL1()
     run, book = _exit_run(spot_usdc, l1)
     e2e.step_exit(run)
-    assert book.pools == {0: 0} and book.spot == (spot_usdc - withdrawn) * 10**6
+    assert book.pools == {0: Decimal(0)} and book.spot == (spot_usdc - withdrawn) * 10**6
     assert book.withdrawals == [(Decimal(withdrawn), 3)]  # after the fund (1) and the sweep (2)
     assert l1.sent == [("withdrawPendingBalance(address,uint16,uint128)", "0x" + "aa" * 20, e2e.USDC_ASSET,
                         withdrawn * 100)]
@@ -662,26 +704,27 @@ def test_the_spot_legs_orders_clear_the_backends_least_order_value(env, monkeypa
     sent = []
     run = e2e.Run(dataclasses.replace(e2e.Config.read(), spot_price=Decimal(ref)))
     run.spot, run.spot_l2 = "EBS", {"quoteAssetId": e2e.USDC_ASSET, "baseAssetId": 2}
+    run.decimals = {"EBS": (2, 2)}
     run.chain = types.SimpleNamespace(asset=lambda proxy, asset: {"decimals": 18})
     run.users = {n: e2e.User(n, wallet=None, client=FakeSpotClient(sent)) for n in e2e.USERS}
     monkeypatch.setattr(e2e.Run, "cancel_all", lambda self: None)
     with pytest.raises(SpotStop):
         e2e.step_spot(run)
     [(quantity, bid)] = sent
-    assert bid == run.cents(Decimal(ref) * Decimal("0.98"), False)
+    assert bid == run.to_tick("EBS", Decimal(ref) * Decimal("0.98"), False)
     assert quantity == size and quantity * bid >= 25 > (quantity - 1) * bid
 
 
 class FakeVenue:
     """A spot book and a perps book: a GTC order rests, an IOC fills against one resting at its price (the whole of
-    it) or is refused NOT_FILLED; spot moves tokens and cents, perps moves base and nothing else. Books and
-    balances are the venue's; each user's client only names the user."""
+    it) or is refused NOT_FILLED; spot moves tokens and cents, perps moves base (tokens, as the SDK reads it) and
+    nothing else. Books and balances are the venue's; each user's client only names the user."""
 
-    def __init__(self, spot="EBS", perps="PERP", ext=1_000_000):
-        self.spot, self.perps_t, self.ext = spot, perps, ext
+    def __init__(self, spot="EBS", perps="PERP"):
+        self.spot, self.perps_t = spot, perps
         self.rest = {}  # (ticker, buy) -> [(price, qty, user)]
         self.tokens, self.cents, self.base = {}, {}, {}  # user -> base units; user -> cents; (user, pool) -> base
-        self.pools = {}  # (user, pool) -> collateral
+        self.pools = {}  # (user, pool) -> collateral, dollars
         self.fills, self.seq, self.lock = {spot: 0, perps: 0}, 0, threading.Lock()
 
     def client(self, name):
@@ -707,7 +750,7 @@ class FakeVenue:
                     self.cents[u] = self.cents.get(u, 0) - sign * (1 if buy else -1) * (cost + (cost // 200 if u == user else 0))
             else:
                 for u, sign in ((user, 1), (maker, -1)):
-                    self.base[(u, pool)] = self.base.get((u, pool), 0) + sign * (1 if buy else -1) * int(qty * 10)
+                    self.base[(u, pool)] = self.base.get((u, pool), Decimal(0)) + sign * (1 if buy else -1) * qty
             self.fills[ticker] += 1
             return {"orderId": self.seq, "status": "FILLED", "quantityLeft": "0"}
 
@@ -730,14 +773,14 @@ class FakeVenueClient:
 
     def allocate(self, amount, *, from_side, to_side):
         pool, sign = (from_side, -1) if to_side == e2e.PERPS_SPOT_SIDE else (to_side, 1)
-        self.v.pools[(self.name, pool)] = self.v.pools.get((self.name, pool), 0) + sign * int(amount * 100) * self.v.ext
+        self.v.pools[(self.name, pool)] = self.v.pools.get((self.name, pool), Decimal(0)) + sign * amount
         self.v.cents[self.name] = self.v.cents.get(self.name, 0) - sign * int(amount * 100)
         return {"journalSeq": 1}
 
     def positions(self):
         pools = {p for (u, p) in list(self.v.pools) + list(self.v.base) if u == self.name}
-        return {"pools": [{"pool": p, "collateral": str(self.v.pools.get((self.name, p), 0)),
-                           "positions": [{"market": 0, "base": str(b)}] if (b := self.v.base.get((self.name, p), 0))
+        return {"pools": [{"pool": p, "collateral": self.v.pools.get((self.name, p), Decimal(0)),
+                           "positions": [{"market": 0, "base": b}] if (b := self.v.base.get((self.name, p), 0))
                            else []} for p in sorted(pools)]}
 
     def summary(self):
@@ -755,8 +798,10 @@ def mixed_run(venue, secs="0.4"):
     run.spot, run.spot_l2 = venue.spot, {"quoteAssetId": e2e.USDC_ASSET, "baseAssetId": 2}
     run.chain = types.SimpleNamespace(asset=lambda proxy, asset: {"decimals": 6})
     run.anon = types.SimpleNamespace(market=types.SimpleNamespace(get=lambda t: {"market": {"live": {
-        "tradingState": "OPEN", "indexPrice": "1500000", "markPrice": "1500000"}}}))
-    run.perps, run.tickers = {0: {"minBase": "1"}}, {0: venue.perps_t}
+        "tradingState": "OPEN", "indexPrice": Decimal(1500), "markPrice": Decimal(1500)}}}))
+    run.perps, run.tickers = {0: {"minBase": Decimal("0.0001")}}, {0: venue.perps_t}
+    # Cent ticks, as the venue books cash in cents.
+    run.decimals = {venue.spot: (2, 2), venue.perps_t: (2, 4)}
     run.users = {n: e2e.User(n, wallet=None, client=venue.client(n)) for n in e2e.USERS}
     return run
 
@@ -874,12 +919,13 @@ def test_a_users_closes_are_the_rows_that_closed_its_pool():
 
 
 def test_payments_of_keeps_a_pools_moves_on_a_market_past_after():
+    # Payments in dollars, as the SDK reads them; a receipt under a millionth reads 0.
     rows = [
-        {"journalSeq": 31, "marketIndex": 8, "pool": 6, "payment": "0"},
-        {"journalSeq": 30, "marketIndex": 8, "pool": 6, "payment": "-12"},
-        {"journalSeq": 29, "marketIndex": 9, "pool": 6, "payment": "3"},
-        {"journalSeq": 28, "marketIndex": 8, "pool": 5, "payment": "4"},
-        {"journalSeq": 20, "marketIndex": 8, "pool": 6, "payment": "4"},
+        {"journalSeq": 31, "marketIndex": 8, "pool": 6, "payment": Decimal(0)},
+        {"journalSeq": 30, "marketIndex": 8, "pool": 6, "payment": Decimal("-0.000012")},
+        {"journalSeq": 29, "marketIndex": 9, "pool": 6, "payment": Decimal("0.3")},
+        {"journalSeq": 28, "marketIndex": 8, "pool": 5, "payment": Decimal("0.4")},
+        {"journalSeq": 20, "marketIndex": 8, "pool": 6, "payment": Decimal("0.4")},
     ]
     history = types.SimpleNamespace(funding=lambda *, page_size: {"funding": rows})
     user = e2e.User("A", wallet=None, client=types.SimpleNamespace(history=history))
@@ -912,14 +958,15 @@ def test_the_private_channel_keeps_every_frame(env):
     run = e2e.Run(e2e.Config.read())
     e2e.listen(run, user)
     assert calls == ["on_message", "subscribe_portfolio", "start", 30] and run.sockets == [socket]
-    push = {"type": "perps_account_update", "perps": {"l2AccountIndex": 5, "pools": [
-        {"pool": 0, "positions": [{"market": 4, "base": "-20"}, {"market": 6, "base": "15"}]},
-        {"pool": 3, "positions": [{"market": 6, "base": "7"}]}]}}
+    push = {"type": "perps_account_update", "perps": {"l2AccountIndex": 5, "pools": [  # bases as the SDK reads them
+        {"pool": 0, "positions": [{"market": 4, "base": Decimal(-2)}, {"market": 6, "base": Decimal("1.5")}]},
+        {"pool": 3, "positions": [{"market": 6, "base": Decimal("0.7")}]}]}}
     for frame in (push, {"type": "trade_new", "trade": {"tradeId": 1}}, {"type": "echo"}, push):
         socket.fn(frame)
     assert run.sent(user, "perps_account_update") == [push, push]
     assert run.sent(user, "trade_new") == [{"type": "trade_new", "trade": {"tradeId": 1}}]
-    assert (e2e.pushed_base(push, 6, 0), e2e.pushed_base(push, 4, 0), e2e.pushed_base(push, 6, 3)) == (15, -20, 7)
+    assert (e2e.pushed_base(push, 6, 0), e2e.pushed_base(push, 4, 0), e2e.pushed_base(push, 6, 3)) == (
+        Decimal("1.5"), Decimal(-2), Decimal("0.7"))
     assert e2e.pushed_base(push, 4, 3) == 0 and e2e.pushed_base(push, 6, 1) == 0
 
 
@@ -930,7 +977,7 @@ def test_a_live_state_the_backend_has_not_read_is_read_again(env, monkeypatch):
     tickers = e2e.perp_tickers([{"marketIndex": 6, "ticker": "H100-PERP", "type": "PERP"},
                                 {"marketIndex": 2050, "ticker": "MUS", "type": "SPOT"}])
     assert tickers == {6: "H100-PERP"}
-    answers = iter([None, None, {"indexPrice": 1_500_000, "markPrice": 1_503_000}])
+    answers = iter([None, None, {"indexPrice": Decimal("1.5"), "markPrice": Decimal("1.503")}])
     sent = []
 
     def get(ticker):
@@ -939,7 +986,7 @@ def test_a_live_state_the_backend_has_not_read_is_read_again(env, monkeypatch):
 
     run = e2e.Run(dataclasses.replace(e2e.Config.read(), wait_s=5), tickers=tickers)
     run.anon = types.SimpleNamespace(market=types.SimpleNamespace(get=get))
-    assert run.live(6) == {"indexPrice": 1_500_000, "markPrice": 1_503_000} and sent == ["H100-PERP"] * 3
+    assert run.live(6) == {"indexPrice": Decimal("1.5"), "markPrice": Decimal("1.503")} and sent == ["H100-PERP"] * 3
     run.cfg = dataclasses.replace(run.cfg, wait_s=0.05)
     run.anon = types.SimpleNamespace(market=types.SimpleNamespace(get=lambda t: {"market": {"live": None}}))
     with pytest.raises(e2e.Failed, match="no market 6's live state within"):
@@ -950,18 +997,18 @@ def test_mark_near_waits_for_the_mark_to_follow_the_index(env, monkeypatch):
     """The mark lags a walked index: mark_near ends once it is within 25 bp (inclusive), and fails past
     E2E_FINAL_WAIT_S while it stays off."""
     monkeypatch.setattr(e2e.time, "sleep", lambda s: None)
-    marks = iter([1_440_000, 1_490_000, 1_496_250])  # off the index 1,500,000 by 4 %, 66.7 bp, then 25 bp
+    marks = iter(Decimal(m) for m in ("1.44", "1.49", "1.49625"))  # off the index $1.50 by 4 %, 66.7 bp, then 25 bp
     run = e2e.Run(dataclasses.replace(e2e.Config.read(), wait_s=1, final_wait_s=5), tickers={2: "MUS-PERP"})
     run.anon = types.SimpleNamespace(market=types.SimpleNamespace(
-        get=lambda t: {"market": {"live": {"indexPrice": 1_500_000, "markPrice": next(marks)}}}))
+        get=lambda t: {"market": {"live": {"indexPrice": Decimal("1.5"), "markPrice": next(marks)}}}))
     run.mark_near(2)
     assert next(marks, None) is None
     run.cfg = dataclasses.replace(run.cfg, final_wait_s=0.05)
     run.anon = types.SimpleNamespace(market=types.SimpleNamespace(
-        get=lambda t: {"market": {"live": {"indexPrice": 1_500_000, "markPrice": 1_496_249}}}))
+        get=lambda t: {"market": {"live": {"indexPrice": Decimal("1.5"), "markPrice": Decimal("1.496249")}}}))
     with pytest.raises(e2e.Failed, match="no market 2's mark within 25 bp of its index within"):
         run.mark_near(2)
-    assert run.mark(2) == 1_496_249
+    assert run.mark(2) == Decimal("1.496249")
 
 
 def test_a_saved_leverage_is_read_back_from_its_answer_the_component_and_a_push(env, monkeypatch):
@@ -1203,10 +1250,11 @@ def test_the_liquidation_step_refuses_a_stack_whose_backstop_holds_a_position_on
 
 
 class FakeStack:
-    """The engine and the backend for a step's restore. A market's index is the pump's newest walk of it (else
-    ``start``, else 1,500,000); its state is ``states``' (the admin halt and the operator's controls set it), else
-    PRICE_STALE while the pump's newest mode for it is quiet, else OPEN. Patches Run.index, Run.live, Run.admin and
-    Pg.__call__ (the operator's flags)."""
+    """The engine and the backend for a step's restore, on the role markets (ROLE_DECIMALS). A market's index is the
+    pump's newest walk of it (else ``start``, else 1,500,000), the engine's, which the SDK reads in dollars; its
+    state is ``states``' (the admin halt and the operator's controls set it), else PRICE_STALE while the pump's
+    newest mode for it is quiet, else OPEN. Patches Run.index, Run.live, Run.admin and Pg.__call__ (the operator's
+    flags)."""
 
     def __init__(self, monkeypatch, pump, states=None, start=None):
         self.pump, self.states, self.start, self.flags = pump, dict(states or {}), dict(start or {}), {}
@@ -1228,8 +1276,8 @@ class FakeStack:
         for body in reversed(self.pump.seen):
             got = body.get("markets", {}).get(str(m))
             if got and got["mode"] == "walk":
-                return got["index"]
-        return self.start.get(m, 1_500_000)
+                return dollars_of(got["index"])
+        return dollars_of(self.start.get(m, 1_500_000))
 
     def state(self, m):
         if m in self.states:
@@ -1256,28 +1304,34 @@ def walks_of(pump):
     return [(int(m), v["index"]) for b in pump.seen for m, v in b["markets"].items() if v["mode"] == "walk"]
 
 
+def listed(run):
+    """A setup that reads only the role markets' listing: their tickers and decimals."""
+    run.tickers, run.decimals = dict(ROLE_TICKERS), dict(ROLE_DECIMALS)
+
+
 def knobs_of(pump):
     return [b["backstop"]["free_ticks"] for b in pump.seen if "backstop" in b]
 
 
-@pytest.mark.parametrize("home", ["1500000", None])
+@pytest.mark.parametrize("home", ["1500", None])
 def test_a_failing_step_puts_back_what_it_moved(env, tmp_path, monkeypatch, capsys, home):
     """Run-2's liquidation and halt steps failed at a check and left their markets walked, halted and the knob up:
-    the step's restore (run_step's finally) reopens what it controlled, walks home what it moved (E2E_HOME_INDEX,
-    else the index before its first move) and puts the knob at 0."""
+    the step's restore (run_step's finally) reopens what it controlled, walks home what it moved (E2E_HOME_PRICE,
+    else the index before its first move) and puts the knob at 0. The pump takes each walk in the market's signed
+    price units, the engine's."""
     pump = FakePump(tmp_path)
     stack = FakeStack(monkeypatch, pump, start={6: 1_234_000, 2: 1_455_000, 8: 1_510_000})
     env.setenv("E2E_STEPS", "liquidation")
     env.setenv("E2E_WAIT_S", "5")
     env.setenv("E2E_OPERATOR", "sql")
     if home:
-        env.setenv("E2E_HOME_INDEX", home)
+        env.setenv("E2E_HOME_PRICE", home)
 
     def moves(run):
         run.pump = e2e.Prices(str(pump.control), str(pump.status), 5)
-        run.walk(6, 1_386_086)
+        run.walk(6, Decimal("1386.086"))
         run.backstop(5_000_000)
-        run.walk(2, 1_432_808)
+        run.walk(2, Decimal("1432.808"))
         assert run.halt(3).status_code == 200
         run.operator(0, "REDUCE_ONLY")
         run.silence(8)
@@ -1285,14 +1339,14 @@ def test_a_failing_step_puts_back_what_it_moved(env, tmp_path, monkeypatch, caps
         raise e2e.Failed("no the tape's take 299153 within 180 s; last None")
 
     try:
-        assert e2e.main({"setup": step("ok"), "liquidation": moves}) == 1
+        assert e2e.main({"setup": listed, "liquidation": moves}) == 1
     finally:
         pump.stop = True
     out = capsys.readouterr().out
-    homes = {m: int(home) if home else stack.start[m] for m in (2, 6, 8)}
+    homes = {m: 1_500_000 if home else stack.start[m] for m in (2, 6, 8)}  # the pump's
     assert " ==== exit liquidation 1" in out and "not restored" not in out
-    assert (f"restore: market 0 OPEN; market 3 OPEN; market 8 OPEN; market 2's index home at {homes[2]}; "
-            f"market 6's index home at {homes[6]}; market 8's index home at {homes[8]}; "
+    assert (f"restore: market 0 OPEN; market 3 OPEN; market 8 OPEN; market 2's index home at ${dollars_of(homes[2])}; "
+            f"market 6's index home at ${dollars_of(homes[6])}; market 8's index home at ${dollars_of(homes[8])}; "
             "the backstop's knob at 0") in out
     assert walks_of(pump) == [(6, 1_386_086), (2, 1_432_808), (0, 1_500_000), (3, 1_500_000), (8, 1_510_000),
                               (2, homes[2]), (6, homes[6]), (8, homes[8])]
@@ -1316,7 +1370,7 @@ def test_a_step_whose_restore_fails_says_what_it_left(env, tmp_path, monkeypatch
         step(kind)(run)
 
     try:
-        assert e2e.main({"setup": step("ok"), "halt": halts}) == 1
+        assert e2e.main({"setup": listed, "halt": halts}) == 1
     finally:
         pump.stop = True
     out = capsys.readouterr().out
@@ -1328,10 +1382,12 @@ def test_the_one_shot_restore_runs_alone_and_puts_every_role_market_back(env, tm
     """E2E_STEPS=restore: no setup; every role market reopened if it is not OPEN and walked home, the knob at 0."""
     pump = FakePump(tmp_path)
     stack = FakeStack(monkeypatch, pump, states={3: "HALTED"}, start={2: 1_432_808, 3: 1_480_000})
-    monkeypatch.setattr(e2e, "LoafClient",
-                        lambda **kw: types.SimpleNamespace(market=types.SimpleNamespace(list=lambda: {"markets": []})))
+    rows = [{"marketIndex": m, "ticker": t, "type": "PERP", "priceDecimals": 1, "quantityDecimals": 4}
+            for m, t in ROLE_TICKERS.items()]
+    monkeypatch.setattr(e2e, "LoafClient", lambda **kw: types.SimpleNamespace(
+        market=types.SimpleNamespace(list=lambda: {"markets": rows})))
     for var, value in (("E2E_STEPS", "restore"), ("E2E_WAIT_S", "5"), ("E2E_OPERATOR", "sql"),
-                       ("E2E_HOME_INDEX", "1500000"), ("E2E_PRICE_CONTROL", str(pump.control)),
+                       ("E2E_HOME_PRICE", "1500"), ("E2E_PRICE_CONTROL", str(pump.control)),
                        ("E2E_PRICE_STATUS", str(pump.status))):
         env.setenv(var, value)
     fns = dict(e2e.STEP_FNS, setup=lambda run: pytest.fail("setup ran"))
@@ -1343,7 +1399,7 @@ def test_the_one_shot_restore_runs_alone_and_puts_every_role_market_back(env, tm
     assert "==== step setup" not in out and "==== VERDICT PASS restore=0" in out
     assert walks_of(pump) == [(3, 1_480_000)] + [(m, 1_500_000) for m in (0, 2, 3, 6, 8, 9)]
     assert knobs_of(pump) == [0] and stack.flags == {3: False}
-    assert all(f"ok market {m} is OPEN at its home index 1500000" in out for m in (0, 2, 3, 6, 8, 9))
+    assert all(f"ok market {m} is OPEN at its home index $1500" in out for m in (0, 2, 3, 6, 8, 9))
 
 
 def test_the_one_shot_restore_runs_alone_and_needs_its_home(env, capsys):
@@ -1360,18 +1416,18 @@ def test_a_stop_runs_the_steps_restore_on_the_way_out(env, tmp_path, monkeypatch
     """SIGTERM (a stopped run, as run-1 was) ends the run as SystemExit: the running step's restore still runs."""
     pump = FakePump(tmp_path)
     FakeStack(monkeypatch, pump)
-    for var, value in (("E2E_STEPS", "liquidation,halt"), ("E2E_WAIT_S", "5"), ("E2E_HOME_INDEX", "1500000")):
+    for var, value in (("E2E_STEPS", "liquidation,halt"), ("E2E_WAIT_S", "5"), ("E2E_HOME_PRICE", "1500")):
         env.setenv(var, value)
     before = signal.getsignal(signal.SIGTERM)
 
     def stopped(run):
         assert signal.getsignal(signal.SIGTERM) is e2e._stopped
         run.pump = e2e.Prices(str(pump.control), str(pump.status), 5)
-        run.walk(2, 1_432_808)
+        run.walk(2, Decimal("1432.808"))
         e2e._stopped(signal.SIGTERM, None)  # what the handler does on a SIGTERM here
 
     try:
-        assert e2e.main({"setup": step("ok"), "liquidation": stopped, "halt": step("ok")}) == 143
+        assert e2e.main({"setup": listed, "liquidation": stopped, "halt": step("ok")}) == 143
     finally:
         pump.stop = True
     out = capsys.readouterr().out
@@ -1514,7 +1570,7 @@ def test_p5_fullstack_maps_the_phase_and_evaluates_nothing(p5kit):
         "E2E_PRICE_CONTROL": f"{run}/price-control.json", "E2E_PRICE_STATUS": f"{run}/price-status.json",
         "E2E_SETTLESUB_METRICS": "http://127.0.0.1:49476/metrics", "E2E_ADMIN_API_KEY_FILE": f"{run}/lb-admin.key",
         "E2E_ENGINE_METRICS": "http://127.0.0.1:49091/metrics",
-        "E2E_OPERATOR": "sql", "E2E_HOME_INDEX": "1500000", "E2E_TAG": "p5fs",
+        "E2E_OPERATOR": "sql", "E2E_HOME_PRICE": "1500", "E2E_TAG": "p5fs",
         "E2E_PSQL_DSN_FILE": f"{run}/lb.dsn", "E2E_JOURNAL_DSN_FILE": f"{run}/journal.dsn",
         "E2E_WALLET_SEED_FILE": str(script.parent / "state" / "wallet.seed"),
     }

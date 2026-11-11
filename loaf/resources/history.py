@@ -5,13 +5,17 @@
 take ``nextCursor`` from one response and pass it as ``cursor`` to the next.
 Pass back only ``nextCursor`` values: a malformed cursor silently returns the
 first page. Do not derive "has more" from ``total`` (it is capped at 10000, for
-trades too). ``funding`` pages by cursor alone.
+trades too). ``funding`` pages by cursor alone. A fill's or funding payment's
+value served as no exact decimal string raises
+:class:`~loaf.exceptions.LoafServerError` naming it: it is never read in
+another unit.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
+from .. import _served
 from ..exceptions import LoafError
 from .base import Resource
 
@@ -75,10 +79,13 @@ class HistoryResource(Resource):
         spot, ``OPEN_LONG`` / ``CLOSE_LONG`` / ``OPEN_SHORT`` / ``CLOSE_SHORT``
         on a perp; ``pool`` is a perps fill's margin pool (``None`` on spot);
         ``closedPnl`` is dollars, signed, before fees, ``None`` unless the fill
-        reduced a position.
+        reduced a position. ``quantity`` (tokens), ``price`` (dollars: a
+        perps fill off the book, a liquidation's say, at the engine's price,
+        which can fall between ticks), ``fee`` and ``closedPnl`` are exact
+        :class:`~decimal.Decimal` values, on every market.
 
         Returns ``{trades, total, page, pageSize, nextCursor}``. ``side``,
-        ``fee`` (dollars, to 0.001), ``orderId`` (your order the fill belongs
+        ``fee`` (dollars, to 0.000001), ``orderId`` (your order the fill belongs
         to) and ``role`` (``"MAKER"`` or ``"TAKER"``) are reported from this
         user's perspective.
 
@@ -90,10 +97,11 @@ class HistoryResource(Resource):
         l2TradeDigest, batchTxHash, final}`` once a proven batch includes the
         trade (:class:`~loaf.models.TradeProofStatus`).
         """
-        return self._client.get(
+        answer = self._client.get(
             "/history/trades",
             params={"page": page, "pageSize": page_size, "cursor": cursor},
         )
+        return _served.read(answer, _served.trades, "GET /history/trades")
 
     def funding(self, *, page_size: int | None = None, cursor: str | None = None) -> Any:
         """``GET /history/funding`` — your funding payments, newest first: one
@@ -102,17 +110,18 @@ class HistoryResource(Resource):
         Returns ``{funding, nextCursor}``. ``page_size`` max is 100 (default
         20). Each row is a :class:`~loaf.models.FundingPayment`, keyed by
         ``(journalSeq, pool)``: ``base`` the position's signed base at the
-        tick, ``payment`` what the tick charged it, in the extended USDC units
-        of a pool's collateral (a decimal string, positive paid, negative
-        received), ``rateCbp`` the rate it applied, centi-bp of the index per
-        period (funding is paid on the index). The pool's ``value`` counts
-        it at once, and its ``collateral`` moves at its next refresh. What a
-        position owes since it last settled is its ``fundingOwed``
-        (:meth:`loaf.resources.perps.PerpsResource.positions`).
+        tick (tokens), ``payment`` what the tick charged it (dollars, rounded
+        up, positive paid, negative received), both exact
+        :class:`~decimal.Decimal` values, ``rateCbp`` the rate it applied,
+        centi-bp of the index per period (funding is paid on the index). The
+        pool's ``value`` counts it at once, and its ``collateral`` moves at its
+        next refresh. What a position owes since it last settled is its
+        ``fundingOwed`` (:meth:`loaf.resources.perps.PerpsResource.positions`).
         """
-        return self._client.get(
+        answer = self._client.get(
             "/history/funding", params={"pageSize": page_size, "cursor": cursor}
         )
+        return _served.read(answer, _served.funding, "GET /history/funding")
 
     def cancelled_orders(self) -> Any:
         """``GET /history/orders/cancelled`` — all cancel events, newest first (not paginated).
@@ -141,25 +150,32 @@ class HistoryResource(Resource):
         """Yield every order across all pages using cursor pagination. A
         ``nextCursor`` the server already gave raises
         :class:`~loaf.exceptions.LoafError` instead of paging forever."""
-        yield from self._iter("/history/orders", "orders", page_size)
+        yield from self._iter(
+            "/history/orders", "orders", lambda cursor: self.orders(page_size=page_size, cursor=cursor)
+        )
 
     def iter_trades(self, *, page_size: int = 100) -> Iterator[Any]:
         """Yield every trade across all pages using cursor pagination. A
         ``nextCursor`` the server already gave raises
         :class:`~loaf.exceptions.LoafError` instead of paging forever."""
-        yield from self._iter("/history/trades", "trades", page_size)
+        yield from self._iter(
+            "/history/trades", "trades", lambda cursor: self.trades(page_size=page_size, cursor=cursor)
+        )
 
     def iter_funding(self, *, page_size: int = 100) -> Iterator[Any]:
         """Yield every funding payment across all pages using cursor pagination. A
         ``nextCursor`` the server already gave raises
         :class:`~loaf.exceptions.LoafError` instead of paging forever."""
-        yield from self._iter("/history/funding", "funding", page_size)
+        yield from self._iter(
+            "/history/funding", "funding", lambda cursor: self.funding(page_size=page_size, cursor=cursor)
+        )
 
-    def _iter(self, path: str, key: str, page_size: int) -> Iterator[Any]:
+    def _iter(self, path: str, key: str, read: Callable[[str | None], Any]) -> Iterator[Any]:
+        """Each ``key`` row of ``path``'s pages, as ``read`` (the page at a cursor) serves them."""
         cursor: str | None = None
         followed: set[str] = set()
         while True:
-            page = self._client.get(path, params={"pageSize": page_size, "cursor": cursor})
+            page = read(cursor)
             for item in page.get(key, []) or []:
                 yield item
             cursor = page.get("nextCursor")

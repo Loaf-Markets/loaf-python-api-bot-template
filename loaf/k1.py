@@ -90,8 +90,10 @@ def order_message(
     """K1's order message: the 32 bytes an order's account key signs.
 
     The arguments are the order's 12 signed fields, its body keys in snake case:
-    integers, with ``price`` and ``quantity`` already scaled (x1000 and x10),
-    and ``is_ask`` true for a SELL. On a perps market (``l2_market_index`` at
+    integers, with ``price`` and ``quantity`` in the market's signed units
+    (price x 10^(7 - quantityDecimals) and quantity x 10^quantityDecimals: its
+    ``l2.signedPriceDecimals`` and ``l2.signedQuantityDecimals``), and
+    ``is_ask`` true for a SELL. On a perps market (``l2_market_index`` at
     most 254) ``l2_base_asset_id`` is the order's pool byte, 0 to 15
     (:func:`perps_base_field`); on a spot market it is the base asset, 1 to 62.
     A field the engine would refuse is refused first, as the web app's signer
@@ -108,7 +110,7 @@ def order_message(
     _width("l2_order_index", l2_order_index, 1, 2**40 - 1)
     _width("l2_epoch", l2_epoch, 0, _MAX_48)
     _width("quantity", quantity, 1, _MAX_48)
-    _width("price", price, 1, 2**32 - 1)
+    _width("price", price, 1, _MAX_32)
     _width("l2_fee_rate_cap", l2_fee_rate_cap, 0, 2**20 - 1)
     _width("l2_expiry_ms", l2_expiry_ms, 0, _MAX_48)
     if l2_market_index <= _PERPS_LAST:  # a perps market has no base asset: the pool byte
@@ -333,6 +335,7 @@ _BIG_SCALAR = "l2 signature: a signature scalar is not below the ECgFp5 group or
 _NO_KEY = "l2 signature: the api key has no usable public key"
 _BAD_MESSAGE = "l2 signature: the message must be 32 bytes of four limbs below p"
 
+_MAX_32 = (1 << 32) - 1
 _MAX_48 = (1 << 48) - 1
 _M24 = (1 << 24) - 1
 _M64 = (1 << 64) - 1

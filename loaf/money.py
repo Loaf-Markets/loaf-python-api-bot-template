@@ -1,17 +1,33 @@
 """Order-input validation and small unit helpers.
 
 Prices and quantities are human units: prices in **dollars**, quantities in
-**tokens**, both in what you send and in the market data you receive. The
-limits to respect (the SDK pre-checks these before a request goes out):
+**tokens**, both in what you send and in the market data you receive (the
+perps reads, a perp's order limits and every fill's quantity, price, fee and
+closed PnL as exact :class:`~decimal.Decimal` values). Each market has its own
+price step and lot, set at its listing: the ``priceDecimals`` and
+``quantityDecimals`` of ``market.get(ticker).market``. The limits to respect
+(the SDK checks them before an order is signed):
 
-* price: on the 0.01 grid (cents), from 0.01 to 4,294,967.29;
-* quantity: on the 0.1 grid (0.1 token), from 0.1 to 28,147,497,671,065.5;
-* an order's price x quantity: below about $281 billion (K1's 48-bit fill
+* price: at most ``priceDecimals`` decimal places (a tick of
+  10^-priceDecimals dollars), from one tick to the market's highest price, the
+  largest on its tick whose signed price fits 32 bits: (2^32 - 1) /
+  10^(7 - quantityDecimals) dollars rounded down to the tick, 429,496.72 on a
+  market of 3 quantity decimals and 2 price decimals;
+* quantity: at most ``quantityDecimals`` decimal places (a lot of
+  10^-quantityDecimals tokens), from one lot to 1,000,000,000 tokens and
+  2^48 - 1 lots;
+* an order's price x quantity: below about $281.47 million (K1's 48-bit fill
   quote).
 
 Off-grid input is **refused, never rounded**: derive prices with
-``round(x, 2)``. Internally every order is signed over scaled integers
-(price x 1000, quantity x 10); nothing you send or receive is scaled.
+``round(x, market.priceDecimals)``. A price or quantity that no market takes
+(not a positive number, more than 6 decimal places, or above 1,000,000,000) is
+refused before anything is read; the market's own grid and bounds once its
+market is read (one public request, the first time an order names it).
+Internally every order is signed over the market's integers, price x
+10^(7 - quantityDecimals) and quantity x 10^quantityDecimals (its
+``l2.signedPriceDecimals`` and ``l2.signedQuantityDecimals``); nothing you send
+is scaled.
 
 Balances and transfer amounts are the exception: decimal strings in the
 token's base units (``"1500000"`` is 1.5 of a 6-decimal token). Turn one into
@@ -38,16 +54,10 @@ from decimal import (
 )
 from typing import Any
 
-from .constants import (
-    MAX_PRICE_DECIMALS,
-    MAX_QUANTITY_DECIMALS,
-    ORDER_PRICE_MAX,
-    ORDER_QUANTITY_MAX,
-)
+from .constants import L2_SIGNED_DECIMALS, ORDER_DECIMALS, ORDER_PRICE_MAX, ORDER_QUANTITY_MAX
 from .exceptions import _client_validation_error
+from .k1 import _MAX_32, _MAX_48
 
-_PRICE_TICK = Decimal(1).scaleb(-MAX_PRICE_DECIMALS)  # 0.01
-_QUANTITY_TICK = Decimal(1).scaleb(-MAX_QUANTITY_DECIMALS)  # 0.1
 # Order math never uses the caller's decimal context (its precision or traps).
 _DECIMAL_CONTEXT = Context(prec=60, traps=[InvalidOperation, DivisionByZero, Overflow])
 _BASE_UNITS_RE = re.compile(r"0|[1-9][0-9]*")
@@ -103,31 +113,106 @@ def _to_decimal(value: Any, field: str) -> Decimal:
     return d
 
 
-def _on_grid(value: Any, field: str, tick: Decimal, places: int, maximum: Decimal) -> Decimal:
+def _integral(value: Any) -> bool:
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+
+def _decimals_field(price_decimals: Any, quantity_decimals: Any) -> str | None:
+    """The first of a market's ``priceDecimals`` and ``quantityDecimals`` that cannot be one, or
+    ``None``: whole numbers, the price's from 0 and the quantity's from 1, at most
+    :data:`~loaf.constants.ORDER_DECIMALS` together. A quantity's at least 1 makes a signed price
+    unit a whole number of millionths, and the two together at most 6 make a tick at least 10 signed
+    price units, so that K1's quote of an order on the grid is exact."""
+    if not (_integral(price_decimals) and 0 <= price_decimals < ORDER_DECIMALS):
+        return "priceDecimals"
+    most = ORDER_DECIMALS - price_decimals
+    if not (_integral(quantity_decimals) and 1 <= quantity_decimals <= most):
+        return "quantityDecimals"
+    return None
+
+
+def _tick(places: int) -> Decimal:
+    """One step of a grid of ``places`` decimal places: 10^-places."""
+    return Decimal(1).scaleb(-places)
+
+
+def _price_max(price_decimals: int, quantity_decimals: int) -> Decimal:
+    """A market's highest price: the largest on its tick whose signed price, price x
+    10^(7 - quantity_decimals), fits 32 bits."""
+    with localcontext(_DECIMAL_CONTEXT):
+        widest = Decimal(_MAX_32).scaleb(quantity_decimals - L2_SIGNED_DECIMALS)  # in dollars
+        return widest.quantize(_tick(price_decimals), rounding=ROUND_FLOOR)
+
+
+def _quantity_max(quantity_decimals: int) -> Decimal:
+    """A market's largest quantity: :data:`~loaf.constants.ORDER_QUANTITY_MAX` tokens, and
+    2^48 - 1 lots."""
+    with localcontext(_DECIMAL_CONTEXT):
+        return min(ORDER_QUANTITY_MAX, Decimal(_MAX_48).scaleb(-quantity_decimals))
+
+
+def _any_market(value: Any, field: str, maximum: Decimal) -> Decimal:
+    """``value`` as a Decimal, refused unless a number some market could take: positive, at most
+    ``maximum``, at most :data:`~loaf.constants.ORDER_DECIMALS` decimal places."""
     d = _to_decimal(value, field)
     if d <= 0:
         raise _client_validation_error(f"{field} must be positive (got {value!r})")
     if d > maximum:  # bounds BEFORE quantize (1e300 would overflow it)
         raise _client_validation_error(f"{field} must be at most {maximum:,} (got {value!r})")
     with localcontext(_DECIMAL_CONTEXT):
-        on_grid = d.quantize(tick)
-    if d != on_grid:
+        millionths = d.quantize(_tick(ORDER_DECIMALS))
+    if d != millionths:
         raise _client_validation_error(
-            f"{field} must have at most {places} decimal places (got {value!r})"
+            f"{field} must have at most {ORDER_DECIMALS} decimal places (got {value!r})"
+        )
+    return d
+
+
+def _on_grid(value: Decimal, field: str, places: int, maximum: Decimal, ticker: str) -> Decimal:
+    """``value`` on ``ticker``'s grid of ``places`` decimal places and at most ``maximum``, as a
+    Decimal on that grid; refused, never rounded."""
+    if value > maximum:
+        raise _client_validation_error(
+            f"{field} must be at most {maximum:,} on {ticker} (got {value})"
+        )
+    with localcontext(_DECIMAL_CONTEXT):
+        on_grid = value.quantize(_tick(places))
+    if value != on_grid:
+        raise _client_validation_error(
+            f"{field} must have at most {places} decimal places on {ticker} (got {value})"
         )
     return on_grid
 
 
+def _market_price(
+    value: Decimal, field: str, price_decimals: int, quantity_decimals: int, ticker: str
+) -> Decimal:
+    """A price :func:`validate_price` took (``field``: an order's or a trigger) on ``ticker``'s
+    tick and at most its highest price, a market of ``price_decimals`` and ``quantity_decimals``."""
+    most = _price_max(price_decimals, quantity_decimals)
+    return _on_grid(value, field, price_decimals, most, ticker)
+
+
+def _market_quantity(value: Decimal, quantity_decimals: int, ticker: str) -> Decimal:
+    """A quantity :func:`validate_quantity` took on ``ticker``'s lot and at most its largest
+    quantity, a market of ``quantity_decimals``."""
+    return _on_grid(value, "quantity", quantity_decimals, _quantity_max(quantity_decimals), ticker)
+
+
 def validate_price(value: float | Decimal, field: str = "price") -> Decimal:
-    """Raise :class:`LoafValidationError` unless ``value`` is a price the
-    exchange accepts; returns it as an exact ``Decimal`` on the 0.01 grid."""
-    return _on_grid(value, field, _PRICE_TICK, MAX_PRICE_DECIMALS, ORDER_PRICE_MAX)
+    """Raise :class:`LoafValidationError` unless ``value`` is a price some market takes: positive,
+    at most :data:`~loaf.constants.ORDER_PRICE_MAX`, at most 6 decimal places; returns it as an
+    exact ``Decimal``. An order checks it against its market's tick and highest price once the
+    market is read."""
+    return _any_market(value, field, ORDER_PRICE_MAX)
 
 
 def validate_quantity(value: float | Decimal, field: str = "quantity") -> Decimal:
-    """Raise :class:`LoafValidationError` unless ``value`` is a quantity the
-    exchange accepts; returns it as an exact ``Decimal`` on the 0.1 grid."""
-    return _on_grid(value, field, _QUANTITY_TICK, MAX_QUANTITY_DECIMALS, ORDER_QUANTITY_MAX)
+    """Raise :class:`LoafValidationError` unless ``value`` is a quantity some market takes:
+    positive, at most :data:`~loaf.constants.ORDER_QUANTITY_MAX`, at most 6 decimal places; returns
+    it as an exact ``Decimal``. An order checks it against its market's lot and largest quantity
+    once the market is read."""
+    return _any_market(value, field, ORDER_QUANTITY_MAX)
 
 
 def validate_slippage_bps(value: int, field: str = "max_slippage_bps") -> int:
@@ -148,60 +233,96 @@ def _check_side(side: Any) -> str:
     return side
 
 
-def _worst_price(reference_price: Any, side: str, max_slippage_bps: int) -> Decimal:
+def _reference(reference_price: Any) -> Decimal:
+    """A price the SDK derives one from, as a Decimal: refused unless a positive number."""
     ref = _to_decimal(reference_price, "reference_price")
     if ref <= 0:
         raise _client_validation_error(
             f"reference_price must be positive (got {reference_price!r}); a market price of 0 "
             "means the exchange has no reference yet"
         )
+    return ref
+
+
+def _worst_price(
+    reference_price: Any,
+    side: str,
+    max_slippage_bps: int,
+    price_decimals: int,
+    quantity_decimals: int,
+    where: str = "",
+) -> Decimal:
+    """:func:`worst_price` on a market of ``price_decimals`` and ``quantity_decimals`` (``where``
+    names it in the refusal) as an exact Decimal."""
+    ref = _reference(reference_price)
     side = _check_side(side)
     bps = validate_slippage_bps(max_slippage_bps)
+    tick, most = _tick(price_decimals), _price_max(price_decimals, quantity_decimals)
     with localcontext(_DECIMAL_CONTEXT):
         raw = ref * (10_000 + bps if side == "BUY" else 10_000 - bps) / 10_000
-        if raw < ORDER_PRICE_MAX + _PRICE_TICK:  # bounded first: quantize overflows on huge values
+        if raw < most + tick:  # bounded first: quantize overflows on huge values
             # Toward the reference, so the signed price never exceeds the tolerance.
             rounding = ROUND_FLOOR if side == "BUY" else ROUND_CEILING
-            price = max(raw.quantize(_PRICE_TICK, rounding=rounding), _PRICE_TICK)
-            if price <= ORDER_PRICE_MAX:
+            price = max(raw.quantize(tick, rounding=rounding), tick)
+            if price <= most:
                 return price
     raise _client_validation_error(
-        f"The worst price {side} {bps} bps from {reference_price!r} is above "
-        f"{ORDER_PRICE_MAX:,}, the highest price an order can sign"
+        f"The worst price {side} {bps} bps from {reference_price!r} is above {most:,}, the highest "
+        f"price an order can sign{where}"
     )
 
 
-def worst_price(reference_price: float | Decimal, side: str, max_slippage_bps: int) -> float:
-    """The worst price the SDK signs off a reference.
+def worst_price(
+    reference_price: float | Decimal,
+    side: str,
+    max_slippage_bps: int,
+    *,
+    price_decimals: int,
+    quantity_decimals: int,
+) -> float:
+    """The worst price the SDK signs off a reference, on a market of ``price_decimals`` and
+    ``quantity_decimals``: its ``priceDecimals`` and ``quantityDecimals``
+    (``market.get(ticker).market``).
 
     ``reference_price x (1 + max_slippage_bps/10,000)`` for a BUY and
     ``x (1 - max_slippage_bps/10,000)`` for a SELL, rounded toward the
-    reference to the cent (down for a BUY, up for a SELL), so it never exceeds
-    the tolerance, and never below 0.01. It is what
-    :meth:`~loaf.resources.orders.OrdersResource.market_buy` / ``market_sell``
-    sign (off the market reference), what a ``*_MARKET`` conditional books at
-    (off its trigger), and the lowest price a TP/SL leg sells at (off its
-    trigger, as a SELL). On a perp the SDK holds the move to half the market's
-    band first: pass ``min(max_slippage_bps, band // 2)`` (``band``, the
-    market's ``l2.band``; 0 bounds nothing) and, for a MARKET order, the live
-    mark to get what it signs there, unless this price crosses an off-grid mark
-    (a SELL's above it, a BUY's below it) or lies outside the band, as a BUY's
-    0.01 off a mark under one cent can. The SDK then signs the cent on the
-    mark's near side (a SELL's below the mark, a BUY's above it) when this
-    price crossed and that cent is inside the band and within the order's whole
-    max slippage of the mark (not the min passed here), else this price when it
-    is inside the band, else refuses the order (the orders module, **The perps
-    band**). A MARKET order's ``reference_price`` with a max slippage of 0 signs
-    this price whatever the band. Refused when it would be above 4,294,967.29,
-    the highest price an order can sign.
+    reference to the market's tick, 10^-price_decimals dollars (down for a BUY,
+    up for a SELL), so it never exceeds the tolerance, and never below one tick.
+    It is what :meth:`~loaf.resources.orders.OrdersResource.market_buy` /
+    ``market_sell`` sign (off the market reference), what a ``*_MARKET``
+    conditional books at (off its trigger), and the lowest price a TP/SL leg
+    sells at (off its trigger, as a SELL). On a perp the SDK holds the move to
+    half the market's band first: pass ``min(max_slippage_bps, band // 2)``
+    (``band``, the market's ``l2.band``; 0 bounds nothing) and, for a MARKET
+    order, the live mark to get what it signs there, unless this price crosses
+    a mark off the tick (a SELL's above it, a BUY's below it) or lies outside
+    the band, as a BUY's one tick off a mark under one tick can. The SDK then
+    signs the tick on the mark's near side (a SELL's below the mark, a BUY's
+    above it) when this price crossed and that tick is inside the band and
+    within the order's whole max slippage of the mark (not the min passed
+    here), else this price when it is inside the band, else refuses the order
+    (the orders module, **The perps band**). A MARKET order's
+    ``reference_price`` with a max slippage of 0 signs this price whatever the
+    band. Refused when it would be above the market's highest price, the
+    largest on its tick whose signed price, x 10^(7 - quantity_decimals), fits
+    32 bits.
 
     Use it to size a MARKET BUY: a BUY holds the price it signs x quantity x
     (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of your cash:
-    this price, or on a perp the cent above an off-grid mark where the SDK
+    this price, or on a perp the tick above an off-grid mark where the SDK
     signs that instead.
 
     ``side`` is ``BUY`` or ``SELL``; ``max_slippage_bps`` a whole number from 0
     to 9999, required so your sizing cannot drift from what the client signs:
     pass ``client.max_slippage_bps`` for the client's default.
     """
-    return float(_worst_price(reference_price, side, max_slippage_bps))
+    if _decimals_field(price_decimals, quantity_decimals) is not None:
+        raise _client_validation_error(
+            "price_decimals and quantity_decimals must be a market's priceDecimals and "
+            "quantityDecimals: whole numbers, price_decimals from 0 and quantity_decimals from 1, "
+            f"at most {ORDER_DECIMALS} together (got {price_decimals!r}, {quantity_decimals!r})"
+        )
+    price = _worst_price(
+        reference_price, side, max_slippage_bps, int(price_decimals), int(quantity_decimals)
+    )
+    return float(price)
