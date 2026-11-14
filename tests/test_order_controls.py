@@ -358,7 +358,7 @@ def test_cancel_all_scopes_by_market_and_tag(exchange, trading_client):
 
 
 def test_a_market_no_order_was_placed_on_is_read_once_without_a_login(exchange, trading_client):
-    exchange.details["MUS"] = market_detail("MUS", market_index=7)
+    exchange.details["MUS"] = market_detail("MUS", market_index=2057)
     orders = trading_client().orders
     for _ in range(2):
         exchange.queue("/orders/cancel-all", ok(CANCELLED))
@@ -368,7 +368,28 @@ def test_a_market_no_order_was_placed_on_is_read_once_without_a_login(exchange, 
         "GET /trade/MUS", "POST /orders/cancel-all", "POST /orders/cancel-all"
     ]
     assert "authorization" not in exchange.requests[0].headers  # a public read
-    assert [json.loads(r.content) for r in exchange.requests[1:]] == [{"marketIndex": 7}] * 2
+    assert [json.loads(r.content) for r in exchange.requests[1:]] == [{"marketIndex": 2057}] * 2
+
+
+@pytest.mark.parametrize("served", ["OPRA", None, "mus", ...])
+def test_a_scope_read_from_another_markets_detail_sends_no_cancel(
+    exchange, trading_client, served
+):
+    # Another market's detail served for MUS (a mis-keyed cache, a routing mistake) would scope
+    # that market's orders: refused, never kept, and nothing cancelled.
+    detail = market_detail("MUS", market_index=2057)
+    if served is ...:
+        del detail["market"]["ticker"]
+    else:
+        detail["market"]["ticker"] = served
+    exchange.details["MUS"] = detail
+    orders = trading_client().orders
+    for cancel in (lambda: orders.cancel_all("MUS"), lambda: orders.cancel_after(0, ticker="MUS")):
+        with pytest.raises(loaf.LoafServerError) as info:
+            cancel()
+        assert info.value.message == "GET /trade/MUS answered an unusable market.ticker"
+        assert info.value.status_code == 200
+    assert routes(exchange.requests) == ["GET /trade/MUS"] * 2
 
 
 def test_a_scope_is_checked_before_the_market_read(exchange, trading_client):
@@ -397,8 +418,44 @@ def test_a_market_read_without_a_usable_index_is_a_server_error(
     exchange, trading_client, market_index
 ):
     exchange.details["OPRA"] = market_detail(market_index=market_index)
-    with pytest.raises(loaf.LoafServerError, match="answered no market index"):
+    with pytest.raises(loaf.LoafServerError) as info:
         trading_client().orders.cancel_all("OPRA")
+    assert info.value.message == "GET /trade/OPRA answered an unusable market.marketIndex"
+    assert routes(exchange.requests) == ["GET /trade/OPRA"]
+
+
+@pytest.mark.parametrize(
+    ("ticker", "change", "field"),
+    [
+        ("OPRA-PERP", {"marketIndex": 2050}, "marketIndex"),  # a spot market's index for a perp
+        ("OPRA", {"marketIndex": 4}, "marketIndex"),  # a perp's index for a spot market
+        ("OPRA-PERP", {"type": "SPOT"}, "type"),
+        ("OPRA", {"type": "PERP"}, "type"),
+        ("OPRA", {"type": None}, "type"),
+    ],
+)
+def test_a_scope_read_whose_type_or_index_is_not_its_tickers_sends_no_cancel(
+    exchange, trading_client, ticker, change, field
+):
+    # The checks an order's market gets: a perp's detail served with a spot market's index (or
+    # the other way round) would scope that other market's orders.
+    detail = market_detail(ticker)
+    detail["market"].update(change)
+    exchange.details[ticker] = detail
+    orders = trading_client().orders
+    for cancel in (lambda: orders.cancel_all(ticker), lambda: orders.cancel_after(0, ticker=ticker)):
+        with pytest.raises(loaf.LoafServerError) as info:
+            cancel()
+        assert info.value.message == f"GET /trade/{ticker} answered an unusable market.{field}"
+    assert routes(exchange.requests) == [f"GET /trade/{ticker}"] * 2
+
+
+@pytest.mark.parametrize("answer", [["OPRA"], {"error": "busy"}, {"market": "OPRA"}])
+def test_a_scope_read_with_no_market_sends_no_cancel(exchange, trading_client, answer):
+    exchange.queue("/trade/OPRA", httpx.Response(200, json=answer))
+    with pytest.raises(loaf.LoafServerError) as info:
+        trading_client().orders.cancel_all("OPRA")
+    assert info.value.message == "GET /trade/OPRA answered no market"
     assert routes(exchange.requests) == ["GET /trade/OPRA"]
 
 

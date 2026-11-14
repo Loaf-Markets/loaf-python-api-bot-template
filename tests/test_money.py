@@ -5,6 +5,7 @@ base-unit balances as tokens."""
 from __future__ import annotations
 
 import enum
+import random
 from decimal import Decimal
 from fractions import Fraction
 from typing import Any
@@ -52,8 +53,8 @@ EVERY_MARKET = [(pd, qd) for qd in range(1, 7) for pd in range(7 - qd)]
         (100.005, "SELL", 50, 99.51),
         (171.555, "BUY", 0, 171.55),
         (171.555, "SELL", 0, 171.56),
-        (0.004, "SELL", 200, 0.01),  # never below one tick
-        (0.004, "BUY", 200, 0.01),
+        (0.004, "SELL", 200, 0.01),  # never below one tick, and above the reference
+        (0.0098, "BUY", 205, 0.01),  # one tick, within 2.05% above $0.0098 ($0.0100009)
         (0.01, "SELL", 9999, 0.01),
         (429496.72, "BUY", 0, 429496.72),  # the highest price an order can sign on OPRA
         # The web app's own vectors, on a cent tick.
@@ -76,7 +77,7 @@ def test_worst_price_table(reference, side, bps, expected):
         # A tick of $1 (0 price decimals, a BTC-like listing): toward the reference to the dollar.
         (75_000.4, "BUY", 200, (0, 5), 76_500),  # 76,500.408
         (75_000.4, "SELL", 200, (0, 5), 73_501),  # 73,500.392
-        (0.4, "BUY", 200, (0, 5), 1),  # never below one tick
+        (0.4, "SELL", 200, (0, 5), 1),  # never below one tick
         # A tick of $0.0001 (an H100-like listing near $3).
         (3.3217, "BUY", 200, (4, 1), 3.3881),  # 3.388134
         (3.3217, "SELL", 200, (4, 1), 3.2553),  # 3.255266
@@ -122,6 +123,76 @@ def test_worst_price_above_the_markets_max_refused(reference, side, bps, decimal
     assert info.value.status_code == 0
     assert info.value.message.startswith(f"The worst price {side} {bps} bps from ")
     assert info.value.message.endswith(f"is above {most}, the highest price an order can sign")
+
+
+@pytest.mark.parametrize(
+    "reference, bps, decimals, shown",
+    [
+        # One tick, the lowest price, lies more than the max slippage above the reference: a
+        # BUY's worst price rounds below it, and is refused rather than lifted to it.
+        (0.004, 200, (2, 3), "0.004"),  # one tick is 150% above
+        (0.004, 0, (2, 3), "0.004"),  # exact: never moved, so never lifted
+        (0.0098, 200, (2, 3), "0.0098"),  # $0.009996: one tick is 2.04% above
+        (0.4, 200, (0, 5), "0.4"),
+        (0.00004, 9_999, (4, 1), "0.00004"),  # $0.00007999...6
+    ],
+)
+def test_worst_price_of_a_buy_under_one_tick_is_refused(reference, bps, decimals, shown):
+    price_decimals, quantity_decimals = decimals
+    with pytest.raises(loaf.LoafValidationError) as info:
+        worst_price(
+            reference, "BUY", bps, price_decimals=price_decimals, quantity_decimals=quantity_decimals
+        )
+    tick = format(Decimal(1).scaleb(-price_decimals), "f")
+    assert info.value.status_code == 0
+    assert info.value.message == (
+        f"No BUY price lies within max_slippage_bps={bps} of {shown}: one tick ({tick}), its "
+        "lowest price, lies further above it; place a LIMIT order"
+    )
+
+
+def test_a_worst_price_never_lies_further_against_the_order_than_its_max_slippage():
+    # Over every market's decimals, references from far under one tick to thousands of ticks,
+    # each side and slippages from 0 to 9,999 bp: what worst_price returns is on the tick, at least
+    # one tick, and no further against the order than the max slippage from the reference (a BUY's
+    # no higher than reference x (1 + bps/10,000), a SELL's no lower than reference x (1 -
+    # bps/10,000)), and no nearer to it than the tick (rounded toward it, never past it). Where it
+    # refuses, a BUY's, no price on the tick is within the slippage.
+    rng = random.Random(20261113)
+    refused = 0
+    for _ in range(20_000):
+        price_decimals, quantity_decimals = rng.choice(EVERY_MARKET)
+        tick = Fraction(1, 10**price_decimals)
+        # A reference in millionths, under one tick or up to 2,000 ticks (moved at most 99.99%,
+        # below every market's highest price).
+        millionths = rng.choice((
+            rng.randrange(1, 10**6 // 10**price_decimals + 1),
+            rng.randrange(1, 2_000 * 10**6 // 10**price_decimals),
+        ))
+        reference = Decimal(millionths).scaleb(-6)
+        side = rng.choice(("BUY", "SELL"))
+        bps = rng.choice((0, 1, rng.randrange(10_000), 9_999))
+        ref = Fraction(millionths, 10**6)
+        bound = ref * (10_000 + bps if side == "BUY" else 10_000 - bps) / 10_000
+        case = (reference, side, bps, price_decimals, quantity_decimals)
+        try:
+            price = worst_price(
+                reference, side, bps,
+                price_decimals=price_decimals, quantity_decimals=quantity_decimals,
+            )
+        except loaf.LoafValidationError as exc:
+            assert exc.status_code == 0
+            # Only a BUY whose bound lies under one tick: no price on the tick is within it.
+            assert side == "BUY" and bound < tick, case
+            refused += 1
+            continue
+        signed = Fraction(Decimal(str(price)))
+        assert signed >= tick and signed % tick == 0, (*case, price)
+        if side == "BUY":
+            assert bound - tick < signed <= bound, (*case, price)
+        else:
+            assert bound <= signed < bound + tick, (*case, price)
+    assert refused >= 100, refused
 
 
 def test_worst_price_needs_max_slippage_and_the_markets_decimals_by_name():

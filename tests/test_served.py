@@ -17,6 +17,7 @@ from loaf import LoafClient
 from loaf._served import Malformed, decimal
 
 from conftest import (
+    BASE,
     PERP_L2,
     PERPS_ACCOUNT,
     PERPS_ACCOUNT_READ,
@@ -28,7 +29,6 @@ from conftest import (
     verify_login,
 )
 
-BASE = "http://test/api"
 FILL_DECIMALS = ("quantity", "price", "fee", "closedPnl")
 FUNDING_DECIMALS = ("base", "payment")
 
@@ -75,6 +75,20 @@ def test_anything_else_is_malformed_never_read(value):
         "before a negative, no exponent, no leading or trailing zero, '0' for zero, at most 6 "
         "decimal places)"
     )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["1" * 500_000 + ".0", ["x" * 1000] * 10_000, {f"k{i}": "v" * 1000 for i in range(10_000)},
+     [[[[[["deep"]]]]]], "1." + "0" * 100 + "1"],
+    ids=["long text", "long list", "long object", "nested", "long fraction"],
+)
+def test_a_malformed_values_message_shows_a_bounded_part_of_it(value):
+    # A served value of 500 KB is not a 500 KB log line.
+    with pytest.raises(Malformed) as info:
+        decimal(value, "market.live.markPrice")
+    assert len(str(info.value)) < 400
+    assert str(info.value).startswith("a malformed market.live.markPrice: ")
 
 
 def perp_detail() -> dict[str, Any]:

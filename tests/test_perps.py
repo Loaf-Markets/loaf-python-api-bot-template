@@ -713,6 +713,7 @@ def test_a_refused_resubmit_is_still_unknown(exchange, trading_client):
     with pytest.raises(PerpsOutcomeUnknownError) as again:
         perps.resubmit(body)  # an exit goes back to /l2/exits
     assert again.value.signed_body == body
+    assert isinstance(again.value.last_error, loaf.LoafAPIError)
     assert again.value.last_error.status_code == 422
     assert len(exchange.posts("/l2/exits")) == 2
 
@@ -1098,15 +1099,15 @@ def test_a_band_of_zero_and_a_spot_market_bound_nothing(exchange, trading_client
     "mark, place, signed",
     [
         # Today's price, rounded toward an off-grid reference, crosses it (a SELL's 1.01 above
-        # $1.009, a BUY's 1.00 below $1.001), and the price signed off $0.005 is the one-tick
-        # floor, $0.01: with no band to hold them to, each is signed as it is, on a perp at its
-        # mark or on spot (mark None) off reference_price.
+        # $1.009, a BUY's 1.00 below $1.001), and a SELL's off $0.005 rounds up to one tick: with
+        # no band to hold them to, each is signed as it is, on a perp at its mark or on spot (mark
+        # None) off reference_price.
         (1_009_000, lambda o: o.market_sell("OPRA-PERP", 20, max_slippage_bps=5), 1.01),
         (1_001_000, lambda o: o.market_buy("OPRA-PERP", 20, max_slippage_bps=5), 1.0),
-        (5_000, lambda o: o.market_buy("OPRA-PERP", 20), 0.01),
+        (5_000, lambda o: o.market_sell("OPRA-PERP", 2_000), 0.01),
         (None, lambda o: o.market_sell("OPRA", 20, reference_price=1.009, max_slippage_bps=5), 1.01),
         (None, lambda o: o.market_buy("OPRA", 20, reference_price=1.001, max_slippage_bps=5), 1.0),
-        (None, lambda o: o.market_buy("OPRA", 20, reference_price=0.005), 0.01),
+        (None, lambda o: o.market_sell("OPRA", 2_000, reference_price=0.005), 0.01),
     ],
     ids=["perp-sell", "perp-buy", "perp-sub-cent", "spot-sell", "spot-buy", "spot-sub-cent"],
 )
@@ -1119,6 +1120,66 @@ def test_a_band_of_zero_signs_todays_price_across_an_off_grid_reference_or_not(
     (body,) = exchange.bodies("/orders")
     assert body["price"] == signed
     verify_order(body)
+
+
+@pytest.mark.parametrize(
+    "mark, band, place, reference, bps",
+    [
+        # A BUY off a reference under one tick: one tick, $0.01, the lowest price, lies further
+        # above it than the max slippage, so the order is refused rather than lifted to it. On
+        # spot, off reference_price, the exact path (a max slippage of 0) among them.
+        (None, 0, lambda o: o.market_buy("OPRA", 2_000, reference_price=0.004), "0.004", 200),
+        (
+            None,
+            0,
+            lambda o: o.market_buy("OPRA", 2_000, reference_price=0.004, max_slippage_bps=0),
+            "0.004",
+            0,
+        ),
+        (
+            None,
+            0,
+            lambda o: o.market_buy("OPRA", 2_000, reference_price=0.0098),  # $0.009996
+            "0.0098",
+            200,
+        ),
+        # On a perp off its mark, with no band, and inside a band that would hold one tick.
+        (5_000, 0, lambda o: o.market_buy("OPRA-PERP", 2_000), "0.005", 200),
+        (
+            6_000,
+            9_000,
+            lambda o: o.market_buy("OPRA-PERP", 2_000, max_slippage_bps=10),
+            "0.006",
+            10,
+        ),
+        (
+            6_000,
+            9_000,
+            lambda o: o.market_buy("OPRA-PERP", 2_000, reference_price=0.006, max_slippage_bps=0),
+            "0.006",
+            0,
+        ),
+    ],
+    ids=["spot", "spot-exact", "spot-near", "perp-no-band", "perp-band", "perp-exact"],
+)
+def test_a_buy_under_one_tick_beyond_its_slippage_is_refused_before_anything_is_reserved(
+    exchange, trading_client, mark, band, place, reference, bps
+):
+    ticker = "OPRA" if mark is None else "OPRA-PERP"
+    if mark is not None:
+        serve_perp(exchange, band=band, live=live_at(mark))
+    orders = trading_client().orders
+    with pytest.raises(loaf.LoafValidationError) as info:
+        place(orders)
+    assert (info.value.status_code, info.value.message) == (
+        0,
+        f"No BUY price on {ticker} lies within max_slippage_bps={bps} of {reference}: one tick "
+        "(0.01), its lowest price, lies further above it; place a LIMIT order",
+    )
+    assert routes(exchange.requests) == [f"GET /trade/{ticker}"]  # no account read, no numbers
+    orders.limit_buy(ticker, 2_000, 0.01)
+    (body,) = exchange.bodies("/orders")
+    assert body["l2OrderIndex"] == 4097  # nothing was reserved or spent
 
 
 def perp_with_band(band: int, decimals: tuple[int, int] = (2, 3)) -> Any:
@@ -1141,14 +1202,15 @@ SWEEP_MARKETS = [(2, 3), (4, 1), (0, 5), (1, 5), (5, 1)]
 def test_a_derived_perps_price_lies_inside_the_band_by_the_exchanges_rule():
     # On each market, at marks under one tick and 4,000 drawn from one tick up, at every band (0 to
     # 65,535 bp), slippage and side, the rule: today's price (the reference moved min(slippage,
-    # band // 2) against the order, rounded toward it to the market's tick, at least one tick); if
-    # that crossed the reference (a SELL's above it, a BUY's below it), the grid price on the
+    # band // 2) against the order, rounded toward it to the market's tick; a BUY's that rounds
+    # below one tick is one tick when one tick lies within the whole max slippage, else refused);
+    # if that crossed the reference (a SELL's above it, a BUY's below it), the grid price on the
     # reference's near side when that is positive, inside the band and within the whole max
     # slippage; else today's price, across the reference or not, when it lies inside the band; else
     # a local refusal. A band of 0 changes nothing: today's price, moved the whole slippage,
-    # crossing or not. Whatever is signed is on the tick, inside the band around its reference by
-    # the exchange's integer rule, and no farther from it against the order than the max slippage
-    # unless it is a BUY's off a mark under one tick (at least one tick); a refusal comes only where
+    # crossing or not. Whatever is signed is on the tick, at least one tick, inside the band around
+    # its reference by the exchange's integer rule, and no farther from it against the order (a
+    # BUY's above it, a SELL's below it) than the whole max slippage; a refusal comes only where
     # no price on the tick is both.
     rng = random.Random(20261110)
     branches: Counter[str] = Counter()
@@ -1165,6 +1227,11 @@ def test_a_derived_perps_price_lies_inside_the_band_by_the_exchanges_rule():
             band, bps = rng.choice(SWEEP_BANDS), rng.choice(SWEEP_SLIPPAGES)
             ticks = rng.choice((rng.randrange(1, 1_000), rng.randrange(1_000, 500_000)))
             draws.append((ticks * tick + rng.randrange(per_tick) * step, band, bps))
+        # Marks between half a tick and one tick, at any band and slippage: one tick lies within
+        # 10,000 bp of them, so the slippage and the band each hold it or not.
+        for _ in range(300):
+            mark = rng.randrange(per_tick // 2, per_tick) * step
+            draws.append((mark, rng.randrange(1, 20_001), rng.randrange(10_000)))
         markets: dict[int, Any] = {}
         for reference, band, bps in draws:
             market = markets.get(band) or markets.setdefault(
@@ -1183,13 +1250,24 @@ def test_a_derived_perps_price_lies_inside_the_band_by_the_exchanges_rule():
                     )
 
                 moved = min(bps, band // 2) if band else bps  # a band of 0 bounds nothing
-                rounded = scaled(loaf.worst_price(start, side, moved, **decimals))
                 floor, ceiling = reference // tick * tick, -(-reference // tick) * tick
                 near = floor if side == "SELL" else ceiling
-                crossed = rounded > reference if side == "SELL" else rounded < reference
-                floored = side == "BUY" and reference < tick  # at least one tick, whatever the slippage
+                # A BUY whose moved price lies under one tick: one tick, within the whole slippage.
+                floored = side == "BUY" and reference * (10_000 + moved) < tick * 10_000
+                if floored:
+                    against = (tick - reference) * 10_000 <= bps * reference
+                    rounded = tick if against else None
+                    with pytest.raises(loaf.LoafValidationError):  # beyond the half-band move
+                        loaf.worst_price(start, side, moved, **decimals)
+                else:
+                    rounded = scaled(loaf.worst_price(start, side, moved, **decimals))
+                crossed = rounded is not None and (
+                    rounded > reference if side == "SELL" else rounded < reference
+                )
                 expected: int | None
-                if band == 0:
+                if rounded is None:
+                    branch, expected = "floored, past the slippage", None
+                elif band == 0:
                     branch, expected = ("no band, crossed" if crossed else "no band"), rounded
                 elif crossed and admitted(near):
                     branch, expected = "near", near
@@ -1209,9 +1287,10 @@ def test_a_derived_perps_price_lies_inside_the_band_by_the_exchanges_rule():
                     continue
                 assert price == expected, (*case, branch, price)
                 assert price % tick == 0 and within_band(int(price), reference, band), (*case, price)
-                assert admitted(int(price)) or floored, (*case, price)
+                # Never further against the order than the whole max slippage, one tick included.
+                assert admitted(int(price)), (*case, branch, price)
     # Each branch of the rule is drawn, by the hundred at least.
-    assert len(branches) == 8 and min(branches.values()) >= 100, branches
+    assert len(branches) == 9 and min(branches.values()) >= 100, branches
 
 
 @pytest.mark.parametrize(
@@ -1308,27 +1387,30 @@ def test_the_band_and_the_slippage_admit_a_price_at_their_edge_and_not_beyond(
 
 
 @pytest.mark.parametrize(
-    "mark, side, band, signed",
+    "mark, side, band, bps, signed",
     [
-        # Off a mark under one tick a BUY's price is the one-tick floor, $0.01, which does not cross
-        # the mark yet lies 10,000 bp above $0.005: signed inside a band of 10,000 bp (its edge,
-        # admitted), refused here inside a narrower one.
-        ("0.005", "BUY", 1_000, None),
-        ("0.005", "BUY", 9_999, None),
-        ("0.005", "BUY", 10_000, "0.01"),
-        # $0.01 is 1,111.1 bp above $0.009: a band of 1,112 bp holds it, one of 1,111 does not.
-        ("0.009", "BUY", 1_111, None),
-        ("0.009", "BUY", 1_112, "0.01"),
-        # A SELL's rounds up across the mark to the same cent, with no tick on its near side: the
-        # two sides alike.
-        ("0.005", "SELL", 9_999, None),
-        ("0.005", "SELL", 10_000, "0.01"),
+        # Off a mark under one tick a BUY's price moved half the band rounds below one tick, the
+        # lowest price. $0.01 does not cross the mark, but lies 1,111.1 bp above $0.009: signed
+        # only where the whole max slippage and the band both hold it.
+        ("0.009", "BUY", 1_112, 2_000, "0.01"),
+        ("0.009", "BUY", 1_111, 2_000, None),  # the band does not
+        ("0.009", "BUY", 5_000, 1_111, None),  # the max slippage does not
+        ("0.009", "BUY", 5_000, 1_112, "0.01"),  # moved the whole 1,112 bp: $0.0100008, down
+        # 10,000 bp above $0.005, beyond any max slippage (at most 9,999 bp), whatever the band.
+        ("0.005", "BUY", 10_000, 200, None),
+        ("0.005", "BUY", 65_535, 9_999, None),
+        # 66.7% above $0.006, past the 0.1% asked, inside a band of 9,000 bp.
+        ("0.006", "BUY", 9_000, 10, None),
+        # A SELL's rounds up across the mark to the same cent, with no tick on its near side: in
+        # its favour, it is signed wherever the band holds it.
+        ("0.005", "SELL", 9_999, 200, None),
+        ("0.005", "SELL", 10_000, 200, "0.01"),
     ],
 )
-def test_a_price_off_a_mark_under_one_tick_is_signed_only_inside_the_band(
-    mark, side, band, signed
+def test_a_price_off_a_mark_under_one_tick_is_signed_only_within_the_slippage_and_the_band(
+    mark, side, band, bps, signed
 ):
-    derived = _Derived(Decimal(mark), side, 200)
+    derived = _Derived(Decimal(mark), side, bps)
     if signed is None:
         with pytest.raises(loaf.LoafValidationError) as info:
             derived.on(perp_with_band(band), "OPRA-PERP")
@@ -1337,6 +1419,8 @@ def test_a_price_off_a_mark_under_one_tick_is_signed_only_inside_the_band(
     price = derived.on(perp_with_band(band), "OPRA-PERP")
     assert price == Decimal(signed)
     assert within_band(int(price * SCALE), int(Decimal(mark) * SCALE), band)
+    if side == "BUY":
+        assert (price - Decimal(mark)) * 10_000 <= bps * Decimal(mark)
 
 
 def test_a_near_price_above_the_markets_highest_is_never_signed():
@@ -1414,9 +1498,15 @@ def test_a_market_sell_off_an_off_grid_mark_signs_the_tick_inside_the_band(
         ),
         # A band of 1 bp around $1.005 holds no cent at all.
         (1_005_000, 1, lambda o: o.market_buy("OPRA-PERP", 20), (1, "1.005", 200)),
-        # Off a mark of $0.005 a BUY's price is the one-tick floor, $0.01, 10,000 bp above it: it
-        # does not cross the mark, but lies outside a band of 1,000 bp, which holds no cent.
-        (5_000, 1_000, lambda o: o.market_buy("OPRA-PERP", 20), (1_000, "0.005", 200)),
+        # Off a mark of $0.009 a BUY's price moved half the band rounds below one tick, the lowest
+        # price: $0.01, 1,111.1 bp above the mark, lies within the 20% asked but outside a band of
+        # 1,000 bp, which holds no cent.
+        (
+            9_000,
+            1_000,
+            lambda o: o.market_buy("OPRA-PERP", 20, max_slippage_bps=2_000),
+            (1_000, "0.009", 2_000),
+        ),
     ],
     ids=["mark-sell", "reference-sell", "reference-buy", "no-tick-in-band", "sub-tick-buy"],
 )

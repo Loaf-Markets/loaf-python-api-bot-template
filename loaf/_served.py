@@ -17,6 +17,7 @@ client drops and logs the frame. Only the integers an order signs are scaled, in
 from __future__ import annotations
 
 import re
+import reprlib
 from decimal import Decimal
 from typing import Any, Callable, Mapping, MutableMapping
 
@@ -47,12 +48,28 @@ _ACCOUNT = ("withdrawable",)
 _NULLABLE = frozenset({"value", "requirement", "liquidationPrice", "closedPnl", "withdrawable"})
 
 
+#: How much of a malformed value its error shows: the start and end of a long string, the first
+#: items of a long list or object, three levels of nesting, at most _SHOWN_MAX characters.
+_SHOWN = reprlib.Repr()
+_SHOWN.maxstring = _SHOWN.maxother = 80
+_SHOWN.maxlevel = 3
+_SHOWN_MAX = 200
+
+
+def _shown(value: Any) -> str:
+    """A bounded repr of ``value``."""
+    text = _SHOWN.repr(value)
+    return text if len(text) <= _SHOWN_MAX else text[: _SHOWN_MAX - 1] + "…"
+
+
 class Malformed(ValueError):
-    """A served decimal that is not one, ``field`` naming it in its answer or frame."""
+    """A served decimal that is not one, ``field`` naming it in its answer or frame. The message
+    shows at most 200 characters of the value."""
 
     def __init__(self, field: str, value: Any) -> None:
         super().__init__(
-            f"a malformed {field}: {value!r} is not an exact decimal (digits, a '-' before a "
+            f"a malformed {field}: {_shown(value)} is not an exact decimal (digits, a '-' "
+            "before a "
             "negative, no exponent, no leading or trailing zero, '0' for zero, at most "
             f"{ORDER_DECIMALS} decimal places)"
         )

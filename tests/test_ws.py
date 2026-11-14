@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -41,7 +42,7 @@ README = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8"
 
 
 def _client() -> LoafWebSocketClient:
-    return LoafWebSocketClient(ws_url="ws://test/ws")
+    return LoafWebSocketClient(ws_url="wss://test/ws")
 
 
 def _frame(**fields: Any) -> str:
@@ -56,7 +57,7 @@ def test_reconnect_delay_must_be_a_positive_number(delay: Any):
     # pause, and a str, None or NaN from 3.13 would end the thread.
     message = f"reconnect_delay must be a positive number of seconds, got {delay!r}"
     for make in (
-        lambda: LoafWebSocketClient(ws_url="ws://test/ws", reconnect_delay=delay),
+        lambda: LoafWebSocketClient(ws_url="wss://test/ws", reconnect_delay=delay),
         lambda: LoafClient().websocket(reconnect_delay=delay),
     ):
         with pytest.raises(LoafConfigError) as info:
@@ -337,7 +338,7 @@ def test_a_refused_auth_drops_the_login_token_it_carried():
 
 
 def test_an_anonymous_client_has_no_login_tokens():
-    assert LoafWebSocketClient(ws_url="ws://test/ws")._login_tokens is None
+    assert LoafWebSocketClient(ws_url="wss://test/ws")._login_tokens is None
     assert LoafClient().websocket()._login_tokens is None
     assert LoafClient(TRADING_KEY).websocket()._login_tokens is not None
 
@@ -376,7 +377,7 @@ def test_a_refresh_that_wakes_early_sends_nothing_until_half_life(
 
     monkeypatch.setattr("loaf.ws.client.asyncio", SimpleNamespace(sleep=sleep))
     with pytest.raises(_Stop):
-        asyncio.run(ws._keep_authenticated(Connection(), tokens, renew_in))
+        asyncio.run(ws._keep_authenticated(Connection(), tokens, renew_in, ws._stop_event))
     assert waits == [300.0, 0.001, 300.0]
     assert len(sent) == 1 and sent[0] != held and ws._auth_token == sent[0]
 
@@ -471,8 +472,8 @@ def test_after_a_stale_turn_any_stamped_private_frame_is_news_again(mtype: str):
     ws = _client().subscribe("portfolio:42")
     events = _beat_log(ws)
     ws._dispatch(_stamped(snapshot=True))
-    ws._beat_lost("silent")  # what the watch calls once stale_after passed
-    ws._beat_lost("silent")  # once per turn
+    ws._beat_lost("silent", ws._stop_event)  # what the watch calls once stale_after passed
+    ws._beat_lost("silent", ws._stop_event)  # once per turn
     assert ws.fresh is False
     # No snapshot needed now: this connection already showed that the exchange beats.
     ws._dispatch(_stamped(ENGINE_MS + 1, type=mtype))
@@ -489,7 +490,8 @@ def test_after_a_stale_turn_any_stamped_private_frame_is_news_again(mtype: str):
 def test_a_stale_turn_needs_a_fresh_stream():
     ws = _client().subscribe_portfolio()
     events = _beat_log(ws)
-    ws._beat_lost("silent")  # before the first snapshot: nothing was known to be live
+    # Before the first snapshot: nothing was known to be live.
+    ws._beat_lost("silent", ws._stop_event)
     assert ws.fresh is None and events == []
 
 
@@ -542,7 +544,7 @@ def test_stale_after_must_be_a_number_of_seconds_from_1(stale_after: Any):
         f"one a second), got {stale_after!r}"
     )
     for make in (
-        lambda: LoafWebSocketClient(ws_url="ws://test/ws", stale_after=stale_after),
+        lambda: LoafWebSocketClient(ws_url="wss://test/ws", stale_after=stale_after),
         lambda: LoafClient().websocket(stale_after=stale_after),
     ):
         with pytest.raises(LoafConfigError) as info:
@@ -553,7 +555,7 @@ def test_stale_after_must_be_a_number_of_seconds_from_1(stale_after: Any):
 @pytest.mark.parametrize("stale_after, seconds", [(1, 1.0), (Fraction(3, 2), 1.5), (30, 30.0)])
 def test_stale_after_takes_any_real_number_of_seconds_from_1(stale_after: Any, seconds: float):
     for ws in (
-        LoafWebSocketClient(ws_url="ws://test/ws", stale_after=stale_after),
+        LoafWebSocketClient(ws_url="wss://test/ws", stale_after=stale_after),
         LoafClient().websocket(stale_after=stale_after),
     ):
         assert ws.stale_after == seconds and type(ws.stale_after) is float
@@ -594,7 +596,7 @@ def _watch(monkeypatch: pytest.MonkeyPatch, clock: _Clock) -> None:
     monkeypatch.setattr("loaf.ws.client.time", clock)
     monkeypatch.setattr("loaf.ws.client.asyncio", SimpleNamespace(sleep=clock.sleep))
     with pytest.raises(_Stop):
-        asyncio.run(clock.ws._watch_beats())
+        asyncio.run(clock.ws._watch_beats(clock.ws._stop_event))
 
 
 def test_the_watch_waits_while_nothing_is_live(monkeypatch: pytest.MonkeyPatch):
@@ -609,7 +611,7 @@ def test_the_watch_waits_while_nothing_is_live(monkeypatch: pytest.MonkeyPatch):
 def test_the_watch_turns_stale_exactly_stale_after_the_last_beat(
     monkeypatch: pytest.MonkeyPatch, stale_after: float
 ):
-    ws = LoafWebSocketClient(ws_url="ws://test/ws", stale_after=stale_after).subscribe_portfolio()
+    ws = LoafWebSocketClient(ws_url="wss://test/ws", stale_after=stale_after).subscribe_portfolio()
     events = _beat_log(ws)
     clock = _Clock(ws, now=100.0)
     monkeypatch.setattr("loaf.ws.client.time", clock)
@@ -642,3 +644,318 @@ def test_each_beat_restarts_the_wait(monkeypatch: pytest.MonkeyPatch):
         ("fresh", {"engineMs": ENGINE_MS}),
         ("stale", {"reason": "silent", "engineMs": ENGINE_MS + 4500, "silentSeconds": 3.0}),
     ]
+
+
+def test_a_beat_is_timed_from_when_its_frame_was_taken_off_the_socket(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A slow handler must not make the frame it holds look newer than it is.
+    ws = LoafWebSocketClient(ws_url="ws://127.0.0.1/ws").subscribe_portfolio()
+    events = _beat_log(ws)
+    clock = _Clock(ws, now=100.0)
+    monkeypatch.setattr("loaf.ws.client.time", clock)
+
+    def slow(_: Any) -> None:
+        clock.now += 2.5
+
+    ws.on_perps_account(slow)
+    ws._dispatch(_stamped(snapshot=True))
+    assert ws._last_beat == 100.0 and clock.now == 102.5
+    assert events == [("fresh", {"engineMs": ENGINE_MS})]  # still after the frame's handlers
+    clock.now = 103.5  # the beat is 3.5 s old, though its handler returned 1 s ago
+    assert ws.fresh is False
+
+
+def test_fresh_reads_false_once_stale_after_passed_whatever_the_loop_is_doing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The watch that fires on_stale runs on the loop, which a handler can block (or which can be
+    # gone): read from any thread, fresh tells the truth by itself.
+    ws = LoafWebSocketClient(ws_url="ws://127.0.0.1/ws").subscribe_portfolio()
+    events = _beat_log(ws)
+    clock = _Clock(ws, now=100.0)
+    monkeypatch.setattr("loaf.ws.client.time", clock)
+    ws._dispatch(_stamped(snapshot=True))
+    clock.now = 103.0
+    assert ws.fresh is True  # exactly stale_after: the watch's own turn
+    clock.now = 103.001
+    assert ws.fresh is False and ws._fresh is True and len(events) == 1  # no on_stale yet
+    # The loop runs again, and the next frame reaches it before the watch does: it reports the
+    # gap fresh read, then brings on_fresh, so the events turn as the property did.
+    ws._dispatch(_stamped(ENGINE_MS + 3001, snapshot=True))
+    assert ws.fresh is True and events == [
+        ("fresh", {"engineMs": ENGINE_MS}),
+        ("stale", {"reason": "silent", "engineMs": ENGINE_MS + 3001, "silentSeconds": 3.001}),
+        ("fresh", {"engineMs": ENGINE_MS + 3001}),
+    ]
+
+
+@pytest.mark.parametrize("snapshot", [True, None], ids=["snapshot", "order_update"])
+def test_a_handler_that_holds_the_loop_past_stale_after_brings_on_stale_then_on_fresh(
+    monkeypatch: pytest.MonkeyPatch, snapshot: bool | None
+):
+    # One handler call holds the loop 3.6 s, at 1 Hz snapshots and stale_after 3: the watch
+    # cannot run meanwhile, and the first stamped frame after it, queued behind the call, is
+    # taken off 2.6 s after its read, within bounds. It reports the gap before it counts as a
+    # beat: on_stale, then on_fresh after its own handlers.
+    ws = LoafWebSocketClient(ws_url="ws://127.0.0.1/ws").subscribe_portfolio()
+    events = _beat_log(ws)
+    clock = _Clock(ws, now=100.0)
+    monkeypatch.setattr("loaf.ws.client.time", clock)
+    seen: list[Any] = []
+
+    def hold(m: Any) -> None:
+        seen.append((m.type, clock.now, ws.fresh))
+        if m.engineMs == ENGINE_MS + 1000:
+            clock.now += 3.6
+
+    ws.on("perps_account_update", hold)
+    ws.on("order_update", hold)
+    ws._dispatch(_stamped(snapshot=True))
+    clock.now = 101.0
+    ws._dispatch(_stamped(ENGINE_MS + 1000, snapshot=True))  # held until 104.6
+    kind = "perps_account_update" if snapshot else "order_update"
+    ws._dispatch(_stamped(ENGINE_MS + 2000, snapshot=snapshot, type=kind))
+    assert seen[-1] == (kind, 104.6, False)  # fresh read False while the frame was handled
+    assert ws.fresh is True and [(k, m.get("reason")) for k, m in events] == [
+        ("fresh", None), ("stale", "silent"), ("fresh", None),
+    ]
+    assert events[1][1]["silentSeconds"] == pytest.approx(3.6)
+
+
+def test_a_gap_a_frame_reports_is_timed_to_its_arrival(monkeypatch: pytest.MonkeyPatch):
+    # The gap ended when the frame was taken off the socket: its own handlers' time is not in it.
+    ws = LoafWebSocketClient(ws_url="ws://127.0.0.1/ws").subscribe_portfolio()
+    events = _beat_log(ws)
+    clock = _Clock(ws, now=100.0)
+    monkeypatch.setattr("loaf.ws.client.time", clock)
+
+    def slow(m: Any) -> None:
+        if m.engineMs == ENGINE_MS + 4000:
+            clock.now += 2.0
+
+    ws.on_perps_account(slow)
+    ws._dispatch(_stamped(snapshot=True))
+    clock.now = 104.0  # the watch could not run meanwhile
+    ws._dispatch(_stamped(ENGINE_MS + 4000, snapshot=True))
+    assert clock.now == 106.0 and [kind for kind, _ in events] == ["fresh", "stale", "fresh"]
+    assert events[1][1]["reason"] == "silent" and events[1][1]["silentSeconds"] == 4.0
+
+
+class _Feed:
+    """Feeds a client the exchange's account snapshots on a stand-in clock. ``engine`` is the
+    engine's clock and ``at`` the moment the client takes the frame off the socket, both in
+    seconds; the engine's clock reads ``ENGINE_MS`` at 0."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, stale_after: float = 3.0) -> None:
+        self.ws = LoafWebSocketClient(
+            ws_url="ws://127.0.0.1/ws", stale_after=stale_after
+        ).subscribe_portfolio()
+        self.events = _beat_log(self.ws)
+        self.clock = _Clock(self.ws, now=0.0)
+        monkeypatch.setattr("loaf.ws.client.time", self.clock)
+
+    def snapshot(self, at: float, engine: float) -> None:
+        self.clock.now = at
+        self.ws._dispatch(_stamped(ENGINE_MS + round(engine * 1000), snapshot=True))
+
+    def turns(self) -> list[Any]:
+        return [m["reason"] if kind == "stale" else kind for kind, m in self.events]
+
+
+def test_snapshots_up_to_a_beat_old_never_fall_behind(monkeypatch: pytest.MonkeyPatch):
+    # An hour of 1 Hz snapshots at the tightest stale_after. Each waits for the next beat before
+    # it is sent, anywhere from no time to a full second, then 5 to 200 ms in flight: offsets
+    # that range over more than a second above the least one, which is never a lag. (A gap over
+    # stale_after between two of them is a silent turn; the behind check never trips.)
+    feed = _Feed(monkeypatch, stale_after=1.0)
+    rng = random.Random(7)
+    waits = [0.0, 1.0] + [rng.uniform(0.0, 1.0) for _ in range(3598)]  # the extremes first
+    for second, wait in enumerate(waits):
+        feed.snapshot(second + wait + rng.uniform(0.005, 0.2), second)
+        assert feed.ws._behind_since is None
+    assert "behind" not in feed.turns()
+
+
+def test_a_handler_too_slow_for_the_feed_falls_behind_and_recovers_once_caught_up(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Ten snapshots a second and a handler that takes 0.5 s: every frame waits longer than the
+    # last. Each frame taken off the socket still looks like a beat, but the engine's clock
+    # falls behind this machine's, and once by more than stale_after and a beat the stream is
+    # behind.
+    feed = _Feed(monkeypatch, stale_after=1.0)
+    handling = [0.5]
+    lags: list[float] = []
+
+    def handle(m: Any) -> None:
+        lags.append(feed.clock.now - (m.engineMs - ENGINE_MS) / 1000)
+        feed.clock.now += handling[0]
+
+    feed.ws.on_perps_account(handle)
+    sent = [k / 10 for k in range(400)]  # the engine's clock as each was sent, 0 s in flight
+    for k, engine in enumerate(sent[:24]):
+        feed.snapshot(max(feed.clock.now, engine), engine)
+        if k == 5:
+            assert lags[-1] == pytest.approx(2.0) and feed.turns() == ["fresh"]
+        if k == 6:
+            # 2.4 s behind by the 7th frame: no beat, and on_stale fires once.
+            assert lags[-1] == pytest.approx(2.4)
+            assert feed.turns() == ["fresh", "behind"] and feed.ws.fresh is False
+    # The last beat is the 6th frame's, taken off the socket at 2.5 s.
+    assert feed.turns() == ["fresh", "behind"] and feed.ws._last_beat == 2.5
+    # Another stamped frame, even a fresh one, says nothing about the backlog.
+    feed.ws._dispatch(_stamped(ENGINE_MS + 99_000, type="order_update"))
+    assert feed.turns() == ["fresh", "behind"] and feed.ws.fresh is False
+    # The handler speeds up and works off the backlog within 15 s: fresh at the first snapshot
+    # handled within stale_after and a beat of its engine time, on the same connection.
+    handling[0] = 0.01
+    for engine in sent[24:]:
+        feed.snapshot(max(feed.clock.now, engine), engine)
+        if feed.turns()[-1] == "fresh":
+            break
+    assert feed.turns() == ["fresh", "behind", "fresh"] and feed.ws.fresh is True
+    assert feed.ws._behind_since is None and feed.clock.now < 3.0 + 15
+    # Measured from the baseline (here an offset of ENGINE_MS / 1000 less a frame's lag), which
+    # rose by at most 0.1% of the time since: about 0.013 s.
+    assert feed.ws._lag_base is not None
+    base = feed.ws._lag_base + ENGINE_MS / 1000
+    assert 0.01 < base < 0.015
+    assert lags[-1] - base <= 2.0 < lags[-2] - base
+
+
+@pytest.mark.parametrize("ppm", [500, -500])
+def test_a_day_of_clock_drift_never_falls_behind(monkeypatch: pytest.MonkeyPatch, ppm: int):
+    # This machine's clock and the engine's run 500 ppm apart, as fast as NTP slews one: 43 s a
+    # day, which a fixed baseline would take for a lag. Each snapshot up to a beat old.
+    feed = _Feed(monkeypatch, stale_after=1.0)
+    rng = random.Random(11)
+    for second in range(0, 86_400, 2):
+        feed.snapshot(second * (1 + ppm / 1e6) + rng.uniform(0.0, 1.0), second)
+        assert feed.ws._behind_since is None
+    assert "behind" not in feed.turns()
+
+
+def test_an_unsubscribe_ends_a_behind_stretch_and_the_next_subscription_measures_afresh(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Behind, then portfolio unsubscribed, and subscribed again 30 s later while the handlers
+    # are still late: the first snapshot back starts a stretch of its own, which gets its own
+    # on_stale and its own 15 s before the connection is ended.
+    feed = _Feed(monkeypatch)
+    feed.snapshot(0.05, 0)
+    feed.snapshot(1.05, 1)
+    feed.snapshot(7.05, 2)  # 5 s late
+    assert feed.turns() == ["fresh", "behind"] and feed.ws._behind_since == 7.05
+    feed.ws.unsubscribe("portfolio")
+    assert feed.ws._behind_since is None and feed.ws._lag_base is None
+    feed.ws.subscribe_portfolio()
+    feed.snapshot(42.05, 37)  # still 5 s late, against no baseline yet
+    assert feed.turns() == ["fresh", "behind", "fresh"] and feed.ws.fresh is True
+    feed.snapshot(48.05, 38)  # 5 s later than the one before
+    assert feed.turns() == ["fresh", "behind", "fresh", "behind"]
+    feed.snapshot(63.0, 39)  # behind for 14.95 s
+    with pytest.raises(ConnectionError, match="the handlers stayed behind the feed"):
+        feed.snapshot(63.1, 40)
+
+
+def test_a_backlog_that_grows_slowly_is_flagged_at_stale_after_and_a_beat(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The handlers fall 20 ms further behind every second: flagged once the backlog passes
+    # stale_after and a beat (with the 0.1% a second the baseline may rise, 4.2 s here), not
+    # minutes later, and the connection is ended once it has stayed behind 15 s.
+    feed = _Feed(monkeypatch)  # stale_after 3
+    handled: list[int] = []
+    flagged: list[int] = []
+    with pytest.raises(ConnectionError) as ended:
+        for second in range(3600):
+            handled.append(second)
+            feed.snapshot(second + 0.05 + 0.02 * second, second)
+            if not flagged and feed.turns()[-1:] == ["behind"]:
+                flagged.append(second)
+    assert str(ended.value) == "the handlers stayed behind the feed"
+    assert feed.turns() == ["fresh", "behind"]
+    (first,) = flagged
+    assert 4.0 < 0.02 * first < 4.3
+    # Taken off the socket every 1.02 s: the 15th snapshot after the first behind is past 15 s.
+    assert handled[-1] == first + 15
+
+
+def test_an_engine_clock_stepped_back_ends_the_connection_after_15_s(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The engine's clock steps back 5 s (an NTP correction, say): on this connection its
+    # snapshots look 5 s late for good. Behind at once, and the connection is ended once that
+    # has lasted 15 s; the next one measures from a baseline of its own (test_ws_lifecycle).
+    feed = _Feed(monkeypatch)
+    handled: list[int] = []
+    with pytest.raises(ConnectionError) as ended:
+        for second in range(3600):
+            handled.append(second)
+            feed.snapshot(second + 0.1, second if second < 600 else second - 5)
+    assert str(ended.value) == "the handlers stayed behind the feed"
+    assert feed.turns() == ["fresh", "behind"] and handled[-1] == 616
+
+
+def test_a_stall_that_drains_at_once_recovers_without_a_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A handler holds the loop 6 s once, at 1 Hz snapshots: the six read meanwhile are taken off
+    # the socket together as it returns, 6 s late down to 1 s late. Behind at the first of them,
+    # fresh at the first within bounds, and the connection stays.
+    feed = _Feed(monkeypatch)
+    for second in range(60):
+        late = 10 <= second < 16
+        feed.snapshot(16.05 + (second - 10) * 0.001 if late else second + 0.05, second)
+    assert feed.turns() == ["fresh", "behind", "fresh"] and feed.ws.fresh is True
+
+
+def test_a_handler_cancelled_error_is_logged_and_swallowed(caplog: pytest.LogCaptureFixture):
+    # A task's cancellation reaches only an await, never a handler's own code: one raised there
+    # is the handler's failure, and the other handlers still run.
+    ws = _client()
+    seen: list[str] = []
+
+    def cancelled(_: Any) -> None:
+        raise asyncio.CancelledError
+
+    ws.on_market_halt(cancelled)
+    ws.on_market_halt(lambda m: seen.append(m.type))
+    ws.on_message(lambda m: seen.append("*"))
+    ws._dispatch(_frame(type="market_halt", ticker="OPRA", isHalted=True))
+    assert seen == ["market_halt", "*"]
+    assert "Loaf WebSocket handler for 'market_halt' raised" in caplog.text
+    assert "CancelledError" in caplog.text
+
+
+def test_an_error_frame_with_no_handler_is_logged(caplog: pytest.LogCaptureFixture):
+    ws = _client()
+    ws._dispatch(_frame(
+        type="error", code="UNKNOWN_CHANNEL", message="Unknown channel orderbook:opra\n" * 500,
+    ))
+    (record,) = [r for r in caplog.records if r.name == "loaf.ws"]
+    assert record.levelname == "WARNING"
+    text = record.getMessage()
+    assert text.startswith(
+        "Loaf WebSocket server error UNKNOWN_CHANNEL: Unknown channel orderbook:opra Unknown"
+    )
+    assert "\n" not in text and text.endswith("...") and len(text) < 300
+    caplog.clear()
+    ws.on_error(lambda m: None)  # handled: not logged
+    ws._dispatch(_frame(type="error", code="UNKNOWN_CHANNEL", message="Unknown channel"))
+    assert not [r for r in caplog.records if r.name == "loaf.ws"]
+
+
+@pytest.mark.parametrize("mtype", ["__connect__", "__disconnect__", "__stale__", "__fresh__", "*"])
+def test_a_wire_type_that_names_an_internal_key_reaches_only_on_message(mtype: str):
+    ws = _client().subscribe_portfolio()
+    seen: list[Any] = []
+    ws.on_connect(lambda m: seen.append("connect"))
+    ws.on_disconnect(lambda m: seen.append("disconnect"))
+    ws.on_stale(lambda m: seen.append("stale"))
+    ws.on_fresh(lambda m: seen.append("fresh"))
+    ws.on_message(lambda m: seen.append(("*", m.type)))
+    ws._dispatch(_frame(type=mtype, reason="silent", engineMs=ENGINE_MS))
+    assert seen == [("*", mtype)]
+    assert ws.fresh is None

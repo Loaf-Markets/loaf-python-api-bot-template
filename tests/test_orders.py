@@ -25,6 +25,7 @@ import loaf
 from loaf import LoafClient, OrderOutcomeUnknownError, k1
 from loaf._l2 import AccountState, L2State, market_of
 from loaf.constants import (
+    DEFAULT_IMMEDIATE_ORDER_TTL_MS,
     DEFAULT_ORDER_TTL_MS,
     L2_BUFFER_MS,
     L2_ORDER_LIFE_MARGIN_MS,
@@ -498,15 +499,66 @@ def test_derived_prices_round_to_the_markets_tick(listings, trading_client):
     verify_order(stop, l2=BTC_L2)
 
 
-@pytest.mark.parametrize("market_index", [0, 254, 2048, 4094, 4095])
-def test_any_12_bit_market_index_is_signed(exchange, trading_client, market_index):
-    # 0 is a market (a perp's), never "none". The SDK checks only K1's 12 bits; the exchange
-    # knows its markets.
-    exchange.details["OPRA"] = market_detail(market_index=market_index)
-    trading_client().orders.limit_buy("OPRA", 10, 167.49)
+@pytest.mark.parametrize(
+    "ticker, market_index",
+    [("OPRA-PERP", 0), ("OPRA-PERP", 254), ("OPRA", 255), ("OPRA", 2048), ("OPRA", 4095)],
+)
+def test_any_12_bit_market_index_of_its_type_is_signed(
+    exchange, trading_client, ticker, market_index
+):
+    # 0 is a market (a perp's), never "none". The SDK checks K1's 12 bits and the market's type
+    # (a perp's 0 to 254, a spot market's above); the exchange knows its markets.
+    exchange.details[ticker] = market_detail(ticker, market_index=market_index)
+    trading_client().orders.limit_buy(ticker, 2, 101.5)
     (body,) = exchange.bodies("/orders")
     assert body["l2MarketIndex"] == market_index
     verify_order(body)
+
+
+def _served_as(detail: dict, **fields: Any) -> dict:
+    """``detail`` with its ``market``'s ``fields`` changed (``...``: left out)."""
+    market = {**detail["market"], **fields}
+    return {**detail, "market": {k: v for k, v in market.items() if v is not ...}}
+
+
+@pytest.mark.parametrize(
+    "ticker, detail, field",
+    [
+        # Another market's detail served for the ticker asked (a mis-keyed cache, a routing
+        # mistake): never signed as the market asked for.
+        ("MUS", market_detail("OPRA"), "ticker"),
+        ("OPRA", market_detail("OPRA-PERP"), "ticker"),
+        ("OPRA-PERP", market_detail("OPRA"), "ticker"),
+        ("OPRA", _served_as(market_detail(), ticker=None), "ticker"),
+        ("OPRA", _served_as(market_detail(), ticker="opra"), "ticker"),
+        ("OPRA", _served_as(market_detail(), ticker=...), "ticker"),
+        # The type the ticker names, and a market index of that type: K1 reads indices 0 to 254
+        # as perps', whose base-asset field is a pool and a reduce-only bit.
+        ("OPRA", _served_as(market_detail(), type="PERP"), "type"),
+        ("OPRA-PERP", _served_as(market_detail("OPRA-PERP"), type="SPOT"), "type"),
+        ("OPRA", market_detail(market_index=4), "marketIndex"),
+        ("OPRA", market_detail(market_index=254), "marketIndex"),
+        ("OPRA-PERP", market_detail("OPRA-PERP", market_index=255), "marketIndex"),
+        ("OPRA-PERP", market_detail("OPRA-PERP", market_index=MARKET_INDEX), "marketIndex"),
+    ],
+)
+def test_a_market_that_is_not_the_one_asked_for_is_refused_before_anything_is_reserved(
+    exchange, trading_client, ticker, detail, field
+):
+    exchange.details[ticker] = detail
+    message = f"GET /trade/{ticker} answered an unusable market.{field}"
+    orders = trading_client().orders
+    for place in (
+        lambda: orders.limit_buy(ticker, 2, 101.5),
+        lambda: orders.market_buy(ticker, 2),
+        lambda: orders.stop_loss(ticker, 2, 95),
+        lambda: orders.warm(ticker),
+    ):
+        with pytest.raises(loaf.LoafServerError, match=re.escape(message)) as info:
+            place()
+        assert info.value.status_code == 200
+    # Read each time (never kept), and nothing reserved, signed or sent.
+    assert routes(exchange.requests) == [f"GET /trade/{ticker}"] * 4
 
 
 # --------------------------------------------------------------------------- #
@@ -583,7 +635,7 @@ def test_a_market_on_another_chain_is_refused_before_anything_is_signed(
             orders.limit_buy("OPRA", 10, 167.49)
         assert str(info.value) == (
             "OPRA's market is on L2 chain 4243 and your trading key is for L2 chain 4242: "
-            "LOAF_TRADING_KEY is from another Loaf deployment than the one at http://test/api "
+            "LOAF_TRADING_KEY is from another Loaf deployment than the one at https://test/api "
             "(LOAF_API_BASE_URL). Set LOAF_TRADING_KEY to the trading key this deployment's web "
             "app shows (README §2), or LOAF_API_BASE_URL to the key's deployment."
         )
@@ -668,13 +720,13 @@ def test_unusable_reservation(exchange, trading_client, answer, reads):
 @pytest.mark.parametrize(
     "path, message",
     [
-        ("/trade/OPRA", "GET /trade/OPRA answered no market"),
-        ("/l2/keys", "GET /l2/keys answered an unusable accountIndex"),
-        ("/l2/order-indices", "POST /l2/order-indices answered a range no order can be signed in"),
+        ("/trade/OPRA", "GET /trade/OPRA answered a body that is not JSON"),
+        ("/l2/keys", "GET /l2/keys answered a body that is not JSON"),
+        ("/l2/order-indices", "POST /l2/order-indices answered a body that is not JSON"),
     ],
 )
 def test_a_web_page_answering_a_read_is_refused(exchange, trading_client, path, message):
-    # A host answering with a web page (the web app's, an edge challenge): read as text.
+    # A host answering with a web page (the web app's, an edge challenge): no JSON, no answer.
     exchange.queue(path, httpx.Response(200, html="<!doctype html><html>app</html>"))
     with pytest.raises(loaf.LoafServerError, match=re.escape(message)):
         trading_client().orders.limit_buy("OPRA", 10, 167.49)
@@ -1040,6 +1092,81 @@ def test_expiry_is_now_plus_buffer_plus_ttl(exchange, trading_client, l2_clock):
     for ttl in (60_000, MAX_ORDER_TTL_MS):
         orders.limit_buy("OPRA", 10, 167.49, ttl_ms=ttl)
         assert exchange.bodies("/orders")[-1]["l2ExpiryMs"] == now + L2_BUFFER_MS + ttl
+
+
+@pytest.mark.parametrize(
+    "place, path, life",
+    [
+        # An order that cannot rest: a MARKET order, an IOC or FOK limit, with no legs. Its
+        # signature covers neither its type nor its time in force, so its bytes would verify as a
+        # GTC limit at its price: 10 minutes, not 7 days.
+        (lambda o: o.market_buy("OPRA", 1), "/orders", DEFAULT_IMMEDIATE_ORDER_TTL_MS),
+        (lambda o: o.market_sell("OPRA", 1), "/orders", DEFAULT_IMMEDIATE_ORDER_TTL_MS),
+        (
+            lambda o: o.market_buy("OPRA", 1, reference_price=160, max_slippage_bps=0),
+            "/orders",
+            DEFAULT_IMMEDIATE_ORDER_TTL_MS,
+        ),
+        (
+            lambda o: o.limit_buy("OPRA", 1, 100, time_in_force="IOC"),
+            "/orders",
+            DEFAULT_IMMEDIATE_ORDER_TTL_MS,
+        ),
+        (
+            lambda o: o.limit_sell("OPRA", 1, 100, time_in_force="FOK"),
+            "/orders",
+            DEFAULT_IMMEDIATE_ORDER_TTL_MS,
+        ),
+        (
+            lambda o: o.create("OPRA", "BUY", 1, type="MARKET", time_in_force="FOK"),
+            "/orders",
+            DEFAULT_IMMEDIATE_ORDER_TTL_MS,
+        ),
+        # An order that may rest, and any order with legs, which share its expiry and must
+        # outlive it: 7 days.
+        (lambda o: o.limit_buy("OPRA", 1, 100), "/orders", DEFAULT_ORDER_TTL_MS),
+        (
+            lambda o: o.limit_buy("OPRA", 1, 100, time_in_force="POST_ONLY"),
+            "/orders",
+            DEFAULT_ORDER_TTL_MS,
+        ),
+        (lambda o: o.market_buy("OPRA", 1, tp_price=200), "/orders", DEFAULT_ORDER_TTL_MS),
+        (lambda o: o.market_buy("OPRA", 1, sl_price=120), "/orders", DEFAULT_ORDER_TTL_MS),
+        (
+            lambda o: o.limit_buy("OPRA", 1, 100, sl_price=90, time_in_force="IOC"),
+            "/orders",
+            DEFAULT_ORDER_TTL_MS,
+        ),
+        (lambda o: o.stop_loss("OPRA", 1, 90), "/orders/conditional", DEFAULT_ORDER_TTL_MS),
+        (lambda o: o.take_profit("OPRA", 1, 120), "/orders/conditional", DEFAULT_ORDER_TTL_MS),
+    ],
+)
+def test_an_order_that_cannot_rest_signs_a_short_life_by_default(
+    exchange, trading_client, l2_clock, place, path, life
+):
+    now = freeze(l2_clock)
+    place(trading_client().orders)
+    (body,) = exchange.bodies(path)
+    assert body["l2ExpiryMs"] == now + L2_BUFFER_MS + life
+    for leg in ("tp", "sl"):
+        if leg in body:
+            assert body[leg]["l2ExpiryMs"] == body["l2ExpiryMs"]
+    verify_order(body)
+    assert "sendByMs" not in body  # compared with the exchange's clock: never set by default
+
+
+def test_a_short_default_life_is_10_minutes_and_a_given_ttl_wins(
+    exchange, trading_client, l2_clock
+):
+    assert DEFAULT_IMMEDIATE_ORDER_TTL_MS == 600_000
+    now = freeze(l2_clock)
+    orders = trading_client().orders
+    orders.market_buy("OPRA", 1, ttl_ms=DAY_MS)
+    orders.limit_buy("OPRA", 1, 100, time_in_force="IOC", ttl_ms=60_000)
+    orders.limit_buy("OPRA", 1, 100, ttl_ms=60_000)
+    assert [body["l2ExpiryMs"] - now - L2_BUFFER_MS for body in exchange.bodies("/orders")] == [
+        DAY_MS, 60_000, 60_000
+    ]
 
 
 @pytest.mark.parametrize("ttl", [59_999, MAX_ORDER_TTL_MS + 1, 1.5, True, "60000", Decimal(60000)])
@@ -1826,21 +1953,22 @@ def test_placement_backoff_ignores_rate_limit_headers(exchange, trading_client, 
     # A signed price goes stale: re-sends wait only the jittered 0.5 / 1 / 2 s.
     assert len(sleeps) == 3 and all(0 <= s <= 2.0 for s in sleeps)
 
-    # Reads wait out a 503's Retry-After and a 429's RateLimit-Reset, but never a 503's
-    # RateLimit-Reset: the time left in the rate-limit window says nothing about the outage.
+    # Reads wait out a 503's Retry-After and a 429's RateLimit-Reset (up to MAX_HINTED_WAIT), but
+    # never a 503's RateLimit-Reset: the time left in the rate-limit window says nothing about the
+    # outage.
     del sleeps[:]
     replies = [
         httpx.Response(
             503, json={"error": "busy"}, headers={"Retry-After": "7", "RateLimit-Reset": "57"}
         ),
         httpx.Response(503, json={"error": "busy"}, headers={"RateLimit-Reset": "57"}),
-        httpx.Response(429, json={"error": "slow"}, headers={"RateLimit-Reset": "41"}),
+        httpx.Response(429, json={"error": "slow"}, headers={"RateLimit-Reset": "4"}),
         httpx.Response(200, json={"markets": []}),
     ]
     http = httpx.Client(transport=httpx.MockTransport(lambda r: replies.pop(0)), base_url=BASE)
     LoafClient(base_url=BASE, http_client=http, max_retries=3).market.list()
     assert len(sleeps) == 3 and replies == []
-    assert sleeps[0] == 7.0 and 0 <= sleeps[1] <= 1.0 and sleeps[2] == 41.0
+    assert sleeps[0] == 7.0 and 0 <= sleeps[1] <= 1.0 and sleeps[2] == 4.0
 
 
 def test_backoff_stays_capped_through_a_long_outage(exchange, trading_client, monkeypatch):
@@ -2438,9 +2566,10 @@ def test_ticker_and_side_validation(exchange, trading_client, ticker, side):
 
 @pytest.mark.parametrize("ticker", ["A", "MUS", "OPRA", "X1", "1234", "OPERAHOUSE", "H100-PERP"])
 def test_ticker_accepted(exchange, trading_client, ticker):
-    exchange.details[ticker] = market_detail(ticker, market_index=7)
+    market_index = 7 if ticker.endswith("-PERP") else 2057  # a perp's, else a spot market's
+    exchange.details[ticker] = market_detail(ticker, market_index=market_index)
     trading_client().orders.limit_buy(ticker, 1, 100)
     (body,) = exchange.bodies("/orders")
     # The ticker names the market to read; the body names it by the index it signs.
-    assert "ticker" not in body and body["l2MarketIndex"] == 7
+    assert "ticker" not in body and body["l2MarketIndex"] == market_index
     assert len(exchange.gets(f"/trade/{ticker}")) == 1

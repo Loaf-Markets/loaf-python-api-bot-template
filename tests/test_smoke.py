@@ -25,9 +25,7 @@ from loaf.exceptions import error_from_response
 from loaf.money import bps_to_fraction, fraction_to_bps
 from loaf.ws.client import derive_ws_url
 
-from conftest import MARKET_STATES, TRADING_KEY, verify_login
-
-BASE = "http://test/api"
+from conftest import BASE, MARKET_INDEX, MARKET_STATES, TRADING_KEY, market_detail, verify_login
 
 
 def make_client(handler, *, trading_key: str | None = TRADING_KEY, **kwargs) -> LoafClient:
@@ -165,6 +163,7 @@ def test_time_in_force_is_the_exchanges():
 @pytest.mark.parametrize("message, code, cls, state", MARKET_STATES, ids=lambda x: str(x)[:24])
 def test_market_state_errors(message, code, cls, state):
     error = error_from_response(403, {"error": message, "code": code})
+    assert isinstance(error, loaf.MarketStateError)
     assert type(error) is cls and (error.state, error.status_code, error.code) == (state, 403, code)
     assert isinstance(error, loaf.LoafForbiddenError)
     # Code that backs off on halts catches the market's own halt too.
@@ -437,23 +436,34 @@ def test_rate_limit_not_retried_for_non_idempotent_post():
 
 @pytest.mark.parametrize(
     "headers",
-    [{"Retry-After": "0"}, {"RateLimit-Reset": "0"}, {"Retry-After": "-3"}, {"Retry-After": "nan"}, {}],
+    [
+        {"Retry-After": "0"}, {"RateLimit-Reset": "0"}, {"Retry-After": "-3"},
+        {"Retry-After": "nan"}, {"Retry-After": "inf"}, {},
+    ],
 )
 def test_a_rate_limit_hint_of_zero_or_less_still_backs_off(monkeypatch, headers):
     slept: list = []
     monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=slept.append))
     monkeypatch.setattr("loaf.client.random", SimpleNamespace(uniform=lambda low, high: high))
-    make_client(lambda r: httpx.Response(200, json={}))._sleep_backoff(0, httpx.Response(429, headers=headers))
+    replies = [httpx.Response(429, json={"error": "slow"}, headers=headers)]
+    client = make_client(lambda r: replies.pop(0) if replies else httpx.Response(200, json={}))
+    client.market.list()
     assert slept == [0.5]  # the first exponential step, as with no hint at all
 
 
-@pytest.mark.parametrize("value, expected", [("3", 3.0), ("120", 60.0)])
-def test_a_positive_rate_limit_hint_is_honoured(monkeypatch, value, expected):
+@pytest.mark.parametrize("value, waits", [("3", [3.0]), ("10", [10.0]), ("10.5", []), ("120", [])])
+def test_a_rate_limit_hint_is_honoured_up_to_ten_seconds(monkeypatch, value, waits):
     slept: list = []
     monkeypatch.setattr("loaf.client.time", SimpleNamespace(sleep=slept.append))
-    response = httpx.Response(429, headers={"Retry-After": value})
-    make_client(lambda r: httpx.Response(200, json={}))._sleep_backoff(0, response)
-    assert slept == [expected]
+    replies = [httpx.Response(429, json={"error": "slow"}, headers={"Retry-After": value})]
+    client = make_client(lambda r: replies.pop(0) if replies else httpx.Response(200, json={}))
+    if waits:
+        client.market.list()
+    else:  # longer: raised at once, for the caller to decide
+        with pytest.raises(loaf.LoafRateLimitError) as info:
+            client.market.list()
+        assert info.value.retry_after == float(value)
+    assert slept == waits
 
 
 def test_candles_params_and_no_auth():
@@ -538,7 +548,14 @@ def test_market_routes_take_only_a_market_ticker(call, route):
 
     def handler(request: httpx.Request) -> httpx.Response:
         sent.append((request.url.path, request.headers.get("authorization")))
-        return httpx.Response(200, json={})
+        path = request.url.path
+        if path.endswith("/candles"):
+            return httpx.Response(200, json={"candles": [], "oldestTs": None, "hasMore": False})
+        if path.endswith("/trades"):
+            return httpx.Response(200, json={"trades": []})
+        ticker = path.rsplit("/", 1)[1]
+        index = 3 if ticker.endswith("-PERP") else MARKET_INDEX
+        return httpx.Response(200, json=market_detail(ticker, market_index=index))
 
     client = make_client(handler)
     for ticker in ("OPRA", "OPERAHOUSE", "H100-PERP"):

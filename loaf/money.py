@@ -251,19 +251,38 @@ def _worst_price(
     price_decimals: int,
     quantity_decimals: int,
     where: str = "",
+    whole_bps: int | None = None,
 ) -> Decimal:
     """:func:`worst_price` on a market of ``price_decimals`` and ``quantity_decimals`` (``where``
-    names it in the refusal) as an exact Decimal."""
+    names it in the refusals) as an exact Decimal.
+
+    ``whole_bps`` is the order's whole max slippage when ``max_slippage_bps`` is less (a perp's
+    move held to half its band; default: ``max_slippage_bps``): a BUY whose moved price rounds
+    below one tick, the lowest price, signs one tick only where one tick lies within
+    ``whole_bps`` above the reference, and is refused otherwise. A SELL's never rounds below one
+    tick."""
     ref = _reference(reference_price)
     side = _check_side(side)
     bps = validate_slippage_bps(max_slippage_bps)
+    whole = bps if whole_bps is None else validate_slippage_bps(whole_bps)
     tick, most = _tick(price_decimals), _price_max(price_decimals, quantity_decimals)
     with localcontext(_DECIMAL_CONTEXT):
         raw = ref * (10_000 + bps if side == "BUY" else 10_000 - bps) / 10_000
         if raw < most + tick:  # bounded first: quantize overflows on huge values
             # Toward the reference, so the signed price never exceeds the tolerance.
             rounding = ROUND_FLOOR if side == "BUY" else ROUND_CEILING
-            price = max(raw.quantize(tick, rounding=rounding), tick)
+            price = raw.quantize(tick, rounding=rounding)
+            if price < tick:
+                # A BUY off a reference under one tick: one tick, the lowest price, lies above the
+                # moved price, so it is signed only within the whole max slippage of the reference.
+                if (tick - ref) * 10_000 > whole * ref:
+                    shown = format(ref.normalize(), "f")  # the reference without trailing zeros
+                    raise _client_validation_error(
+                        f"No BUY price{where} lies within max_slippage_bps={whole} of {shown}: "
+                        f"one tick ({tick}), its lowest price, lies further above it; place a "
+                        "LIMIT order"
+                    )
+                price = tick
             if price <= most:
                 return price
     raise _client_validation_error(
@@ -287,7 +306,11 @@ def worst_price(
     ``reference_price x (1 + max_slippage_bps/10,000)`` for a BUY and
     ``x (1 - max_slippage_bps/10,000)`` for a SELL, rounded toward the
     reference to the market's tick, 10^-price_decimals dollars (down for a BUY,
-    up for a SELL), so it never exceeds the tolerance, and never below one tick.
+    up for a SELL), so it never exceeds the tolerance. A SELL's is at least one
+    tick, the lowest price. A BUY's that rounds below one tick (off a reference
+    under one tick) is refused, since one tick lies more than
+    ``max_slippage_bps`` above the reference: a price the SDK derives never lies
+    further against the order than its max slippage from its reference.
     It is what :meth:`~loaf.resources.orders.OrdersResource.market_buy` /
     ``market_sell`` sign (off the market reference), what a ``*_MARKET``
     conditional books at (off its trigger), and the lowest price a TP/SL leg
@@ -296,21 +319,23 @@ def worst_price(
     (``band``, the market's ``l2.band``; 0 bounds nothing) and, for a MARKET
     order, the live mark to get what it signs there, unless this price crosses
     a mark off the tick (a SELL's above it, a BUY's below it) or lies outside
-    the band, as a BUY's one tick off a mark under one tick can. The SDK then
+    the band, or this refuses a BUY off a mark under one tick. The SDK then
     signs the tick on the mark's near side (a SELL's below the mark, a BUY's
     above it) when this price crossed and that tick is inside the band and
     within the order's whole max slippage of the mark (not the min passed
-    here), else this price when it is inside the band, else refuses the order
-    (the orders module, **The perps band**). A MARKET order's
-    ``reference_price`` with a max slippage of 0 signs this price whatever the
-    band. Refused when it would be above the market's highest price, the
-    largest on its tick whose signed price, x 10^(7 - quantity_decimals), fits
-    32 bits.
+    here), else this price when it is inside the band; for a BUY off a mark
+    under one tick, one tick when it lies inside the band and within the
+    order's whole max slippage of the mark; else it refuses the order (the
+    orders module, **The perps band**). A MARKET order's ``reference_price``
+    with a max slippage of 0 signs this price whatever the band, and is
+    refused where this is. Refused too when it would be above the market's
+    highest price, the largest on its tick whose signed price, x 10^(7 -
+    quantity_decimals), fits 32 bits.
 
     Use it to size a MARKET BUY: a BUY holds the price it signs x quantity x
     (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of your cash:
-    this price, or on a perp the tick above an off-grid mark where the SDK
-    signs that instead.
+    this price, or on a perp the tick above an off-grid mark, or one tick,
+    where the SDK signs that instead.
 
     ``side`` is ``BUY`` or ``SELL``; ``max_slippage_bps`` a whole number from 0
     to 9999, required so your sizing cannot drift from what the client signs:

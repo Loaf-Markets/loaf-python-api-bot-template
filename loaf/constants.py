@@ -42,6 +42,24 @@ DEFAULT_PLACEMENT_TIMEOUT = 45.0
 #: signed placements (network/5xx, re-sent unchanged).
 DEFAULT_MAX_RETRIES = 3
 
+#: The longest wait (seconds) a read's retry takes on a 429's or a 503's ``Retry-After`` (a 429's
+#: ``RateLimit-Reset``). An answer that asks for longer is raised at once, its
+#: ``retry_after`` saying how long, so the caller decides what to do with the time.
+MAX_HINTED_WAIT = 10.0
+
+#: The most ``retry_after`` an error carries (seconds): one day. A longer hint is read as this.
+MAX_RETRY_AFTER = 86_400.0
+
+#: The response body size (bytes, decompressed) past which the client stops reading: once what
+#: it has decoded passes this, a read raises :class:`~loaf.exceptions.LoafConnectionError`, and a
+#: signed order's, perps op's or withdrawal's outcome is unknown. httpx hands over a compressed
+#: body one decoded network read at a time, so the most held is this plus one decoded read. Every
+#: request the SDK sends asks only for gzip and deflate, which expand a read at most about a
+#: thousandfold, and an answer that names any other ``Content-Encoding`` (two stacked, or brotli)
+#: is refused the same way before any of it is read, whichever ``http_client`` sent it. A body
+#: must also arrive within the request's read timeout of its headers.
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
 # --------------------------------------------------------------------------- #
 # Numeric precision
 # --------------------------------------------------------------------------- #
@@ -94,8 +112,18 @@ L2_MAX_ORDER_LIFE_MS = 4_261_412_864
 #: One K1 expiry window (about 4.7 hours): the margin kept for clocks that disagree.
 L2_ORDER_LIFE_MARGIN_MS = 16_777_216
 
-#: How long an order may rest when ``ttl_ms=`` is omitted: 7 days.
+#: How long an order may rest when ``ttl_ms=`` is omitted: 7 days. A GTC or POST_ONLY limit, a
+#: stop or take, and any order with TP/SL legs, which share its expiry and must outlive it.
 DEFAULT_ORDER_TTL_MS = 604_800_000
+
+#: The life an order that cannot rest signs when ``ttl_ms=`` is omitted: 10 minutes. A MARKET
+#: order, or a LIMIT order whose time in force is IOC or FOK, with no TP/SL legs. Its signature
+#: covers neither its type nor its time in force, so its bytes verify as a resting limit at its
+#: price for as long as its life lasts: a short one bounds how long a copy of them could rest. Not
+#: the one-minute minimum: the exchange refuses an order whose life has ended by its own clock, and
+#: 10 minutes still leaves 5 to an order signed on a clock 5 minutes slow, the most the SDK allows
+#: elsewhere (its login tokens).
+DEFAULT_IMMEDIATE_ORDER_TTL_MS = 600_000
 
 #: The shortest ``ttl_ms=`` accepted: one minute.
 MIN_ORDER_TTL_MS = 60_000

@@ -10,12 +10,13 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
 import threading
 import time
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator, Mapping
 
 import httpx
 import pytest
@@ -25,7 +26,7 @@ import loaf._l2
 from loaf import LoafClient, k1
 from loaf.constants import DEFAULT_TIMEOUT
 
-BASE = "http://test/api"
+BASE = "https://test/api"
 KAT = json.loads(Path(__file__).with_name("k1-sign.json").read_text())
 
 # The trading key every test signs with: K1's first known-answer key, public — never use it for
@@ -42,6 +43,8 @@ TRADING_KEY = f"loaf_tk_{L2_CHAIN_ID}_{ACCOUNT_INDEX}_{L2_SECRET}"
 # the exchange serves them.
 MARKET_INDEX = 2050
 DECIMALS = (2, 3)
+# OPRA-PERP's market index: a perp's is 0 to 254, a spot market's above.
+PERP_MARKET_INDEX = 4
 
 
 def signed_decimals(quantity_decimals: int) -> dict[str, int]:
@@ -303,7 +306,7 @@ def l2_clock(_no_sleep: SimpleNamespace) -> SimpleNamespace:
     return _no_sleep
 
 
-_TYPES_L2 = object()
+_ITS_TYPES = object()
 
 
 def freeze(l2_clock: SimpleNamespace, at_ms: int | None = None) -> int:
@@ -316,8 +319,8 @@ def freeze(l2_clock: SimpleNamespace, at_ms: int | None = None) -> int:
 def market_detail(
     ticker: str = "OPRA",
     *,
-    market_index: Any = MARKET_INDEX,
-    l2: Any = _TYPES_L2,
+    market_index: Any = _ITS_TYPES,
+    l2: Any = _ITS_TYPES,
     market_price: float = 160,
     decimals: tuple[int, int] = DECIMALS,
 ) -> dict:
@@ -325,13 +328,16 @@ def market_detail(
     ``live``.
 
     ``market_index=...`` or ``l2=...`` leaves that field out. ``decimals`` is the
-    market's ``(priceDecimals, quantityDecimals)``. ``l2`` defaults to its type's, signing
-    in those decimals: ``PERP_L2`` for a perp (its ticker ends in -PERP), else
-    ``MARKET_L2``; one given is served as given.
+    market's ``(priceDecimals, quantityDecimals)``. ``market_index`` and ``l2`` default to
+    its type's, ``l2`` signing in those decimals: ``PERP_MARKET_INDEX`` and ``PERP_L2`` for
+    a perp (its ticker ends in -PERP), else ``MARKET_INDEX`` and ``MARKET_L2``; one given is
+    served as given. Its ``market.ticker`` is ``ticker``.
     """
     perp = ticker.endswith("-PERP")
     price_decimals, quantity_decimals = decimals
-    if l2 is _TYPES_L2:
+    if market_index is _ITS_TYPES:
+        market_index = PERP_MARKET_INDEX if perp else MARKET_INDEX
+    if l2 is _ITS_TYPES:
         l2 = {**(PERP_L2 if perp else MARKET_L2), **signed_decimals(quantity_decimals)}
     market: dict[str, Any] = {
         "marketIndex": market_index,
@@ -768,36 +774,84 @@ def login_refusal(
     return None
 
 
+def chained(exc: BaseException) -> list[BaseException]:
+    """``exc`` and every exception it chains, by ``__cause__`` and ``__context__``, each once."""
+    found: list[BaseException] = []
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is not None and all(current is not seen for seen in found):
+            found.append(current)
+            pending += (current.__cause__, current.__context__)
+    return found
+
+
+def _held(value: Any, depth: int = 3) -> Iterator[Any]:
+    """``value``, and what it holds ``depth`` levels down: a mapping's keys and values (httpx's
+    headers too), a tuple's, list's or set's items (``**kwargs``, ``*args``, httpcore's header
+    pairs), a regex match's string, an object's attributes (a request's headers)."""
+    yield value
+    if depth == 0 or isinstance(value, (str, bytes, bytearray, int, float, type(None))):
+        return
+    if isinstance(value, Mapping):
+        inner: list[Any] = [*value.keys(), *value.values()]
+    elif isinstance(value, (tuple, list, set, frozenset)):
+        inner = list(value)
+    elif isinstance(value, re.Match):
+        inner = [value.string]
+    else:
+        inner = list(getattr(value, "__dict__", {}).values())
+    for item in inner:
+        yield from _held(item, depth - 1)
+
+
 def secret_locals(exc: BaseException, *secrets: str) -> list[str]:
-    """``frame:name`` of each local of the SDK's frames in ``exc``'s traceback that holds
-    one of ``secrets`` (lowercase: hex, a trading key or a login token), as text, as bytes
-    (raw or hex) or, for a trading key's secret (80 hex), as the int k1 turns it into:
-    directly, among a dict's, tuple's or list's items (``**kwargs``, ``*args``), as a regex
-    match's string, or among an object's attributes. Crash reporters and debuggers record
-    these locals."""
+    """``module:frame:name`` of each local, in any frame of the traceback of ``exc`` or of any
+    exception it chains (``__cause__``, ``__context__``: httpx's and httpcore's frames too),
+    that holds one of ``secrets`` (lowercase: hex, a trading key or a login token), as text,
+    as bytes (raw or hex) or, for a trading key's secret (80 hex), as the int k1 turns it into:
+    directly or among what it holds (:func:`_held`). Crash reporters and debuggers record
+    these locals. The frames still running (the caller's own, which catches ``exc``) are not
+    the error's and are skipped."""
     scalars = {int.from_bytes(bytes.fromhex(s), "little") for s in secrets if len(s) == 80}
+    running = set()
+    frame = sys._getframe()
+    while frame is not None:
+        running.add(id(frame))
+        frame = frame.f_back
     found = []
-    tb = exc.__traceback__
-    while tb is not None:
-        frame = tb.tb_frame
-        if frame.f_globals.get("__name__", "").startswith("loaf"):
-            for name, value in frame.f_locals.items():
-                if isinstance(value, dict):
-                    held = list(value.values())
-                elif isinstance(value, (tuple, list)):
-                    held = list(value)
-                elif isinstance(value, re.Match):
-                    held = [value.string]
-                else:
-                    held = [value]
-                held += getattr(value, "__dict__", {}).values()
-                for item in held:
-                    if isinstance(item, (bytes, bytearray)):
-                        item = f"{item.hex()} {item.decode('latin-1')}"
-                    if (isinstance(item, int) and item in scalars) or (
-                        isinstance(item, str) and any(s in item.lower() for s in secrets)
-                    ):
-                        found.append(f"{frame.f_code.co_name}:{name}")
-                        break
-        tb = tb.tb_next
+    for error in chained(exc):
+        tb = error.__traceback__
+        while tb is not None:
+            frame = tb.tb_frame
+            if id(frame) not in running:
+                for name, value in frame.f_locals.items():
+                    for item in _held(value):
+                        if isinstance(item, (bytes, bytearray)):
+                            item = f"{item.hex()} {item.decode('latin-1')}"
+                        if (isinstance(item, int) and item in scalars) or (
+                            isinstance(item, str) and any(s in item.lower() for s in secrets)
+                        ):
+                            module = frame.f_globals.get("__name__", "")
+                            found.append(f"{module}:{frame.f_code.co_name}:{name}")
+                            break
+            tb = tb.tb_next
+    return found
+
+
+def bearer_requests(exc: BaseException) -> list[httpx.Request]:
+    """The requests hanging off ``exc`` and the exceptions it chains (an httpx error's
+    ``request``, an ``HTTPStatusError``'s response's) that still carry an ``Authorization``
+    header."""
+    found = []
+    for error in chained(exc):
+        requests = []
+        if isinstance(error, httpx.HTTPError):
+            try:
+                requests.append(error.request)
+            except RuntimeError:  # raised with no request
+                pass
+        if isinstance(error, httpx.HTTPStatusError):
+            requests.append(error.response.request)
+        found += [r for r in requests if "authorization" in r.headers]
     return found

@@ -30,6 +30,7 @@ from .constants import (
     L2_MAX_ORDER_LIFE_MS,
     L2_ORDER_LIFE_MARGIN_MS,
     L2_SIGNED_DECIMALS,
+    MAX_PERP_MARKET_INDEX,
     PERPS_QUOTE_ASSET_ID,
     TRADING_KEY_PREFIX,
 )
@@ -306,7 +307,10 @@ def market_of(detail: Any, ticker: str) -> Market:
     Raises:
         LoafConfigError: the server does not run the exchange this SDK trades on.
         LoafValidationError: the market has no L2 market right now (local).
-        LoafServerError: the answer is no JSON object (a web page), or an unusable market.
+        LoafServerError: the answer is no JSON object (a web page), or an unusable market:
+            among them another ticker's (its ``ticker`` not ``ticker``), or one whose
+            ``type`` disagrees with ``ticker`` or its ``marketIndex``
+            (:func:`_unusable_market_field`).
     """
     if not isinstance(detail, Mapping):  # the web app's page, an edge challenge
         raise LoafServerError(
@@ -322,7 +326,7 @@ def market_of(detail: Any, ticker: str) -> Market:
         raise _client_validation_error(
             f"{ticker} has no L2 market right now (market.l2 is null), so it cannot be traded"
         )
-    field = _unusable_market_field(market)
+    field = _unusable_market_field(market, ticker)
     if field is not None:
         raise LoafServerError(
             f"GET /trade/{ticker} answered an unusable market.{field}",
@@ -770,18 +774,42 @@ def _whole(value: object, low: int, high: int) -> TypeGuard[int]:
     return _is_int(value) and low <= value <= high
 
 
-def _unusable_market_field(market: Mapping[str, Any]) -> str | None:
-    """The first field of a ``market`` no order can sign, in schema order: its
-    ``marketIndex``, ``type``, ``priceDecimals`` and ``quantityDecimals``, then its
-    ``l2``'s: the custody, then a spot market's assets, or a perp's quote asset (USDC)
-    and status, then the decimals an order signs in, which must be the market's (7 less
-    its quantity decimals for the price, its quantity decimals for the quantity). A
-    perp's other terms are not signed."""
-    if not _whole(market.get("marketIndex"), 0, 4095):
+def _unusable_identity_field(market: Mapping[str, Any], ticker: str) -> str | None:
+    """The first field of ``ticker``'s ``market`` that does not say which market it is, in
+    schema order: its ``marketIndex`` (0 to 4095), ``ticker`` (``ticker`` itself: another
+    market's detail names that market), ``type`` (``"PERP"`` exactly when ``ticker`` ends in
+    ``-PERP``, else ``"SPOT"``), then its ``marketIndex`` again against its type (a perp's 0
+    to :data:`~loaf.constants.MAX_PERP_MARKET_INDEX`, a spot market's above it). The first
+    checks of :func:`_unusable_market_field`, and all a cancel's scope reads."""
+    index = market.get("marketIndex")
+    if not _whole(index, 0, 4095):
         return "marketIndex"
-    kind = market.get("type")
-    if kind not in ("SPOT", "PERP"):
+    served = market.get("ticker")
+    if not (isinstance(served, str) and served == ticker):
+        return "ticker"
+    perp = ticker.endswith("-PERP")
+    if market.get("type") != ("PERP" if perp else "SPOT"):
         return "type"
+    if (index <= MAX_PERP_MARKET_INDEX) != perp:
+        return "marketIndex"
+    return None
+
+
+def _unusable_market_field(market: Mapping[str, Any], ticker: str) -> str | None:
+    """The first field of ``ticker``'s ``market`` no order on it can sign, in schema order:
+    its ``marketIndex``, ``ticker`` (``ticker`` itself: another market's detail signs that
+    market), ``type`` (``"PERP"`` exactly when ``ticker`` ends in ``-PERP``, else
+    ``"SPOT"``), its ``marketIndex`` again against its type (a perp's 0 to
+    :data:`~loaf.constants.MAX_PERP_MARKET_INDEX`, a spot market's above it: K1 reads an
+    order's base-asset field as a perp's pool and reduce-only bit by its market index),
+    ``priceDecimals`` and ``quantityDecimals``, then its ``l2``'s: the custody, then a spot
+    market's assets, or a perp's quote asset (USDC) and status, then the decimals an order
+    signs in, which must be the market's (7 less its quantity decimals for the price, its
+    quantity decimals for the quantity). A perp's other terms are not signed."""
+    identity = _unusable_identity_field(market, ticker)
+    if identity is not None:
+        return identity
+    kind = market["type"]
     decimals = _decimals_field(market.get("priceDecimals"), market.get("quantityDecimals"))
     if decimals is not None:
         return decimals

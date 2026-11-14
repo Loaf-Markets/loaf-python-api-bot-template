@@ -60,6 +60,8 @@ committed, and ``batchSeq``, that batch's journal number: the private frames
 (``order_status``, ``order_update``, ``trade_new``, ``balances_update``,
 ``holding_update``, ``perps_account_update``, ``funding_payment``,
 ``l2_keys_update``) and ``orderbook_update``, whose ``engineMs`` is its book's.
+An account snapshot (``perps_account_update`` with ``snapshot: True``) is the
+exception: its ``engineMs`` is the engine's clock at the read it was taken at.
 ``timestamp`` stays the server's send time in whole unix seconds, so
 ``timestamp * 1000 - engineMs`` is a frame's age when it left, to within a
 second. ``batchSeq`` does not order frames: one batch's frames share it.
@@ -69,7 +71,14 @@ account as a snapshot (``perps_account_update`` with ``snapshot: True``) about
 once a second, changed or not, as long as its engine runs. The client watches
 it: :attr:`LoafWebSocketClient.fresh` turns ``True`` at a connection's first
 snapshot, and ``False`` once no stamped private frame came for ``stale_after``
-seconds (default 3: two beats missed) or the connection drops;
+seconds (default 3: two beats missed), the connection drops, or your handlers
+fall behind: a handler too slow for the feed leaves frames queued, so what is
+being handled is older than ``stale_after`` (the client compares how far the
+snapshots' ``engineMs`` and its own clock each advanced, allows a second more,
+as a snapshot waits for the next beat before it is sent, and tolerates the
+drift between the two machines' clocks). A connection behind for 15 s is ended
+and reconnected: the next one starts without the queued frames. A frame
+counts from the moment it is taken off the socket, before its handlers run.
 :meth:`LoafWebSocketClient.on_stale` and :meth:`LoafWebSocketClient.on_fresh`
 fire at those turns. Pull your quotes on stale. A missing snapshot means no
 news, never no positions. A deployment without perps sends no snapshots, so
@@ -80,8 +89,15 @@ the key signs (the ``auth`` frame), and sends a fresh one on the live
 connection each time the one it holds passes half its life.
 
 Handlers run on the client's internal event-loop thread: keep them short. An
-exception raised in a handler is logged and swallowed. Don't place orders from
-a handler: a placement can block the feed for minutes while the exchange is
+exception raised in a handler (``asyncio.CancelledError`` included) is logged
+and swallowed; a ``SystemExit`` ends the client's run, once
+:meth:`LoafWebSocketClient.on_stale`, then
+:meth:`LoafWebSocketClient.on_disconnect`, have fired and an error is logged,
+and so does a ``KeyboardInterrupt`` in the background thread
+(:meth:`LoafWebSocketClient.start`); under
+:meth:`LoafWebSocketClient.run_forever` a ``KeyboardInterrupt`` is Ctrl-C, and
+stops the client.
+Don't place orders from a handler: a placement can block the feed for minutes while the exchange is
 slow to answer (long enough for the server to drop the connection), and an
 :class:`~loaf.exceptions.OrderOutcomeUnknownError` raised there is only logged.
 Record the event and act from your own loop, as ``bot.py`` does.
@@ -124,11 +140,13 @@ logger = logging.getLogger("loaf.ws")
 
 Handler = Callable[[Any], None]
 
-# Internal pseudo-types for lifecycle callbacks (never collide with wire types).
+# Internal pseudo-types for lifecycle callbacks. A wire frame whose type is one of these, or "*",
+# reaches the catch-all handlers only.
 _ON_CONNECT = "__connect__"
 _ON_DISCONNECT = "__disconnect__"
 _ON_STALE = "__stale__"
 _ON_FRESH = "__fresh__"
+_INTERNAL_KEYS = frozenset({_ON_CONNECT, _ON_DISCONNECT, _ON_STALE, _ON_FRESH, "*"})
 
 # The private frames that relay an engine change, and so carry its engineMs: the beat's signs
 # of life. orderbook_update carries one too, but says nothing about your private stream.
@@ -146,24 +164,58 @@ _STAMPED_PRIVATE = frozenset({
 # The shortest stale_after: the beat is about one a second, so a shorter wait always goes stale.
 _MIN_STALE_AFTER = 1.0
 
+# How fast the lag baseline may rise, in seconds per second elapsed (0.1%): above any drift between
+# this machine's clock and the engine's (NTP slews a clock by at most 0.05%), so drift never adds
+# up to a lag, and far below any backlog that matters, so the baseline never absorbs one.
+_LAG_CREEP = 0.001
+
+# How much more than stale_after a snapshot may lag before the handlers count as behind, in
+# seconds: the exchange reads the account at each beat (about one a second) but sends that read
+# only once the next beat has come, so a snapshot leaves up to a beat old, and its offset ranges
+# over about a second above the least one.
+_BEAT_ALLOWANCE = 1.0
+
+# How long a connection may stay behind before the client ends it and reconnects, in seconds of
+# this machine's clock from the snapshot that first read behind. The next connection starts
+# without the frames queued on this one and with a baseline of its own, so a consumer that fell
+# behind gets current frames again, and a lasting shift of the offset (a step of the engine's
+# clock) heals.
+_BEHIND_LIMIT = 15.0
+
+# The reason on_disconnect reports for a connection the client ended at _BEHIND_LIMIT.
+_BEHIND_REASON = "the handlers stayed behind the feed"
+
 # The longest wait before a reconnect attempt, in seconds.
 _MAX_RECONNECT_DELAY = 30.0
+
+# How long a connection stays live after on_connect before the reconnect wait starts over from
+# reconnect_delay, in seconds: a server that accepts and closes at once keeps the wait growing.
+_STABLE_CONNECTION = 10.0
+
+# The largest frame the client takes, in bytes: a whole book can outgrow websockets' 1 MiB default.
+_MAX_FRAME_SIZE = 16 * 1024 * 1024
+
+# The most characters of a server error frame's code and message that go to the log.
+_ERROR_TEXT_LIMIT = 200
 
 
 def derive_ws_url(base_url: str) -> str:
     """Map a REST base URL to its WebSocket URL.
 
     ``https://host/api`` -> ``wss://host/ws``; ``http://host:8005/api`` ->
-    ``ws://host:8005/ws``.
+    ``ws://host:8005/ws``. The scheme is matched in any case, and the scheme and
+    host come back lowercased; a URL that is not http(s) with a host raises
+    :class:`~loaf.exceptions.LoafConfigError`.
     """
-    url = base_url.rstrip("/")
-    if url.endswith("/api"):
-        url = url[: -len("/api")]
-    if url.startswith("https://"):
-        url = "wss://" + url[len("https://") :]
-    elif url.startswith("http://"):
-        url = "ws://" + url[len("http://") :]
-    return url.rstrip("/") + "/ws"
+    from .. import _urls
+
+    return _urls.derive_ws_url(base_url)
+
+
+def _bounded(value: Any) -> str:
+    """A server-sent value for the log: on one line, at most ``_ERROR_TEXT_LIMIT`` characters."""
+    text = " ".join((value if isinstance(value, str) else repr(value)).split())
+    return text if len(text) <= _ERROR_TEXT_LIMIT else text[:_ERROR_TEXT_LIMIT] + "..."
 
 
 class LoafWebSocketClient:
@@ -175,13 +227,22 @@ class LoafWebSocketClient:
     instance as a context manager (background thread).
 
     ``reconnect_delay`` is the longest wait before the first reconnect attempt,
-    in seconds; it doubles after each attempt that does not reach
-    :meth:`on_connect`, up to 30 s, and each wait is drawn at random below it.
+    in seconds; it doubles after each attempt that does not stay live for 10 s
+    after :meth:`on_connect`, up to 30 s, and each wait is drawn at random below
+    it.
 
     Each connection authenticates with a login token that ``client``'s trading
     key signs, and stays authenticated (see :meth:`on_disconnect`). Without a
     ``client``, or with one that has no trading key, the connection is
     anonymous: the public channels only.
+
+    ``ws_url`` must be a ``wss://`` URL, or ``ws://`` to this machine
+    (``localhost``, 127.0.0.0/8 or ``[::1]``), else
+    :class:`~loaf.exceptions.LoafConfigError`; ``allow_http=True`` also takes
+    ``ws://`` to other hosts, for a dev server on your own network or in a
+    container network, never a remote host. It defaults to ``client``'s own
+    setting, else ``False``. A ``ws_url`` on another host than ``client``'s
+    ``base_url`` warns (``UserWarning``): the login token is sent there too.
 
     ``stale_after`` is how many seconds may pass without a stamped private
     frame before the client calls the feed stale (:attr:`fresh`), at least 1;
@@ -193,6 +254,7 @@ class LoafWebSocketClient:
         client: LoafClient | None = None,
         *,
         ws_url: str | None = None,
+        allow_http: bool | None = None,
         verify: bool | ssl.SSLContext | None = None,
         auto_reconnect: bool = True,
         reconnect_delay: float = 1.0,
@@ -200,10 +262,18 @@ class LoafWebSocketClient:
     ) -> None:
         #: Signs each connection's login tokens; None for an anonymous connection.
         self._login_tokens: LoginTokens | None = client._login_tokens if client else None
-        resolved_ws_url = ws_url or (client.ws_url if client is not None else None)
-        if not resolved_ws_url:
+        from .. import _urls
+
+        if allow_http is None:
+            allow_http = client._allow_http if client is not None else False
+        if ws_url:
+            self.ws_url: str = _urls.ws_url(ws_url, source="ws_url", allow_http=bool(allow_http))
+            if client is not None:
+                _urls.warn_other_host(self.ws_url, client.base_url, source="ws_url")
+        elif client is not None:
+            self.ws_url = client.ws_url
+        else:
             raise ValueError("ws_url is required when no LoafClient is provided")
-        self.ws_url: str = resolved_ws_url
         verify = verify if verify is not None else (client._verify if client else True)
         # The context httpx builds for REST from the same setting, not websockets' default: the
         # system store, while REST trusts certifi's CAs. Built now, so a bad CA path raises here.
@@ -228,8 +298,20 @@ class LoafWebSocketClient:
         # The beat, kept on the loop's thread: None until a connection's first snapshot, then
         # whether a stamped private frame came within stale_after (_note_beat, _watch_beats).
         self._fresh: bool | None = None
-        self._last_beat: float | None = None  # time.monotonic() of the last stamped private frame
+        # time.monotonic() when the last beat's frame was taken off the socket.
+        self._last_beat: float | None = None
         self._engine_ms: int | None = None
+        # While the handlers are behind the feed (the last snapshot's lag was over stale_after +
+        # _BEAT_ALLOWANCE): when the first snapshot of that stretch was taken off the socket.
+        self._behind_since: float | None = None
+        # The connection's lag baseline: the least arrival-minus-engineMs offset of its
+        # snapshots since portfolio was subscribed, in seconds, allowed to rise by _LAG_CREEP per
+        # second (_snapshot_lag).
+        self._lag_base: float | None = None
+        self._lag_base_at = 0.0  # time.monotonic() of the snapshot that last moved it
+        self._live_at = 0.0  # time.monotonic() when the live connection's on_connect fired
+        # The run ended on a SystemExit, KeyboardInterrupt or unasked-for cancellation (_halt).
+        self._halted = False
 
         self._handlers: dict[str, list[Handler]] = {}
         self._channels: set[str] = set()
@@ -239,7 +321,12 @@ class LoafWebSocketClient:
         self._ws: Any = None
         self._auth_token: str | None = None  # the login token the live connection sent last
         self._auth_refused = False  # the live connection's auth_result was false
+        # The current run's stop token: each run gets its own (_begin_run), so a run that is still
+        # ending after start() began the next one (a close can outlast stop()'s wait) holds an
+        # older one, already set, and leaves the current run's state alone.
         self._stop_event = threading.Event()
+        # The stop token of the run run_forever() is running, None when it runs none.
+        self._foreground: threading.Event | None = None
         self._connected_event = threading.Event()
 
     # ------------------------------------------------------------------ #
@@ -531,7 +618,9 @@ class LoafWebSocketClient:
         its case), ``UNAUTHORIZED`` (``portfolio`` without an accepted login
         token), ``SUBSCRIPTION_LIMIT``, ``TOO_MANY_CHANNELS``,
         ``INVALID_CHANNELS``, ``RATE_LIMITED`` or ``INVALID_MESSAGE``. A
-        refused subscription or a rate-limited frame is dropped.
+        refused subscription or a rate-limited frame is dropped. Without a
+        handler here, each one is logged as a warning with its code and the
+        start of its message.
         """
         return self.on(WSMessageType.ERROR, handler)
 
@@ -557,11 +646,20 @@ class LoafWebSocketClient:
         """Called each time a connection attempt ends, except when you
         :meth:`stop` the client, with ``{code, reason}``.
 
-        After a connection closes, ``code`` is the close code received (1006
-        when it dropped without one) and ``reason`` its reason (``""`` if
-        none). After an attempt that made no connection (refused, DNS, TLS, the
-        handshake answered with an HTTP error), ``code`` is ``None`` and
-        ``reason`` the error text. 1012 with reason ``resync`` (pushes may have
+        After a connection closes, ``code`` is the close code received, or the
+        one the client sent when it closed without receiving one (1009 for a
+        frame over its 16 MiB limit), 1006 when it dropped without either, and
+        ``reason`` its reason (``""`` if none). After an attempt that made no
+        connection (refused, DNS, TLS, the handshake answered with an HTTP
+        error), ``code`` is ``None`` and ``reason`` the error text. When a
+        handler's ``SystemExit``, a handler's ``KeyboardInterrupt`` in the
+        background thread (:meth:`start`; under :meth:`run_forever` it stops the
+        client), or a cancellation that :meth:`stop` did not ask for, ends the
+        client's run, ``code`` is ``None`` and ``reason`` the exception's type
+        name (``"SystemExit"``), and nothing reconnects until :meth:`start` or
+        :meth:`run_forever` is called again. A run that ends after :meth:`stop`
+        has stopped waiting for it reports nothing, even once :meth:`start`
+        began the next. 1012 with reason ``resync`` (pushes may have
         been lost; see below) means re-seed from REST once :meth:`on_connect`
         fires again. 4001 with reason ``expired`` means the connection's login
         token expired before a fresh one reached the server (the client sends
@@ -596,6 +694,14 @@ class LoafWebSocketClient:
         later, or, should none reach it, until its token expires (4001
         ``expired``), at most 10 minutes later; every connection after that is
         refused until you set the key in force (README §2) and restart.
+
+        While ``portfolio`` is subscribed, the client also closes a connection
+        whose handlers stayed behind the feed (:meth:`on_stale` ``"behind"``)
+        for 15 s, with ``code`` 1006 and ``reason`` ``"the handlers stayed
+        behind the feed"``, and reconnects with backoff: the next connection
+        starts without the frames queued on that one. With
+        ``auto_reconnect=False`` the run ends there, as after any other
+        connection that ended.
         """
         return self.on(_ON_DISCONNECT, handler)
 
@@ -604,12 +710,23 @@ class LoafWebSocketClient:
         ``{reason, engineMs, silentSeconds}``.
 
         ``reason`` is ``"silent"`` (no stamped private frame for
-        ``stale_after`` seconds: the exchange's engine or its feed stalled),
-        ``"disconnected"`` (the connection dropped; :meth:`on_disconnect`
+        ``stale_after`` seconds: the exchange's engine or its feed stalled, or
+        a handler held the client's loop that long, which the first frame
+        after it reports before it brings :meth:`on_fresh`), ``"behind"`` (a
+        handler is too slow for the feed, so what is being handled is older
+        than ``stale_after``: an account snapshot lags more than
+        ``stale_after`` and one second, the most a snapshot waits for the next
+        beat before it is sent, behind the least lag seen on this connection,
+        which may rise by 0.1% of the time since, for the drift between the two
+        clocks. The next snapshot back within that bound fires
+        :meth:`on_fresh`; a connection still behind after 15 s is closed and
+        reconnected, see :meth:`on_disconnect`), ``"disconnected"`` (the
+        connection dropped or the client's run ended; :meth:`on_disconnect`
         follows) or ``"unsubscribed"`` (you unsubscribed ``portfolio``).
         ``engineMs`` is the newest engine stamp seen (``None`` if none) and
-        ``silentSeconds`` how long since the last stamped frame. Fires once per
-        turn, only from ``True``. Pull your quotes here (from your own loop, as
+        ``silentSeconds`` how long since the last stamped frame that counted
+        as a beat was taken off the socket. Fires once per turn, only from
+        ``True``. Pull your quotes here (from your own loop, as
         for every handler: set a flag), and keep
         :meth:`~loaf.resources.orders.OrdersResource.cancel_after` running as
         the exchange's side of the same guard.
@@ -619,8 +736,10 @@ class LoafWebSocketClient:
     def on_fresh(self, handler: Handler | None = None) -> Any:
         """Your private stream is live: :attr:`fresh` turned ``True``, with
         ``{engineMs}``. Fires at a connection's first account snapshot, and when
-        stamped private frames come again after :meth:`on_stale`. It fires
-        after that frame's own handlers, so the snapshot is applied first."""
+        stamped private frames come again after :meth:`on_stale` (after a
+        ``"behind"`` turn, an account snapshot that is no longer behind). It
+        fires after that frame's own handlers, so the snapshot is applied
+        first."""
         return self.on(_ON_FRESH, handler)
 
     @property
@@ -629,12 +748,26 @@ class LoafWebSocketClient:
 
         ``None`` until this connection's first account snapshot (and on a
         deployment without perps, which sends none), ``True`` while stamped
-        private frames keep coming within ``stale_after`` seconds, ``False``
-        once they stop or the connection drops. A new connection starts at
-        ``None`` again, and :meth:`stop` leaves it ``None``. Requires
-        ``portfolio`` subscribed. Safe to read from any thread.
+        private frames keep coming within ``stale_after`` seconds and the
+        handlers keep up with them, ``False`` once they stop, the handlers fall
+        behind (an account snapshot lags more than ``stale_after`` and one
+        second, see :meth:`on_stale`) or the connection drops. A new connection
+        starts at ``None`` again, and :meth:`stop` leaves it ``None``. Once a
+        ``SystemExit``, a background ``KeyboardInterrupt`` or a cancellation
+        :meth:`stop` did not ask for has ended a run, it is ``False`` until
+        :meth:`start`, :meth:`run_forever` or :meth:`stop`. Requires
+        ``portfolio`` subscribed. Safe to read from any thread: it reads
+        ``False`` once ``stale_after`` seconds have passed since the last beat,
+        even while a handler blocks the client's loop (:meth:`on_stale` waits
+        for the loop, and fires once it runs again, before the next
+        :meth:`on_fresh`).
         """
-        return self._fresh
+        fresh = self._fresh
+        if fresh is True:
+            last = self._last_beat
+            if last is None or time.monotonic() - last > self.stale_after:
+                return False
+        return fresh
 
     @property
     def engine_ms(self) -> int | None:
@@ -659,7 +792,7 @@ class LoafWebSocketClient:
         self._channels -= gone
         self._send_now({"type": "unsubscribe", "channels": sorted(gone)})
         if not self._holds_portfolio():
-            self._on_loop(self._portfolio_dropped)
+            self._on_loop(self._portfolio_dropped, self._stop_event)
         return self
 
     def subscribe_orderbook(self, ticker: str) -> LoafWebSocketClient:
@@ -707,45 +840,89 @@ class LoafWebSocketClient:
     # ------------------------------------------------------------------ #
 
     def start(self) -> LoafWebSocketClient:
-        """Connect and run in a background daemon thread. Non-blocking."""
+        """Connect and run in a background daemon thread. Non-blocking.
+
+        While that thread's run is live, calling it again changes nothing.
+        While :meth:`run_forever` is running on another thread (and not
+        stopped), it raises ``RuntimeError``: :meth:`stop` that run first.
+        """
         if self._thread and self._thread.is_alive():
             return self
-        self._stop_event.clear()
-        self._connected_event.clear()
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._thread_main, name="loaf-ws", daemon=True)
+        if self._foreground is not None and not self._foreground.is_set():
+            raise RuntimeError(
+                "start() was called while run_forever() is running: stop() the client first"
+            )
+        stop = self._begin_run()
+        loop = self._loop = asyncio.new_event_loop()
+        task = self._run_task = loop.create_task(self._run(stop))
+        self._thread = threading.Thread(
+            target=self._thread_main, args=(loop, task, stop), name="loaf-ws", daemon=True
+        )
         self._thread.start()
         return self
 
     def run_forever(self) -> None:
-        """Connect and block the current thread until stopped (Ctrl-C)."""
-        self._stop_event.clear()
-        self._connected_event.clear()
+        """Connect and block the current thread until stopped (Ctrl-C).
+
+        A ``KeyboardInterrupt`` stops the client and returns, wherever it lands
+        (a handler's code included): this is your thread, so it is Ctrl-C, and
+        as with :meth:`stop`, neither :meth:`on_stale` nor :meth:`on_disconnect`
+        fires. A ``SystemExit`` raised in a handler ends the run and is raised
+        from here, after :meth:`on_stale` and :meth:`on_disconnect`.
+
+        While another run is live (:meth:`start`'s background thread, or
+        ``run_forever()`` on another thread) and not stopped, it raises
+        ``RuntimeError``: :meth:`stop` that run first.
+        """
+        live = self._thread is not None and self._thread.is_alive()
+        if (live and not self._stop_event.is_set()) or (
+            self._foreground is not None and not self._foreground.is_set()
+        ):
+            raise RuntimeError(
+                "run_forever() was called while another run of the client is live: stop() it "
+                "first"
+            )
+        stop = self._foreground = self._begin_run()
         loop = self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        task = self._run_task = loop.create_task(self._run())
+        task = self._run_task = loop.create_task(self._run(stop, foreground=True))
         try:
             loop.run_until_complete(task)
-        except KeyboardInterrupt:  # pragma: no cover
-            self._stop_event.set()
-            task.cancel()
-            try:
-                loop.run_until_complete(task)
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                pass
-        except asyncio.CancelledError:  # pragma: no cover
-            pass
+        except KeyboardInterrupt:
+            # Ctrl-C. One raised in the run's own code (a handler's) has already stopped the run:
+            # asyncio would never stop the loop for that task again.
+            stop.set()
+            if not task.done():
+                task.cancel()
+                try:
+                    loop.run_until_complete(task)
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    pass
+        except asyncio.CancelledError:
+            pass  # a cancellation stop() did not ask for: _run reported it
+        except BaseException as exc:
+            self._halt(exc, stop)  # raised outside the run's own task, by the beat's watch say
+            raise
         finally:
             self._drain_and_close(loop)
-            self._loop = None
-            self._run_task = None
+            if self._loop is loop:  # not when another thread began the next run meanwhile
+                self._loop = None
+                self._run_task = None
+            if self._foreground is stop:
+                self._foreground = None
 
     def stop(self) -> None:
         """Stop the connection and tear down the background thread/loop.
 
         Safe to call from any thread and idempotent. The connection's
         ``_run`` task is cancelled on the loop thread, which lets that thread
-        close its own loop cleanly (no cross-thread ``loop.stop`` race).
+        close its own loop cleanly (no cross-thread ``loop.stop`` race). It
+        waits up to 5 s for the thread to end, then returns and logs a warning
+        if it is still running: a handler is blocking it, or the server is not
+        answering the close (the client waits up to 10 s for that). The
+        thread then ends by itself; a handler that is running finishes, and
+        no frame reaches a handler after it. The run it ends reports nothing
+        and changes nothing of a run :meth:`start` begins meanwhile.
         """
         self._stop_event.set()
         loop, task = self._loop, self._run_task
@@ -761,9 +938,18 @@ class LoafWebSocketClient:
         thread = self._thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=5)
+            if thread.is_alive():
+                logger.warning(
+                    "Loaf WebSocket thread is still running 5 s after stop(): a handler is "
+                    "blocking it or the server is not answering the close; it ends by itself"
+                )
             self._thread = None
             self._run_task = None
             self._loop = None
+        if thread is None or not thread.is_alive():
+            # No thread left to reset the beat as its run ends (one a SystemExit ended, say);
+            # a blocking run_forever's run resets it again as it ends.
+            self._fresh = self._last_beat = None
 
     def wait_until_connected(self, timeout: float | None = None) -> bool:
         """Block until a connection is live, the moment :meth:`on_connect` fires
@@ -780,17 +966,30 @@ class LoafWebSocketClient:
     # Internals
     # ------------------------------------------------------------------ #
 
-    def _thread_main(self) -> None:
-        loop = self._loop
-        assert loop is not None
+    def _thread_main(
+        self, loop: asyncio.AbstractEventLoop, task: asyncio.Task[None], stop: threading.Event
+    ) -> None:
         asyncio.set_event_loop(loop)
-        task = self._run_task = loop.create_task(self._run())
         try:
             loop.run_until_complete(task)
-        except asyncio.CancelledError:
-            pass
+        except BaseException as exc:  # noqa: BLE001
+            # Reported, and the thread ends: nothing is left to raise it to. Raised outside the
+            # run's own task (by the beat's watch, say), _halt reports it here.
+            self._halt(exc, stop)
         finally:
             self._drain_and_close(loop)
+
+    def _begin_run(self) -> threading.Event:
+        """Make a new run the current one, and return its stop token. The run before it, if
+        still ending, is stopped too: its token is set, so it changes nothing from here on."""
+        self._stop_event.set()
+        stop = self._stop_event = threading.Event()
+        self._connected_event.clear()
+        self._halted = False
+        self._fresh = self._last_beat = None
+        self._ws = None
+        self._auth_token = None
+        return stop
 
     def _drain_and_close(self, loop: asyncio.AbstractEventLoop) -> None:
         """Cancel any leftover tasks and close the loop (runs on the loop's thread)."""
@@ -809,72 +1008,98 @@ class LoafWebSocketClient:
         if not loop.is_closed():
             loop.close()
 
-    async def _run(self) -> None:
+    async def _run(self, stop: threading.Event, *, foreground: bool = False) -> None:
+        """One run, until ``stop`` (its own token) is set: ``foreground`` under run_forever()."""
         try:
-            await self._connect_until_stopped()
+            await self._connect_until_stopped(stop, foreground)
+        except BaseException as exc:
+            # A handler's SystemExit or KeyboardInterrupt, or a cancellation stop() did not ask
+            # for: the run ends, never silently unless it is Ctrl-C (_ended).
+            self._ended(exc, stop, foreground)
+            raise
         finally:
             # Stopped, however the run ended (stop() cancels it, which skips the loop's own
-            # checks): nothing is watched. A run that ends after start() began the next one (a
-            # close can outlast stop()'s join) finds the stop event cleared and leaves the beat
-            # to that run.
-            if self._stop_event.is_set():
+            # checks): nothing is watched. A run start() has replaced leaves the beat to the next.
+            if stop.is_set() and self._stop_event is stop:
                 self._fresh = self._last_beat = None
 
-    async def _connect_until_stopped(self) -> None:
-        connect_kwargs: dict[str, Any] = {} if self._ssl is None else {"ssl": self._ssl}
+    async def _connect_until_stopped(self, stop: threading.Event, foreground: bool) -> None:
+        connect_kwargs: dict[str, Any] = {"max_size": _MAX_FRAME_SIZE}
+        if self._ssl is not None:
+            connect_kwargs["ssl"] = self._ssl
         ceiling = min(self.reconnect_delay, _MAX_RECONNECT_DELAY)
-        while not self._stop_event.is_set():
+        while not stop.is_set():
             ws = None
             try:
                 async with websockets.connect(self.ws_url, **connect_kwargs) as ws:
+                    if stop.is_set():
+                        break  # stopped during the handshake: the state is the next run's
                     self._ws = ws
                     self._auth_refused = False
-                    self._fresh = self._last_beat = None  # each connection waits for its own beat
-                    keeper = await self._on_open(ws)
-                    watch = asyncio.ensure_future(self._watch_beats())
+                    # Each connection waits for its own beat, and measures its own lag.
+                    self._fresh = self._last_beat = self._lag_base = self._behind_since = None
+                    keeper = await self._on_open(ws, stop)
+                    watch = asyncio.ensure_future(self._watch_beats(stop))
                     try:
                         async for raw in ws:
-                            self._dispatch(raw)
+                            if stop.is_set():
+                                break  # stopped: frames already queued reach no handler
+                            self._dispatch(raw, stop)
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception):
+                            # Before the close below waits on the server.
+                            self._ended(exc, stop, foreground)
+                        raise
                     finally:
                         if keeper is not None:
                             keeper.cancel()
                         watch.cancel()
                 # A normal close (1000/1001/1005), read once the context has finished it: the
                 # legacy client (websockets 12) reports close_code only in the CLOSED state.
-                code = ws.close_code if ws.close_code is not None else 1006
+                code = int(ws.close_code) if ws.close_code is not None else 1006
                 reason = ws.close_reason or ""
-            except asyncio.CancelledError:  # pragma: no cover
-                break
+            except asyncio.CancelledError:
+                if stop.is_set():
+                    break
+                raise  # not a stop: _run reports it
             except websockets.ConnectionClosed as exc:
-                code = exc.rcvd.code if exc.rcvd is not None else 1006
-                reason = exc.rcvd.reason if exc.rcvd is not None else ""
+                # The close frame received, else the one the client sent (1009 for a frame over
+                # max_size), else none: dropped.
+                frame = exc.rcvd if exc.rcvd is not None else exc.sent
+                code = int(frame.code) if frame is not None else 1006  # not websockets' enum
+                reason = frame.reason if frame is not None else ""
                 logger.warning("Loaf WebSocket closed: %s %s", code, reason)
             except Exception as exc:  # noqa: BLE001
-                if self._stop_event.is_set():
+                if stop.is_set():
                     break
-                # No connection (refused, DNS, TLS, an HTTP error answering the handshake),
-                # or a failure on a live one. The type stands in for an empty text: websockets
+                # No connection (refused, DNS, TLS, an HTTP error answering the handshake), a
+                # failure on a live one, or the client's own end of one (a refused login token,
+                # handlers behind the feed). The type stands in for an empty text: websockets
                 # 12 and 13 time a handshake out with a bare TimeoutError.
                 code = None if ws is None else 1006
                 reason = str(exc) or type(exc).__name__
                 logger.warning("Loaf WebSocket connection error: %s", reason)
             finally:
-                connected = self._connected_event.is_set()
-                # Only this attempt's own state: a stop() that stopped waiting (a close can
-                # outlast its join) lets start() begin the next run before this one ends.
-                owned = self._ws is ws
+                # Live long enough after on_connect for the next wait to start over.
+                stable = (
+                    self._connected_event.is_set()
+                    and time.monotonic() - self._live_at >= _STABLE_CONNECTION
+                )
+                # Only this run's own connection: once start() has begun the next run (a close
+                # can outlast stop()'s wait), the state is that run's.
+                owned = self._stop_event is stop and self._ws is ws
                 if owned:
                     self._ws = None
                     self._auth_token = None
                     self._connected_event.clear()
-            if self._stop_event.is_set():
+            if stop.is_set():
                 break  # _run resets the beat
             if owned:
-                self._beat_lost("disconnected")
-            self._emit(_ON_DISCONNECT, LoafObject({"code": code, "reason": reason}))
-            if not self.auto_reconnect:
+                self._beat_lost("disconnected", stop)
+            self._emit(_ON_DISCONNECT, LoafObject({"code": code, "reason": reason}), stop)
+            if stop.is_set() or not self.auto_reconnect:
                 break
-            if connected:
+            if stable:
                 ceiling = min(self.reconnect_delay, _MAX_RECONNECT_DELAY)
             # float(): a numpy float32 delay stays float32 through the draw, and from Python 3.10
             # macOS's selector (kqueue) refuses it as a timeout, outside the try: this thread ends.
@@ -883,10 +1108,11 @@ class LoafWebSocketClient:
             # failures (hours offline), and an error here, outside the try, ends this thread.
             ceiling = min(ceiling * 2, _MAX_RECONNECT_DELAY)
 
-    async def _on_open(self, ws: Any) -> asyncio.Task[None] | None:
+    async def _on_open(self, ws: Any, stop: threading.Event) -> asyncio.Task[None] | None:
         """Send a connection's first frames: the auth frame with a login token (when the
         client has a trading key), the subscribe and a ping. Returns the task that keeps
-        the connection authenticated, to cancel when it ends, or None for an anonymous one."""
+        the connection authenticated, to cancel when it ends, or None for an anonymous one.
+        ``stop`` is its run's token."""
         tokens = self._login_tokens
         renew_in = None
         if tokens is not None:
@@ -899,15 +1125,20 @@ class LoafWebSocketClient:
         await ws.send(self._frame("ping"))
         if tokens is None or renew_in is None:
             return None
-        return asyncio.ensure_future(self._keep_authenticated(ws, tokens, renew_in))
+        return asyncio.ensure_future(self._keep_authenticated(ws, tokens, renew_in, stop))
 
-    async def _keep_authenticated(self, ws: Any, tokens: LoginTokens, renew_in: float) -> None:
+    async def _keep_authenticated(
+        self, ws: Any, tokens: LoginTokens, renew_in: float, stop: threading.Event
+    ) -> None:
         """Send a fresh login token on the live connection each time the one it sent last
         passes half its life: the server closes a connection whose token expires (4001
-        ``expired``). ``renew_in`` is the seconds until the first one does."""
+        ``expired``). ``renew_in`` is the seconds until the first one does; ``stop`` is its
+        run's token."""
         try:
             while True:
                 await asyncio.sleep(renew_in)
+                if stop.is_set():
+                    return  # the token it holds may be the next run's
                 token, renew_in = tokens.token_and_renewal()
                 if token != self._auth_token:  # not when the sleep ended a little early
                     self._auth_token = token
@@ -918,10 +1149,11 @@ class LoafWebSocketClient:
             # The connection stays up until its token expires; the next one signs again.
             logger.exception("Loaf WebSocket could not send a fresh login token")
 
-    async def _watch_beats(self) -> None:
+    async def _watch_beats(self, stop: threading.Event) -> None:
         """Turn :attr:`fresh` False once no stamped private frame came for ``stale_after``
-        seconds (one task per connection, on the loop's thread)."""
-        while True:
+        seconds (one task per connection, on the loop's thread), until ``stop``, its run's
+        token, is set."""
+        while not stop.is_set():
             last = self._last_beat
             if self._fresh is not True or last is None:
                 await asyncio.sleep(self.stale_after)  # nothing to time yet
@@ -930,11 +1162,16 @@ class LoafWebSocketClient:
             if wait > 0:
                 await asyncio.sleep(wait)
             else:
-                self._beat_lost("silent")
+                self._beat_lost("silent", stop)
 
-    def _note_beat(self, message: dict) -> None:
-        """A stamped private frame: news from the exchange's engine (on the loop's thread). The
-        watch starts at a connection's first account snapshot, which shows the exchange beats."""
+    def _note_beat(self, message: dict, arrived: float, stop: threading.Event) -> None:
+        """A stamped private frame, taken off the socket at ``arrived``: news from the exchange's
+        engine (on the loop's thread). The watch starts at a connection's first account
+        snapshot, which shows the exchange beats. A snapshot also shows whether the handlers
+        keep up: while one lags more than ``stale_after + _BEAT_ALLOWANCE``, no frame is a beat,
+        and once that has lasted ``_BEHIND_LIMIT`` the connection is ended (ConnectionError),
+        to be reconnected as after a refused login token. ``stop`` is the token of the run
+        that took the frame off its socket."""
         engine_ms = message.get("engineMs")
         if not isinstance(engine_ms, int) or isinstance(engine_ms, bool):
             return  # a bool is an int to isinstance
@@ -942,30 +1179,113 @@ class LoafWebSocketClient:
             return
         if self._engine_ms is None or engine_ms > self._engine_ms:
             self._engine_ms = engine_ms
-        if self._fresh is None and message.get("snapshot") is not True:
-            return
-        self._last_beat = time.monotonic()
+        if message.get("snapshot") is True:
+            if self._snapshot_lag(arrived, engine_ms) > self.stale_after + _BEAT_ALLOWANCE:
+                if self._behind_since is None:
+                    self._behind_since = arrived
+                    self._beat_lost("behind", stop)
+                elif arrived - self._behind_since > _BEHIND_LIMIT:
+                    raise ConnectionError(_BEHIND_REASON)
+                return
+            self._behind_since = None
+        elif self._fresh is None or self._behind_since is not None:
+            return  # only a snapshot starts the watch, or shows the handlers caught up
+        last = self._last_beat
+        if self._fresh is True and last is not None and arrived - last > self.stale_after:
+            # A handler held the loop past stale_after, so the watch could not run: the gap is
+            # reported before this frame, which then brings on_fresh, as fresh read meanwhile. The
+            # gap ended when the frame arrived, before its own handlers ran.
+            self._beat_lost("silent", stop, arrived)
+            if stop.is_set():
+                return  # an on_stale handler outlasted stop()'s wait: the state is the next run's
+        self._last_beat = arrived
         if self._fresh is not True:
             self._fresh = True
-            self._emit(_ON_FRESH, LoafObject({"engineMs": self._engine_ms}))
+            self._emit(_ON_FRESH, LoafObject({"engineMs": self._engine_ms}), stop)
 
-    def _beat_lost(self, reason: str) -> None:
-        """The private stream is no longer known to be live (on the loop's thread)."""
-        if self._fresh is not True:
+    def _snapshot_lag(self, arrived: float, engine_ms: int) -> float:
+        """How much later than the connection's best one this snapshot was handled, in seconds.
+
+        Each snapshot's offset is when it was taken off the socket (this machine's clock) less
+        its ``engineMs`` (the engine's at the read the snapshot was taken at, which advances at
+        wall-clock rate while the engine runs): a handler too slow for the feed leaves frames
+        queued, and the offset grows by the time they wait. The baseline is the least offset
+        seen on this connection, but rises by up to ``_LAG_CREEP`` of the time elapsed, so drift
+        between the two clocks never adds up to a lag. A larger lasting shift (a step of the
+        engine's clock) stays behind until ``_BEHIND_LIMIT`` ends the connection, and the next
+        one measures from a baseline of its own.
+        """
+        offset = arrived - engine_ms / 1000
+        base = self._lag_base
+        if base is None:
+            base = offset
+        else:
+            base = min(offset, base + _LAG_CREEP * max(arrived - self._lag_base_at, 0.0))
+        self._lag_base, self._lag_base_at = base, arrived
+        return offset - base
+
+    def _beat_lost(self, reason: str, stop: threading.Event, now: float | None = None) -> None:
+        """The private stream is no longer known to be live (on the loop's thread), as of
+        ``now`` (``time.monotonic()``, by default the moment of the call). Nothing once
+        ``stop``, the token of the run that saw it, is set."""
+        if self._fresh is not True or stop.is_set():
             return
         last = self._last_beat
         self._fresh = False
-        silent = None if last is None else round(time.monotonic() - last, 3)
+        if now is None:
+            now = time.monotonic()
+        silent = None if last is None else round(now - last, 3)
         self._emit(
             _ON_STALE,
             LoafObject({"reason": reason, "engineMs": self._engine_ms, "silentSeconds": silent}),
+            stop,
         )
 
-    def _portfolio_dropped(self) -> None:
+    def _ended(self, exc: BaseException, stop: threading.Event, foreground: bool) -> None:
+        """The run ``stop`` is the token of is ending on ``exc``, a BaseException no handler
+        swallowed. Under run_forever() (``foreground``, the caller's own thread) a
+        KeyboardInterrupt is Ctrl-C, landed in a handler's code: a stop, reported as none. Any
+        other is a halt (_halt), a KeyboardInterrupt in the background thread included: only a
+        handler's code can raise one there."""
+        if foreground and isinstance(exc, KeyboardInterrupt):
+            stop.set()
+        else:
+            self._halt(exc, stop)
+
+    def _halt(self, exc: BaseException, stop: threading.Event) -> None:
+        """The run ``stop`` is the token of is ending on ``exc`` without a stop() (a handler's
+        SystemExit, a handler's KeyboardInterrupt in the background thread, a cancellation
+        stop() did not ask for): say so through the beat, on_disconnect and the log, once,
+        before the thread ends or run_forever raises it. Nothing for a run asked to stop, as
+        every run that start() has since replaced was."""
+        if self._halted or stop.is_set():
+            return
+        self._halted = True
+        self._connected_event.clear()
+        self._beat_lost("disconnected", stop)
+        if stop.is_set():
+            return  # an on_stale handler outlasted stop()'s wait: the state is the next run's
+        self._fresh = False  # until start(), run_forever() or stop()
+        name = type(exc).__name__
+        self._emit(_ON_DISCONNECT, LoafObject({"code": None, "reason": name}), stop)
+        if stop.is_set():
+            return
+        logger.error(
+            "Loaf WebSocket feed has stopped: %s ended the client's run; it does not reconnect "
+            "until start() or run_forever() is called again",
+            name,
+            exc_info=exc,
+        )
+
+    def _portfolio_dropped(self, stop: threading.Event) -> None:
         """After an unsubscribe left no portfolio channel (on the loop's thread): not when one
-        was subscribed again meanwhile, from another thread."""
-        if not self._holds_portfolio():
-            self._beat_lost("unsubscribed")
+        was subscribed again meanwhile, from another thread, nor once ``stop``, the token of the
+        run current at the unsubscribe, is set. The lag is measured afresh from the next
+        subscription's snapshots."""
+        if stop.is_set() or self._holds_portfolio():
+            return
+        self._behind_since = self._lag_base = None
+        self._beat_lost("unsubscribed", stop)
 
     def _holds_portfolio(self) -> bool:
         # A tuple first: another thread may subscribe meanwhile.
@@ -987,7 +1307,16 @@ class LoafWebSocketClient:
         except RuntimeError:  # the run closed its loop after the read above
             fn(*args)
 
-    def _dispatch(self, raw: Any) -> None:
+    def _dispatch(self, raw: Any, stop: threading.Event | None = None) -> None:
+        """Hand a frame to its handlers and note what it says. ``stop`` is the token of the run
+        that took it off its socket, as the run always passes it; ``None`` (a frame handed in
+        directly) stands for the current run's. Once it is set, a handler's call can have
+        outlasted stop()'s wait, so the frame reaches no further handler and changes nothing."""
+        arrived = time.monotonic()  # taken off the socket: before any handler can hold the loop
+        if stop is None:
+            stop = self._stop_event
+        if stop.is_set():
+            return
         try:
             message = json.loads(raw)
         except (TypeError, ValueError):
@@ -1007,14 +1336,26 @@ class LoafWebSocketClient:
             and isinstance(message.get("data"), dict)
             and message["data"].get("type") == "ping"
         ):
+            self._live_at = arrived
             self._connected_event.set()
-            self._emit(_ON_CONNECT, None)
-        if mtype is not None:
-            self._emit(str(mtype), obj)
-        self._emit("*", obj)
-        # After the frame's own handlers, so a snapshot is applied before on_fresh.
+            self._emit(_ON_CONNECT, None, stop)
+        if mtype is not None and str(mtype) not in _INTERNAL_KEYS:
+            self._emit(str(mtype), obj, stop)
+        self._emit("*", obj, stop)
+        if stop.is_set():
+            return
+        if mtype == WSMessageType.ERROR and not self._handlers.get(WSMessageType.ERROR.value):
+            logger.warning(
+                "Loaf WebSocket server error %s: %s",
+                _bounded(message.get("code")),
+                _bounded(message.get("message")),
+            )
+        # After the frame's own handlers, so a snapshot is applied before on_fresh; timed by its
+        # arrival, so a slow handler never makes an old frame look new.
         if isinstance(mtype, str) and mtype in _STAMPED_PRIVATE:
-            self._note_beat(message)
+            self._note_beat(message, arrived, stop)
+            if stop.is_set():
+                return
         if mtype == WSMessageType.AUTH_RESULT:
             self._auth_refused = message.get("success") is False
             if self._auth_refused and self._login_tokens is not None and self._auth_token:
@@ -1033,11 +1374,17 @@ class LoafWebSocketClient:
             # comes once the subscribe has gone out (a queued send fails on a closed socket).
             raise ConnectionError("the server did not accept the login token")
 
-    def _emit(self, key: str, payload: Any) -> None:
+    def _emit(self, key: str, payload: Any, stop: threading.Event) -> None:
+        """Call ``key``'s handlers with ``payload``, none once ``stop`` (the token of the run
+        that calls them) is set."""
         for handler in list(self._handlers.get(key, ())):
+            if stop.is_set():
+                return
             try:
                 handler(payload)
-            except Exception:  # noqa: BLE001
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                # A task's cancellation reaches it only at an await, never inside a handler's own
+                # code: a CancelledError here is the handler's, as any other exception.
                 logger.exception("Loaf WebSocket handler for %r raised", key)
 
     def _send_now(self, message: dict) -> None:

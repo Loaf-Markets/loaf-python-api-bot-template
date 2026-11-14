@@ -15,8 +15,15 @@ from __future__ import annotations
 from typing import Any, Iterator
 
 from .. import _served
-from ..exceptions import LoafError
+from ..exceptions import LoafError, LoafServerError
 from .base import Resource, _check_market_ticker
+
+
+def _unusable(path: str, what: str, page: Any) -> LoafServerError:
+    """The error of a candle page that cannot be paged on."""
+    return LoafServerError(
+        f"GET {path} answered {what}; stopped paging", status_code=200, body=page
+    )
 
 
 class MarketResource(Resource):
@@ -201,9 +208,12 @@ class MarketResource(Resource):
         ``hasMore`` is true (or use :meth:`iter_candles`).
 
         Resolutions coarser than ``1m`` may answer 503 ``Candle history is busy.
-        Please try again shortly.`` under load. The client retries it (honouring
-        ``Retry-After``) up to ``max_retries``, then raises
-        :class:`~loaf.exceptions.LoafServiceUnavailableError`.
+        Please try again shortly.`` under load. The client retries it up to
+        ``max_retries`` (after its ``Retry-After`` when that is at most
+        :data:`~loaf.constants.MAX_HINTED_WAIT`, 10 s), then raises
+        :class:`~loaf.exceptions.LoafServiceUnavailableError`; at once when its
+        ``Retry-After`` asks for longer, with those seconds as its
+        ``retry_after``.
         """
         _check_market_ticker(ticker)
         return self._client.get(
@@ -220,23 +230,42 @@ class MarketResource(Resource):
         Note the ordering: pages are walked backwards in time and each page is
         yielded newest -> oldest, so the stream is strictly reverse-chronological.
         A page that stays busy (503, see :meth:`candles`) raises
-        :class:`~loaf.exceptions.LoafServiceUnavailableError` mid-iteration,
-        and a page whose ``oldestTs`` is not before the ``to`` it was asked for
-        raises :class:`~loaf.exceptions.LoafError` instead of paging forever.
+        :class:`~loaf.exceptions.LoafServiceUnavailableError` mid-iteration
+        (its ``retry_after`` the answer's ``Retry-After``), and a page whose
+        ``oldestTs`` is not before the ``to`` it was asked for raises
+        :class:`~loaf.exceptions.LoafError` instead of paging forever. A
+        page that cannot be paged on raises
+        :class:`~loaf.exceptions.LoafServerError`: not an object, its
+        ``candles`` not a list, a ``hasMore`` that is not a bool (or null), or
+        ``hasMore`` true with no candles or an ``oldestTs`` that is not a whole
+        number.
         """
+        path = f"/trade/{ticker}/candles"
         to: int | None = None
         while True:
             page = self.candles(ticker, resolution, to=to, count_back=page_size)
-            for candle in reversed(page.get("candles") or []):
-                yield candle
-            if not page.get("hasMore") or page.get("oldestTs") is None:
+            if not isinstance(page, dict):
+                raise _unusable(path, "a page that is not an object", page)
+            candles = page.get("candles")
+            if not isinstance(candles, list):
+                raise _unusable(path, "a page whose candles is not a list", page)
+            more = page.get("hasMore")
+            if more is not None and not isinstance(more, bool):
+                raise _unusable(path, f"a hasMore that is not a bool ({more!r:.40})", page)
+            yield from reversed(candles)
+            if not more:
                 return
-            if to is not None and not page["oldestTs"] < to:
+            oldest = page.get("oldestTs")
+            if not isinstance(oldest, int) or isinstance(oldest, bool):
+                shown = f"{oldest!r:.40}"
+                raise _unusable(path, f"an oldestTs that is not a whole number ({shown})", page)
+            if not candles:
+                raise _unusable(path, "an empty page with hasMore", page)
+            if to is not None and not oldest < to:
                 raise LoafError(
-                    f"GET /trade/{ticker}/candles answered oldestTs {page['oldestTs']} for to={to}; "
-                    "stopped paging"
+                    f"GET {path} answered oldestTs {oldest} for to={to}; stopped paging"
                 )
-            to = page["oldestTs"]
+            to = oldest
 
     # -- Trades (the tape's backfill) -------------------------------------- #
 

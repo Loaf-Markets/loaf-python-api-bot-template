@@ -577,7 +577,7 @@ def test_any_other_refusal_of_a_resend_after_a_lost_answer_is_still_unknown(
     with pytest.raises(WithdrawalOutcomeUnknownError) as info:
         trading_client(max_retries=1).funds.withdraw(5)
     last = info.value.last_error
-    assert type(last) is cls
+    assert type(last) is cls and isinstance(last, loaf.LoafAPIError)
     assert (last.code, info.value.attempts) == (refusal.json()["code"], 2)
 
 

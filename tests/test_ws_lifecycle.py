@@ -17,10 +17,13 @@ import json
 import logging
 import socket
 import ssl
+import sys
 import threading
 import time
+import warnings
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Collection
 
 import certifi
@@ -368,13 +371,47 @@ def test_a_dropped_connection_reports_1006():
     assert log.events == ["on_connect", (1006, ""), "on_connect"]
 
 
-@pytest.mark.parametrize("delay, below_cap", [(3.0, [3.0, 6.0, 12.0, 24.0]), (45.0, [])])
-def test_backoff_doubles_to_30_s_and_resets_once_connected(
-    ceilings: list[float], delay: float, below_cap: list[float]
+class _Ahead:
+    """Stands in for ``loaf.ws.client``'s ``time``: the real clocks, ``monotonic()`` moved on by
+    ``ahead`` seconds."""
+
+    def __init__(self) -> None:
+        self.ahead = 0.0
+
+    def time(self) -> float:
+        return time.time()
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.ahead
+
+
+@pytest.fixture
+def ahead(monkeypatch: pytest.MonkeyPatch) -> _Ahead:
+    clock = _Ahead()
+    monkeypatch.setattr("loaf.ws.client.time", clock)
+    return clock
+
+
+@pytest.mark.parametrize(
+    "delay, below_cap, lived, after",
+    [
+        (3.0, [3.0, 6.0, 12.0, 24.0], 10.0, 3.0),
+        (45.0, [], 10.0, 30.0),
+        (3.0, [3.0, 6.0, 12.0, 24.0], 9.9, 30.0),  # not live long enough: no reset
+    ],
+)
+def test_backoff_doubles_to_30_s_and_resets_once_a_connection_stayed_live_10_s(
+    ceilings: list[float], ahead: _Ahead, delay: float, below_cap: list[float], lived: float,
+    after: float,
 ):
     port = _closed_port()
     log = _Log()
     ws = _client(port, log, reconnect_delay=delay)
+
+    def live_for(_: Any) -> None:  # before the server's close: the connection lived this long
+        ahead.ahead += lived
+
+    ws.on_connect(live_for)
     ws.start()
     server = None
     try:
@@ -390,7 +427,25 @@ def test_backoff_doubles_to_30_s_and_resets_once_connected(
     assert all(code is None and reason for code, reason in log.events[:failures])
     assert log.events[failures:] == ["on_connect", (1012, "resync"), "on_connect"]
     assert ceilings[:failures] == below_cap + [30.0] * (failures - len(below_cap))
-    assert ceilings[failures:] == [min(delay, 30.0)]
+    assert ceilings[failures:] == [after]
+
+
+def test_a_server_that_closes_each_connection_at_once_keeps_the_wait_growing(
+    ceilings: list[float],
+):
+    # Each connection goes live (on_connect) and closes: none lasted, so each wait doubles, as
+    # after a failed attempt, and every fresh login token goes out ever more slowly.
+    server = _Server(*[_close_resync] * 4).start()
+    log = _Log()
+    ws = _client(server.port, log, TRADING_KEY)
+    ws.start()
+    try:
+        log.wait_for(lambda events: events.count("on_connect") == 5)
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events == ["on_connect", (1012, "resync")] * 4 + ["on_connect"]
+    assert ceilings == [1.0, 2.0, 4.0, 8.0]
 
 
 def test_a_failed_reconnect_after_a_connection_reports_no_code():
@@ -480,7 +535,7 @@ def test_the_websocket_trusts_what_rest_trusts(monkeypatch: pytest.MonkeyPatch, 
 
     def tls(base_url: str = "https://127.0.0.1/api", **kwargs: Any) -> dict[str, Any]:
         ws = LoafClient(base_url=base_url, **kwargs).websocket(auto_reconnect=False)
-        asyncio.run(ws._run())  # one attempt, which the stand-in fails
+        asyncio.run(ws._run(ws._stop_event))  # one attempt, which the stand-in fails
         return connects.pop()
 
     default = tls()["ssl"]
@@ -489,7 +544,8 @@ def test_the_websocket_trusts_what_rest_trusts(monkeypatch: pytest.MonkeyPatch, 
     assert tls(verify=context)["ssl"] is context
     off = tls(verify=False)["ssl"]
     assert (off.verify_mode, off.check_hostname) == (ssl.CERT_NONE, False)
-    assert tls("http://127.0.0.1/api", verify=context) == {}  # websockets refuses ssl for ws://
+    # websockets refuses ssl for ws://
+    assert "ssl" not in tls("http://127.0.0.1/api", verify=context)
     # The WebSocket's own verify wins over the LoafClient's, and needs no LoafClient.
     own = LoafClient(base_url="https://127.0.0.1/api", verify=context).websocket(verify=False)._ssl
     assert own is not None and (own.verify_mode, own.check_hostname) == (ssl.CERT_NONE, False)
@@ -928,3 +984,598 @@ def test_unsubscribing_portfolio_from_another_thread_turns_the_stream_stale():
     assert len(log.events) == 3
     _, reason, engine_ms, silent = log.events[2]
     assert (reason, engine_ms) == ("unsubscribed", ENGINE_MS) and 0 <= silent < 5
+
+
+def test_each_connection_measures_its_own_lag():
+    # The first connection's snapshots show the engine's clock stepping back 5 s: behind, as far
+    # as that connection can tell. The next connection starts its baseline afresh, so the same
+    # engine clock is on time there.
+    server = _Server(
+        _then(_snapshot(ENGINE_MS), _snapshot(ENGINE_MS - 5000), _close_resync),
+        _snapshot(ENGINE_MS - 5000),
+    ).start()
+    log = _Log()
+    ws = _beat_client(server.port, log)
+    ws.start()
+    try:
+        log.wait_for(lambda seen: len(seen) == 6)
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events[:2] == ["on_connect", ("fresh", ENGINE_MS)]
+    assert log.events[2][:3] == ("stale", "behind", ENGINE_MS)  # engineMs: the newest seen
+    # Already stale: the drop fires no second stale turn.
+    assert log.events[3:] == [(1012, "resync"), "on_connect", ("fresh", ENGINE_MS)]
+
+
+# ---------------------------------------------------------------------------
+# Frame size: a whole book can outgrow websockets' 1 MiB default
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=["asyncio", "legacy"])
+def ws_library(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Runs a test with each client the declared websockets range ships: the asyncio one (14 and
+    later) and the legacy one (``websockets.connect`` in 12 and 13, still inside later ones)."""
+    if request.param == "legacy":
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            legacy = pytest.importorskip("websockets.legacy.client")
+        monkeypatch.setattr(
+            "loaf.ws.client.websockets",
+            SimpleNamespace(connect=legacy.connect, ConnectionClosed=websockets.ConnectionClosed),
+        )
+    return request.param
+
+
+def _push_big_book(size: int) -> Action:
+    async def send(ws: Any) -> None:
+        await ws.send(json.dumps({
+            "type": "orderbook_update", "ticker": "OPRA", "bids": [], "asks": [],
+            "padding": "x" * size, "timestamp": 0,
+        }))
+
+    return send
+
+
+def test_a_book_over_1_mib_reaches_its_handler(ws_library: str):
+    server = _Server(_push_big_book(2 * 1024 * 1024)).start()
+    log = _Log()
+    ws = _client(server.port, log)
+    ws.on_orderbook(lambda m: log.add(("book", len(m.padding))))
+    ws.subscribe_orderbook("OPRA")
+    ws.start()
+    try:
+        log.wait_for(lambda events: len(events) == 2)
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events == ["on_connect", ("book", 2 * 1024 * 1024)]
+
+
+def test_the_client_takes_frames_up_to_16_mib(monkeypatch: pytest.MonkeyPatch):
+    connects: list[dict[str, Any]] = []
+
+    def connect(url: str, **kwargs: Any) -> _TimesOut:
+        connects.append(kwargs)
+        return _TimesOut()
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    for url in ("ws://127.0.0.1:1/ws", "wss://127.0.0.1:1/ws"):
+        ws = LoafWebSocketClient(ws_url=url, auto_reconnect=False)
+        asyncio.run(ws._run(ws._stop_event))
+    assert [kwargs["max_size"] for kwargs in connects] == [16 * 1024 * 1024] * 2
+
+
+def test_a_frame_over_the_limit_reports_the_close_the_client_sent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, ws_library: str
+):
+    # The client refuses the frame and closes 1009; the server drops the connection without
+    # answering that close. on_disconnect reports the close the client sent, not 1006.
+    monkeypatch.setattr("loaf.ws.client._MAX_FRAME_SIZE", 4096)
+    server = _Server(_then(_push_big_book(8192), _drop)).start()
+    log = _Log()
+    ws = _client(server.port, log, auto_reconnect=False)
+    ws.start()
+    try:
+        log.wait_for(lambda events: len(events) == 2)
+    finally:
+        ws.stop()
+        server.stop()
+    code, reason = log.events[1]  # the legacy client sends no reason
+    assert log.events[0] == "on_connect" and code == 1009 and type(code) is int
+    assert f"Loaf WebSocket closed: 1009 {reason}" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# What a handler's SystemExit, KeyboardInterrupt or a stray cancellation does
+# ---------------------------------------------------------------------------
+
+
+def _exit(_: Any) -> None:
+    sys.exit(3)
+
+
+def _interrupt(_: Any) -> None:
+    raise KeyboardInterrupt
+
+
+def _cancel_the_run(_: Any) -> None:
+    # Cancels the client's own task: the cancellation lands at its next await, not in here.
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+
+
+def _ending_client(port: int, log: _Log, handler: Callable[[Any], None]) -> LoafWebSocketClient:
+    ws = _beat_client(port, log)
+    ws.on_orderbook(handler)  # the book after the snapshot: the stream is fresh by then
+    return ws
+
+
+def _assert_reported(
+    ws: LoafWebSocketClient, log: _Log, caplog: pytest.LogCaptureFixture, name: str
+) -> None:
+    assert log.events[:2] == ["on_connect", ("fresh", ENGINE_MS)]
+    _, reason, engine_ms, _silent = log.events[2]
+    assert (reason, engine_ms) == ("disconnected", ENGINE_MS)
+    assert log.events[3:] == [(None, name)]  # and no reconnect
+    assert ws.fresh is False and not ws.wait_until_connected(timeout=0)
+    assert f"Loaf WebSocket feed has stopped: {name} ended the client's run" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "handler, name",
+    [(_exit, "SystemExit"), (_interrupt, "KeyboardInterrupt"),
+     (_cancel_the_run, "CancelledError")],
+    ids=["SystemExit", "KeyboardInterrupt", "cancelled"],
+)
+def test_a_run_a_handler_ends_says_so_and_stays_stale(
+    caplog: pytest.LogCaptureFixture, handler: Callable[[Any], None], name: str
+):
+    server = _Server(_then(_snapshot(ENGINE_MS), _push_book)).start()
+    log = _Log()
+    ws = _ending_client(server.port, log, handler)
+    ws.start()
+    try:
+        assert ws._thread is not None
+        ws._thread.join(timeout=5)
+        assert not ws._thread.is_alive()
+        _assert_reported(ws, log, caplog, name)
+        assert len(server.received) == 1  # it did not reconnect
+    finally:
+        ws.stop()
+        server.stop()
+    assert ws.fresh is None  # stop() resets it
+
+
+def test_after_a_run_a_handler_ended_start_runs_again():
+    server = _Server(_then(_snapshot(ENGINE_MS), _push_book)).start()
+    log = _Log()
+    ws = _ending_client(server.port, log, _exit)
+    ws.start()
+    try:
+        assert ws._thread is not None
+        ws._thread.join(timeout=5)
+        assert ws.fresh is False
+        ws.start()  # the next connection idles: no snapshot yet
+        assert ws.fresh is None
+        log.wait_for(lambda events: events.count("on_connect") == 2)
+    finally:
+        ws.stop()
+        server.stop()
+
+
+def test_run_forever_raises_a_handlers_system_exit_once_it_has_said_so(
+    caplog: pytest.LogCaptureFixture,
+):
+    server = _Server(_then(_snapshot(ENGINE_MS), _push_book)).start()
+    log = _Log()
+    ws = _ending_client(server.port, log, _exit)
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            ws.run_forever()
+        except BaseException as exc:  # noqa: BLE001
+            raised.append(exc)
+
+    runner = threading.Thread(target=run, daemon=True)
+    runner.start()
+    try:
+        runner.join(timeout=5)
+        assert not runner.is_alive()
+        assert len(raised) == 1 and isinstance(raised[0], SystemExit) and raised[0].code == 3
+        _assert_reported(ws, log, caplog, "SystemExit")
+    finally:
+        ws.stop()
+        server.stop()
+
+
+def test_run_forever_stops_at_a_handlers_keyboard_interrupt_as_at_ctrl_c(
+    caplog: pytest.LogCaptureFixture,
+):
+    # run_forever runs on the caller's own thread, so a KeyboardInterrupt in a handler's code is
+    # Ctrl-C landing there: the client stops and run_forever returns, and as after stop(),
+    # neither on_stale nor on_disconnect fires and no error is logged.
+    server = _Server(_then(_snapshot(ENGINE_MS), _push_book)).start()
+    log = _Log()
+    ws = _ending_client(server.port, log, _interrupt)
+    runner = threading.Thread(target=ws.run_forever, daemon=True)
+    runner.start()
+    try:
+        runner.join(timeout=5)
+        assert not runner.is_alive()
+        assert log.events == ["on_connect", ("fresh", ENGINE_MS)]
+        assert ws.fresh is None and not ws.wait_until_connected(timeout=0) and not ws._halted
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+        assert len(server.received) == 1  # it did not reconnect
+    finally:
+        ws.stop()
+        server.stop()
+
+
+def test_a_system_exit_in_on_stale_still_reports_the_end(caplog: pytest.LogCaptureFixture):
+    # Raised from the beat's watch, a task of its own, not from the connection's run.
+    server = _Server(_snapshot(ENGINE_MS)).start()  # then silence
+    log = _Log()
+    ws = _beat_client(server.port, log, stale_after=1)
+    ws.on_stale(_exit)
+    ws.start()
+    try:
+        assert ws._thread is not None
+        ws._thread.join(timeout=5)
+        assert not ws._thread.is_alive()
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events[:2] == ["on_connect", ("fresh", ENGINE_MS)]
+    assert log.events[2][:2] == ("stale", "silent") and log.events[3:] == [(None, "SystemExit")]
+    assert "Loaf WebSocket feed has stopped: SystemExit" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# stop() that cannot wait for the thread
+# ---------------------------------------------------------------------------
+
+
+def test_stop_warns_when_the_thread_outlives_its_wait(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    # A handler holds the loop's thread through stop()'s wait: stop() says so and returns. Once
+    # the handler returns the thread ends by itself, and the frames queued behind it reach no
+    # handler.
+    server = _Server(_then(_push_book, _push_book, _push_book)).start()
+    log = _Log()
+    ws = _client(server.port, log)
+    holding, release = threading.Event(), threading.Event()
+    books: list[Any] = []
+
+    def hold(m: Any) -> None:
+        books.append(m)
+        holding.set()
+        release.wait(5)
+
+    ws.on_orderbook(hold)
+    ws.subscribe_orderbook("OPRA")
+    joins: list[Any] = []
+    real_join = threading.Thread.join
+
+    def join(self: threading.Thread, timeout: Any = None) -> None:
+        joins.append(timeout)
+        real_join(self, 0.05)  # stands in for the 5 s wait
+
+    ws.start()
+    thread = ws._thread
+    try:
+        assert holding.wait(5)
+        time.sleep(0.05)  # the other two books arrive behind it
+        with monkeypatch.context() as patch:
+            patch.setattr(threading.Thread, "join", join)
+            ws.stop()
+        assert joins == [5] and thread is not None and thread.is_alive()
+        assert "Loaf WebSocket thread is still running 5 s after stop()" in caplog.text
+    finally:
+        release.set()
+        if thread is not None:
+            thread.join(timeout=5)
+        server.stop()
+    assert thread is not None and not thread.is_alive()
+    assert len(books) == 1 and log.events == ["on_connect"]
+
+
+def _stop_that_gives_up(ws: LoafWebSocketClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """stop(), its 5 s wait for the client's thread cut to 50 ms: it gives up while the thread
+    runs on."""
+    real_join = threading.Thread.join
+
+    def join(self: threading.Thread, timeout: Any = None) -> None:
+        real_join(self, 0.05)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "join", join)
+        ws.stop()
+
+
+def _when(event: threading.Event, step: Action) -> Action:
+    """Runs ``step`` once the test sets ``event``."""
+
+    async def run(ws: Any) -> None:
+        while not event.is_set():
+            await asyncio.sleep(0.01)
+        await step(ws)
+
+    return run
+
+
+def test_a_run_cancelled_after_stop_gave_up_leaves_the_next_run_alone(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    # A handler holds the old run's loop through stop()'s wait, and start() begins the next run.
+    # Once the handler returns, the old run meets the cancellation stop() asked for: it reports
+    # nothing and changes nothing of the next run, whose own halt is still reported.
+    halt = threading.Event()
+    server = _Server(
+        _then(_snapshot(ENGINE_MS), _push_book),
+        _then(_snapshot(ENGINE_MS + 5000), _when(halt, _push_book)),
+    ).start()
+    log = _Log()
+    ws = _beat_client(server.port, log)
+    holding, release = threading.Event(), threading.Event()
+    books: list[Any] = []
+
+    def book(m: Any) -> None:
+        books.append(m)
+        if len(books) == 1:  # the old run's
+            holding.set()
+            release.wait(5)
+        else:  # the next run's, once the old one has ended
+            sys.exit(3)
+
+    ws.on_orderbook(book)
+    ws.start()
+    old = ws._thread
+    try:
+        assert holding.wait(5)
+        _stop_that_gives_up(ws, monkeypatch)
+        assert old is not None and old.is_alive()
+        ws.start()
+        log.wait_for(lambda seen: ("fresh", ENGINE_MS + 5000) in seen)
+        release.set()
+        old.join(timeout=5)
+        assert not old.is_alive()
+        assert log.events == [
+            "on_connect", ("fresh", ENGINE_MS), "on_connect", ("fresh", ENGINE_MS + 5000),
+        ]
+        assert ws.wait_until_connected(timeout=0) and ws.fresh is True and not ws._halted
+        assert "feed has stopped" not in caplog.text and len(books) == 1
+        new = ws._thread
+        halt.set()
+        assert new is not None
+        new.join(timeout=5)
+        assert not new.is_alive()
+    finally:
+        release.set()
+        ws.stop()
+        server.stop()
+    assert log.events[4][:3] == ("stale", "disconnected", ENGINE_MS + 5000)
+    assert log.events[5:] == [(None, "SystemExit")]
+    assert caplog.text.count("Loaf WebSocket feed has stopped: SystemExit ended") == 1
+
+
+def test_a_run_ending_by_itself_after_stop_gave_up_leaves_the_next_run_alone(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The server closed the old run's connection, and its on_stale handler holds the loop through
+    # stop()'s wait; start() begins the next run. Once the handler returns, the old run ends by
+    # itself, with no cancellation to meet (it does not reconnect): it calls no on_disconnect,
+    # and leaves the next run live and fresh.
+    server = _Server(_then(_snapshot(ENGINE_MS), _close_resync), _snapshot(ENGINE_MS + 5000))
+    server.start()
+    log = _Log()
+    ws = _beat_client(server.port, log, auto_reconnect=False)
+    holding, release = threading.Event(), threading.Event()
+
+    def hold(_: Any) -> None:
+        if not holding.is_set():
+            holding.set()
+            release.wait(5)
+
+    ws.on_stale(hold)
+    ws.start()
+    old = ws._thread
+    try:
+        assert holding.wait(5)
+        _stop_that_gives_up(ws, monkeypatch)
+        assert old is not None and old.is_alive()
+        ws.start()
+        log.wait_for(lambda seen: ("fresh", ENGINE_MS + 5000) in seen)
+        release.set()
+        old.join(timeout=5)
+        assert not old.is_alive()
+        assert ws.wait_until_connected(timeout=0) and ws.fresh is True and not ws._halted
+    finally:
+        release.set()
+        ws.stop()
+        server.stop()
+    assert log.events[:2] == ["on_connect", ("fresh", ENGINE_MS)]
+    assert log.events[2][:3] == ("stale", "disconnected", ENGINE_MS)
+    assert log.events[3:] == ["on_connect", ("fresh", ENGINE_MS + 5000)]
+
+
+def _replaced_client(port: int, log: _Log, **kwargs: Any) -> LoafWebSocketClient:
+    """A client whose handlers record which thread called them."""
+    ws = LoafClient(TRADING_KEY, base_url=f"http://127.0.0.1:{port}/api").websocket(**kwargs)
+    me = threading.get_ident
+    ws.on_connect(lambda _: log.add(("connect", me())))
+    ws.on_disconnect(lambda m: log.add(("disconnect", m.reason, me())))
+    ws.on_fresh(lambda m: log.add(("fresh", m.engineMs, me())))
+    ws.subscribe_portfolio()
+    return ws
+
+
+def _next_runs_state(ws: LoafWebSocketClient) -> tuple[Any, ...]:
+    return (
+        ws._fresh, ws._last_beat, ws._engine_ms, ws._connected_event.is_set(), ws._halted,
+        ws._ws, ws._auth_token, ws._auth_refused, ws._lag_base, ws._behind_since, ws._live_at,
+        ws.fresh,
+    )
+
+
+def _book_exits(m: Any) -> None:
+    sys.exit(3)
+
+
+@pytest.mark.parametrize(
+    "path, first, reason, stale_after",
+    [
+        # A frame after a gap reports it: a handler moved this machine's clock on 31 s (the
+        # engine's too), so the next snapshot is on time but past stale_after.
+        ("frame", _then(_snapshot(ENGINE_MS), _snapshot(ENGINE_MS + 31_000)), "silent", 30),
+        ("watch", _snapshot(ENGINE_MS), "silent", 1),  # then silence: the beat's watch
+        ("halt", _then(_snapshot(ENGINE_MS), _push_book), "disconnected", 3),
+        ("closed", _then(_snapshot(ENGINE_MS), _close_resync), "disconnected", 3),
+    ],
+)
+def test_a_run_whose_on_stale_outlasts_stop_changes_nothing_of_the_next_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, ahead: _Ahead,
+    path: str, first: Action, reason: str, stale_after: float,
+):
+    # The first on_stale handler holds the old run's loop through stop()'s wait (pulling quotes
+    # over REST, say), and start() begins the next run. Once it returns, the old run calls no
+    # other handler (the second on_stale, on_fresh, on_disconnect) and leaves the next run's
+    # state as it was: its beat, its connection, and no "feed has stopped" error.
+    server = _Server(first, _snapshot(ENGINE_MS + 60_000)).start()
+    log = _Log()
+    ws = _replaced_client(server.port, log, stale_after=stale_after)
+    holding, release = threading.Event(), threading.Event()
+
+    def hold(m: Any) -> None:
+        log.add(("stale", m.reason, threading.get_ident()))
+        if not holding.is_set():
+            holding.set()
+            release.wait(5)
+
+    def jump(m: Any) -> None:
+        if m.engineMs == ENGINE_MS and path in ("frame", "watch"):
+            ahead.ahead += 31
+
+    ws.on_stale(hold)
+    ws.on_stale(lambda m: log.add(("stale#2", m.reason, threading.get_ident())))
+    ws.on_perps_account(jump)
+    if path == "halt":
+        ws.on_orderbook(_book_exits)
+    ws.start()
+    old = ws._thread
+    assert old is not None
+    try:
+        assert holding.wait(5)
+        _stop_that_gives_up(ws, monkeypatch)
+        assert old.is_alive()
+        ws.stale_after = 30.0  # the next run's own watch stays quiet through the test
+        ws.start()
+        new = ws._thread
+        assert new is not None and new is not old
+        log.wait_for(lambda seen: any(e[:2] == ("fresh", ENGINE_MS + 60_000) for e in seen))
+        before = _next_runs_state(ws)
+        assert before[0] is True and before[3] and not before[4]
+        release.set()
+        old.join(timeout=5)
+        assert not old.is_alive()
+        assert _next_runs_state(ws) == before
+    finally:
+        release.set()
+        ws.stop()
+        server.stop()
+    assert [e[:-1] for e in log.events if e[-1] == old.ident] == [
+        ("connect",), ("fresh", ENGINE_MS), ("stale", reason),
+    ]
+    assert [e[:-1] for e in log.events if e[-1] == new.ident] == [
+        ("connect",), ("fresh", ENGINE_MS + 60_000),
+    ]
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert len(server.received) == 2  # the old run did not reconnect
+
+
+def test_start_while_run_forever_runs_raises_and_stop_ends_that_run():
+    server = _Server().start()
+    log = _Log()
+    ws = _client(server.port, log)
+    runner = threading.Thread(target=ws.run_forever, daemon=True)
+    runner.start()
+    try:
+        assert ws.wait_until_connected(timeout=5)
+        with pytest.raises(RuntimeError, match=r"^start\(\) was called while run_forever\(\)"):
+            ws.start()
+        with pytest.raises(RuntimeError, match=r"^run_forever\(\) was called while another run"):
+            ws.run_forever()  # a second run_forever, here from this thread
+        assert ws._thread is None and runner.is_alive()
+        ws.stop()
+        runner.join(timeout=5)
+        assert not runner.is_alive()
+        ws.start()  # nothing is live now
+        log.wait_for(lambda seen: seen.count("on_connect") == 2)
+    finally:
+        ws.stop()
+        server.stop()
+    assert len(server.received) == 2
+
+
+def test_run_forever_while_the_background_thread_runs_raises_and_stop_ends_that_run():
+    server = _Server().start()
+    log = _Log()
+    ws = _client(server.port, log)
+    ws.on_connect(lambda _: ws.stop() if log.events.count("on_connect") == 2 else None)
+    ws.start()
+    thread = ws._thread
+    try:
+        assert ws.wait_until_connected(timeout=5)
+        with pytest.raises(RuntimeError, match=r"^run_forever\(\) was called while another run"):
+            ws.run_forever()
+        assert ws.start() is ws and ws._thread is thread  # its own run: nothing changes
+        assert thread is not None and thread.is_alive() and ws.wait_until_connected(timeout=0)
+        ws.stop()
+        assert not thread.is_alive()
+        ws.run_forever()  # nothing is live now: it runs, until its on_connect stops it
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events == ["on_connect", "on_connect"] and len(server.received) == 2
+
+
+@pytest.mark.parametrize("stable_after, after", [(10.0, 1.0), (20.0, 2.0)], ids=["rule", "20s"])
+def test_a_connection_behind_for_15_s_is_ended_and_the_next_is_fresh_at_its_first_snapshot(
+    monkeypatch: pytest.MonkeyPatch, ceilings: list[float], ahead: _Ahead, stable_after: float,
+    after: float,
+):
+    # The engine's clock steps back 5 s: the connection reads behind, and once 15 s have passed
+    # on this machine's clock (moved on here by a handler) the client ends it, as it does for a
+    # refused login token, and reconnects. The next connection measures from a baseline of its
+    # own: fresh at its first snapshot. The wait before it starts over only as the rule says: the
+    # connection was live 16 s, against the rule's 10 s (or 20 s here).
+    monkeypatch.setattr("loaf.ws.client._STABLE_CONNECTION", stable_after)
+    server = _Server(
+        _close_resync,  # not live long enough: the wait after it doubles
+        _then(_snapshot(ENGINE_MS), _snapshot(ENGINE_MS - 5000), _snapshot(ENGINE_MS + 11_000)),
+        _snapshot(ENGINE_MS + 12_000),
+    ).start()
+    log = _Log()
+    ws = _beat_client(server.port, log)
+
+    def later(m: Any) -> None:
+        if m.engineMs == ENGINE_MS - 5000:
+            ahead.ahead += 16
+
+    ws.on_perps_account(later)
+    ws.start()
+    try:
+        log.wait_for(lambda seen: ("fresh", ENGINE_MS + 12_000) in seen)
+    finally:
+        ws.stop()
+        server.stop()
+    assert log.events[:4] == ["on_connect", (1012, "resync"), "on_connect", ("fresh", ENGINE_MS)]
+    assert log.events[4][:3] == ("stale", "behind", ENGINE_MS)
+    assert log.events[5:] == [
+        (1006, "the handlers stayed behind the feed"), "on_connect", ("fresh", ENGINE_MS + 12_000),
+    ]
+    assert ceilings == [1.0, after]

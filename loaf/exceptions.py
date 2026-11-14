@@ -26,7 +26,7 @@ Every error the API can return is mapped to a specific exception so a bot can
         │   └── ReplaceTargetGoneError    409  the order a replace names is not resting
         ├── LoafRateLimitError            429  (carries .retry_after seconds)
         └── LoafServerError               5xx  (503 -> LoafServiceUnavailableError)
-            └── LoafServiceUnavailableError 503
+            └── LoafServiceUnavailableError 503  (carries .retry_after seconds)
 
 An order route's refusal, and a withdrawal's, names why in
 :attr:`LoafAPIError.code`, one of :class:`~loaf.enums.OrderErrorCode`'s values,
@@ -40,7 +40,28 @@ import html
 import re
 from typing import Any
 
-_PRE_RE = re.compile(r"<pre>(.*?)</pre>", re.IGNORECASE | re.DOTALL)
+# A <pre> block's tags, found one after the other: one pass over the page, whatever it holds.
+_PRE_OPEN = re.compile(r"<pre>", re.IGNORECASE)
+_PRE_CLOSE = re.compile(r"</pre>", re.IGNORECASE)
+
+# The most characters of a page that is not JSON its error's message keeps (``body`` keeps all).
+_PAGE_MESSAGE_MAX = 500
+
+
+def _page_message(page: str) -> str:
+    """The message of an error answered with a page that is not JSON: the text of its first
+    ``<pre>`` block (a route that does not exist answers with an HTML page), else the page,
+    either cut to :data:`_PAGE_MESSAGE_MAX` characters."""
+    text = page
+    opened = _PRE_OPEN.search(page)
+    if opened is not None:
+        closed = _PRE_CLOSE.search(page, opened.end())
+        if closed is not None:
+            text = html.unescape(page[opened.end() : closed.start()])
+    text = text.strip()
+    if len(text) > _PAGE_MESSAGE_MAX:
+        text = text[: _PAGE_MESSAGE_MAX - 1] + "…"
+    return text
 
 
 class LoafError(Exception):
@@ -74,7 +95,10 @@ class LoafConfigError(LoafError):
 
 class LoafConnectionError(LoafError):
     """The request never received an HTTP response (network error / timeout), or
-    received one whose compressed body could not be decompressed."""
+    received one whose compressed body could not be decompressed, whose body
+    passed :data:`~loaf.constants.MAX_RESPONSE_BYTES`, or whose body took longer
+    than the request's read timeout to arrive after its headers. A read is not
+    retried past either bound."""
 
 
 class OrderOutcomeUnknownError(LoafError):
@@ -254,7 +278,8 @@ class LoafAPIError(LoafError):
         status_code: HTTP status code.
         message: Human-readable error message (the API's ``error`` field; a
             refused login token's is followed by what it means).
-        code: Machine-readable code when present. On the order routes (placements,
+        code: Machine-readable code when present (a string; any other value
+            the body holds there is no code, and ``None``). On the order routes (placements,
             cancels, ``cancel_after``, ``cancel_by_index``) and on a withdrawal
             every refusal has one, an :class:`~loaf.enums.OrderErrorCode` value:
             compare with it, never with the message. The list grows: treat a
@@ -453,9 +478,15 @@ class ReplaceTargetGoneError(LoafConflictError):
 class LoafRateLimitError(LoafAPIError):
     """429 — too many requests.
 
+    A read is retried after a ``Retry-After`` (or ``RateLimit-Reset``) of at
+    most :data:`~loaf.constants.MAX_HINTED_WAIT` (10 s); one that asks for
+    longer is raised at once, for you to decide what to do with the time.
+
     Attributes:
-        retry_after: Seconds to wait before retrying, derived from the
-            ``RateLimit-Reset`` / ``Retry-After`` headers when present.
+        retry_after: Seconds to wait before retrying, from the
+            ``Retry-After`` header, else ``RateLimit-Reset``: finite, from 0 to
+            :data:`~loaf.constants.MAX_RETRY_AFTER` (one day), or ``None``
+            without a usable one.
     """
 
     def __init__(self, *args: Any, retry_after: float | None = None, **kwargs: Any) -> None:
@@ -466,8 +497,10 @@ class LoafRateLimitError(LoafAPIError):
 class LoafServerError(LoafAPIError):
     """5xx — the server failed to process the request.
 
-    Also raised with a 2xx ``status_code`` for an answer the SDK cannot use,
-    e.g. a body labelled JSON that is not JSON.
+    Also raised with a 2xx ``status_code`` for an answer the SDK cannot use:
+    a body that is not JSON (a CDN's or a captive portal's page, say), or a
+    history or candle page that is not one (its rows not a list, a cursor that
+    is not one, an empty page that points to another).
     """
 
 
@@ -476,11 +509,23 @@ class LoafServiceUnavailableError(LoafServerError):
     candle history under load (``Candle history is busy…``), or your perps read
     through ``loaf.perps`` (a summary's ``perps`` is ``None``).
 
-    Transient: the client retries reads, and re-sends signed placements (see
+    Transient: the client retries reads (after its ``Retry-After`` when that is
+    at most :data:`~loaf.constants.MAX_HINTED_WAIT`, 10 s; a longer one is
+    raised at once, for you to decide what to do with the time), and re-sends
+    signed placements (see
     :meth:`~loaf.resources.orders.OrdersResource.create`), before raising it.
     From a placement it means the order was not placed: a 503 that might have
     placed it raises :class:`OrderOutcomeUnknownError` instead.
+
+    Attributes:
+        retry_after: The seconds the answer's ``Retry-After`` asked for
+            (finite, from 0 to :data:`~loaf.constants.MAX_RETRY_AFTER`, one
+            day), or ``None`` without a usable one.
     """
+
+    def __init__(self, *args: Any, retry_after: float | None = None, **kwargs: Any) -> None:
+        self.retry_after = retry_after
+        super().__init__(*args, **kwargs)
 
 
 class TradingPausedError(TradingHaltedError, LoafServiceUnavailableError):
@@ -492,15 +537,9 @@ class TradingPausedError(TradingHaltedError, LoafServiceUnavailableError):
     both, so code that backs off on halts and code that retries a 503 each
     catch it. A signed placement refused so was re-sent first, like any 503
     that placed nothing (:meth:`~loaf.resources.orders.OrdersResource.create`).
-
-    Attributes:
-        retry_after: The seconds the exchange's ``Retry-After`` asked for, or
-            ``None`` without one.
+    Its ``retry_after`` is the 503's, as for any
+    :class:`LoafServiceUnavailableError`.
     """
-
-    def __init__(self, *args: Any, retry_after: float | None = None, **kwargs: Any) -> None:
-        self.retry_after = retry_after
-        super().__init__(*args, **kwargs)
 
 
 # The refusals that raise a class of their own, by status and code (the code is the contract; the
@@ -536,25 +575,25 @@ def error_from_response(
     """Map an HTTP error response to the most specific :class:`LoafAPIError`: by
     its status, and on the order routes by its ``code`` too, never by its text.
 
-    ``retry_after`` is the answer's own hint, in seconds: carried by a 429 and a
-    503 ``TRADING_PAUSED``.
+    ``retry_after`` is the answer's own hint, in seconds: carried by a 429 and
+    by every 503.
     """
     message = "Unknown error"
-    code: Any = None
+    code: str | None = None
     details: list[str] | None = None
     replaced_order_cancelled = False
 
     if isinstance(body, dict):
         message = str(body.get("error") or message)
         code = body.get("code")
+        if not isinstance(code, str):
+            code = None  # a code is a string: anything else names no reason
         raw_details = body.get("details")
         if isinstance(raw_details, list):
             details = [str(d) for d in raw_details]
         replaced_order_cancelled = body.get("replacedOrderCancelled") is True
     elif isinstance(body, str) and body.strip():
-        # A route that does not exist answers with an HTML page: keep just its <pre> text.
-        pre = _PRE_RE.search(body)
-        message = html.unescape(pre.group(1)).strip() if pre else body.strip()
+        message = _page_message(body)
 
     kwargs: dict[str, Any] = dict(
         status_code=status_code,
@@ -565,7 +604,7 @@ def error_from_response(
         replaced_order_cancelled=replaced_order_cancelled,
     )
 
-    if isinstance(code, str):
+    if code is not None:
         if status_code == 403 and code in _MARKET_STATES:
             cls, state = _MARKET_STATES[code]
             return cls(message, state=state, **kwargs)
@@ -587,7 +626,7 @@ def error_from_response(
     if status_code == 429:
         return LoafRateLimitError(message, retry_after=retry_after, **kwargs)
     if status_code == 503:
-        return LoafServiceUnavailableError(message, **kwargs)
+        return LoafServiceUnavailableError(message, retry_after=retry_after, **kwargs)
     if status_code >= 500:
         return LoafServerError(message, **kwargs)
     return LoafAPIError(message, **kwargs)

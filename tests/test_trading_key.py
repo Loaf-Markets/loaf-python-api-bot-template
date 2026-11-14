@@ -249,9 +249,9 @@ def test_half_built_objects_still_repr():
     assert repr(client) == f"<LoafClient base_url=None anonymous v{loaf.__version__}>"
     assert repr(key) == "TradingKey(public_key=None, l2_account_index=None)"
     with pytest.raises(loaf.LoafConfigError) as refused:
-        loaf.LoafWebSocketClient(ws_url="ws://test/ws", reconnect_delay=0)
+        loaf.LoafWebSocketClient(ws_url="wss://test/ws", reconnect_delay=0)
     (ws,) = selves(refused.value)
-    assert repr(ws) == "<LoafWebSocketClient 'ws://test/ws' idle channels=0>"
+    assert repr(ws) == "<LoafWebSocketClient 'wss://test/ws' idle channels=0>"
 
 
 # --------------------------------------------------------------------------- #

@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Callable, Iterator
 
 from .. import _served
-from ..exceptions import LoafError
+from ..exceptions import LoafError, LoafServerError
 from .base import Resource
 
 
@@ -149,7 +149,10 @@ class HistoryResource(Resource):
     def iter_orders(self, *, page_size: int = 100) -> Iterator[Any]:
         """Yield every order across all pages using cursor pagination. A
         ``nextCursor`` the server already gave raises
-        :class:`~loaf.exceptions.LoafError` instead of paging forever."""
+        :class:`~loaf.exceptions.LoafError` instead of paging forever, and a
+        page that cannot be paged on (not an object, its rows not a list, a
+        cursor that is not one, or no rows yet a ``nextCursor``)
+        :class:`~loaf.exceptions.LoafServerError`."""
         yield from self._iter(
             "/history/orders", "orders", lambda cursor: self.orders(page_size=page_size, cursor=cursor)
         )
@@ -157,7 +160,10 @@ class HistoryResource(Resource):
     def iter_trades(self, *, page_size: int = 100) -> Iterator[Any]:
         """Yield every trade across all pages using cursor pagination. A
         ``nextCursor`` the server already gave raises
-        :class:`~loaf.exceptions.LoafError` instead of paging forever."""
+        :class:`~loaf.exceptions.LoafError` instead of paging forever, and a
+        page that cannot be paged on (not an object, its rows not a list, a
+        cursor that is not one, or no rows yet a ``nextCursor``)
+        :class:`~loaf.exceptions.LoafServerError`."""
         yield from self._iter(
             "/history/trades", "trades", lambda cursor: self.trades(page_size=page_size, cursor=cursor)
         )
@@ -165,22 +171,48 @@ class HistoryResource(Resource):
     def iter_funding(self, *, page_size: int = 100) -> Iterator[Any]:
         """Yield every funding payment across all pages using cursor pagination. A
         ``nextCursor`` the server already gave raises
-        :class:`~loaf.exceptions.LoafError` instead of paging forever."""
+        :class:`~loaf.exceptions.LoafError` instead of paging forever, and a
+        page that cannot be paged on (not an object, its rows not a list, a
+        cursor that is not one, or no rows yet a ``nextCursor``)
+        :class:`~loaf.exceptions.LoafServerError`."""
         yield from self._iter(
             "/history/funding", "funding", lambda cursor: self.funding(page_size=page_size, cursor=cursor)
         )
 
     def _iter(self, path: str, key: str, read: Callable[[str | None], Any]) -> Iterator[Any]:
-        """Each ``key`` row of ``path``'s pages, as ``read`` (the page at a cursor) serves them."""
+        """Each ``key`` row of ``path``'s pages, as ``read`` (the page at a cursor) serves them.
+
+        A page that is not one raises :class:`~loaf.exceptions.LoafServerError` instead of
+        paging on: not an object, its rows not a list, a ``nextCursor`` that is not a string,
+        or no rows yet a ``nextCursor`` (or ``hasMore``) pointing on. A ``nextCursor`` that is
+        null or empty ends the walk. A ``nextCursor`` the server already gave raises
+        :class:`~loaf.exceptions.LoafError`."""
         cursor: str | None = None
         followed: set[str] = set()
         while True:
             page = read(cursor)
-            for item in page.get(key, []) or []:
-                yield item
+            if not isinstance(page, dict):
+                raise _unusable(path, "a page that is not an object", page)
+            rows = page.get(key)
+            if not isinstance(rows, list):
+                raise _unusable(path, f"a page whose {key} is not a list", page)
+            yield from rows
             cursor = page.get("nextCursor")
-            if not cursor:
+            if cursor is None or cursor == "":
+                if page.get("hasMore") is True and not rows:
+                    raise _unusable(path, "an empty page with hasMore and no nextCursor", page)
                 return
+            if not isinstance(cursor, str):
+                raise _unusable(path, f"a nextCursor that is not one ({cursor!r:.40})", page)
+            if not rows:
+                raise _unusable(path, "an empty page that points to another", page)
             if cursor in followed:
                 raise LoafError(f"GET {path} answered a nextCursor it had already given; stopped paging")
             followed.add(cursor)
+
+
+def _unusable(path: str, what: str, page: Any) -> LoafServerError:
+    """The error of a history page that cannot be paged on."""
+    return LoafServerError(
+        f"GET {path} answered {what}; stopped paging", status_code=200, body=page
+    )

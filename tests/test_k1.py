@@ -460,7 +460,7 @@ def test_perps_base_field_refusals():
     with pytest.raises(TypeError, match="l2_pool"):
         perps_base_field(True, False)
     with pytest.raises(TypeError, match="reduce_only"):
-        perps_base_field(0, 1)
+        perps_base_field(0, 1)  # type: ignore[arg-type]
 
 
 def test_k1_bounds_on_the_orders_largest_fill():

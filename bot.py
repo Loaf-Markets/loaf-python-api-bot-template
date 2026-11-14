@@ -15,7 +15,8 @@ Run it:
     pip install -e ".[dotenv]"    # the dotenv extra loads .env; or export the variables yourself
     python bot.py
 
-Stop with Ctrl-C.
+Stop with Ctrl-C (or SIGTERM: docker stop, systemd, kill): the bot stops after the
+current tick. A second Ctrl-C stops it at once.
 """
 
 from __future__ import annotations
@@ -25,8 +26,8 @@ import signal
 import sys
 import threading
 import time
-from decimal import Decimal
-from typing import Any
+from decimal import ROUND_FLOOR, Decimal
+from typing import Any, Mapping
 
 import loaf
 from loaf import LoafClient
@@ -44,15 +45,23 @@ except ImportError:
     pass
 
 # The market this template watches/trades: a market's ticker from
-# `loaf.market.list()`, exactly as listed (uppercase), e.g. "OPRA". Leave it
-# empty to follow the first tradeable listed market (resolve_target says which
-# while none trades).
+# `loaf.market.list()`, exactly as listed (uppercase), e.g. "OPRA" or "OPRA-PERP".
+# One that is not listed stops the bot. Leave it empty to follow the first
+# tradeable spot market (resolve_target says which while none trades).
 TARGET_TICKER = ""
 
 # The tag this bot's orders carry once your strategy places some (order_tag=, a whole number
 # from 1 to 4,294,967,295): its cancels and its dead man's switch then touch its own orders
 # only, never the ones you place by hand in the web app.
 BOT_ORDER_TAG = 7
+
+# How often the strategy runs, in seconds.
+TICK_SECONDS = 5.0
+
+# The feed sends each subscribed order book at least every 5 s, changed or not. A book
+# older than this many seconds (the subscription was refused, or the feed stalled) is
+# treated as unknown: the tick reads its bid and ask as None.
+BOOK_MAX_AGE = 15.0
 
 
 def build_client() -> LoafClient:
@@ -87,6 +96,13 @@ def trading_started(starts_at: int | None) -> bool:
     """Whether a market's trading has started, from its ``tradingStartsAt`` (unix seconds;
     ``None``: no wait). The exchange refuses its orders before then."""
     return starts_at is None or starts_at <= time.time()
+
+
+def best_prices(book: Any) -> tuple[Any, Any]:
+    """A book's best bid and best ask prices, from its ``bids`` and ``asks`` levels (best
+    first): None for an empty side."""
+    bids, asks = book.get("bids"), book.get("asks")
+    return (bids[0]["price"] if bids else None), (asks[0]["price"] if asks else None)
 
 
 # --------------------------------------------------------------------------- #
@@ -126,25 +142,36 @@ def preflight(client: LoafClient) -> None:
 
 
 def resolve_target(client: LoafClient) -> Any:
-    """Pick the market to follow: the configured one, else the first tradeable
-    one, else the first LIVE one with an L2 market, whose halt or start the loop
-    waits out (while the platform-wide halt is on, every row reads halted), else
-    the first listed (or None)."""
+    """Pick the market to follow.
+
+    With TARGET_TICKER set: that market, or stop, listing the tickers there are,
+    when it is not listed (a typo, or a delisted market): never another market in
+    its place. With it empty: the first tradeable spot market, else the first
+    tradeable market of any type, else the first LIVE one with an L2 market, whose
+    halt or start the loop waits out (while the platform-wide halt is on, every row
+    reads halted), else the first listed (or None when none is)."""
     listing = client.market.list().get("markets") or []
     if not listing:
         print("No markets available on this environment.")
         return None
     if TARGET_TICKER:
         for market in listing:
-            if market.ticker == TARGET_TICKER:
+            if market.get("ticker") == TARGET_TICKER:
                 return market
-        print(f"Ticker {TARGET_TICKER!r} not found; picking one as with no TARGET_TICKER.")
+        listed = ", ".join(sorted(str(m.get("ticker")) for m in listing))
+        sys.exit(
+            f"TARGET_TICKER {TARGET_TICKER!r} is not a listed market.\n"
+            f"  Listed: {listed}\n"
+            "  Set TARGET_TICKER in bot.py to one of them, exactly as listed, or to \"\" to\n"
+            "  follow the first tradeable spot market."
+        )
     # Tradeable: LIVE, not halted, with an L2 market, its trading started.
     live = [m for m in listing if m.get("status") == "LIVE" and m.get("hasL2Market")]
-    return next(
-        (m for m in live if not m.get("isHalted") and trading_started(m.get("tradingStartsAt"))),
-        live[0] if live else listing[0],
-    )
+    tradeable = [
+        m for m in live if not m.get("isHalted") and trading_started(m.get("tradingStartsAt"))
+    ]
+    spot = [m for m in tradeable if m.get("type") == "SPOT"]
+    return (spot or tradeable or live or listing)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -156,8 +183,9 @@ class Strategy:
     """Holds live state fed by the WebSocket, and decides what to do.
 
     This template only OBSERVES the market (it prints a snapshot each tick and
-    never sends an order). Replace `on_tick` with your own logic — the order
-    helpers you need are commented inline.
+    never sends an order). Put your own logic in `trade`, which `on_tick` runs
+    only while the market trades and your private stream is not stale — the
+    order helpers you need are commented inline there.
     """
 
     def __init__(self, client: LoafClient, ticker: str) -> None:
@@ -169,14 +197,24 @@ class Strategy:
         self.mark_price: Decimal | None = None  # a mark_price frame's: exact dollars
         self.last_trade: dict | None = None
         self.is_halted = False
+        # When the book above was last set (a frame, or the read below), by time.monotonic(),
+        # which a change to the computer's clock leaves alone: None while no book is held.
+        # One older than BOOK_MAX_AGE is not used.
+        self.book_at: float | None = None
         # What no frame sends: the market's status, whether it has an L2 market (its
-        # `l2`), and its tradingStartsAt; and its priceDecimals, which never changes:
-        # its prices have at most that many decimal places (its tick).
+        # `l2`), and its tradingStartsAt; and what never changes: its type ("SPOT", or
+        # "PERP": a perpetual future, traded from a margin pool), its priceDecimals and
+        # quantityDecimals (its prices have at most that many decimal places, its tick,
+        # and its quantities at most that many, its lot), and its minOrderValue, the
+        # least price x quantity, in dollars, of an order on it.
         self.status: str | None = None
         self.has_l2_market = False
         self.trading_starts_at: int | None = None
+        self.market_type: str | None = None
         self.price_decimals: int | None = None
-        # The book, the halt flag and those three are read from REST on the next tick: at
+        self.quantity_decimals: int | None = None
+        self.min_order_value: Any = None
+        # The book, the halt flag and all of those are read from REST on the next tick: at
         # startup and each time the feed goes live again (nothing is replayed). Until the
         # market trades, a halt aside (a frame ends it), every tick reads them again.
         self.needs_seed = True
@@ -202,8 +240,8 @@ class Strategy:
             self.from_feed.add("book")
 
     def _set_book(self, book) -> None:  # under the lock
-        self.best_bid = book.bids[0].price if book.get("bids") else None
-        self.best_ask = book.asks[0].price if book.get("asks") else None
+        self.best_bid, self.best_ask = best_prices(book)
+        self.book_at = time.monotonic()
 
     def on_mark_price(self, msg) -> None:
         with self._lock:
@@ -214,7 +252,7 @@ class Strategy:
         # from here on is missed. Drop what may be stale and re-seed on the next tick,
         # from the main thread (a slow REST read in a handler stalls the socket).
         with self._lock:
-            self.best_bid = self.best_ask = None
+            self.best_bid = self.best_ask = self.book_at = None
             self.mark_price = None
             self.from_feed.clear()
             self.feed_live = True
@@ -222,17 +260,20 @@ class Strategy:
             self.needs_seed = True
 
     def on_disconnect(self, msg) -> None:
-        # Every ended connection attempt; the client reconnects with backoff. Forget
+        # Every ended connection attempt; the client reconnects with backoff (its
+        # on_connect, on_feed_reset here, says when it is live again). Forget
         # the book and the mark so no order is priced off a dead feed: no read made
         # before the feed is live again seeds the book, and with no mark the SDK reads
         # the reference itself.
         with self._lock:
-            self.best_bid = self.best_ask = None
+            self.best_bid = self.best_ask = self.book_at = None
             self.mark_price = None
             self.feed_live = False
             self.feed_changes += 1
         if msg.code is None:
-            print(f"  feed: no connection ({msg.reason}); retrying")
+            # No close from the server: an attempt that failed, or the feed's own run ending
+            # (a handler's SystemExit or KeyboardInterrupt, named here), which no retry follows.
+            print(f"  feed: no connection ({msg.reason})")
         else:
             print(f"  feed closed: {msg.code} {msg.reason}; reconnecting")
 
@@ -293,29 +334,57 @@ class Strategy:
         sends, and its halt flag and book, which the feed does not send on
         subscribe. The read leaves alone what a frame has set since the feed went
         live, and the book unless the feed was live from the request until the
-        answer is applied. False if the read failed: the next tick tries again."""
+        answer is applied. False if the read failed, or its answer is not a market's:
+        the next tick tries again."""
         with self._lock:
             self.needs_seed = False  # first: a reconnect during the read asks again
             live_at_request, changes = self.feed_live, self.feed_changes
         try:
             detail = self.client.market.get(self.ticker)
-        except loaf.LoafError as exc:
+            market = detail.get("market") if isinstance(detail, Mapping) else None
+            if not isinstance(market, Mapping):
+                raise ValueError(f"no market in the answer ({type(detail).__name__})")
+            book = detail.get("orderBook")  # None: not known now
+            top = best_prices(book) if book else None
+        except (loaf.LoafError, ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
             with self._lock:
                 self.needs_seed = True
             print(f"  could not read {self.ticker} ({exc}); trying again next tick")
             return False
         with self._lock:
-            self.status = detail.market.get("status")
-            self.has_l2_market = detail.market.get("l2") is not None
-            self.trading_starts_at = detail.market.get("tradingStartsAt")
-            self.price_decimals = detail.market.get("priceDecimals")
+            self.status = market.get("status")
+            self.has_l2_market = market.get("l2") is not None
+            self.trading_starts_at = market.get("tradingStartsAt")
+            self.market_type = market.get("type")
+            self.price_decimals = market.get("priceDecimals")
+            self.quantity_decimals = market.get("quantityDecimals")
+            self.min_order_value = market.get("minOrderValue")
             if "halt" not in self.from_feed:
-                self.is_halted = bool(detail.market.isHalted)
-            # orderBook None: not known now.
+                self.is_halted = bool(market.get("isHalted"))
             live_throughout = live_at_request and changes == self.feed_changes
-            if live_throughout and "book" not in self.from_feed and detail.get("orderBook"):
-                self._set_book(detail.orderBook)
+            if live_throughout and "book" not in self.from_feed and top is not None:
+                self.best_bid, self.best_ask = top
+                self.book_at = time.monotonic()
         return True
+
+    def quantity_worth(
+        self, dollars: float | Decimal, price: float | Decimal
+    ) -> Decimal | None:
+        """At most ``dollars`` worth of this market at ``price``: that over the price, rounded
+        down to the market's lot (10^-quantityDecimals tokens), in Decimal, so the rounding
+        is exact. None when even one lot is worth more than ``dollars`` (a coarse lot at a
+        high price): place no order then, rather than one worth more than you asked for.
+        Rounded down, it can be worth up to one lot less than ``dollars``: the exchange
+        refuses an order worth less than the market's ``min_order_value`` at the price it
+        signs, so ask for more than that."""
+        if self.quantity_decimals is None:
+            raise RuntimeError(f"{self.ticker} has not been read yet, so its lot is not known")
+        value, at = Decimal(str(dollars)), Decimal(str(price))
+        if not (value.is_finite() and at.is_finite() and value > 0 and at > 0):
+            raise ValueError(f"dollars and price must be positive (got {dollars!r}, {price!r})")
+        lot = Decimal(1).scaleb(-self.quantity_decimals)
+        quantity = (value / at).quantize(lot, rounding=ROUND_FLOOR)
+        return quantity if quantity >= lot else None
 
     def _waiting(self) -> list[str]:  # under the lock
         """Why the market does not trade, a halt aside: no frame announces a
@@ -334,6 +403,11 @@ class Strategy:
             return
         with self._lock:
             bid, ask, mark = self.best_bid, self.best_ask, self.mark_price
+            # A book the feed has not sent again for BOOK_MAX_AGE is not known now.
+            age = None if self.book_at is None else time.monotonic() - self.book_at
+            old_book = age is not None and age > BOOK_MAX_AGE
+            if old_book:
+                bid = ask = None
             halted, waiting = self.is_halted, self._waiting()
             stale = self.private_fresh is False
             if waiting:
@@ -341,40 +415,73 @@ class Strategy:
         spread = (ask - bid) if (bid is not None and ask is not None) else None
         flags = "".join(
             f" [{reason}]"
-            for reason in (["HALTED"] if halted else []) + waiting + (["STALE"] if stale else [])
+            for reason in (["HALTED"] if halted else [])
+            + waiting
+            + (["OLD BOOK"] if old_book else [])
+            + (["STALE"] if stale else [])
         )
         print(f"[{self.ticker}] bid={bid} ask={ask} spread={spread} mark={mark}{flags}")
 
+        if stale:
+            # Your orders and fills may be out of date: act on nothing until the
+            # private stream is live again (on_fresh). A strategy that quotes pulls
+            # its quotes here, scoped to its tag:
+            #   self.client.orders.cancel_all(self.ticker, order_tag=BOT_ORDER_TAG)
+            return
         if halted:
             return  # orders would be rejected with loaf.TradingHaltedError
         if waiting:
             return  # orders would be refused until the market trades
+        self.trade(bid, ask, mark)
 
+    def trade(self, bid: Any, ask: Any, mark: Decimal | None) -> None:
+        """Your strategy: run each tick while the market trades and your private
+        stream is not stale, with this tick's best bid and ask (None while not known)
+        and mark price (None until the feed sends one)."""
         # ----------------------------------------------------------------- #
-        # YOUR STRATEGY GOES HERE. Examples (uncomment & adapt). on_tick runs
-        # every 5 s, and each example as written acts on every tick (a new
+        # YOUR STRATEGY GOES HERE. Examples (uncomment & adapt). This runs
+        # every tick (5 s), and each example as written acts on every one (a new
         # order each time): gate it, e.g. keep the orderId a placement returns
-        # and place again only once that order is gone.
+        # and place again only once that order is gone. bid and ask are None
+        # while the book is not known (none yet, the feed down, or OLD BOOK).
         #
-        #   # Quote a limit buy 1% below the best bid, on the market's tick,
-        #   # resting for an hour at most (ttl_ms; the default is 7 days): a
-        #   # bot's quotes should die with it.
+        # Size orders by value, never by a fixed number of tokens: one market's
+        # token can cost $3 and another's $75,000. self.quantity_worth(25, price)
+        # is at most $25 worth at that price on the market's lot, rounded down,
+        # or None when even one lot is worth more than $25 (each example below
+        # then places nothing); the exchange refuses an order worth less than
+        # self.min_order_value ($10) at the price it signs. On a perp
+        # (self.market_type == "PERP") a BUY opens or grows a long and a SELL a
+        # short, with leverage, from margin pool 0 unless pool= names another:
+        # pass reduce_only=True to an order that must only close.
+        #
+        #   # Quote a limit buy of $25, 1% below the best bid, on the market's
+        #   # tick, resting for an hour at most (ttl_ms; the default is 7 days):
+        #   # a bot's quotes should die with it.
         #   if bid:
         #       price = round(bid * 0.99, self.price_decimals)
-        #       self.client.orders.limit_buy(self.ticker, quantity=1, price=price,
-        #                                    ttl_ms=3_600_000)
+        #       quantity = self.quantity_worth(25, price)
+        #       if quantity is not None:  # None: one lot is worth more than $25
+        #           self.client.orders.limit_buy(self.ticker, quantity=float(quantity),
+        #                                        price=price, ttl_ms=3_600_000)
         #
-        #   # Market sell 0.5 tokens at no worse than mark x (1 - max slippage);
-        #   # with no mark yet (None) the SDK reads the reference itself. The
-        #   # unfilled rest RESTS at that price — cancel it if you don't want it
-        #   # on the book:
-        #   res = self.client.orders.market_sell(self.ticker, quantity=0.5,
-        #                                        reference_price=mark)
-        #   if res.status in ("OPEN", "PARTIALLY_FILLED"):
-        #       self.client.orders.cancel(res.orderId)
+        #   # Market sell $25 worth (on a spot market, of tokens you hold) at no
+        #   # worse than mark x (1 - max slippage); with no mark yet (None) the
+        #   # SDK reads the reference itself. A MARKET order never rests: what
+        #   # cannot fill at once is cancelled, and one that fills nothing is
+        #   # refused (loaf.LoafValidationError).
+        #   if bid:
+        #       quantity = self.quantity_worth(25, bid)
+        #       if quantity is not None:  # None: one lot is worth more than $25
+        #           self.client.orders.market_sell(self.ticker, quantity=float(quantity),
+        #                                          reference_price=mark)
         #
         #   # Arm a stop-loss 5% below the mark (STOP_MARKET SELL; the exchange
         #   # holds it, and it books at up to the max slippage below the trigger).
+        #   # Its quantity is the holding (spot) or the long (perp) it protects,
+        #   # here $25 worth. On a perp it must be reduce-only: a stop that fires
+        #   # after the long is gone would open a short (the SDK refuses
+        #   # reduce_only on a spot market).
         #   # The exchange FAILS it if it is still ARMED once its life (ttl_ms,
         #   # default 7 days) ends, fired or not (a fired one it has not booked
         #   # yet stays ARMED); once it has booked its order (PLACED), that order
@@ -384,28 +491,33 @@ class Strategy:
         #   # order numbers until it fires.
         #   if mark:
         #       trigger = round(mark * Decimal("0.95"), self.price_decimals)
-        #       self.client.orders.stop_loss(self.ticker, quantity=1, trigger_price=trigger)
+        #       quantity = self.quantity_worth(25, trigger)
+        #       if quantity is not None:  # None: one lot is worth more than $25
+        #           self.client.orders.stop_loss(
+        #               self.ticker, quantity=float(quantity),
+        #               trigger_price=trigger, reduce_only=self.market_type == "PERP")
         #
-        #   # Cancel every open order, stop and take (it sells nothing):
+        #   # Cancel every open order, stop and take, the ones you placed by
+        #   # hand included (it sells nothing):
         #   self.client.orders.cancel_all()
         #
         #   # Quoting: tag the bot's quotes, replace in one step, never let a
         #   # quote land late, and keep the exchange's dead man's switch armed
         #   # from this loop, scoped to the tag: if this loop stops, the
-        #   # exchange cancels the bot's quotes within 60 s. While the private
-        #   # stream is stale, pull them and quote nothing.
-        #   if stale:
-        #       self.client.orders.cancel_all(self.ticker, order_tag=BOT_ORDER_TAG)
-        #       return
+        #   # exchange cancels the bot's quotes within 60 s. (While the private
+        #   # stream is stale on_tick does not call this, and pulls them instead.)
         #   self.client.orders.cancel_after(60_000, order_tag=BOT_ORDER_TAG)
         #   if bid:
-        #       res = self.client.orders.limit_buy(
-        #           self.ticker, quantity=1, price=round(bid * 0.99, self.price_decimals),
-        #           ttl_ms=3_600_000,
-        #           order_tag=BOT_ORDER_TAG,
-        #           send_by_ms=time.time_ns() // 1_000_000 + 2_000,
-        #           replaces_order_id=self.quote_id)  # set self.quote_id = None in __init__
-        #       self.quote_id = res.orderId
+        #       price = round(bid * 0.99, self.price_decimals)
+        #       quantity = self.quantity_worth(25, price)
+        #       if quantity is not None:  # None: one lot is worth more than $25
+        #           res = self.client.orders.limit_buy(
+        #               self.ticker, quantity=float(quantity), price=price,
+        #               ttl_ms=3_600_000,
+        #               order_tag=BOT_ORDER_TAG,
+        #               send_by_ms=time.time_ns() // 1_000_000 + 2_000,
+        #               replaces_order_id=self.quote_id)  # set self.quote_id = None in __init__
+        #           self.quote_id = res.orderId
         #   # On loaf.ReplaceTargetGoneError the old quote no longer rests (it
         #   # filled or was cancelled): set self.quote_id = None and quote again.
         #
@@ -422,12 +534,100 @@ class Strategy:
         # if it landed, placed now if not); otherwise settle it with
         # cancel_by_index(e.signed_body["l2OrderIndex"]): CANCELLED, ENDED or
         # VOIDED (never placed, and never will be). Never place it afresh.
+        # On loaf.PerpsOutcomeUnknownError (a margin move or an exit) or
+        # loaf.WithdrawalOutcomeUnknownError it may have been applied: never
+        # sign it afresh (a fresh one takes the next nonce, so both could
+        # apply), but re-send the same body with
+        # self.client.perps.resubmit(e.signed_body) or
+        # self.client.funds.resubmit(e.signed_body), whose answer settles it
+        # (each error's help() says how).
+        # A loaf.LoafError that this lets out is printed and the next tick
+        # runs, but any of those three that it lets out stops the bot (run,
+        # below): only your strategy holds the signed body to re-send.
         # ----------------------------------------------------------------- #
+
+    def on_shutdown(self) -> None:
+        """Called once as the bot stops (Ctrl-C, SIGTERM, or an error), before the
+        feed stops and the client closes: settle what the strategy leaves on the book.
+
+        As shipped the template places no order, so this sends nothing. Once your
+        strategy places orders tagged BOT_ORDER_TAG, the usual choice is to cancel
+        them here, leaving the ones you placed by hand alone (a tagged cancel leaves
+        stops and takes, which carry no tag: cancel_conditional them by id). The dead
+        man's switch, cancel_after (in the quoting example above), is the exchange's
+        side of the same guard: it cancels them even when this never runs (the
+        process killed, the machine or its network down).
+        """
+        # self.client.orders.cancel_all(order_tag=BOT_ORDER_TAG)
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+
+
+def run(strategy: Strategy, stop: threading.Event) -> None:
+    """Run the strategy every TICK_SECONDS until ``stop`` is set.
+
+    A loaf.LoafError that on_tick lets out is printed, and the next tick runs. A
+    loaf.OrderOutcomeUnknownError, loaf.PerpsOutcomeUnknownError or
+    loaf.WithdrawalOutcomeUnknownError it lets out stops the bot: that order, margin
+    move, exit or withdrawal may have gone through, so nothing more is traded until
+    you have settled it. Any other exception ends the loop as it is. Either way main's
+    shutdown runs. A signed body is never printed: anyone who has it can send it.
+    """
+    while not stop.is_set():
+        try:
+            strategy.on_tick()
+        except loaf.PerpsOutcomeUnknownError as exc:
+            kind = "margin move" if "fromSide" in exc.signed_body else "exit"
+            sys.exit(
+                f"Stopping: the {kind} signed at your account's nonce "
+                f"{exc.signed_body.get('l2Nonce')} may or may not\n"
+                "  have been applied. Never sign it afresh: a fresh one takes the next nonce,\n"
+                "  so both could apply. A re-send of the same signed body settles it:\n"
+                "  client.perps.resubmit(error.signed_body) answers 202 (applied, before or\n"
+                "  now), and once its expiry has passed a refusal (422) means it was never\n"
+                "  applied. The bot cannot re-send it once stopped: catch\n"
+                "  loaf.PerpsOutcomeUnknownError in your strategy and resubmit\n"
+                "  error.signed_body there (help(loaf.PerpsOutcomeUnknownError) says more)."
+            )
+        except loaf.WithdrawalOutcomeUnknownError as exc:
+            sys.exit(
+                "Stopping: the withdrawal signed at your account's nonce "
+                f"{exc.signed_body.get('l2Nonce')} may or may not\n"
+                "  have been journaled (to be paid out). Never withdraw it afresh: a fresh one\n"
+                "  takes the next nonce, so both could be paid. A re-send of the same signed\n"
+                "  body settles it: client.funds.resubmit(error.signed_body) answers 202\n"
+                "  (journaled, before or now), or is refused ORDER_INDEX_USED (never journaled:\n"
+                "  withdraw again). The bot cannot re-send it once stopped: catch\n"
+                "  loaf.WithdrawalOutcomeUnknownError in your strategy and resubmit\n"
+                "  error.signed_body there (help(loaf.WithdrawalOutcomeUnknownError) also says\n"
+                "  what settles it once the exchange no longer takes the body)."
+            )
+        except loaf.OrderOutcomeUnknownError as exc:
+            index = exc.signed_body.get("l2OrderIndex")
+            sys.exit(
+                f"Stopping: the outcome of order number {index} is unknown. It may be live,\n"
+                "  or already filled. Settle it before you start the bot again:\n"
+                f"  client.orders.cancel_by_index({index}) cancels it if it rests, and voids it\n"
+                "  if it never arrived (a stop or take that was placed is refused there, the\n"
+                "  message naming its id: cancel_conditional that). Never place it afresh.\n"
+                "  To keep the bot running instead, catch the error in on_tick, and resubmit\n"
+                "  its signed body while you still want the order."
+            )
+        except loaf.LoafError as exc:
+            print(f"  tick failed: {exc}; trying again next tick")
+        stop.wait(TICK_SECONDS)
+
+
+def ask_to_stop(stop: threading.Event) -> None:
+    """The first Ctrl-C or SIGTERM: stop after the current tick, and let a second one act as
+    it does in any Python program."""
+    stop.set()
+    signal.signal(signal.SIGINT, signal.default_int_handler)  # raises KeyboardInterrupt
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)  # ends the process
+    print("\nStopping after the current tick (press Ctrl-C again to stop now) ...")
 
 
 def main() -> None:
@@ -439,7 +639,13 @@ def main() -> None:
     if target is None:
         client.close()
         return
-    print(f"\nFollowing market {target.ticker} ({target.name}, index {target.marketIndex}).\n")
+    kind = target.get("type") or "unknown"
+    print(f"\nFollowing market {target.ticker} ({target.get('name')}, {kind}, "
+          f"index {target.get('marketIndex')}).")
+    if kind == "PERP":
+        print("  A perpetual future: its orders open and close leveraged positions, backed by")
+        print("  a margin pool (pool 0, the cross pool, unless an order names another).")
+    print()
     strategy = Strategy(client, target.ticker)
 
     # Wire up the real-time feed.
@@ -464,23 +670,30 @@ def main() -> None:
     ws.subscribe_market_status(target.ticker)
     ws.subscribe_portfolio()  # your private fills/balances stream (your trading key's account)
 
-    ws.start()  # background thread
-    if ws.wait_until_connected(timeout=10):
-        print("Live feed connected. Press Ctrl-C to stop.\n")
-    else:
-        print("Live feed not connected yet; still trying. Press Ctrl-C to stop.\n")
-
+    # Ctrl-C (SIGINT) and SIGTERM (docker stop, systemd, kill) both end the loop after the
+    # current tick, so the shutdown below runs. A tick can take minutes (a placement whose
+    # answer is lost is re-sent), so a second one stops the bot at once: Ctrl-C raises
+    # KeyboardInterrupt, whose shutdown below still runs, and SIGTERM ends the process.
     stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda *_: ask_to_stop(stop))
 
     try:
-        while not stop.is_set():
-            strategy.on_tick()
-            stop.wait(5.0)  # tick every 5 seconds
+        ws.start()  # background thread
+        if ws.wait_until_connected(timeout=10):
+            print("Live feed connected. Press Ctrl-C to stop.\n")
+        else:
+            print("Live feed not connected yet; still trying. Press Ctrl-C to stop.\n")
+        run(strategy, stop)
     finally:
         print("\nShutting down ...")
-        ws.stop()
-        client.close()
+        try:
+            strategy.on_shutdown()
+        except loaf.LoafError as exc:
+            print(f"  on_shutdown failed: {exc}")
+        finally:
+            ws.stop()
+            client.close()
 
 
 if __name__ == "__main__":

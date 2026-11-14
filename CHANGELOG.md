@@ -10,7 +10,11 @@ For each market's own tick and lot, the perps reads as actual values, the
 exchange's perps band around the mark and its coded withdrawal refusals. It
 needs the exchange API that serves each market's decimals and its perps values
 as exact decimal strings; an older SDK's orders are refused there
-(`INVALID_SIGNATURE`: it signs at the old scale).
+(`INVALID_SIGNATURE`: it signs at the old scale). It also takes only an
+encrypted base URL (or one on this machine), gives an order that cannot rest a
+10-minute life, holds every derived price within your max slippage, bounds what
+a read waits for and reads, and makes `bot.py` a template you fill in one
+method of.
 
 ### Breaking
 
@@ -44,8 +48,9 @@ as exact decimal strings; an older SDK's orders are refused there
   market takes. What to change: read the market's decimals.
 - **`worst_price` takes the market's decimals.** `loaf.worst_price(reference_price,
   side, max_slippage_bps, *, price_decimals, quantity_decimals)` rounds toward
-  the reference to the market's tick (at least one tick) and refuses a price
-  above the market's highest. Every price the SDK derives (a MARKET order's
+  the reference to the market's tick and refuses a price above the market's
+  highest, and a BUY's below one tick that one tick would take beyond its max
+  slippage (below). Every price the SDK derives (a MARKET order's
   worst price, a `*_MARKET` stop's or take's booked price, a TP/SL leg's
   limit, a `reference_price` with no slippage) is on the market's tick, and on
   a perp the price on the near side of an off-grid mark is the tick's, not the
@@ -88,9 +93,177 @@ as exact decimal strings; an older SDK's orders are refused there
   can be priced between ticks. A `mark_price` frame's `price` is a `Decimal`
   too (a perp's is its mark). What to change: compare and sum them as
   `Decimal`s.
+- **The base URL must be encrypted, or on this machine.** `base_url` /
+  `$LOAF_API_BASE_URL` must be `https://`, or `http://` only to this machine
+  (`localhost`, 127.0.0.0/8, `[::1]`); `ws_url` / `$LOAF_WS_URL` `wss://`,
+  or `ws://` to this machine. Any other scheme, no scheme, no host, a bad
+  port, a user name or password in the URL, or plain http to another host
+  (a `*.localhost` name included) raises
+  `LoafConfigError` when the client is created (it was taken as given). The
+  scheme and host are lowercased. The SDK sends that host its login tokens
+  (bearer credentials anyone can use for their 10-minute life to read your
+  account and cancel your orders) and your signed orders, and signs orders
+  from its market data, so plain http to another host put all three on the
+  wire unencrypted. What to change: use `https://`; for a dev server on your own
+  network, in a container network or on a `*.localhost` name pass
+  `LoafClient(allow_http=True)` (below); drop any user name and password from
+  the URL.
+- **`loaf.request()` / `loaf.get()` never return text.** A 2xx whose body is
+  not JSON raises `LoafServerError` (`answered a body that is not JSON`)
+  whatever its content type; it was returned as a `str` unless labelled JSON.
+  What to change: a caller of `request()` on a route that answers text
+  catches `LoafServerError` (its `body` holds the text).
+- **A MARKET BUY under one tick is refused where one tick lies beyond your
+  max slippage.** A price the SDK derives never lies further against the
+  order than its whole `max_slippage_bps` from its reference. A BUY off a
+  reference below one tick signs one tick only when one tick lies within the
+  whole max slippage of the reference (and, on a perp, inside the band), and
+  is refused locally otherwise (`LoafValidationError`, status 0: nothing
+  reserved, signed or sent); it was lifted to one tick whatever the slippage
+  (on a perp, while inside the band).
+  The exact form (`reference_price=X, max_slippage_bps=0`) with X below one
+  tick is refused, and `loaf.worst_price()` raises by the same rule. What to
+  change: give a LIMIT order's price where you mean to pay one tick for a
+  token priced below it.
+- **`bot.py`: your strategy goes in `Strategy.trade(bid, ask, mark)`.**
+  `on_tick` calls it only while the market trades and your private stream is
+  not stale, with the tick's best bid and ask (`None` while the book is not
+  known) and the mark. A `TARGET_TICKER` that is not listed stops the bot,
+  printing the listed tickers (it picked another market); empty, the bot
+  follows the first tradeable spot market, else the first tradeable market of
+  any type (it took the first tradeable market, a perp included). What to
+  change: move strategy code from your copy's `on_tick` into `trade`.
+
+### Added
+
+- `LoafClient(allow_http=True)` (and `allow_http=` on `LoafWebSocketClient`,
+  defaulting to its client's setting) also takes plain `http://` and `ws://`
+  to other hosts, for a dev server on your own network or in a container
+  network; never for a remote host. No environment variable turns it on.
+- A `ws_url=` / `$LOAF_WS_URL` on another host than the base URL warns
+  (`UserWarning`) when the client is created: the login token is sent there
+  too.
+- `loaf.constants.DEFAULT_IMMEDIATE_ORDER_TTL_MS` (10 minutes),
+  `MAX_HINTED_WAIT` (10 s), `MAX_RETRY_AFTER` (one day) and
+  `MAX_RESPONSE_BYTES` (32 MiB).
+- `bot.py`: a `[OLD BOOK]` tick flag (no book frame for more than 15 s: bid
+  and ask read `None` that tick, its age taken on the monotonic clock);
+  SIGTERM stops the bot cleanly after the current tick, as Ctrl-C does, and a
+  second Ctrl-C stops it at once (a second SIGTERM ends the process);
+  `Strategy.on_shutdown()` runs as the bot stops and, as shipped, sends
+  nothing (the usual choice once you place tagged orders:
+  `cancel_all(order_tag=BOT_ORDER_TAG)`); `Strategy.quantity_worth(dollars,
+  price)` sizes an order by value on the market's lot, never worth more than
+  `dollars` (`None` when one lot is). A `LoafError` the strategy lets out is
+  printed and the loop goes on; an `OrderOutcomeUnknownError`,
+  `PerpsOutcomeUnknownError` or `WithdrawalOutcomeUnknownError` it lets out
+  stops the bot, printing the order's number or the op's nonce and how to
+  settle it. The `Following market` line names the market's type.
+- A `LICENSE` file (MIT).
 
 ### Changed
 
+- **An order that cannot rest signs a 10-minute life by default.** With
+  `ttl_ms` omitted, a MARKET order, or a LIMIT order with time in force `IOC`
+  or `FOK`, that has no TP/SL legs signs a life of 10 minutes
+  (`DEFAULT_IMMEDIATE_ORDER_TTL_MS`); `GTC` and `POST_ONLY` limits, stops and
+  takes, and any order with TP/SL legs keep 7 days, and an explicit
+  `ttl_ms=` always wins. An order's signature covers neither its type nor its
+  time in force, and a placement carries no login token, so a copy of a
+  signed order can be placed as a resting limit at its signed price while its
+  life lasts and its order number is unused; ten minutes rather than the
+  one-minute minimum keeps room for a clock up to 5 minutes slow. What to
+  change: `resubmit` an `OrderOutcomeUnknownError`'s body of such an order
+  within its 10 minutes, or settle it with `cancel_by_index`.
+- **A read waits out a hint of at most 10 s.** A read retries a 429 or a 503
+  after its `Retry-After` (a 429's `RateLimit-Reset` without one) only when
+  that is at most `MAX_HINTED_WAIT`; a longer hint is raised at once (a 429
+  as `LoafRateLimitError`, a 503 as `LoafServiceUnavailableError`, each with
+  its `retry_after`), where it waited up to 60 s for each retry. Without a
+  usable hint the jittered backoff applies; the reads a placement makes are
+  unchanged. `retry_after` (`LoafRateLimitError`, and now every
+  `LoafServiceUnavailableError`, `TradingPausedError` included) is finite, 0
+  to 86,400 s, or `None`, and
+  `client.last_rate_limit` holds only finite values from 0 up. What to
+  change: bound your own wait on `retry_after`, e.g.
+  `time.sleep(min(e.retry_after or 5, 60))`.
+- **What settles a signed op.** A 2xx answers an order only as a JSON object
+  whose `success` is not false and whose `orderId` is a whole number, and a
+  perps op or a withdrawal only so with a whole-number `journalSeq`; any other
+  2xx, and an answer whose body arrived but cannot be interpreted, raises the
+  op's outcome-unknown error (unless its status is itself a refusal below
+  500), not re-sent, as does an answer of any status whose body was not read
+  to its end (see **Bounded answers**). A 503 without a code counts as
+  nothing done only when the exchange's JSON error object says so, never a
+  page that is not JSON. `LoafAPIError.code` is always a string or `None`.
+- **A market detail that names another market is refused.** Every order and
+  `orders.warm` refuse (`LoafServerError`, `GET /trade/{ticker} answered an
+  unusable market.<field>`) a detail whose `market.ticker` is not the ticker
+  asked for, whose `type` is not `PERP` exactly for a `-PERP` ticker (and
+  `SPOT` for any other), or whose `marketIndex` does not fit its type (a
+  perp's 0 to 254, a spot market's above). `cancel_all(ticker)` and
+  `cancel_after(..., ticker=)` refuse such a detail too, and send no cancel.
+- **Bounded answers.** A response body over 32 MiB decoded, or still arriving
+  past the read timeout, raises `LoafConnectionError` on a read (not
+  retried) and is an unknown outcome for a signed op (not re-sent), whatever
+  its status. Reading stops once what has been decoded passes 32 MiB, so the
+  most held is that plus one decoded network read; every request the SDK
+  sends carries `Accept-Encoding: gzip, deflate` whatever decoders are
+  installed (never brotli or zstd, whose read decodes to any size), and an
+  answer that names any other `Content-Encoding` (two stacked, or brotli) is
+  refused the same way before any of it is read, with your own
+  `http_client=` too. The
+  iterators
+  (`history.iter_orders`, `iter_trades`, `iter_funding`,
+  `market.iter_candles`) raise `LoafServerError` on a page they cannot page
+  on (not an object, its rows not a list, a cursor that is not one, an empty
+  page that still points onward), where they stopped or went on. An error
+  built from a page that is not JSON has its message cut to about 500
+  characters; `.body` keeps it all.
+- **The WebSocket beat sees a slow handler.** `on_stale` has a reason
+  `"behind"`: a handler is too slow for the feed, so what is being handled is
+  older than `stale_after`. It fires once an account snapshot's `engineMs`
+  lags this machine's clock by more than `stale_after` plus one second (a
+  snapshot waits for the next beat before it is sent) beyond the least lag of
+  the connection, which may rise by 0.1% of the time since, for drift between
+  the two clocks. While behind, `fresh` is `False`; `on_fresh` fires at the
+  next snapshot back within bounds. A connection still behind after 15 s is
+  closed (`on_disconnect` 1006, `the handlers stayed behind the feed`) and
+  reconnected, without the frames queued on it (with `auto_reconnect=False`
+  the run ends there, as after any other ended connection). A frame counts as a beat from
+  when it is taken off the socket, before its handlers, and `fresh` reads
+  `False` from any thread once `stale_after` seconds pass since the last
+  beat, even while a handler blocks the loop; the first frame after such a
+  block fires `on_stale("silent")`, then `on_fresh`.
+- **A handler cannot end the feed silently.** A handler's
+  `asyncio.CancelledError` is logged and swallowed like any exception. A
+  handler's `SystemExit`, its `KeyboardInterrupt` on the background thread
+  (`start()`), or a cancellation `stop()` did not ask for, ends the run with
+  `on_stale("disconnected")` if it was fresh, then `on_disconnect` with
+  `code` `None` and the exception's type name as `reason`, and an ERROR log;
+  `fresh` is then `False` until `start()`, `run_forever()` or `stop()`, and
+  nothing reconnects by itself. `run_forever` raises the `SystemExit` again;
+  under it a `KeyboardInterrupt`, in a handler's code too, is Ctrl-C: the
+  client stops as with `stop()`, and `run_forever` returns. A run that ends
+  after `stop()` stopped waiting for it reports nothing and changes nothing
+  of the run `start()` begins next.
+- **WebSocket bounds.** The reconnect wait's ceiling doubles after each
+  attempt that does not stay live 10 s after `on_connect`, up to 30 s (it
+  started over at any `on_connect`). A frame may be up to 16 MiB (it was
+  websockets' 1 MiB); a larger one closes the connection with 1009, and
+  `on_disconnect` reports the close code the client sent when it received
+  none (it reported 1006). A server `error` frame with no `on_error` handler
+  registered is logged at WARNING. `stop()` waits up to 5 s, then logs a
+  WARNING and returns if the thread is still running, and no frame queued
+  before `stop()` reaches a handler after it.
+- `examples/03` and `examples/06` use the first tradeable spot market (and
+  exit if there is none, or if its `minOrderValue` is missing), place with a
+  five-minute life, and always cancel what they placed: by its order number
+  (`cancel_by_index`) when even their resubmit cannot tell whether it landed.
+- Dependencies have upper bounds (`httpx<1`, `websockets<18`) and floors for
+  `h11`, `idna` and `certifi` that exclude versions with published
+  advisories. `.gitignore` also covers `.env.*` (not `.env.example`),
+  `.envrc` and `*.log`.
 - **The prices the SDK derives on a perp follow its band.** The exchange
   holds every perps order's price within the market's band (`market.l2.band`
   basis points) around its mark, and, when it is placed, a perps stop's,
@@ -109,9 +282,10 @@ as exact decimal strings; an older SDK's orders are refused there
   when that price is positive, inside the band and within your whole max
   slippage; else the crossing price is kept if it is inside the band; else the
   order is refused locally (`LoafValidationError`, status 0: nothing reserved,
-  signed or sent). A MARKET BUY off a reference under one tick starts at one
-  tick, the lowest price, and is refused so too unless that price is inside
-  the band (off a mark of half a tick, a band of 10,000 bp or more). A trigger
+  signed or sent). A MARKET BUY off a reference under one tick signs one
+  tick, the lowest price, only when that price is inside the band and within
+  your whole max slippage of the reference (above), and is refused so too
+  otherwise. A trigger
   is on the tick, so a stop's or a leg's price never crosses.
   A price you give exactly (a LIMIT order's, a `*_LIMIT` row's, or
   `reference_price` with `max_slippage_bps=0`) is signed as given, never moved
@@ -147,8 +321,19 @@ as exact decimal strings; an older SDK's orders are refused there
   `WithdrawalOutcomeUnknownError`. What to change: a bot that resubmits until
   the body's window closes withdraws again on this code instead.
 
+### Removed
+
+- The `e2e/` directory: its full-stack tests are no longer part of this
+  repository.
+
 ### Fixed
 
+- No login token is left in the locals a traceback records for the SDK's,
+  httpx's or httpcore's finished frames, across a raised error's whole chain,
+  nor on the request an httpx error raised inside the SDK call carries; crash
+  reporters and debuggers record both. An exception you were handling when
+  you called the SDK, chained as the error's `__context__`, is left as it
+  was.
 - A 401 coded `INVALID_SIGNATURE` names your trading key not in force,
   whatever its text: a withdrawal's `l2 money: the signing key is not the key
   the journal set for the api key` had no such hint.
