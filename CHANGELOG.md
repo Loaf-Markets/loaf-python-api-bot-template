@@ -133,6 +133,14 @@ method of.
   follows the first tradeable spot market, else the first tradeable market of
   any type (it took the first tradeable market, a perp included). What to
   change: move strategy code from your copy's `on_tick` into `trade`.
+- **`history.cancelled_orders()` is paged.** Each request examines your next
+  1,000 orders by placement, newest first, cancelled or not, and answers the
+  cancelled ones among them, `{cancelledOrders, nextCursor}`: a page can be
+  short or empty while older orders remain, and only `nextCursor` `None` is
+  the end. It answered every cancel at once, newest cancel first; rows now
+  come newest order first. What to change: pass each
+  `nextCursor` back as `cancelled_orders(cursor=)`, or walk them all with
+  `history.iter_cancelled_orders()`; never stop at an empty page.
 
 ### Added
 
@@ -160,6 +168,7 @@ method of.
   stops the bot, printing the order's number or the op's nonce and how to
   settle it. The `Following market` line names the market's type.
 - A `LICENSE` file (MIT).
+- `history.cancelled_orders(cursor=)` and `history.iter_cancelled_orders()`.
 
 ### Changed
 
@@ -247,6 +256,17 @@ method of.
   client stops as with `stop()`, and `run_forever` returns. A run that ends
   after `stop()` stopped waiting for it reports nothing and changes nothing
   of the run `start()` begins next.
+- **The exchange bounds its reads.** An order book, the `orderbook:{ticker}`
+  frames and `market.get(ticker).orderBook` alike, holds its best 200 levels
+  a side. A candles page coarser than `1m` can hold fewer than `count_back`
+  while `hasMore` is true (`market.iter_candles` pages on from it). An offset
+  page of `history.orders()` with no cursor must start before row 20,000, of
+  `history.trades()` before row 10,000 (`(page - 1) * page_size`); one deeper
+  is refused with a 400 (`LoafValidationError`). The history reads and `GET
+  /l2/keys` count against your account's own rate limit too. What to change:
+  page history deeply with the cursor (the iterators do); read a depth past
+  200 levels as unknown, not empty; never take a short candles page for the
+  end.
 - **WebSocket bounds.** The reconnect wait's ceiling doubles after each
   attempt that does not stay live 10 s after `on_connect`, up to 30 s (it
   started over at any `on_connect`). A frame may be up to 16 MiB (it was

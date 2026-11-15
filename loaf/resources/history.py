@@ -5,8 +5,11 @@
 take ``nextCursor`` from one response and pass it as ``cursor`` to the next.
 Pass back only ``nextCursor`` values: a malformed cursor silently returns the
 first page. Do not derive "has more" from ``total`` (it is capped at 10000, for
-trades too). ``funding`` pages by cursor alone. A fill's or funding payment's
-value served as no exact decimal string raises
+trades too). An offset page with no cursor must start before row 20000 of
+orders, 10000 of trades (``(page - 1) * page_size``); one deeper is refused
+with a 400 (:class:`~loaf.exceptions.LoafValidationError`): page deeper with
+the cursor. ``funding`` and ``cancelled_orders`` page by cursor alone. A
+fill's or funding payment's value served as no exact decimal string raises
 :class:`~loaf.exceptions.LoafServerError` naming it: it is never read in
 another unit.
 """
@@ -123,14 +126,19 @@ class HistoryResource(Resource):
         )
         return _served.read(answer, _served.funding, "GET /history/funding")
 
-    def cancelled_orders(self) -> Any:
-        """``GET /history/orders/cancelled`` — all cancel events, newest first (not paginated).
+    def cancelled_orders(self, *, cursor: str | None = None) -> Any:
+        """``GET /history/orders/cancelled`` — the cancelled orders among your
+        next 1000 orders, newest placed first.
 
-        Returns ``{"cancelledOrders": [{orderId, cancelledAt}]}``. Cancelled
-        BOOKED orders only; a cancelled conditional never appears here. Includes
-        the exchange's own cancels: an expired order or an epoch move.
+        Returns ``{"cancelledOrders": [{orderId, cancelledAt}], nextCursor}``.
+        Each page examines 1000 of your orders, cancelled or not, so a page can
+        be short or empty while older orders remain: page on with ``cursor``
+        until ``nextCursor`` is ``None`` (or use
+        :meth:`iter_cancelled_orders`). Cancelled BOOKED orders only; a
+        cancelled conditional never appears here. Includes the exchange's own
+        cancels: an expired order or an epoch move.
         """
-        return self._client.get("/history/orders/cancelled")
+        return self._client.get("/history/orders/cancelled", params={"cursor": cursor})
 
     def active_orders(self) -> Any:
         """``GET /history/orders/active`` — currently open / partially-filled orders.
@@ -179,14 +187,30 @@ class HistoryResource(Resource):
             "/history/funding", "funding", lambda cursor: self.funding(page_size=page_size, cursor=cursor)
         )
 
-    def _iter(self, path: str, key: str, read: Callable[[str | None], Any]) -> Iterator[Any]:
+    def iter_cancelled_orders(self) -> Iterator[Any]:
+        """Yield every cancelled order across all pages using cursor pagination,
+        an empty page included: one request per 1000 of your orders. A
+        ``nextCursor`` the server already gave raises
+        :class:`~loaf.exceptions.LoafError` instead of paging forever, and a
+        page that cannot be paged on (not an object, its rows not a list, or a
+        cursor that is not one) :class:`~loaf.exceptions.LoafServerError`."""
+        yield from self._iter(
+            "/history/orders/cancelled",
+            "cancelledOrders",
+            lambda cursor: self.cancelled_orders(cursor=cursor),
+            empty_pages=True,
+        )
+
+    def _iter(
+        self, path: str, key: str, read: Callable[[str | None], Any], *, empty_pages: bool = False
+    ) -> Iterator[Any]:
         """Each ``key`` row of ``path``'s pages, as ``read`` (the page at a cursor) serves them.
 
         A page that is not one raises :class:`~loaf.exceptions.LoafServerError` instead of
         paging on: not an object, its rows not a list, a ``nextCursor`` that is not a string,
-        or no rows yet a ``nextCursor`` (or ``hasMore``) pointing on. A ``nextCursor`` that is
-        null or empty ends the walk. A ``nextCursor`` the server already gave raises
-        :class:`~loaf.exceptions.LoafError`."""
+        or no rows yet a ``hasMore``, or a ``nextCursor`` unless ``empty_pages``, pointing on. A
+        ``nextCursor`` that is null or empty ends the walk. A ``nextCursor`` the server already
+        gave raises :class:`~loaf.exceptions.LoafError`."""
         cursor: str | None = None
         followed: set[str] = set()
         while True:
@@ -204,7 +228,7 @@ class HistoryResource(Resource):
                 return
             if not isinstance(cursor, str):
                 raise _unusable(path, f"a nextCursor that is not one ({cursor!r:.40})", page)
-            if not rows:
+            if not rows and not empty_pages:
                 raise _unusable(path, "an empty page that points to another", page)
             if cursor in followed:
                 raise LoafError(f"GET {path} answered a nextCursor it had already given; stopped paging")

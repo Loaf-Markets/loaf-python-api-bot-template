@@ -305,6 +305,52 @@ def test_a_history_page_that_cannot_be_paged_on_raises(key, page, error):
     assert info.value.status_code == 200 and len(sent) == 1
 
 
+@pytest.mark.parametrize(
+    "page, error",
+    [
+        ([], "a page that is not an object"),
+        ({}, "is not a list"),
+        ({"cancelledOrders": {"orderId": 1}}, "is not a list"),
+        ({"cancelledOrders": [], "nextCursor": 7}, "a nextCursor that is not one"),
+    ],
+)
+def test_a_cancelled_orders_page_that_cannot_be_paged_on_raises(page, error):
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json=page)
+
+    with pytest.raises(loaf.LoafServerError, match=error) as info:
+        list(make_client(handler).history.iter_cancelled_orders())
+    assert info.value.status_code == 200 and len(sent) == 1
+
+
+def test_empty_cancelled_orders_pages_with_a_repeated_cursor_stop_paging():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.params.get("cursor"))
+        assert len(sent) < 10, "paged forever"
+        return httpx.Response(200, json={"cancelledOrders": [], "nextCursor": "same"})
+
+    with pytest.raises(loaf.LoafError, match="already given"):
+        list(make_client(handler).history.iter_cancelled_orders())
+    assert sent == [None, "same"]
+
+
+@pytest.mark.parametrize("last", [None, ""])
+def test_an_empty_first_cancelled_orders_page_with_no_cursor_ends_the_walk(last):
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"cancelledOrders": [], "nextCursor": last})
+
+    assert list(make_client(handler).history.iter_cancelled_orders()) == []
+    assert len(sent) == 1
+
+
 @pytest.mark.parametrize("key", ITERATORS)
 @pytest.mark.parametrize("last", [None, ""])
 def test_a_null_or_empty_next_cursor_ends_the_walk(key, last):

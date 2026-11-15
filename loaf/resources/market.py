@@ -73,7 +73,8 @@ class MarketResource(Resource):
         a market index to its ticker. An offering's row, ``type`` ``IPO``,
         stands in for its asset's spot market while that is missing or
         ``PENDING``, with that market's index or ``None``), the current
-        ``orderBook`` snapshot (``bids``/``asks`` price levels),
+        ``orderBook`` snapshot (``bids``/``asks`` price levels, the best 200
+        a side),
         ``recentTrades``, ``volume24h``, ``dailyReferencePrice`` and
         ``liquidity``. Candle history is NOT included — fetch it from the
         dedicated :meth:`candles` endpoint.
@@ -199,8 +200,9 @@ class MarketResource(Resource):
                 ``4h``, ``1d``, ``1w`` (:class:`~loaf.enums.CandleResolution`).
             to: only return candles strictly OLDER than this unix-seconds
                 timestamp. Omit for the most recent candles.
-            count_back: how many candles to return (server default 1000, at
-                most 1500).
+            count_back: the most candles to return (server default 1000, at
+                most 1500). A page coarser than ``1m`` can hold fewer while
+                ``hasMore`` is true: page on from its ``oldestTs``.
 
         Returns ``{resolution, candles, oldestTs, hasMore}`` where ``candles``
         is oldest -> newest, each ``{time, open, high, low, close, volume}``.

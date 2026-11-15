@@ -28,8 +28,9 @@ perp):
 ==================  ========  ===========================================
 Channel             Auth      What you receive
 ==================  ========  ===========================================
-orderbook:{ticker}  public    the full bid/ask book, on change (at most one frame per 100 ms) and
-                              again every 5 s unchanged, empty books included (no frame on subscribe)
+orderbook:{ticker}  public    the best 200 bid/ask levels a side, on change (at most one frame per
+                              100 ms) and again every 5 s unchanged, empty books included (no frame
+                              on subscribe)
 trades:{ticker}     public    every trade, at most one frame per 100 ms (the recent ones on subscribe)
 chart:{ticker}      public    OHLCV candle updates (note: singular "chart")
 markprice:{ticker}  public    canonical mark price (1s, on change)
@@ -192,7 +193,7 @@ _MAX_RECONNECT_DELAY = 30.0
 # reconnect_delay, in seconds: a server that accepts and closes at once keeps the wait growing.
 _STABLE_CONNECTION = 10.0
 
-# The largest frame the client takes, in bytes: a whole book can outgrow websockets' 1 MiB default.
+# The largest frame the client takes, in bytes: a frame can outgrow websockets' 1 MiB default.
 _MAX_FRAME_SIZE = 16 * 1024 * 1024
 
 # The most characters of a server error frame's code and message that go to the log.
@@ -348,9 +349,9 @@ class LoafWebSocketClient:
 
     # public market data
     def on_orderbook(self, handler: Handler | None = None) -> Any:
-        """A market's whole book (``orderbook_update``: ``{ticker, bids, asks,
-        engineMs}``, a :class:`~loaf.models.OrderBook`): replace what you hold
-        for ``ticker``.
+        """A market's book, its best 200 levels a side (``orderbook_update``:
+        ``{ticker, bids, asks, engineMs}``, a :class:`~loaf.models.OrderBook`):
+        replace what you hold for ``ticker``.
 
         Sent on change, at most one frame per market every 100 ms, and again
         every 5 s unchanged (an empty book too), so the first frame can take up

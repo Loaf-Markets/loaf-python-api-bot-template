@@ -1009,7 +1009,7 @@ def test_each_connection_measures_its_own_lag():
 
 
 # ---------------------------------------------------------------------------
-# Frame size: a whole book can outgrow websockets' 1 MiB default
+# Frame size: a frame can outgrow websockets' 1 MiB default
 # ---------------------------------------------------------------------------
 
 

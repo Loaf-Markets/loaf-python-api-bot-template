@@ -30,6 +30,7 @@ class PriceLevel(TypedDict):
 
 
 class OrderBook(TypedDict, total=False):
+    # The best 200 levels a side, best first.
     ticker: str  # an orderbook_update frame's, its channel's; absent on a detail's orderBook
     bids: list[PriceLevel]
     asks: list[PriceLevel]

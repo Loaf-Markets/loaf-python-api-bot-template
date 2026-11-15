@@ -632,6 +632,40 @@ def test_iter_history_follows_the_cursor(key, iterate):
     ]
 
 
+def test_cancelled_orders_sends_its_cursor():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, dict(request.url.params)))
+        return httpx.Response(200, json={"cancelledOrders": [], "nextCursor": None})
+
+    client = make_client(handler)
+    client.history.cancelled_orders()
+    client.history.cancelled_orders(cursor="MTAwOjI")
+    assert sent == [
+        ("/api/history/orders/cancelled", {}),
+        ("/api/history/orders/cancelled", {"cursor": "MTAwOjI"}),
+    ]
+
+
+def test_iter_cancelled_orders_walks_an_empty_page_to_a_null_cursor():
+    pages = {
+        None: {"cancelledOrders": [{"orderId": 9, "cancelledAt": 3}], "nextCursor": "a"},
+        "a": {"cancelledOrders": [], "nextCursor": "b"},
+        "b": {"cancelledOrders": [{"orderId": 4, "cancelledAt": 1}], "nextCursor": None},
+    }
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.params.get("cursor"))
+        assert len(sent) <= len(pages), "paged past the last page"
+        return httpx.Response(200, json=pages[sent[-1]])
+
+    rows = make_client(handler).history.iter_cancelled_orders()
+    assert [row.orderId for row in rows] == [9, 4]
+    assert sent == [None, "a", "b"]
+
+
 def test_portfolio_and_funding_routes():
     sent = []
 

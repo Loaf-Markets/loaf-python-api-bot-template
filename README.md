@@ -293,9 +293,9 @@ portfolio.set_perps_leverage(ticker, leverage)
 
 history.orders() / trades() / funding()
                                       GET    /history/orders, /history/trades, /history/funding
-history.cancelled_orders()            GET    /history/orders/cancelled
+history.cancelled_orders(cursor=)     GET    /history/orders/cancelled (cancels among your next 1000 orders; a page can be empty)
 history.active_orders()               GET    /history/orders/active
-history.iter_orders() / iter_trades() / iter_funding()
+history.iter_orders() / iter_trades() / iter_funding() / iter_cancelled_orders()
                                       (auto-paginate via cursor)
 ```
 
@@ -1241,7 +1241,7 @@ Channels:
 
 | Channel | Auth | Handler | Payload |
 | --- | --- | --- | --- |
-| `orderbook:{ticker}` | public | `on_orderbook` | full-depth bid/ask snapshot when the book changes (throttled) and again every 5 s even when it did not, empty books included; no initial frame — seed from `market.get(ticker).orderBook` |
+| `orderbook:{ticker}` | public | `on_orderbook` | the best 200 bid/ask levels a side, a snapshot when the book changes (throttled) and again every 5 s even when it did not, empty books included; no initial frame — seed from `market.get(ticker).orderBook` |
 | `trades:{ticker}` | public | `on_trades` | every trade, in at most one frame every 100 ms holding every trade since the previous one, newest first; right after subscribing, the recent trades (up to 20) once, before `on_connect` — dedupe by `tradeId` |
 | `chart:{ticker}` | public | `on_candle` | OHLCV candle updates |
 | `markprice:{ticker}` | public | `on_mark_price` | canonical mark price (1s, on change) |
@@ -1533,8 +1533,9 @@ might have landed raises `OrderOutcomeUnknownError` instead. `LoafServerError` w
 means an answer the SDK cannot use: a body that is not JSON, whatever its
 content type (`answered a body that is not JSON`: `loaf.request()` and
 `loaf.get()` never return text), or a page the iterators
-(`history.iter_orders`, `iter_trades`, `iter_funding`, `market.iter_candles`)
-cannot page on, an empty page that still points onward among them. An error
+(`history.iter_orders`, `iter_trades`, `iter_funding`,
+`iter_cancelled_orders`, `market.iter_candles`) cannot page on, an empty page
+that still points onward among them (but for `iter_cancelled_orders`). An error
 answered with a page that is not JSON has its message cut to about 500
 characters; `e.body` keeps the whole page. `e.code` is always a string or
 `None`.
@@ -1582,8 +1583,9 @@ with `loaf.funds.resubmit(e.signed_body)`); see **Withdrawals**.
 
 The backend rate limits requests per IP and sends standard `RateLimit-*`
 headers (snapshot at `loaf.last_rate_limit`). Order placements, cancels,
-order-number reservations, withdrawals, perps allocates and exits, and
-portfolio reads are additionally limited **per account** (a placement counts
+order-number reservations, withdrawals, perps allocates and exits, portfolio
+and history reads, and `GET /l2/keys` (the epoch and nonce reads) are
+additionally limited **per account** (a placement counts
 for the account it is signed for), so rotating
 IPs doesn't raise the ceiling. Reads are retried automatically on 429, 503 and
 network errors: after the answer's positive `Retry-After` (a 429's
