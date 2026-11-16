@@ -144,6 +144,10 @@ class OrderErrorCode(_StrEnum):
     TRIGGER_THROUGH = "TRIGGER_THROUGH"
     #: Its signed fee-rate cap is below the rate it trades at.
     FEE_RATE_CAP_TOO_LOW = "FEE_RATE_CAP_TOO_LOW"
+    #: A withdrawal's: the withdraw fee in force is above the most it accepts (``max_fee``, its
+    #: ``maxWithdrawFee``), raised since it was read. Nothing was taken; the SDK reads the fee
+    #: again for the next withdrawal.
+    WITHDRAW_FEE_ABOVE_MAX = "WITHDRAW_FEE_ABOVE_MAX"
     # The signed fields: sign again.
     #: The signature, its key or its account does not verify (401).
     INVALID_SIGNATURE = "INVALID_SIGNATURE"

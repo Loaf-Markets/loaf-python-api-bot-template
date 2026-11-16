@@ -16,7 +16,7 @@ import time
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 import httpx
 import pytest
@@ -252,6 +252,9 @@ KEYS = {
 NONCE_REFUSAL = "l2 money: the nonce is not the api key's nonce (tx_nonce == api_key.nonce)"
 # The exchange's 400 ORDER_EXPIRY_INVALID for a withdrawal whose expiry is inside the 72-hour buffer.
 EXPIRY_INSIDE_BUFFER = "l2 expiry: the expiry is inside the buffer"
+# The exchange's 422 WITHDRAW_FEE_ABOVE_MAX: the withdraw fee in force is above the body's
+# maxWithdrawFee (absent: 0), checked after the duplicate and the nonce.
+FEE_ABOVE_MAX = "l2 money: the withdraw fee is above the request's max_withdraw_fee"
 
 # The backend's 401s to a request whose login token it does not take, each with code
 # UNAUTHENTICATED (login_reply).
@@ -394,7 +397,9 @@ class FakeExchange:
     * ``GET /portfolio/summary`` serves no balances or holdings, and as its
       ``perps`` ``perps_account`` with ``perps_collateral`` as its collateral
       (``perps_account`` ``None``: ``perps`` null, as when the exchange could not
-      read it).
+      read it), and as its ``withdrawFee`` ``withdraw_fee`` (``"0"``: none set;
+      ``None`` serves null), none at all while ``serves_withdraw_fee`` is false
+      (an exchange before the fee).
     * ``GET /portfolio/component`` serves as its ``perpsLeverage`` the
       ``perps_leverage`` saved.
     * ``PUT /portfolio/perps-leverage`` saves its body's leverage in
@@ -406,7 +411,10 @@ class FakeExchange:
       withdrawal's with code ``ORDER_INDEX_USED``). A withdrawal is first refused 400
       ``ORDER_EXPIRY_INVALID`` when its expiry is inside the buffer (by ``now_ms``),
       and its 202 echoes its terms with ``status`` PENDING. A withdrawal's refusal
-      is ``{error, code}``, as an order's.
+      is ``{error, code}``, as an order's. After the duplicate and the nonce, a
+      withdrawal is refused 422 ``WITHDRAW_FEE_ABOVE_MAX`` while ``withdraw_fee``
+      is above its ``maxWithdrawFee`` (absent: 0), nothing applied; its 202 names
+      the fee it paid, ``withdrawFee`` (a duplicate's its first's).
 
     ``queue(path, *replies)`` makes ``path`` (without ``/api``) answer with each
     reply in turn before any of that, once its login token is taken: an
@@ -429,8 +437,11 @@ class FakeExchange:
         self.perps_collateral: dict[str, Any] | None = dict(PERPS_COLLATERAL)
         self.perps_account: dict[str, Any] | None = json.loads(json.dumps(PERPS_ACCOUNT))
         self.perps_leverage: dict[str, int] = {}
-        # The ops applied, by nonce: (their body, their journal seq).
+        self.withdraw_fee: Any = "0"
+        self.serves_withdraw_fee = True
+        # The ops applied, by nonce: (their body, their journal seq); a withdrawal's fee paid.
         self.applied: dict[int, tuple[bytes, int]] = {}
+        self.fees_paid: dict[int, str] = {}
         self._next_seq = 1000
 
     def queue(self, path: str, *replies: Any) -> None:
@@ -490,7 +501,10 @@ class FakeExchange:
             )
         if route == "GET /portfolio/summary":
             perps = self.perps_account and {**self.perps_account, "collateral": self.perps_collateral}
-            return httpx.Response(200, json={"balances": [], "holdings": [], "perps": perps})
+            summary: dict[str, Any] = {"balances": [], "holdings": [], "perps": perps}
+            if self.serves_withdraw_fee:
+                summary["withdrawFee"] = self.withdraw_fee
+            return httpx.Response(200, json=summary)
         if route == "GET /portfolio/component":
             leverage = [{"ticker": t, "leverage": v} for t, v in sorted(self.perps_leverage.items())]
             return httpx.Response(200, json={"perpsLeverage": leverage})
@@ -507,9 +521,19 @@ class FakeExchange:
                 return httpx.Response(
                     400, json={"error": EXPIRY_INSIDE_BUFFER, "code": "ORDER_EXPIRY_INVALID"}
                 )
-            reply = self._apply(request.content, nonce_code="ORDER_INDEX_USED")
+            fee = self.withdraw_fee or "0"
+
+            def fee_check() -> httpx.Response | None:
+                if Decimal(fee) <= Decimal(body.get("maxWithdrawFee", "0")):
+                    return None
+                return httpx.Response(
+                    422, json={"error": FEE_ABOVE_MAX, "code": "WITHDRAW_FEE_ABOVE_MAX"}
+                )
+
+            reply = self._apply(request.content, nonce_code="ORDER_INDEX_USED", check=fee_check)
             if reply.status_code != 202:
                 return reply
+            paid = self.fees_paid.setdefault(body["l2Nonce"], fee)
             return httpx.Response(
                 202,
                 json={
@@ -518,6 +542,7 @@ class FakeExchange:
                     "assetId": body["l2AssetId"],
                     "amount": int(body["amount"]),
                     "nonce": body["l2Nonce"],
+                    "withdrawFee": paid,
                     "status": {"status": "PENDING"},
                 },
             )
@@ -542,10 +567,16 @@ class FakeExchange:
             )
         return httpx.Response(404, json={"error": "Not found"})
 
-    def _apply(self, content: bytes, nonce_code: str | None = None) -> httpx.Response:
+    def _apply(
+        self,
+        content: bytes,
+        nonce_code: str | None = None,
+        check: Callable[[], httpx.Response | None] | None = None,
+    ) -> httpx.Response:
         """A signed perps op or withdrawal: applied once, at the account's nonce
         (signatures are not checked here: verify_op does that). One off the nonce is
-        refused 422, with ``nonce_code`` as its code when given."""
+        refused 422, with ``nonce_code`` as its code when given; then ``check``'s
+        refusal, if it answers one, applies nothing."""
         nonce = json.loads(content)["l2Nonce"]
         if nonce in self.applied:
             body, seq = self.applied[nonce]
@@ -556,6 +587,9 @@ class FakeExchange:
             return httpx.Response(
                 422, json=refusal if nonce_code is None else {**refusal, "code": nonce_code}
             )
+        refused = check() if check is not None else None
+        if refused is not None:
+            return refused
         self._next_seq += 1
         self.applied[nonce] = (content, self._next_seq)
         self.keys["withdrawalNonce"] = nonce + 1

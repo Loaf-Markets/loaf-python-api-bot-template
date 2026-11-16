@@ -113,9 +113,11 @@ _EXIT_KEYS = ("pool", "market")
 class PerpsResource(Resource):
     def __init__(self, client: LoafClient) -> None:
         super().__init__(client)
-        #: The collateral an allocate is counted in, read once (under ``_collateral_lock``).
+        #: The collateral an allocate is counted in, read once, and the withdraw fee the same
+        #: summary served, read again while unknown (both under ``_collateral_lock``).
         self._collateral_lock = threading.Lock()
         self._kept_collateral: _Collateral | None = None
+        self._kept_withdraw_fee: Decimal | None = None
 
     # -- Your pools and positions ------------------------------------------- #
 
@@ -403,7 +405,33 @@ class PerpsResource(Resource):
             if self._kept_collateral is None:
                 answer = self._client._request("GET", "/portfolio/summary", before_order=True)
                 self._kept_collateral = _collateral_of(answer)
+                if self._kept_withdraw_fee is None:
+                    try:  # the withdrawal's to refuse, never the allocate's
+                        self._kept_withdraw_fee = _withdraw_fee_of(answer)
+                    except LoafServerError:
+                        pass
             return self._kept_collateral
+
+    def _withdrawal_terms(self) -> tuple[_Collateral, Decimal | None]:
+        """The collateral a withdrawal's amount is counted in and the withdraw fee it accepts
+        (its ``maxWithdrawFee``), from your summary: one read gives both. The collateral is kept
+        as an allocate's; the fee is read again while the last read gave none (an exchange that
+        serves none, or no USDC row) and after a withdrawal refused for it
+        (:meth:`_forget_withdraw_fee`): the most a withdrawal accepts is the fee last read."""
+        with self._collateral_lock:
+            collateral, fee = self._kept_collateral, self._kept_withdraw_fee
+            if collateral is None or fee is None:
+                answer = self._client._request("GET", "/portfolio/summary", before_order=True)
+                fee = _withdraw_fee_of(answer)
+                if collateral is None:
+                    collateral = _collateral_of(answer)
+                self._kept_collateral, self._kept_withdraw_fee = collateral, fee
+            return collateral, fee
+
+    def _forget_withdraw_fee(self) -> None:
+        """A withdrawal was refused ``WITHDRAW_FEE_ABOVE_MAX``: the next one reads the fee again."""
+        with self._collateral_lock:
+            self._kept_withdraw_fee = None
 
 
 def _perps_of(summary: Any) -> Mapping[str, Any]:
@@ -450,6 +478,27 @@ def _collateral_of(answer: Any) -> _Collateral:
     with localcontext(_EXACT):
         tick = Decimal(tick_size).scaleb(-decimals)
     return _Collateral(row, symbol, decimals, tick_size, tick)
+
+
+def _withdraw_fee_of(answer: Any) -> Decimal | None:
+    """A summary's ``withdrawFee``, the withdraw fee in force, as its exact Decimal; ``None`` when
+    it serves none (an exchange before the fee, no USDC row, or unread), and
+    :class:`LoafServerError` for one served as no exact decimal string of 0 or more."""
+    fee = answer.get("withdrawFee") if isinstance(answer, Mapping) else None
+    if fee is None:
+        return None
+    try:
+        value = _served.decimal(fee, "withdrawFee")
+        if value < 0:
+            raise _served.Malformed("withdrawFee", fee)
+    except _served.Malformed as exc:
+        raise LoafServerError(
+            f"GET /portfolio/summary answered {exc}: a withdrawal accepts the fee it read, which "
+            "the SDK never assumes",
+            status_code=200,
+            body=answer,
+        ) from None
+    return value
 
 
 def _decimal_string(value: Any, high: int) -> int | None:

@@ -24,8 +24,8 @@ class PortfolioResource(Resource):
     def summary(self) -> Any:
         """``GET /portfolio/summary`` — what you hold.
 
-        Returns ``{balances, holdings, perps, accountMode, withdrawable}``
-        (:class:`~loaf.models.PortfolioSummary`).
+        Returns ``{balances, holdings, perps, accountMode, withdrawable,
+        withdrawFee}`` (:class:`~loaf.models.PortfolioSummary`).
 
         ``balances`` is your whole L2 book, one row per asset with a balance or
         a hold: ``{assetId, symbol, decimals, isQuote, total, hold,
@@ -54,14 +54,17 @@ class PortfolioResource(Resource):
         ``"MANUAL"`` or ``"UNIFIED"`` (pool 0 draws on your spot USDC), and
         ``withdrawable`` the USDC a withdrawal can take now, dollars, an exact
         :class:`~decimal.Decimal` rounded down (README, **Withdrawals**); each
-        ``None`` while the exchange cannot read it.
+        ``None`` while the exchange cannot read it. ``withdrawFee`` is the
+        withdraw fee in force, dollars, an exact Decimal, which a withdrawal
+        pays on top of its amount: the most one can name is ``withdrawable``
+        less it. ``None`` with no USDC row (nothing to withdraw) or unread.
 
         Raises :class:`~loaf.exceptions.LoafServiceUnavailableError` (503
         ``The L2 balance is temporarily unavailable; try again in a moment``)
         while the exchange's balances cannot be read — transient, so retry;
-        :class:`~loaf.exceptions.LoafServerError` naming a perps value or the
-        withdrawable served as no exact decimal string, never read in another
-        unit.
+        :class:`~loaf.exceptions.LoafServerError` naming a perps value, the
+        withdrawable or the withdraw fee served as no exact decimal string,
+        never read in another unit.
         """
         answer = self._client.get("/portfolio/summary")
         return _served.read(answer, _served.summary, "GET /portfolio/summary")

@@ -318,6 +318,9 @@ def test_models_list_every_shape():
     summary = get_type_hints(models.PortfolioSummary)
     assert summary["perps"] == Optional[models.PerpsAccount]
     assert summary["withdrawable"] == Optional[Decimal]
+    assert summary["withdrawFee"] == Optional[Decimal]
+    # A withdrawal's 202 keeps the fee it paid as served: it is journaled, so no read of it raises.
+    assert get_type_hints(models.WithdrawalAccepted)["withdrawFee"] == Optional[str]
     assert "perpsLeverage" not in summary
     # Every section of a component is there, None when its read failed, never empty.
     component = get_type_hints(models.PortfolioComponent)

@@ -1046,12 +1046,12 @@ try:
     res = loaf.funds.withdraw(250)            # 250 USDC: spot balance -> your wallet
 except WithdrawalOutcomeUnknownError as e:
     res = loaf.funds.resubmit(e.signed_body)  # the same withdrawal: journaled at most once
-print(res.journalSeq, res.amount, res.duplicate)
+print(res.journalSeq, res.amount, res.withdrawFee, res.duplicate)
 ```
 
 - **What happens.** The exchange journals the withdrawal at once and takes it
   from your spot balance (the 202, `{journalSeq, accountIndex, assetId,
-  amount, nonce, duplicate, status}`), then settles it on chain in a batch,
+  amount, nonce, duplicate, withdrawFee, status}`), then settles it on chain in a batch,
   whose transaction makes it payable to your wallet, and pays it there. Follow
   it in `loaf.portfolio.component().transfers`: a `WITHDRAWAL` row with its
   `journalSeq`, `PENDING` until its batch is on chain, then `CONFIRMED` with
@@ -1068,6 +1068,20 @@ print(res.journalSeq, res.amount, res.duplicate)
   (`accountMode` `"UNIFIED"`, whose pool 0 draws on that USDC) less pool 0's
   shortfall below the initial margin its resting orders need, or, with none,
   plus what pool 0 can give back now.
+- **Fee.** A withdrawal pays the exchange's withdraw fee on top of its amount:
+  a flat amount of USDC the exchange sets (at most 5 USDC), which your spot
+  balance gives with the amount, while your wallet receives the amount whole.
+  `loaf.portfolio.summary().withdrawFee` is the fee in force, dollars, an
+  exact `Decimal` (`None` with no USDC to withdraw), so the most a withdrawal
+  can name is `withdrawable - withdrawFee`. The fee is not signed: a
+  withdrawal names the most it accepts, `max_fee=` (dollars, 0 or more, at
+  most 6 places), by default the fee the SDK last read from your summary
+  (with the collateral, and again after a withdrawal refused for it), and the
+  exchange refuses it (422 `WITHDRAW_FEE_ABOVE_MAX`, nothing taken) while the
+  fee in force is higher, so no withdrawal pays a fee it did not accept:
+  withdraw again to pay the new one. The 202's `withdrawFee` is the fee it
+  paid (the exact decimal string served, `"0"` with none set); its transfer
+  row's `fee` is the same in USDC's base units.
 - **Life.** `ttl_ms=` (60,000 to 86,400,000; default 3,600,000, an hour) is
   how long the exchange takes the signed withdrawal. It rests nowhere: the
   exchange journals it at once or refuses it.
@@ -1083,7 +1097,8 @@ print(res.journalSeq, res.amount, res.duplicate)
 
   | Error | Status and code | Why |
   | --- | --- | --- |
-  | `LoafAPIError` | 422 `INSUFFICIENT_BALANCE` | more than your spot USDC available (your resting orders hold some) |
+  | `LoafAPIError` | 422 `INSUFFICIENT_BALANCE` | more than your spot USDC available less the withdraw fee (your resting orders hold some) |
+  | `LoafAPIError` | 422 `WITHDRAW_FEE_ABOVE_MAX` | the withdraw fee in force is above `max_fee` (raised since it was read): withdraw again to pay it, also after a lost answer |
   | `LoafAPIError` | 422 `BELOW_MIN_ORDER_VALUE` | less than the minimum withdrawal |
   | `LoafAPIError` | 422 `RATE_LIMITED` | too many withdrawals not yet settled on chain, yours or everyone's: withdraw again later |
   | `LoafAPIError` | 422 `ORDER_INDEX_USED` | the nonce (above): withdraw again, also after a lost answer (**Retries**, below) |
@@ -1108,7 +1123,10 @@ print(res.journalSeq, res.amount, res.duplicate)
   itself even after a lost answer, a resubmit's too: the exchange answers a
   re-send of a journaled withdrawal as its duplicate before it checks the
   nonce, so none was journaled, and none will be (its nonce went to another
-  op): withdraw again. Any error other than `WithdrawalOutcomeUnknownError`
+  op): withdraw again. So is one refused 422 `WITHDRAW_FEE_ABOVE_MAX`, which
+  the exchange checks after the duplicate too: none was journaled, and a
+  fresh withdrawal signs the same nonce, so at most one of the two ever is.
+  Any error other than `WithdrawalOutcomeUnknownError`
   means nothing was journaled. On that one,
   `loaf.funds.resubmit(e.signed_body)`, never a fresh withdrawal for the same
   intent: a fresh one signs the next nonce, so both could be paid. The
@@ -1168,7 +1186,8 @@ the perps reads too (exact `Decimal`s, below):
   `notional` and `fundingOwed`, a pool's `collateral`, `value` and
   `requirement`, a funding payment's `base` and `payment`), every fill's
   `quantity`, `price`, `fee` and `closedPnl` (on every market), a
-  `mark_price` frame's `price` and the summary's `withdrawable` is its actual
+  `mark_price` frame's `price` and the summary's `withdrawable` and
+  `withdrawFee` is its actual
   value, dollars or tokens, as an exact `Decimal`: the exchange serves each as
   an exact decimal string, which the SDK reads digit for digit, so no float
   rounds it (an open interest past 2^53 stays exact). Sum them as `Decimal`s;

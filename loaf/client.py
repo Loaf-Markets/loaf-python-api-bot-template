@@ -156,11 +156,16 @@ def _definitely_not_done(error: LoafAPIError, op: str) -> bool:
 # withdrawal as its duplicate before any other check, so a 422 ORDER_INDEX_USED to one (its nonce
 # spent by another op, or its idempotency key held by another withdrawal) says no attempt was
 # journaled, and none will be: a nonce only moves up. A perps op's spent nonce carries no code.
-_NEVER_JOURNALED_CODES = {"withdrawal": frozenset({"ORDER_INDEX_USED"})}
+_NEVER_JOURNALED_CODES = {
+    "withdrawal": frozenset({"ORDER_INDEX_USED", "WITHDRAW_FEE_ABOVE_MAX"}),
+}
 
 
 def _never_journaled(error: LoafAPIError, op: str) -> bool:
-    """Whether a refusal of signed ``op`` says no attempt of it was journaled, nor ever will be."""
+    """Whether a refusal of signed ``op`` says no attempt of it was journaled: the exchange answers
+    a re-send of a journaled withdrawal as its duplicate before it checks its nonce
+    (``ORDER_INDEX_USED``: spent by another op, so none ever will be) or its withdraw fee
+    (``WITHDRAW_FEE_ABOVE_MAX``: the fee in force is above its ``maxWithdrawFee``)."""
     return (
         error.status_code == 422
         and isinstance(error.code, str)
@@ -704,7 +709,8 @@ class LoafClient:
 
         ``ambiguous=True`` (resubmit): an earlier attempt may already have
         landed, so anything but a 2xx raises the op's unknown-outcome error,
-        except a withdrawal's 422 ``ORDER_INDEX_USED``, which says none landed
+        except a withdrawal's 422 ``ORDER_INDEX_USED`` or
+        ``WITHDRAW_FEE_ABOVE_MAX``, which say none landed
         (:func:`_never_journaled`): it is raised as itself.
 
         ``op="perps"`` or ``op="withdrawal"``: a signed perps allocate or exit,

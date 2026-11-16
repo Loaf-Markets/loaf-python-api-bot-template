@@ -128,19 +128,23 @@ def test_a_spot_detail_has_no_perps_value_to_read():
     assert client.market.get("OPRA") == detail
 
 
-def test_the_summary_serves_its_perps_and_withdrawable_as_decimals():
+def test_the_summary_serves_its_perps_withdrawable_and_withdraw_fee_as_decimals():
     balances = [{"assetId": 3, "symbol": "USDC", "decimals": 6, "isQuote": True, "total": "5000000000",
                  "hold": "0", "available": "5000000000"}]
     body = {"balances": balances, "holdings": [], "perps": PERPS_ACCOUNT, "accountMode": "UNIFIED",
-            "withdrawable": "4990.000001"}
+            "withdrawable": "4990.000001", "withdrawFee": "0.2"}
     client, _ = client_of(body)
     summary = client.portfolio.summary()
-    assert summary == {**body, "perps": PERPS_ACCOUNT_READ, "withdrawable": Decimal("4990.000001")}
+    assert summary == {**body, "perps": PERPS_ACCOUNT_READ, "withdrawable": Decimal("4990.000001"),
+                       "withdrawFee": Decimal("0.2")}
+    assert summary.withdrawable - summary.withdrawFee == Decimal("4989.800001")  # the most to withdraw
     assert summary.balances == balances  # base units, decimal strings, as served
     assert client.perps.positions() == PERPS_ACCOUNT_READ
-    # Unreadable now: None, not 0.
-    client, _ = client_of({**body, "perps": None, "accountMode": None, "withdrawable": None})
+    # Unreadable now (or no USDC row, for the fee): None, not 0.
+    client, _ = client_of({**body, "perps": None, "accountMode": None, "withdrawable": None,
+                           "withdrawFee": None})
     assert client.portfolio.summary().withdrawable is None
+    assert client.portfolio.summary().withdrawFee is None
 
 
 def test_the_component_serves_its_fills_and_funding_payments_as_decimals():
@@ -215,6 +219,7 @@ READS: dict[str, Callable[[LoafClient], Any]] = {
         ("GET /trade/OPRA-PERP", perp_detail(), ("marketList", 1, "live", "openInterest"),
          "marketList[1].live.openInterest", "1.50"),
         ("GET /portfolio/summary", SUMMARY, ("withdrawable",), "withdrawable", 12.5),
+        ("GET /portfolio/summary", SUMMARY, ("withdrawFee",), "withdrawFee", "0.20"),
         ("GET /portfolio/summary", SUMMARY, ("perps", "pools", 1, "collateral"), "perps.pools[1].collateral",
          None),
         ("GET /portfolio/summary (perps)", SUMMARY, ("perps", "pools", 0, "positions", 0, "entryPrice"),
