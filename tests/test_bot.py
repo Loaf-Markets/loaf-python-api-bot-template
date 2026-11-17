@@ -641,7 +641,7 @@ def _op_body(**fields: Any) -> dict:
             signed_body=_op_body(l2AssetId=1, amount="1000000"), attempts=3,
             last_error=LoafServerError("Bad Gateway", status_code=502)),
          "Stopping: the withdrawal signed at your account's nonce 31 may or may not",
-         ("client.funds.resubmit(error.signed_body)", "ORDER_INDEX_USED",
+         ("client.funds.resubmit(error.signed_body)", "ORDER_INDEX_USED", "WITHDRAW_FEE_ABOVE_MAX",
           "catch\n  loaf.WithdrawalOutcomeUnknownError")),
     ],
     ids=["margin-move", "exit", "withdrawal"],

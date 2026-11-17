@@ -2,7 +2,8 @@
 
 Every price, size and dollar amount the exchange serves of a perp's terms and live state, a
 position, a margin pool, a funding payment and a fill (spot fills too), a ``mark_price`` frame's
-price and an account's withdrawable USDC, is its actual value: an exact decimal string in one
+price and an account's withdrawable USDC and withdraw fee, is its actual value: an exact decimal
+string in one
 canonical form, digits with a ``-`` before a negative and a ``.`` before a fraction whose last
 digit is not 0, no exponent, no ``+`` and no leading zero but the units' (``"0.25"``), zero
 ``"0"``. A size has at most its market's ``quantityDecimals`` places (a lot), a price at most
@@ -41,11 +42,14 @@ _POSITION = ("base", "entryQuote", "entryPrice", "fundingOwed", "notional", "liq
 # A funding payment, and a fill (every market's).
 _FUNDING = ("base", "payment")
 _FILL = ("quantity", "price", "fee", "closedPnl")
-# An account's withdrawable USDC: the summary's, and a perps_account_update frame's.
-_ACCOUNT = ("withdrawable",)
+# An account's withdrawable USDC, the summary's and a perps_account_update frame's, and the withdraw
+# fee in force, the summary's alone.
+_ACCOUNT = ("withdrawable", "withdrawFee")
 # The fields served null where there is no such value (a pool past its range, a position with no
-# liquidation price, a fill that reduced nothing, an account unreadable now).
-_NULLABLE = frozenset({"value", "requirement", "liquidationPrice", "closedPnl", "withdrawable"})
+# liquidation price, a fill that reduced nothing, an account unreadable now or with no USDC row).
+_NULLABLE = frozenset(
+    {"value", "requirement", "liquidationPrice", "closedPnl", "withdrawable", "withdrawFee"}
+)
 
 
 #: How much of a malformed value its error shows: the start and end of a long string, the first
@@ -150,8 +154,8 @@ def perps(summary: Any) -> None:
 
 
 def summary(answer: Any) -> None:
-    """``GET /portfolio/summary``, and a ``perps_account_update`` frame: its ``perps`` and its
-    ``withdrawable``."""
+    """``GET /portfolio/summary``, and a ``perps_account_update`` frame: its ``perps``, its
+    ``withdrawable`` and (the summary's) ``withdrawFee``."""
     perps(answer)
     _convert(answer, "", _ACCOUNT)
 

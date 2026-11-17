@@ -169,6 +169,19 @@ method of.
   settle it. The `Following market` line names the market's type.
 - A `LICENSE` file (MIT).
 - `history.cancelled_orders(cursor=)` and `history.iter_cancelled_orders()`.
+- **The withdraw fee.** A withdrawal pays the exchange's withdraw fee on top
+  of its amount (a flat amount of USDC the exchange sets, at most 5 USDC; your
+  wallet receives the amount whole). `portfolio.summary().withdrawFee` serves
+  the fee in force (a `Decimal`), so the most a withdrawal can name is
+  `withdrawable - withdrawFee`. `funds.withdraw(max_fee=)` names the most a
+  withdrawal accepts, by default the fee the SDK last read from your summary
+  (with the collateral: no extra read), sent as the body's `maxWithdrawFee`
+  beside the signature, which does not cover it; a higher fee in force is
+  refused `OrderErrorCode.WITHDRAW_FEE_ABOVE_MAX` (422, nothing taken, never
+  journaled, a resubmit's too), and the SDK reads the fee again for the next
+  withdrawal. The 202 names the fee paid (`withdrawFee`, the decimal string
+  served) and a transfer row its `fee` in base units. Against an exchange
+  that serves no fee the SDK sends none, as before.
 
 ### Changed
 

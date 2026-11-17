@@ -239,6 +239,10 @@ class WithdrawalAccepted(TypedDict):
     amount: int  # in the asset's ticks: USDC x 10^decimals / tickSize
     nonce: int  # the nonce it spent
     duplicate: bool  # a re-send of one journaled before: nothing was journaled again
+    # The withdraw fee taken on top of amount, dollars, the exact decimal string served ("0.2";
+    # "0": none set), a duplicate's its first's; None: the exchange could not name it. Left a
+    # string: the withdrawal is journaled, so no reading of it ever raises.
+    withdrawFee: Optional[str]
     status: dict[str, Any]  # {"status": "PENDING"}: follow it in portfolio.component().transfers
 
 
@@ -462,6 +466,9 @@ class PortfolioSummary(TypedDict):
     accountMode: Optional[str]  # "MANUAL" or "UNIFIED" (pool 0 draws on your spot USDC); None: unread
     # The USDC a withdrawal can take now, dollars, rounded down (README, Withdrawals); None: unread.
     withdrawable: Optional[Decimal]
+    # The withdraw fee in force, dollars, which a withdrawal pays on top of its amount, so the most
+    # it can name is withdrawable less it; None: no USDC row (nothing to withdraw), or unread.
+    withdrawFee: Optional[Decimal]
 
 
 class PortfolioComponent(TypedDict):
@@ -474,7 +481,8 @@ class PortfolioComponent(TypedDict):
     openOrders: Optional[list[OrderHistoryItem]]  # booked orders + PENDING/ARMED conditionals, merged
     tradeHistory: Optional[list[TradeHistoryItem]]  # without proof
     orderHistory: Optional[list[OrderHistoryItem]]  # newest rows of both kinds, ANY status
-    transfers: Optional[list[dict[str, Any]]]  # newest first, keyed by journalSeq; `amount` in base units
+    # Newest first, keyed by journalSeq; `amount` and a withdrawal's `fee` (on top) in base units.
+    transfers: Optional[list[dict[str, Any]]]
     fundingHistory: Optional[list[FundingPayment]]  # newest first
     holdingDetails: Optional[dict[str, HoldingDetails]]  # by holding ticker
     holdingSparklines: Optional[dict[str, list[float]]]  # by holding ticker: up to 48 closes, oldest first

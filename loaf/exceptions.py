@@ -223,7 +223,8 @@ class WithdrawalOutcomeUnknownError(LoafError):
     Raised by :meth:`~loaf.resources.funds.FundsResource.withdraw` after a
     timeout or a server-side failure that the SDK's own identical re-sends did
     not settle, and by :meth:`~loaf.resources.funds.FundsResource.resubmit` on
-    anything but a 202 or a 422 ``ORDER_INDEX_USED``. Never sign the same
+    anything but a 202 or a 422 ``ORDER_INDEX_USED`` or
+    ``WITHDRAW_FEE_ABOVE_MAX``. Never sign the same
     withdrawal afresh while it may have been journaled: a fresh one signs the
     next nonce, so both could be paid.
 
@@ -233,7 +234,11 @@ class WithdrawalOutcomeUnknownError(LoafError):
     settles it. It answers that before it checks the nonce, so a re-send
     refused 422 ``ORDER_INDEX_USED`` (raised as that
     :class:`LoafAPIError`) settles it too: no attempt was journaled, and none
-    will be (its nonce went to another op): withdraw again. It takes the body
+    will be (its nonce went to another op): withdraw again. So does 422
+    ``WITHDRAW_FEE_ABOVE_MAX``, checked after the duplicate too: the withdraw
+    fee was raised above the body's ``maxWithdrawFee``, no attempt was
+    journaled and nothing was taken; withdraw again to pay the new fee (it
+    signs the same nonce, so at most one of the two is journaled). It takes the body
     only until its ``l2ExpiryMs`` minus
     :data:`~loaf.constants.L2_BUFFER_MS` (the withdrawal's ``ttl_ms`` after it
     was signed), by its own clock. Once it refuses a re-send for that
@@ -263,7 +268,8 @@ class WithdrawalOutcomeUnknownError(LoafError):
             f"journaled after {attempts} attempt(s) (last error: {last_error}). It may have been. "
             "Never sign it afresh: re-send it unchanged with funds.resubmit(error.signed_body), "
             "whose 202 settles it (duplicate: journaled before; otherwise journaled now), as does "
-            "a 422 ORDER_INDEX_USED (never journaled: withdraw again). The "
+            "a 422 ORDER_INDEX_USED (never journaled: withdraw again) or WITHDRAW_FEE_ABOVE_MAX "
+            "(not journaled, the fee was raised: withdraw again to pay it). The "
             f"exchange takes it until its l2ExpiryMs {signed_body.get('l2ExpiryMs')} minus 72 "
             "hours; once it refuses a re-send for that, your account's next nonce settles it "
             f"(GET /l2/keys withdrawalNonce): still {signed_body.get('l2Nonce')}, never "

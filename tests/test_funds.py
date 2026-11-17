@@ -34,6 +34,7 @@ from conftest import (
     BAD_SIGNATURE,
     EXPIRED,
     EXPIRY_INSIDE_BUFFER,
+    FEE_ABOVE_MAX,
     KAT,
     KEY_DISABLED,
     L2_SECRET,
@@ -47,10 +48,11 @@ from conftest import (
     verify_op,
 )
 
-# The SDK sends a withdrawal's keys in this fixed order.
+# The SDK sends a withdrawal's keys in this fixed order (maxWithdrawFee while the summary serves
+# a withdraw fee).
 WITHDRAW_KEYS = (
-    "l2ChainId l2AccountIndex l2ApiKeyIndex l2AssetId l2Route amount l2Nonce l2ExpiryMs l2SigS "
-    "l2SigE"
+    "l2ChainId l2AccountIndex l2ApiKeyIndex l2AssetId l2Route amount maxWithdrawFee l2Nonce "
+    "l2ExpiryMs l2SigS l2SigE"
 ).split()
 NOW_MS = 1_800_000_000_000
 # The exchange's 503s for a withdrawal: paused (TRADING_PAUSED) and not processed
@@ -139,18 +141,20 @@ def test_a_withdrawal_signs_its_terms_and_spends_the_next_nonce(exchange, tradin
         "assetId": PERPS_QUOTE_ASSET_ID,
         "amount": 25_000,
         "nonce": 3,
+        "withdrawFee": "0",  # none set
         "status": {"status": "PENDING"},
     }
     assert set(answer) == set(models.WithdrawalAccepted.__annotations__)
     (body,) = exchange.bodies("/l2/withdrawals")
     assert list(body) == WITHDRAW_KEYS
-    assert {key: body[key] for key in WITHDRAW_KEYS[:8]} == {
+    assert {key: body[key] for key in WITHDRAW_KEYS[:9]} == {
         "l2ChainId": 4242,
         "l2AccountIndex": ACCOUNT_INDEX,
         "l2ApiKeyIndex": 0,  # the trading key
         "l2AssetId": 3,  # USDC
         "l2Route": 1,  # the spot balance, the one route the exchange takes
         "amount": "25000",  # 250 USDC in the collateral's ticks of 0.01 USDC, a decimal string
+        "maxWithdrawFee": "0",  # the fee the summary served: none set
         "l2Nonce": 3,
         # It rests nowhere: the exchange takes it for an hour, and it stays valid for settlement
         # 72 hours past that.
@@ -229,6 +233,13 @@ def test_a_withdrawal_signs_fresh_randomness(exchange, trading_client):
         (lambda f: f.withdraw(5, ttl_ms=MAX_WITHDRAWAL_TTL_MS + 1), "ttl_ms must be"),
         (lambda f: f.withdraw(5, ttl_ms=60_000.0), "ttl_ms must be"),
         (lambda f: f.withdraw(5, ttl_ms=True), "ttl_ms must be"),
+        (lambda f: f.withdraw(5, max_fee=-0.01), "max_fee must be dollars from 0 to"),
+        (lambda f: f.withdraw(5, max_fee=Decimal("0.0000001")), "at most 6 decimal places"),
+        (lambda f: f.withdraw(5, max_fee=Decimal("18446744073709.551616")), "max_fee must be"),
+        (lambda f: f.withdraw(5, max_fee=Decimal("1E+40")), "max_fee must be"),
+        (lambda f: f.withdraw(5, max_fee="0.2"), "max_fee must be a number"),
+        (lambda f: f.withdraw(5, max_fee=True), "max_fee must be a number"),
+        (lambda f: f.withdraw(5, max_fee=float("nan")), "max_fee must be a finite number"),
     ],
 )
 def test_arguments_are_checked_before_anything_is_read(exchange, trading_client, call, message):
@@ -285,7 +296,12 @@ def test_a_withdrawal_needs_the_trading_key(exchange, trading_client):
     funds = trading_client(trading_key=None).funds
     with pytest.raises(loaf.LoafConfigError, match="Withdrawing needs your trading key"):
         funds.withdraw(5)
-    signed = {key: 0 for key in WITHDRAW_KEYS} | {"amount": "1", "l2SigS": "a", "l2SigE": "b"}
+    signed = {key: 0 for key in WITHDRAW_KEYS} | {
+        "amount": "1",
+        "maxWithdrawFee": "0",
+        "l2SigS": "a",
+        "l2SigE": "b",
+    }
     with pytest.raises(loaf.LoafConfigError, match="needs your trading key"):
         funds.resubmit(signed)  # its login token needs the key
     assert exchange.requests == []
@@ -709,6 +725,8 @@ SIGNED_WITHDRAWAL = {
         {**SIGNED_WITHDRAWAL, "l2Nonce": "0"},
         {**SIGNED_WITHDRAWAL, "l2ExpiryMs": True},
         {**SIGNED_WITHDRAWAL, "l2SigS": None},
+        {**SIGNED_WITHDRAWAL, "maxWithdrawFee": 0.2},  # sent as the decimal string it was
+        {**SIGNED_WITHDRAWAL, "maxWithdrawFee": None},
     ],
 )
 def test_resubmit_needs_a_signed_withdrawal(exchange, trading_client, body: Any):
@@ -732,6 +750,7 @@ def test_the_unknown_outcome_survives_pickle_and_names_how_to_settle_it():
         "after 3 attempt(s)",
         "funds.resubmit(error.signed_body)",
         "a 422 ORDER_INDEX_USED (never journaled: withdraw again)",
+        "or WITHDRAW_FEE_ABOVE_MAX (not journaled, the fee was raised: withdraw again to pay it)",
         f"l2ExpiryMs {NOW_MS} minus 72 hours",
         "withdrawalNonce): still 0",
     ):
@@ -739,3 +758,190 @@ def test_the_unknown_outcome_survives_pickle_and_names_how_to_settle_it():
     for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):
         assert type(clone) is WithdrawalOutcomeUnknownError
         assert (clone.signed_body, clone.attempts, str(clone)) == (SIGNED_WITHDRAWAL, 3, text)
+
+
+# --------------------------------------------------------------------------- #
+# The withdraw fee
+# --------------------------------------------------------------------------- #
+
+
+def test_a_withdrawal_accepts_the_fee_its_summary_served_beside_its_signature(
+    exchange, trading_client
+):
+    exchange.withdraw_fee = "0.2"
+    funds = trading_client().funds
+    answer = funds.withdraw(250)
+    assert (answer["amount"], answer["withdrawFee"]) == (25_000, "0.2")  # the fee on top, as served
+    (body,) = exchange.bodies("/l2/withdrawals")
+    assert body["maxWithdrawFee"] == "0.2"
+    # The signature leaves it out: K1's withdraw message has no fee.
+    verify_op(body)
+    verify_op({**body, "maxWithdrawFee": "5"})
+    # Read with the collateral: the next withdrawal reads no summary.
+    funds.withdraw(1)
+    assert [b["maxWithdrawFee"] for b in exchange.bodies("/l2/withdrawals")] == ["0.2", "0.2"]
+    assert len(exchange.gets("/portfolio/summary")) == 1
+
+
+def test_a_fee_raised_since_it_was_read_is_refused_and_read_again(exchange, trading_client):
+    exchange.withdraw_fee = "0.2"
+    funds = trading_client().funds
+    funds.withdraw(5)
+    exchange.withdraw_fee = "0.5"  # the governor raised it
+    with pytest.raises(loaf.LoafAPIError) as info:
+        funds.withdraw(5)
+    error = info.value
+    assert type(error) is loaf.LoafAPIError
+    assert (error.status_code, error.code, error.message) == (
+        422,
+        loaf.OrderErrorCode.WITHDRAW_FEE_ABOVE_MAX,
+        FEE_ABOVE_MAX,
+    )
+    # Nothing was taken and the nonce did not move; the next withdrawal reads the fee again and
+    # pays it.
+    assert sorted(exchange.applied) == [0] and exchange.keys["withdrawalNonce"] == 1
+    assert len(exchange.gets("/portfolio/summary")) == 1
+    answer = funds.withdraw(5)
+    assert (answer["nonce"], answer["withdrawFee"]) == (1, "0.5")
+    assert [b["maxWithdrawFee"] for b in exchange.bodies("/l2/withdrawals")] == ["0.2", "0.2", "0.5"]
+    assert len(exchange.gets("/portfolio/summary")) == 2
+
+
+@pytest.mark.parametrize(
+    "max_fee, sent",
+    [
+        (Decimal("0.25"), "0.25"),
+        (Decimal("0.200000"), "0.2"),
+        (1, "1"),
+        (0.3, "0.3"),
+        (Decimal("1E+1"), "10"),
+        (Decimal("18446744073709.551615"), "18446744073709.551615"),  # the exchange's bound
+    ],
+)
+def test_max_fee_names_the_most_it_accepts(exchange, trading_client, max_fee, sent):
+    exchange.withdraw_fee = "0.2"
+    answer = trading_client().funds.withdraw(5, max_fee=max_fee)
+    assert answer["withdrawFee"] == "0.2"  # the fee in force, at most max_fee
+    (body,) = exchange.bodies("/l2/withdrawals")
+    assert body["maxWithdrawFee"] == sent
+
+
+@pytest.mark.parametrize("max_fee, sent", [(0, "0"), (Decimal("-0"), "0"), (Decimal("0.19"), "0.19")])
+def test_a_max_fee_below_the_fee_in_force_is_refused_and_takes_nothing(
+    exchange, trading_client, max_fee, sent
+):
+    exchange.withdraw_fee = "0.2"
+    funds = trading_client().funds
+    with pytest.raises(loaf.LoafAPIError) as info:
+        funds.withdraw(5, max_fee=max_fee)
+    assert (info.value.status_code, info.value.code) == (422, "WITHDRAW_FEE_ABOVE_MAX")
+    (body,) = exchange.bodies("/l2/withdrawals")
+    assert body["maxWithdrawFee"] == sent
+    assert exchange.applied == {}
+    # The default reads the fee in force again, and pays it.
+    assert funds.withdraw(5)["withdrawFee"] == "0.2"
+
+
+@pytest.mark.parametrize("served", ["absent", "null"])
+def test_a_summary_that_serves_no_fee_sends_none_and_is_read_again(exchange, trading_client, served):
+    # An exchange before the fee serves none, and takes no maxWithdrawFee; a null is no USDC row.
+    if served == "absent":
+        exchange.serves_withdraw_fee = False
+    else:
+        exchange.withdraw_fee = None
+    funds = trading_client().funds
+    funds.withdraw(5)
+    funds.withdraw(5)
+    for body in exchange.bodies("/l2/withdrawals"):
+        assert list(body) == [key for key in WITHDRAW_KEYS if key != "maxWithdrawFee"]
+        verify_op(body)
+    # The collateral is kept; the fee, unknown, is read for each withdrawal.
+    assert len(exchange.gets("/portfolio/summary")) == 2
+
+
+@pytest.mark.parametrize("fee", ["0.20", "-0.2", 0.2, "2E-1", "0.0000001"])
+def test_a_malformed_fee_signs_nothing_and_never_refuses_an_allocate(exchange, trading_client, fee):
+    exchange.withdraw_fee = fee
+    client = trading_client()
+    with pytest.raises(loaf.LoafServerError, match="GET /portfolio/summary answered a malformed "
+                       "withdrawFee") as info:
+        client.funds.withdraw(5)
+    assert type(info.value) is loaf.LoafServerError and info.value.status_code == 200
+    assert routes(exchange.requests) == ["GET /portfolio/summary"]
+    # An allocate counts its amount in the collateral alone: the fee is the withdrawal's to refuse.
+    client.perps.add_margin(5)
+    assert len(exchange.bodies("/l2/allocations")) == 1
+    exchange.withdraw_fee = "0.2"
+    assert client.funds.withdraw(5)["withdrawFee"] == "0.2"
+    assert len(exchange.gets("/portfolio/summary")) == 3  # the fee unknown until it is served
+
+
+def test_a_fee_read_with_an_allocates_collateral_needs_no_second_read(exchange, trading_client):
+    exchange.withdraw_fee = "0.2"
+    client = trading_client()
+    client.perps.add_margin(5)
+    client.funds.withdraw(5)
+    assert exchange.bodies("/l2/withdrawals")[0]["maxWithdrawFee"] == "0.2"
+    assert len(exchange.gets("/portfolio/summary")) == 1
+
+
+def test_a_resend_refused_for_its_fee_after_a_lost_answer_was_never_journaled(
+    exchange, trading_client
+):
+    # The exchange checks the fee after the duplicate, as the nonce: a 422 WITHDRAW_FEE_ABOVE_MAX
+    # to the re-send says no attempt was journaled. Raised as itself: withdraw again.
+    exchange.withdraw_fee = "0.2"
+    client = trading_client(max_retries=1)
+    client.perps.collateral()  # the fee read: 0.2
+    exchange.withdraw_fee = "0.5"
+    exchange.queue("/l2/withdrawals", httpx.ReadTimeout("timed out"))
+    with pytest.raises(loaf.LoafAPIError) as info:
+        client.funds.withdraw(5)
+    error = info.value
+    assert type(error) is loaf.LoafAPIError
+    assert (error.status_code, error.code) == (422, "WITHDRAW_FEE_ABOVE_MAX")
+    sent, resent = (r.content for r in withdrawal_posts(exchange))
+    assert sent == resent and json.loads(sent)["maxWithdrawFee"] == "0.2"
+    assert exchange.applied == {}
+    answer = client.funds.withdraw(5)
+    assert (answer["nonce"], answer["withdrawFee"]) == (0, "0.5")
+
+
+def test_a_resubmit_refused_for_its_fee_settles_it_and_at_most_one_is_journaled(
+    exchange, trading_client
+):
+    exchange.withdraw_fee = "0.2"
+    funds = trading_client(max_retries=0).funds
+    exchange.queue("/l2/withdrawals", httpx.ReadTimeout("timed out"))
+    with pytest.raises(WithdrawalOutcomeUnknownError) as info:
+        funds.withdraw(5)
+    body = info.value.signed_body
+    assert body["maxWithdrawFee"] == "0.2"  # kept with the body: a resubmit sends it
+    exchange.withdraw_fee = "0.5"
+    with pytest.raises(loaf.LoafAPIError) as refused:
+        funds.resubmit(body)
+    assert type(refused.value) is loaf.LoafAPIError
+    assert (refused.value.status_code, refused.value.code) == (422, "WITHDRAW_FEE_ABOVE_MAX")
+    assert exchange.applied == {}
+    # Withdrawing again signs the same nonce at the fee read again ...
+    answer = funds.withdraw(5)
+    assert (answer["nonce"], answer["withdrawFee"]) == (0, "0.5")
+    # ... so the old body can never be journaled beside it, whatever fee it names.
+    exchange.withdraw_fee = "0"
+    with pytest.raises(loaf.LoafAPIError) as late:
+        funds.resubmit(body)
+    assert (late.value.status_code, late.value.code) == (422, "ORDER_INDEX_USED")
+    assert sorted(exchange.applied) == [0]
+
+
+def test_a_resubmit_of_a_body_without_a_max_fee_is_sent_as_it_was(exchange, trading_client):
+    # A body an earlier SDK signed names no maxWithdrawFee: absent is 0 at the exchange.
+    exchange.serves_withdraw_fee = False
+    funds = trading_client(max_retries=0).funds
+    exchange.queue("/l2/withdrawals", httpx.ReadTimeout("timed out"))
+    with pytest.raises(WithdrawalOutcomeUnknownError) as info:
+        funds.withdraw(5)
+    body = info.value.signed_body
+    assert "maxWithdrawFee" not in body
+    assert funds.resubmit(body)["duplicate"] is False
+    assert [r.content for r in withdrawal_posts(exchange)][1] == withdrawal_posts(exchange)[0].content

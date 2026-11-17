@@ -26,6 +26,18 @@ portfolio summary serves, as a perps allocate does
 number of ticks (nothing is rounded). The 202's ``amount`` is that count of
 ticks; a transfer row's ``amount`` is in USDC's base units.
 
+**Fee.** A withdrawal pays the exchange's withdraw fee on top of ``amount``: a
+flat amount of USDC the exchange sets (at most 5 USDC), which your spot
+balance gives with the amount, while your wallet receives ``amount`` whole.
+``portfolio.summary().withdrawFee`` is the fee in force (dollars, a
+``Decimal``), so the most a withdrawal can name is ``withdrawable`` less
+``withdrawFee``. The fee is not signed: a withdrawal names the most it accepts
+(``max_fee=``, by default the fee the SDK last read from your summary), sent
+beside the signature as ``maxWithdrawFee``, and the exchange refuses it
+(``WITHDRAW_FEE_ABOVE_MAX``) while the fee in force is higher: no withdrawal
+pays a fee it did not accept. The 202's ``withdrawFee`` is the fee it paid, a
+transfer row's ``fee`` the same in USDC's base units.
+
 **Signing.** A withdrawal is signed on your machine with your trading key, as
 an order is, and sent with a login token your trading key signs (the exchange
 checks the account is yours). It spends your account's next nonce, the one
@@ -78,7 +90,8 @@ from ..constants import (
     MIN_ORDER_TTL_MS,
     PERPS_QUOTE_ASSET_ID,
 )
-from ..exceptions import LoafConfigError, _client_validation_error
+from ..enums import OrderErrorCode
+from ..exceptions import LoafAPIError, LoafConfigError, _client_validation_error
 from ..money import _to_decimal
 from .base import Resource
 from .perps import _ranged, _ticks
@@ -87,6 +100,10 @@ if TYPE_CHECKING:
     from .._l2 import TradingKey
 
 _WITHDRAW_LIMIT = 2**53  # a withdrawal's amount, in ticks, is below it
+# The most max_fee= names: the exchange's bound on maxWithdrawFee, 2^64 - 1 millionths of a dollar.
+_MAX_FEE_LIMIT = Decimal(2**64 - 1).scaleb(-6)
+_FEE_PLACES = 6  # a dollar amount's, as the exchange serves the fee
+_FEE_STEP = Decimal(1).scaleb(-_FEE_PLACES)
 _SPOT_ROUTE = 1  # the one route a withdrawal takes: your spot balance
 _SIGNED_STRS = ("amount", "l2SigS", "l2SigE")
 _SIGNED_INTS = (
@@ -101,7 +118,13 @@ _SIGNED_INTS = (
 
 
 class FundsResource(Resource):
-    def withdraw(self, amount: float | Decimal, *, ttl_ms: int | None = None) -> Any:
+    def withdraw(
+        self,
+        amount: float | Decimal,
+        *,
+        ttl_ms: int | None = None,
+        max_fee: float | Decimal | None = None,
+    ) -> Any:
         """``POST /l2/withdrawals`` — withdraw ``amount`` USDC from your spot
         balance to your own wallet, signed with your trading key.
 
@@ -120,19 +143,32 @@ class FundsResource(Resource):
                 it at once or refuses it. It signs ``l2ExpiryMs`` = now + 72
                 hours (:data:`~loaf.constants.L2_BUFFER_MS`, the time it
                 stays valid for settlement) + ``ttl_ms``.
+            max_fee: the most withdraw fee it accepts, USDC (a number; a
+                ``Decimal`` for exact cents), 0 or more, at most 6 decimal
+                places (see the module's Fee). Default: the fee your summary
+                served when the SDK last read it (with the collateral, and
+                again after a withdrawal refused for it), none while it serves
+                none. Not signed: sent beside the signature as
+                ``maxWithdrawFee``.
 
         Returns:
             ``{journalSeq, accountIndex, assetId, amount, nonce, duplicate,
-            status}`` (:class:`~loaf.models.WithdrawalAccepted`): the exchange
-            journaled it at ``journalSeq`` and took ``amount`` ticks from your
-            spot balance (``duplicate``: a re-send of one journaled before).
+            withdrawFee, status}`` (:class:`~loaf.models.WithdrawalAccepted`):
+            the exchange journaled it at ``journalSeq`` and took ``amount``
+            ticks from your spot balance, and ``withdrawFee`` dollars on top
+            (``duplicate``: a re-send of one journaled before).
 
         Raises:
             LoafConfigError: no trading key.
             LoafAPIError: 422, refused by the exchange's rules (this class
                 itself; ``code`` says which): ``INSUFFICIENT_BALANCE``, more
-                than your spot USDC available (your resting orders hold some);
-                ``BELOW_MIN_ORDER_VALUE``, less than the minimum withdrawal;
+                than your spot USDC available less the withdraw fee (your
+                resting orders hold some); ``WITHDRAW_FEE_ABOVE_MAX``, the
+                withdraw fee in force above ``max_fee`` (raised since it was
+                read): the SDK reads it again, so withdraw again to pay it,
+                also after an attempt whose answer was lost: none was
+                journaled; ``BELOW_MIN_ORDER_VALUE``, less than the minimum
+                withdrawal;
                 ``RATE_LIMITED``, too many withdrawals not yet settled on
                 chain, yours or everyone's (withdraw again later);
                 ``ORDER_INDEX_USED``, the nonce, spent first by an op sent
@@ -164,19 +200,28 @@ class FundsResource(Resource):
                 was done (your account unread before anything was sent on),
                 after the SDK's re-sends: withdraw again. Or the collateral
                 could not be read just now: nothing was sent.
-            LoafServerError: your summary has no usable collateral.
+            LoafServerError: your summary has no usable collateral, or a
+                withdraw fee served as no exact decimal string: nothing was
+                sent.
             WithdrawalOutcomeUnknownError: it may or may not have been
                 journaled (a timeout, a 503 ``SERVICE_UNAVAILABLE`` that the
                 exchange did not decide, or any refusal of a re-send after an
-                attempt whose answer was lost but ``ORDER_INDEX_USED``):
-                :meth:`resubmit` it, never sign it afresh.
+                attempt whose answer was lost but ``ORDER_INDEX_USED`` and
+                ``WITHDRAW_FEE_ABOVE_MAX``): :meth:`resubmit` it, never sign it
+                afresh.
         """
         key = self._credentials()
         value = _to_decimal(amount, "amount")
         if value <= 0:
             raise _client_validation_error(f"amount must be positive (got {amount!r})")
         ttl = _withdrawal_ttl(ttl_ms)
-        ticks = _ticks(value, amount, self._client.perps._collateral(), _WITHDRAW_LIMIT)
+        most = None if max_fee is None else _max_fee(max_fee)
+        perps = self._client.perps
+        if most is None:
+            collateral, most = perps._withdrawal_terms()
+        else:
+            collateral = perps._collateral()
+        ticks = _ticks(value, amount, collateral, _WITHDRAW_LIMIT)
 
         def message(chain_id: int, account_index: int, nonce: int, expiry_ms: int) -> bytes:
             return k1.withdraw_message(
@@ -188,27 +233,39 @@ class FundsResource(Resource):
                 l2_expiry_ms=expiry_ms,
             )
 
-        terms = {
+        terms: dict[str, Any] = {
             "l2ApiKeyIndex": 0,
             "l2AssetId": PERPS_QUOTE_ASSET_ID,
             "l2Route": _SPOT_ROUTE,
             "amount": str(ticks),
         }
+        if most is not None:  # none: an exchange that serves no fee takes none (absent is 0)
+            terms["maxWithdrawFee"] = _usd(most)  # not in the message: the signature leaves it out
         lead = L2_BUFFER_MS + ttl
-        return submit_signed_op(
-            self._client, key, "/l2/withdrawals", terms, lead, message, "withdrawal"
-        )
+        try:
+            return submit_signed_op(
+                self._client, key, "/l2/withdrawals", terms, lead, message, "withdrawal"
+            )
+        except LoafAPIError as exc:
+            if _fee_refused(exc):
+                perps._forget_withdraw_fee()
+            raise
 
     def resubmit(self, signed_body: Mapping[str, Any]) -> Any:
         """Re-send a signed withdrawal exactly as it was (the ``signed_body`` of
-        a :class:`~loaf.exceptions.WithdrawalOutcomeUnknownError`).
+        a :class:`~loaf.exceptions.WithdrawalOutcomeUnknownError`), its
+        ``maxWithdrawFee`` too.
 
         A 202 settles it: ``duplicate: True``, journaled before; otherwise
         journaled now. A 422 ``ORDER_INDEX_USED`` settles it too, raised as
         itself (a :class:`~loaf.exceptions.LoafAPIError`): the exchange answers
         a re-send of a journaled withdrawal as its duplicate first, so this one
         was never journaled and never will be (its nonce went to another op):
-        withdraw again. Anything else raises ``WithdrawalOutcomeUnknownError``
+        withdraw again. So does a 422 ``WITHDRAW_FEE_ABOVE_MAX``, the withdraw
+        fee raised above its ``maxWithdrawFee`` since: it was not journaled
+        and nothing was taken. Withdraw again to pay the new fee: that signs
+        the same nonce, so at most one of the two is ever journaled. Anything
+        else raises ``WithdrawalOutcomeUnknownError``
         again, with the reason in ``last_error``. The exchange takes the body
         until its ``l2ExpiryMs`` less 72 hours, by its own clock; once it
         refuses a re-send for that (``ORDER_EXPIRY_INVALID``), your account's
@@ -221,14 +278,20 @@ class FundsResource(Resource):
         if not (
             all(isinstance(body.get(field), str) for field in _SIGNED_STRS)
             and all(_is_int(body.get(field)) for field in _SIGNED_INTS)
+            and isinstance(body.get("maxWithdrawFee", ""), str)
         ):
             raise _client_validation_error(
                 "resubmit needs a signed withdrawal body (its fields and signature), e.g. "
                 "WithdrawalOutcomeUnknownError.signed_body"
             )
-        return self._client._send_signed(
-            "/l2/withdrawals", dict(body), ambiguous=True, op="withdrawal"
-        )
+        try:
+            return self._client._send_signed(
+                "/l2/withdrawals", dict(body), ambiguous=True, op="withdrawal"
+            )
+        except LoafAPIError as exc:
+            if _fee_refused(exc):
+                self._client.perps._forget_withdraw_fee()
+            raise
 
     def _credentials(self) -> TradingKey:
         """The trading key that signs the withdrawal and the login tokens that carry it."""
@@ -239,6 +302,31 @@ class FundsResource(Resource):
                 "Show trading key (README §2), or pass trading_key=..."
             )
         return key
+
+
+def _fee_refused(error: LoafAPIError) -> bool:
+    """Whether the exchange refused a withdrawal for a withdraw fee above its ``maxWithdrawFee``."""
+    return error.status_code == 422 and error.code == OrderErrorCode.WITHDRAW_FEE_ABOVE_MAX
+
+
+def _max_fee(given: Any) -> Decimal:
+    """``max_fee=`` checked: a number of dollars from 0 to the exchange's bound, at most 6 places."""
+    fee = _to_decimal(given, "max_fee")
+    # The bound first: quantize() of a far larger number would pass the context's precision.
+    if not 0 <= fee <= _MAX_FEE_LIMIT or fee != fee.quantize(_FEE_STEP):
+        raise _client_validation_error(
+            f"max_fee must be dollars from 0 to {_MAX_FEE_LIMIT}, at most {_FEE_PLACES} decimal "
+            f"places (got {given!r})"
+        )
+    return fee
+
+
+def _usd(value: Decimal) -> str:
+    """Dollars as the exchange takes them: an exact decimal string, no exponent, no trailing 0."""
+    if value == 0:
+        return "0"
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def _withdrawal_ttl(ttl_ms: Any) -> int:
