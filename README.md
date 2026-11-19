@@ -641,6 +641,48 @@ repeat is safe.
   `cancel_all(ticker)` and `cancel_after(..., ticker=)` send no cancel off a
   detail that names another ticker, or whose `type` or `marketIndex` is not
   its ticker's.
+- **What an order signs of its market is held, not read again.** An order
+  signs bare integers: its market's index and assets, its price ×
+  10^(7 − `quantityDecimals`) and its quantity × 10^`quantityDecimals`. A
+  market's listing sets those terms for good, so a client takes them from the
+  first answer an order or `orders.warm` reads for the ticker
+  (`GET /trade/{ticker}`) and refuses any later answer that differs in one
+  (`MarketChangedError`, a `LoafServerError` with status_code 200, before
+  anything is reserved or signed; `e.field`, `e.held` and `e.served` say
+  which). In other units the same signature is the exchange's order for
+  another price and quantity (served one quantity decimal fewer, BUY 10 @
+  163.20 is signed as BUY 1 @ 1,632.00), and under another index it is an
+  order on another market at this one's price. The market held stays held: an
+  order's refusal (a 404, a delisting) has the SDK read the market again for
+  its state and tick, and does not release it, and `cancel_all(ticker)` scopes
+  the held index. If a ticker really is listed again, check the new listing
+  and start a new client.
+
+  That first answer is taken as the exchange serves it. To hold it too, name
+  the markets your bot trades (the numbers below are examples):
+
+  ```python
+  loaf = LoafClient(markets={
+      "MUS": {"marketIndex": 2050, "quantityDecimals": 3, "baseAssetId": 6, "quoteAssetId": 3},
+      "MUS-PERP": {"marketIndex": 4, "quantityDecimals": 3},   # a perp names no assets
+  })
+  ```
+
+  `loaf.orders.held_markets()` gives what a client holds, in that shape. Run
+  once and check it against a source other than this API: the listing's
+  announcement, or the market's listing event on the exchange's contract,
+  which carries its index and its quantity decimals (take the contract's
+  address from elsewhere than this API, too). The web app is no such source:
+  it reads this same API. Then keep the table with your bot's settings and
+  pass it from then on. An answer that differs from the table is refused like
+  any other (`MarketChangedError`), the first one included, and a table that
+  is not one (a misspelt key, a value that is not a whole number) is a
+  `LoafConfigError` when the client is created. A ticker the table does not
+  name is held to its first read. Not held: the tick (`priceDecimals`) and a
+  perp's band and status, which scale nothing signed and can change, and the
+  market reference a MARKET order without `reference_price` is priced off,
+  which moves with the market. That reference is the API's too: where it
+  matters, pass a `reference_price` from a price of your own.
 - The SDK re-sends the **exact** signed order on timeouts and server errors,
   after a short pause, so a re-send can never place it twice: the exchange
   admits one order per account and order number, and answers a repeat with
@@ -1518,6 +1560,9 @@ except loaf.MarketStateError as e:
 except loaf.LoafConfigError:
     ...   # a setup to fix (the message says what): e.g. a market on another deployment's
           # L2 chain than your trading key's — stop and alert
+except loaf.MarketChangedError as e:
+    ...   # the API served another market for e.ticker than the one this client holds
+          # (e.field: e.served, not e.held); nothing was signed — stop trading it and alert
 except loaf.LoafAuthError:
     ...   # your trading key's login token was refused, and the message says why: the
           # key is not the one in force (reset, not active yet, another deployment's) or
@@ -1554,7 +1599,11 @@ content type (`answered a body that is not JSON`: `loaf.request()` and
 `loaf.get()` never return text), or a page the iterators
 (`history.iter_orders`, `iter_trades`, `iter_funding`,
 `iter_cancelled_orders`, `market.iter_candles`) cannot page on, an empty page
-that still points onward among them (but for `iter_cancelled_orders`). An error
+that still points onward among them (but for `iter_cancelled_orders`).
+`MarketChangedError` is one of them: `GET /trade/{ticker}` answered another
+market, or other units, than the client holds for the ticker (see **Signing &
+retries**); nothing was reserved, signed or sent, and the same order is
+refused again until the exchange serves the market held. An error
 answered with a page that is not JSON has its message cut to about 500
 characters; `e.body` keeps the whole page. `e.code` is always a string or
 `None`.

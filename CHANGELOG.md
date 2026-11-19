@@ -141,9 +141,37 @@ method of.
   come newest order first. What to change: pass each
   `nextCursor` back as `cancelled_orders(cursor=)`, or walk them all with
   `history.iter_cancelled_orders()`; never stop at an empty page.
+- **An order follows its ticker to no other market.** A client holds what an
+  order signs of its market (its `marketIndex`, its `quantityDecimals`, a spot
+  market's `l2.baseAssetId` and `l2.quoteAssetId`) from the first answer an
+  order or `orders.warm` reads for the ticker, and refuses a later
+  `GET /trade/{ticker}` answer that differs in one with `MarketChangedError`
+  (a `LoafServerError`, status_code 200) before anything is reserved or
+  signed. Until now a client replaced the market it kept with every answer it
+  read: on each MARKET order without `reference_price`, and on the next order
+  after a refusal that showed the market stale (a 404 or a 403 that is no
+  halt, among others), where it signed the ticker's new index. An order signs
+  bare integers, so an answer in other units had the same signature mean
+  another price and quantity (one quantity decimal fewer: BUY 10 @ 163.20
+  signed as BUY 1 @ 1,632.00), and another index another market at this one's
+  price; a listing sets those terms for good, so no answer that changes them
+  is the market's own. An order's refusal that shows the market stale still
+  has it read again, for its state and tick. `cancel_all(ticker)` and
+  `cancel_after(..., ticker=)` scope the held index, and no longer read it
+  again after such a refusal. What to change: catch `MarketChangedError`,
+  stop trading the ticker and alert; if it really was listed again, check the
+  new listing and start a new client.
 
 ### Added
 
+- `LoafClient(markets=)`: the markets your orders sign, by ticker (`{"MUS":
+  {"marketIndex": ..., "quantityDecimals": ..., "baseAssetId": ...,
+  "quoteAssetId": ...}, "MUS-PERP": {"marketIndex": ..., "quantityDecimals":
+  ...}}`), which the SDK holds every answer to, a client's first read
+  included (without it that read is taken as served). A table that is not
+  one raises `LoafConfigError`. `loaf.orders.held_markets()` gives what a
+  client holds, in that shape, to check once and pass from then on.
+  `loaf.MarketChangedError`, with `ticker`, `field`, `held` and `served`.
 - `LoafClient(allow_http=True)` (and `allow_http=` on `LoafWebSocketClient`,
   defaulting to its client's setting) also takes plain `http://` and `ws://`
   to other hosts, for a dev server on your own network or in a container

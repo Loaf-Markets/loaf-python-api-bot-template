@@ -2166,19 +2166,57 @@ def test_a_refused_reservation_rereads_the_account_alone(exchange, trading_clien
 )
 def test_market_refusal_rereads_the_market(exchange, trading_client, status, message, error):
     # The order names its market by the signed index alone: refused as no market, or as one that
-    # does not trade, it reads the ticker's market again, which may be another one by now.
+    # does not trade, it reads the ticker's market again, for its state and its tick as they are
+    # now.
     orders = trading_client().orders
     orders.limit_buy("OPRA", 10, 167.49)
     exchange.queue("/orders", error_reply(status, message))
     with pytest.raises(error) as info:
         orders.limit_buy("OPRA", 10, 167.49)  # reserves 2 and takes 4098
     assert type(info.value) is error
-    exchange.details["OPRA"] = market_detail(market_index=2052)  # OPRA's market now
+    exchange.details["OPRA"] = market_detail(decimals=(3, 3))  # OPRA's tick now: a tenth of a cent
     sent = len(exchange.requests)
-    orders.limit_buy("OPRA", 10, 167.49)
+    orders.limit_buy("OPRA", 10, 167.495)  # off the tick the market was first read at
     # The market alone is read again; the refused order's number is signed again.
     assert routes(exchange.requests[sent:]) == ["GET /trade/OPRA", "POST /orders"]
-    assert [body["l2MarketIndex"] for body in exchange.bodies("/orders")] == [2050, 2050, 2052]
+    bodies = exchange.bodies("/orders")
+    assert [body["price"] for body in bodies] == [167.49, 167.49, 167.495]
+    assert [body["l2MarketIndex"] for body in bodies] == [2050, 2050, 2050]
+    assert indices(exchange) == [4097, 4098, 4098]
+    verify_order(bodies[2])  # signed in the units the market was listed with
+
+
+@pytest.mark.parametrize(
+    "status, message, error",
+    [
+        (404, "Market not found", loaf.LoafNotFoundError),
+        (403, DELISTED, loaf.LoafForbiddenError),
+        (403, "This market is not yet available for trading", loaf.LoafForbiddenError),
+    ],
+    ids=["no-market", "delisted", "pending"],
+)
+def test_a_market_refusal_follows_the_ticker_to_no_other_market(
+    exchange, trading_client, status, message, error
+):
+    # The ticker may name another market by the time the SDK reads it again. An order follows no
+    # ticker: the refusal that had the market read again comes through the API too, so following
+    # it would let the API move a running bot to a market of its choosing, at this market's price.
+    orders = trading_client().orders
+    orders.limit_buy("OPRA", 10, 167.49)
+    exchange.queue("/orders", error_reply(status, message))
+    with pytest.raises(error):
+        orders.limit_buy("OPRA", 10, 167.49)  # reserves 2 and takes 4098
+    exchange.details["OPRA"] = market_detail(market_index=2052)  # OPRA's market now
+    sent = len(exchange.requests)
+    with pytest.raises(loaf.MarketChangedError) as info:
+        orders.limit_buy("OPRA", 10, 167.49)
+    assert (info.value.ticker, info.value.field) == ("OPRA", "marketIndex")
+    assert (info.value.held, info.value.served) == (2050, 2052)
+    assert routes(exchange.requests[sent:]) == ["GET /trade/OPRA"]  # nothing reserved or sent
+    # The market first read stays the client's: served again, it trades, on the refused number.
+    exchange.details["OPRA"] = market_detail()
+    orders.limit_buy("OPRA", 10, 167.49)
+    assert [body["l2MarketIndex"] for body in exchange.bodies("/orders")] == [2050, 2050, 2050]
     assert indices(exchange) == [4097, 4098, 4098]
 
 
