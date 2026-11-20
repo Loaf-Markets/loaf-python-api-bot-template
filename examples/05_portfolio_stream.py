@@ -1,16 +1,17 @@
-"""05 — Stream your PRIVATE portfolio events (requires an API key).
+"""05 — Stream your PRIVATE portfolio events (requires your trading key).
 
-Receives balance changes, position updates, order transitions, your fills,
-transfers, and IPO order updates in real time.
+Receives your balance book, order transitions, your fills and your perps account
+in real time.
 
     python examples/05_portfolio_stream.py
 
-The channel carries no id — your API key tells the server whose events to send.
+The channel carries no id — the login token your trading key signs tells the
+server whose events to send.
 """
 
 from __future__ import annotations
 
-from loaf import LoafClient
+from loaf import LoafClient, from_base_units
 
 try:
     from dotenv import load_dotenv
@@ -21,25 +22,36 @@ except ImportError:
 
 
 def main() -> None:
-    client = LoafClient()  # needs LOAF_API_KEY for the private channel
+    client = LoafClient()
+    if client.public_key is None:
+        raise SystemExit("Set LOAF_TRADING_KEY for your private channel (see README §2).")
 
     ws = client.websocket()
 
-    ws.on_balances(lambda m: print(f"BALANCE cash={m.cash:,.2f} frozen={m.frozen:,.2f}"))
-    ws.on_position(lambda m: print(f"POSITION {m.tokenName} qty={m.quantity} "
-                                   f"total={m.totalQuantity} avg={m.averageEntryPrice}"))
-    # Two order frames: `order_update` carries the full order (sent when it is
-    # accepted), `order_status` just the transition (FILLED / CANCELLED / ...).
+    # Your whole balance book after every change: replace yours with it (a missing
+    # row means 0). Amounts are base-unit strings; the isQuote rows are your cash.
+    @ws.on_balances
+    def on_balances(m):
+        for b in m.balances:
+            print(f"BALANCE {b.symbol} {from_base_units(b.available, b.decimals)} available")
+
+    # Two order frames: `order_update` carries the full committed order (sent
+    # when it is accepted and on every conditional transition; for an order that
+    # trades immediately it can follow the fill frames), `order_status` just the
+    # transition (FILLED / CANCELLED / ...).
     ws.on_order_update(lambda m: print(f"ORDER #{m.order.id} {m.order.side} {m.order.quantity} "
-                                       f"{m.order.tokenName} @ {m.order.price} -> {m.order.status}"))
+                                       f"{m.order.ticker} @ {m.order.price} -> {m.order.status}"))
     ws.on_order_status(lambda m: print(f"ORDER #{m.orderId} -> {m.status} "
                                        f"(left {m.get('quantityLeft')})"))
-    ws.on_trade(lambda m: print(f"FILL {m.trade.side} {m.trade.quantity} "
-                                f"{m.trade.tokenName} @ {m.trade.price} "
-                                f"[{m.trade.status}] #{m.trade.tradeId}"))
-    ws.on_transfer(lambda m: print(f"TRANSFER {m.transfer.type} {m.transfer.amount} "
-                                   f"-> {m.transfer.status}"))
-    ws.on_offering_order(lambda m: print(f"IPO ORDER #{m.order.ipoOrderId} -> {m.order.status}"))
+    # Every fill of yours; source says what made it. txHash is a trade's content hash, not an
+    # on-chain transaction, and None on a fill that is no trade (a liquidation's, say).
+    ws.on_trade(lambda m: print(f"FILL {m.trade.source} {m.trade.side} {m.trade.quantity} "
+                                f"{m.trade.ticker} @ {m.trade.price} fee={m.trade.fee} "
+                                f"#{m.trade.tradeId}"))
+    # Your perps pools, whole, after every commit that touches them.
+    ws.on_perps_account(lambda m: print(f"PERPS {len(m.perps.pools)} pools"))
+    # Every ended connection attempt (code None: no connection was made); it reconnects.
+    ws.on_disconnect(lambda m: print(f"DISCONNECTED code={m.code} reason={m.reason!r}"))
     ws.on_error(lambda m: print(f"ERROR {m.get('message')}"))
 
     # Subscribe to your own private channel.
