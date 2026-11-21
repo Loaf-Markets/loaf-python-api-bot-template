@@ -15,11 +15,11 @@ import threading
 import time
 import traceback
 from time import monotonic as _monotonic
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 import httpx
 
-from ._l2 import LoginTokens, TradingKey
+from ._l2 import LoginTokens, TradingKey, named_markets
 from ._object import parse
 from ._version import __version__
 from .constants import (
@@ -411,6 +411,20 @@ class LoafClient:
             current one is half used, so a placement waits on neither that
             request nor its one-a-second limit. One that outruns the thread still
             reserves for itself. Default ``False``: no thread.
+        markets: The markets your orders sign, by ticker, for the SDK to hold the
+            exchange's answers to: ``{"MUS": {"marketIndex": 2050,
+            "quantityDecimals": 3, "baseAssetId": 6, "quoteAssetId": 3}, "MUS-PERP":
+            {"marketIndex": 4, "quantityDecimals": 3}}`` (a perp names no assets). An
+            order signs those terms as bare integers, and a market's listing sets
+            them for good: a ``GET /trade/{ticker}`` answer that differs from the
+            table is refused (:class:`~loaf.exceptions.MarketChangedError`) before
+            anything is signed, the first answer too. A ticker with no entry is
+            held to its first read instead: that answer is taken as served, and a
+            later, different one is refused the same way.
+            ``loaf.orders.held_markets()`` gives what a client holds, in this
+            shape: check it once against a source other than this API, then pass
+            it. Anything but such a table raises :class:`LoafConfigError`.
+            Default ``None``: no table.
         verify: TLS verification for REST and the WebSocket (only the WebSocket
             with your own ``http_client``): an ``ssl.SSLContext``, such as
             ``ssl.create_default_context(cafile=...)``, trusts your own CAs. Set
@@ -442,6 +456,7 @@ class LoafClient:
         order_number_block: int = L2_ORDER_INDEX_BLOCK,
         order_number_start: int = 1,
         reserve_ahead: bool = False,
+        markets: Mapping[str, Mapping[str, int]] | None = None,
         verify: bool | ssl.SSLContext = True,
         http_client: httpx.Client | None = None,
     ) -> None:
@@ -483,6 +498,8 @@ class LoafClient:
         self._placement_timeout = _placement_timeout(timeout, placement_timeout)
         self._order_numbers = _order_numbers(order_number_block, order_number_start)
         self._reserve_ahead = bool(reserve_ahead)
+        #: The markets named in ``markets=``: what their orders sign, held from the start.
+        self._named_markets = named_markets(markets)
         self.max_retries = max(0, int(max_retries))
         self._verify = verify
 

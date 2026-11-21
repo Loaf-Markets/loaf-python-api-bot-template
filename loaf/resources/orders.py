@@ -386,10 +386,26 @@ _SEND_BY_RULE = "a unix time in milliseconds, a whole number from 1 to 2^48 - 1"
 class OrdersResource(Resource):
     def __init__(self, client: LoafClient) -> None:
         super().__init__(client)
-        #: The markets, account and order numbers your orders sign, refreshed on refusals.
+        #: The markets, account and order numbers your orders sign, refreshed on refusals;
+        #: what a market's orders sign is held, never refreshed.
         self._l2 = L2State(client)
         #: The market index a cancel's ``ticker=`` names, as last read.
         self._market_indices: dict[str, int] = {}
+
+    def held_markets(self) -> dict[str, dict[str, int]]:
+        """The markets this client holds its orders to, by ticker: each one's
+        ``marketIndex`` and ``quantityDecimals``, and a spot market's ``baseAssetId`` and
+        ``quoteAssetId``; the terms an order signs, which a market's listing sets for good.
+        Those ``LoafClient(markets=)`` named, and those first read here since (by an order
+        or :meth:`warm`), which were taken as the exchange served them.
+
+        It is the table ``LoafClient(markets=)`` takes: check it once against a source other
+        than this API (the listing's announcement, or the market's listing event on the
+        exchange's contract, at an address this API did not give you; the web app reads
+        this same API), keep it, and pass it from then on, so that a first read is held to
+        it too. No request is made.
+        """
+        return self._l2.held_markets()
 
     def warm(self, *tickers: str) -> None:
         """Do now what a first placement would do first: read each ticker's market and your
@@ -1449,13 +1465,14 @@ class OrdersResource(Resource):
         return scope
 
     def _market_index(self, ticker: str) -> int:
-        """``ticker``'s market index: the one an order here signed, else read once, from a
-        market that names ``ticker`` and whose type and index are its ticker's (another
-        market's detail would scope another market)."""
+        """``ticker``'s market index: the one held for its orders (``LoafClient(markets=)``'s,
+        or the one an order here first read), else read once, from a market that names
+        ``ticker`` and whose type and index are its ticker's (another market's detail would
+        scope another market)."""
         _check_market_ticker(ticker)
-        market = self._l2.market(ticker)
-        if market is not None:
-            return market.market_index
+        held = self._l2.held(ticker)
+        if held is not None:
+            return held.market_index
         index = self._market_indices.get(ticker)
         if index is not None:
             return index

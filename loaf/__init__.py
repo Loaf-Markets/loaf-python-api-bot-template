@@ -60,6 +60,7 @@ from .exceptions import (
     LoafServerError,
     LoafServiceUnavailableError,
     LoafValidationError,
+    MarketChangedError,
     MarketHaltedError,
     MarketStateError,
     OrderOutcomeUnknownError,
@@ -138,5 +139,6 @@ __all__ = [
     "ReplaceTargetGoneError",
     "LoafRateLimitError",
     "LoafServerError",
+    "MarketChangedError",
     "LoafServiceUnavailableError",
 ]

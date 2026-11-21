@@ -39,6 +39,7 @@ from .exceptions import (
     LoafConfigError,
     LoafError,
     LoafServerError,
+    MarketChangedError,
     MarketStateError,
     TradingHaltedError,
     _client_validation_error,
@@ -273,6 +274,94 @@ class Market(NamedTuple):
         return L2_SIGNED_DECIMALS - self.quantity_decimals
 
 
+class Held(NamedTuple):
+    """What an order on a market signs that its listing set for good, and an answer of the API
+    is therefore never let change: the market's index, the quantity decimals its two signed
+    integers are scaled by (price x 10^(7 - these), quantity x 10^these), and its assets (a
+    perp's are none and USDC: 0 and :data:`~loaf.constants.PERPS_QUOTE_ASSET_ID`).
+
+    Not held: the L2 chain, which the trading key names (an order on another is refused before
+    it is signed); ``priceDecimals``, the tick a price is checked on, which scales nothing
+    signed; a perp's status and band, which change."""
+
+    market_index: int
+    quantity_decimals: int
+    base_asset_id: int
+    quote_asset_id: int
+
+
+# Held's terms as GET /trade/{ticker} names them (MarketChangedError.field), and as
+# LoafClient(markets=) and OrdersResource.held_markets() do.
+_HELD_FIELDS = ("marketIndex", "quantityDecimals", "l2.baseAssetId", "l2.quoteAssetId")
+_NAMED_KEYS = ("marketIndex", "quantityDecimals", "baseAssetId", "quoteAssetId")
+
+
+def named_markets(markets: Any) -> dict[str, Held]:
+    """``LoafClient(markets=)`` as the markets held from the start: by ticker, a market's
+    ``marketIndex`` and ``quantityDecimals``, and a spot market's ``baseAssetId`` and
+    ``quoteAssetId`` as well; whole numbers, and exactly those keys (a misspelt one would
+    hold nothing).
+
+    Raises:
+        LoafConfigError: it is no such table.
+    """
+    if markets is None:
+        return {}
+    if not isinstance(markets, Mapping):
+        raise LoafConfigError(
+            "markets must map each ticker to its market's terms, e.g. "
+            '{"MUS": {"marketIndex": 2050, "quantityDecimals": 3, "baseAssetId": 6, '
+            f'"quoteAssetId": 3}}}}, got {type(markets).__name__}'
+        )
+    held: dict[str, Held] = {}
+    for ticker, terms in markets.items():
+        if not (isinstance(ticker, str) and _MARKET_TICKER_RE.fullmatch(ticker)):
+            raise LoafConfigError(f"markets: {ticker!r} is not a market's ticker")
+        perp = ticker.endswith("-PERP")
+        keys = _NAMED_KEYS[:2] if perp else _NAMED_KEYS
+        if not (
+            isinstance(terms, Mapping)
+            and set(terms) == set(keys)
+            and all(_is_int(terms[key]) for key in keys)
+        ):
+            raise LoafConfigError(
+                f"markets[{ticker!r}] must give {', '.join(keys[:-1])} and {keys[-1]} "
+                f"({'a perp' if perp else 'a spot market'}'s terms), each a whole number, and "
+                f"nothing else, got {dict(terms) if isinstance(terms, Mapping) else terms!r}"
+            )
+        assets = (0, PERPS_QUOTE_ASSET_ID) if perp else (terms[keys[2]], terms[keys[3]])
+        held[ticker] = Held(terms[keys[0]], terms[keys[1]], *assets)
+    return held
+
+
+def _named(ticker: str, held: Held) -> dict[str, int]:
+    """``held`` as ``LoafClient(markets=)`` names ``ticker``'s market."""
+    keys = _NAMED_KEYS[:2] if ticker.endswith("-PERP") else _NAMED_KEYS
+    return dict(zip(keys, held))
+
+
+def _market_changed(ticker: str, held: Held, served: Held, named: bool) -> MarketChangedError:
+    """The refusal of ``ticker``'s market as ``served``, which is not the one ``held``: by
+    ``LoafClient(markets=)`` (``named``), else since the ticker's first read."""
+    at = next(i for i, (mine, theirs) in enumerate(zip(held, served)) if mine != theirs)
+    origin, way_out = (
+        ("LoafClient(markets=) names", "pass its terms in markets=")
+        if named
+        else ("this client first read", "start a new client")
+    )
+    return MarketChangedError(
+        f"GET /trade/{ticker} answered another market than the one {origin} for {ticker}: its "
+        f"{_HELD_FIELDS[at]} is {served[at]}, not {held[at]}. Nothing was signed. A market's "
+        "index, quantity decimals and assets are set at its listing, and an order signs them: "
+        f"if {ticker} was listed again, check the new listing, then {way_out}.",
+        status_code=200,
+        ticker=ticker,
+        field=_HELD_FIELDS[at],
+        held=held[at],
+        served=served[at],
+    )
+
+
 class AccountState(NamedTuple):
     """Your trading account: what every order signs."""
 
@@ -440,7 +529,8 @@ def submit_signed_op(
 class L2State:
     """What an orders resource keeps between placements: each ticker's market, your
     account and the block of order indices being handed out. In memory only, and
-    refreshed only when a refusal shows it stale.
+    refreshed only when a refusal shows it stale; what a market's orders sign
+    (:class:`Held`) is held for the client's life, and never refreshed.
 
     One lock guards the account and the block, and is held across the account read
     and a reservation, so concurrent placements wait for and share the one in flight.
@@ -457,6 +547,10 @@ class L2State:
         self._lock = threading.Lock()
         # Each access is one atomic dict operation; losing a race costs one detail read.
         self._markets: dict[str, Market] = {}
+        # What each ticker's orders sign: LoafClient(markets=)'s, else the ticker's first read.
+        # Never replaced, and it outlives the market above, which a refusal drops.
+        self._held: dict[str, Held] = dict(client._named_markets)
+        self._named = frozenset(self._held)
         self._account: AccountState | None = None
         self._block: _Block | None = None
         self._last_count = 0
@@ -476,8 +570,32 @@ class L2State:
         return self._markets.get(ticker)
 
     def remember(self, ticker: str, market: Market) -> None:
-        """Keep ``ticker``'s market as just read."""
+        """Keep ``ticker``'s market as just read, once it is the market held for the ticker:
+        the one ``LoafClient(markets=)`` names, else the one first read, held from then on.
+
+        Raises:
+            MarketChangedError: it is another market, or the same in other units. Nothing of
+                it is kept, and the market held stays held.
+        """
+        served = Held(
+            market.market_index,
+            market.quantity_decimals,
+            market.base_asset_id,
+            market.quote_asset_id,
+        )
+        # One atomic dict operation: of two first reads at once, one is held and both are checked.
+        held = self._held.setdefault(ticker, served)
+        if served != held:
+            raise _market_changed(ticker, held, served, ticker in self._named)
         self._markets[ticker] = market
+
+    def held(self, ticker: str) -> Held | None:
+        """What ``ticker``'s orders sign, once named or read."""
+        return self._held.get(ticker)
+
+    def held_markets(self) -> dict[str, dict[str, int]]:
+        """Every market held, by ticker, as ``LoafClient(markets=)`` takes them."""
+        return {ticker: _named(ticker, held) for ticker, held in sorted(self._held.copy().items())}
 
     def account(self, account_index: int) -> AccountState:
         """Your account, ``account_index`` (your trading key's): the one kept, else its
@@ -602,7 +720,9 @@ class L2State:
         # reservation never name it, and a refusal of their login token ('l2 key: …', say) shows
         # your trading key not in force. A placement names its market by the signed index alone:
         # refused as no market (404) or as one that does not trade (403: delisted, say), it shows
-        # the market stale, since the ticker may name another market by now. Refused for a perp's
+        # the market stale, so the next order reads the ticker's market again: its state and tick
+        # as they are now, and, were the ticker another market's by now, that market's refusal
+        # (remember: MarketChangedError), since an order follows no ticker. Refused for a perp's
         # band (PRICE_BAND) with a price the SDK derived within the band kept with the market
         # (``derived``), it shows that band possibly stale (narrowed since it priced the order), so
         # the next order reads the market's terms again; a price signed as given (a LIMIT, IOC or

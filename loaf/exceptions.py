@@ -510,6 +510,40 @@ class LoafServerError(LoafAPIError):
     """
 
 
+class MarketChangedError(LoafServerError):
+    """``GET /trade/{ticker}`` answered another market than the one this client holds
+    for the ticker. Nothing was reserved, signed or sent.
+
+    An order signs bare integers: its market's index and assets, its price x 10^(7 -
+    ``quantityDecimals``) and its quantity x 10^``quantityDecimals``. A market's listing sets
+    its index, its quantity decimals and its assets for good, so a client holds them from its
+    first read of the ticker, or from ``LoafClient(markets=)``, and takes no other answer:
+    signed in other units, your order would be the exchange's order for another price and
+    quantity, and signed for another index, an order on another market at this one's price.
+
+    Its ``status_code`` is 200 (the answer was read, and refused here). The market held
+    stays held: an order on the ticker is refused the same way until the exchange serves
+    it again. If the ticker really was listed again, check the new listing, then start a
+    new client (with its terms in ``markets=``, if you pass that).
+
+    Attributes:
+        ticker: The ticker asked for.
+        field: The first term that differs, as the exchange names it: ``marketIndex``,
+            ``quantityDecimals``, ``l2.baseAssetId`` or ``l2.quoteAssetId``.
+        held: This client's value for it.
+        served: The answer's.
+    """
+
+    def __init__(
+        self, *args: Any, ticker: str, field: str, held: int, served: int, **kwargs: Any
+    ) -> None:
+        self.ticker = ticker
+        self.field = field
+        self.held = held
+        self.served = served
+        super().__init__(*args, **kwargs)
+
+
 class LoafServiceUnavailableError(LoafServerError):
     """503 — a service is temporarily unavailable, e.g. the trading service,
     candle history under load (``Candle history is busy…``), or your perps read
