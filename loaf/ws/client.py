@@ -589,9 +589,15 @@ class LoafWebSocketClient:
         return self.on(WSMessageType.TRANSFER_UPDATE, handler)
 
     def on_fees(self, handler: Handler | None = None) -> Any:
-        """The fees that apply to you changed (``fees_update``:
-        ``{applicableFees}``): replace what
-        ``portfolio.component().applicableFees`` gave you."""
+        """Your fee rates (``fees_update``: ``{applicableFees}``, ``{spot,
+        perps}`` whole, a :class:`~loaf.models.ApplicableFees`). The exchange
+        looks at them once a minute: a frame comes within about a minute of a
+        change to a spot or a perps rate of yours (your orders go with the new
+        rate from the change, up to a minute before its frame), and one can
+        come unchanged within about a minute of a subscribe (a reconnect's
+        too); it can repeat: replace what
+        ``portfolio.component().applicableFees`` gave you, and compare before
+        acting on a change."""
         return self.on(WSMessageType.FEES_UPDATE, handler)
 
     def on_l2_keys(self, handler: Handler | None = None) -> Any:

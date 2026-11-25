@@ -8,8 +8,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 For each market's own tick and lot, the perps reads as actual values, the
 exchange's perps band around the mark and its coded withdrawal refusals. It
-needs the exchange API that serves each market's decimals and its perps values
-as exact decimal strings; an older SDK's orders are refused there
+needs the exchange API that serves each market's decimals, its perps values
+as exact decimal strings and your fee rates by market type (`applicableFees`
+`{spot, perps}`); an older SDK's orders are refused there
 (`INVALID_SIGNATURE`: it signs at the old scale). It also takes only an
 encrypted base URL (or one on this machine), gives an order that cannot rest a
 10-minute life, holds every derived price within your max slippage, bounds what
@@ -161,6 +162,30 @@ method of.
   again after such a refusal. What to change: catch `MarketChangedError`,
   stop trading the ticker and alert; if it really was listed again, check the
   new listing and start a new client.
+- **`applicableFees` is your fee rates by market type.**
+  `portfolio.component().applicableFees` and the `fees_update` frame's
+  (`ws.on_fees`) are `{spot, perps}`, each `{takerFeeBps, makerFeeBps}` in
+  whole bps (`loaf.models.ApplicableFees` and `FeeRates`); they were the spot
+  rates alone, flat, and an exchange that does not yet serve them by market
+  type still sends that, which the SDK passes through as served. Both are
+  your 14-day volume tier's in the exchange's fee schedule, which now prices
+  perps orders as it prices spot ones, or 0 for every rate while the
+  exchange's trading fees are off (they were the tier's spot rates then,
+  which no order paid). A perps order went with its market's own fee; it
+  goes with your perps rates, each held to that fee for its role, so a perp's
+  `l2.takerFee` and `l2.makerFee` (per 1,000,000) are the most an order's
+  rates may be, not the rates it pays. A `fees_update` comes within about a
+  minute of a change to a spot or a perps rate, and can come unchanged after
+  a subscribe. What every order signs is unchanged: `L2_FEE_RATE_CAP` (70
+  bps), which covers every rate of the exchange's default schedule; an order
+  whose taker or maker rate is above it is refused `FEE_RATE_CAP_TOO_LOW`, as
+  before. What to change: read `applicableFees.spot.takerFeeBps` and
+  `.makerFeeBps` where you read `applicableFees.takerFeeBps` and
+  `.makerFeeBps`; and where you priced a perps order from its market's
+  `l2.takerFee` and `l2.makerFee`, price it at
+  `min(applicableFees.perps.takerFeeBps, market.l2.takerFee // 100)` for the
+  taker and `min(applicableFees.perps.makerFeeBps, market.l2.makerFee // 100)`
+  for the maker.
 
 ### Added
 
@@ -353,13 +378,13 @@ method of.
   or refused for the band, and spot markets are unchanged. A perps order
   refused `PRICE_BAND` after it signed a price the SDK derived (its own or a
   TP/SL leg's limit) makes the next one read the market's terms again; one
-  whose prices you all gave keeps them. What to change: a bot that sizes a
-  perps MARKET BUY's hold itself takes `loaf.worst_price(mark, "BUY",
-  min(max_slippage_bps, band // 2), price_decimals=..., quantity_decimals=...)`,
-  or the tick above the mark where that price falls below an off-grid mark
-  and the band and the max slippage admit it (see `worst_price`); one that
-  wants a perps price farther than half the band from its reference gives the
-  price exactly.
+  whose prices you all gave keeps them. What to change: a bot that works out
+  the price a perps MARKET BUY signs, to size it, takes
+  `loaf.worst_price(mark, "BUY", min(max_slippage_bps, band // 2),
+  price_decimals=..., quantity_decimals=...)`, or the tick above the mark
+  where that price falls below an off-grid mark and the band and the max
+  slippage admit it (see `worst_price`); one that wants a perps price farther
+  than half the band from its reference gives the price exactly.
 - **Withdrawal refusals answer as an order's.** Each carries `e.code`
   (`loaf.OrderErrorCode`): 422 `INSUFFICIENT_BALANCE`, `BELOW_MIN_ORDER_VALUE`,
   `RATE_LIMITED` (too many withdrawals not yet settled), `ORDER_INDEX_USED`

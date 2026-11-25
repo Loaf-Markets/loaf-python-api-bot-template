@@ -332,10 +332,24 @@ def worst_price(
     highest price, the largest on its tick whose signed price, x 10^(7 -
     quantity_decimals), fits 32 bits.
 
-    Use it to size a MARKET BUY: a BUY holds the price it signs x quantity x
-    (1 + :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of your cash:
-    this price, or on a perp the tick above an off-grid mark, or one tick,
-    where the SDK signs that instead.
+    Use it to size a MARKET BUY. On a spot market a BUY holds the price it
+    signs, this price, x quantity x (1 +
+    :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of the market's quote
+    asset while it matches. A perps order holds no such amount, so size one
+    from its pool, not from your cash: an order that can grow its pool's
+    position must leave the pool at initial margin (at least twice the
+    maintenance ``l2.risk`` sets) beside the pool's other open orders,
+    positions valued at the mark, each order filled at its own price (so a bid
+    above the mark or an ask below it counts what it loses against the mark)
+    and its fee counted at its signed cap (this one's: the price it signs,
+    which is this price unless the SDK signs the tick above an off-grid mark
+    or one tick instead, x quantity x L2_FEE_RATE_CAP / 1,000,000), or it is
+    refused ``INSUFFICIENT_BALANCE``. On a unified account (``accountMode``
+    ``"UNIFIED"``) pool 0 first draws what it lacks from your spot USDC. A
+    MARKET order is admitted without its own loss against the mark, but a fill
+    of it that would leave the pool below initial margin is not made: the rest
+    is cancelled, or with nothing filled the order is refused
+    ``INSUFFICIENT_BALANCE`` (not ``NOT_FILLED``).
 
     ``side`` is ``BUY`` or ``SELL``; ``max_slippage_bps`` a whole number from 0
     to 9999, required so your sizing cannot drift from what the client signs:

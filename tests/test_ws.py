@@ -173,7 +173,8 @@ def test_a_liquidation_row_reaches_on_trade():
         ("on_perps_account", {"type": "perps_account_update", "perps": {"l2AccountIndex": 5, "pools": []}}),
         ("on_holding", {"type": "holding_update", "holding": {"ticker": "MUS", "averageEntryPrice": 12.5}}),
         ("on_transfer", {"type": "transfer_update", "transfer": {"journalSeq": 9}}),
-        ("on_fees", {"type": "fees_update", "applicableFees": {"takerFeeBps": 30, "makerFeeBps": 10}}),
+        ("on_fees", {"type": "fees_update", "applicableFees": {
+            "spot": {"takerFeeBps": 30, "makerFeeBps": 10}, "perps": {"takerFeeBps": 5, "makerFeeBps": 2}}}),
         ("on_l2_keys", {"type": "l2_keys_update", "apiKeyIndices": [0]}),
         ("on_perps_leverage", {"type": "perps_leverage_update", "ticker": "OPRA-PERP", "leverage": 5}),
         ("on_orderbook", {"type": "orderbook_update", "ticker": "H100-PERP", "bids": [], "asks": []}),

@@ -332,6 +332,12 @@ def test_models_list_every_shape():
     assert component["perpsLeverage"] == Optional[list[models.PerpsLeverage]]
     assert get_type_hints(models.PerpsLeverage) == {"ticker": str, "leverage": int}
     assert models.PerpsLeverage.__required_keys__ == {"ticker", "leverage"}
+    # Your fee rates are by market type, a taker and a maker rate each, whole bps.
+    assert component["applicableFees"] == Optional[models.ApplicableFees]
+    assert get_type_hints(models.ApplicableFees) == {"spot": models.FeeRates, "perps": models.FeeRates}
+    assert models.ApplicableFees.__required_keys__ == {"spot", "perps"}
+    assert get_type_hints(models.FeeRates) == {"takerFeeBps": int, "makerFeeBps": int}
+    assert models.FeeRates.__required_keys__ == {"takerFeeBps", "makerFeeBps"}
     # A book frame names its ticker, never the index.
     assert get_type_hints(models.OrderBook)["ticker"] is str
     assert "marketIndex" not in get_type_hints(models.OrderBook)

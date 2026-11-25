@@ -79,11 +79,16 @@ reference (a perp's live mark) moved against you by the max slippage
 within its band, see **The perps band**), rounded toward the reference to the
 market's tick. The engine matches it up to that price and **never rests it**:
 what it cannot fill at once is cancelled, and one that fills nothing is
-refused. A BUY holds worst price x quantity x (1 +
+refused. On a spot market a BUY holds worst price x quantity x (1 +
 :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of your cash while it
-matches. Its life is 10 minutes unless you pass ``ttl_ms=`` or attach TP/SL
-legs (**Order life**), so its signed bytes, placed again as a resting limit at
-its worst price, could rest at most that long.
+matches. A perps order holds no such amount: one that can grow its pool's
+position must leave the pool at initial margin, its fee counted at the cap,
+and its fills stop where one would leave the pool below it; on a unified
+account pool 0 draws what it lacks from your spot USDC
+(:func:`loaf.worst_price` has the rule). Its life is 10 minutes unless you
+pass ``ttl_ms=`` or attach TP/SL legs (**Order life**), so its signed bytes,
+placed again as a resting limit at its worst price, could rest at most that
+long.
 
 **Time in force.** ``time_in_force=`` (:class:`~loaf.enums.TimeInForce`) on
 :meth:`OrdersResource.create`, :meth:`OrdersResource.limit_buy` and
@@ -189,8 +194,12 @@ Server-side checks reject an order the SDK cannot pre-validate for you (all 400,
 * **Balance and open-order caps** (``INSUFFICIENT_BALANCE``,
   ``OPEN_ORDER_LIMIT``) — not enough available balance, or too many open
   orders (resting stops count too).
-* **Fee-rate cap** (``FEE_RATE_CAP_TOO_LOW``) — your account's fee rate is
-  above :data:`~loaf.constants.L2_FEE_RATE_CAP`, which every order signs.
+* **Fee-rate cap** (``FEE_RATE_CAP_TOO_LOW``) — either fee rate the order
+  goes with, its taker or its maker one (both count, whatever role it fills
+  in), is above :data:`~loaf.constants.L2_FEE_RATE_CAP`, which every order
+  signs: your spot rates on a spot market, on a perp your perps rates, each
+  held to the market's fee for its role
+  (``portfolio.component().applicableFees``).
 * **Time in force** — an IOC or MARKET order that fills nothing
   (``NOT_FILLED``), a FOK order that cannot fill in full (``FOK_NOT_FILLED``),
   and a POST_ONLY order that would trade at once (``POST_ONLY_WOULD_TAKE``,

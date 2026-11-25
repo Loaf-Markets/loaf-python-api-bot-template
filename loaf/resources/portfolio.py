@@ -131,9 +131,12 @@ class PortfolioResource(Resource):
         ``orderHistory`` and ``offeringOrders`` are one read, and so are
         ``holdingDetails`` and ``holdingSparklines``; the others fail alone.
 
-        ``applicableFees`` is raw bps, and streams on the private WS channel as
-        ``fees_update``; ``lifetimeVolume`` (dollars) also streams on the
-        private WS channel as ``lifetime_volume_update``.
+        ``applicableFees`` is your fee rates by market type, ``{spot, perps}``,
+        each ``{takerFeeBps, makerFeeBps}`` in whole bps
+        (:class:`~loaf.models.ApplicableFees` says which an order goes with).
+        It streams on the private WS channel as ``fees_update``;
+        ``lifetimeVolume`` (dollars) also streams on the private WS channel as
+        ``lifetime_volume_update``.
 
         ``openOrders`` interleaves live booked orders with your ``PENDING`` /
         ``ARMED`` conditionals, newest first, before the list is capped, each

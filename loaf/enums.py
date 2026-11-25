@@ -142,7 +142,9 @@ class OrderErrorCode(_StrEnum):
     OPEN_ORDER_LIMIT = "OPEN_ORDER_LIMIT"
     #: A stop or take whose trigger is already reached.
     TRIGGER_THROUGH = "TRIGGER_THROUGH"
-    #: Its signed fee-rate cap is below the rate it trades at.
+    #: Its signed fee-rate cap (L2_FEE_RATE_CAP) is below a rate it goes with, taker or maker,
+    #: whatever role it would fill in: your spot rates on a spot market, on a perp your perps rates
+    #: each held to the market's fee for its role (applicableFees).
     FEE_RATE_CAP_TOO_LOW = "FEE_RATE_CAP_TOO_LOW"
     #: A withdrawal's: the withdraw fee in force is above the most it accepts (``max_fee``, its
     #: ``maxWithdrawFee``), raised since it was read. Nothing was taken; the SDK reads the fee

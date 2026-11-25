@@ -84,7 +84,9 @@ class PerpMarketL2(TypedDict):
     quoteAssetId: int  # 3, USDC
     status: str  # "ACTIVE", or "EXPIRED": no more orders; positions leave by perps.exit()
     qem: str  # its quote extension multiplier, a decimal string (it can pass 2^53)
-    takerFee: int  # per 1,000,000; an order's signed fee-rate cap must cover it
+    # The market's own fee for each role, per 1,000,000 (100 = 1 bp): the most an order's rate for
+    # that role may be, not the rate it pays (ApplicableFees).
+    takerFee: int
     makerFee: int
     risk: int  # the maintenance margin factor per 65,536 (initial margin is twice it)
     maxLeverage: int  # the most leverage it takes: 65,536 // (2 x risk), at least 1
@@ -457,6 +459,25 @@ class PerpsLeverage(TypedDict):
     leverage: int  # 1 to the market's maxLeverage
 
 
+class FeeRates(TypedDict):
+    """A taker and a maker fee rate, whole basis points from 0 to 100 (``30`` = 0.30%)."""
+
+    takerFeeBps: int
+    makerFeeBps: int
+
+
+class ApplicableFees(TypedDict):
+    """Your fee rates by market type: a component's ``applicableFees`` and a ``fees_update``
+    frame's. Your 14-day volume tier's in the exchange's fee schedule, or 0 for every rate while
+    its trading fees are off. A spot order goes with ``spot``; a perps order with ``perps``, each
+    rate held to its market's own fee for that role (PerpMarketL2's ``takerFee`` and
+    ``makerFee``: at most that // 100 bps). An order keeps the rates it was placed with; the order
+    a stop, take or TP/SL leg books when it fires, those of the row's placement."""
+
+    spot: FeeRates
+    perps: FeeRates
+
+
 class PortfolioSummary(TypedDict):
     """``portfolio.summary()``: what you hold."""
 
@@ -476,7 +497,7 @@ class PortfolioComponent(TypedDict):
     saved leverage. A section is ``None`` when its read failed: unread, never empty."""
 
     lifetimeVolume: Optional[float]  # dollars traded over the account's lifetime
-    applicableFees: Optional[dict[str, int]]  # {takerFeeBps, makerFeeBps}
+    applicableFees: Optional[ApplicableFees]  # your fee rates by market type, {spot, perps}
     offeringOrders: Optional[list[dict[str, Any]]]
     openOrders: Optional[list[OrderHistoryItem]]  # booked orders + PENDING/ARMED conditionals, merged
     tradeHistory: Optional[list[TradeHistoryItem]]  # without proof
@@ -520,6 +541,8 @@ __all__ = [
     "Holding",
     "HoldingDetails",
     "PerpsLeverage",
+    "FeeRates",
+    "ApplicableFees",
     "PortfolioSummary",
     "PortfolioComponent",
 ]

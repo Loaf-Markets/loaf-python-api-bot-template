@@ -157,7 +157,8 @@ def test_the_component_serves_its_fills_and_funding_payments_as_decimals():
     funding = {"journalSeq": 7, "marketIndex": 4, "ticker": "OPRA-PERP", "pool": 0, "base": "-2.004",
                "payment": "0.000001", "rateCbp": -250, "atMs": 1_800_000_000_000}
     order = {"id": 991, "marketIndex": 2050, "quantity": 1.5, "price": 160.25, "filledQuantity": 0}
-    body = {"lifetimeVolume": 12.5, "openOrders": [order], "tradeHistory": [spot, close],
+    fees = {"spot": {"takerFeeBps": 70, "makerFeeBps": 40}, "perps": {"takerFeeBps": 5, "makerFeeBps": 2}}
+    body = {"lifetimeVolume": 12.5, "applicableFees": fees, "openOrders": [order], "tradeHistory": [spot, close],
             "fundingHistory": [funding], "orderHistory": [order], "transfers": None}
     client, _ = client_of(body)
     got = client.portfolio.component()
@@ -167,6 +168,9 @@ def test_the_component_serves_its_fills_and_funding_payments_as_decimals():
         "fundingHistory": [as_decimals(funding, FUNDING_DECIMALS)],
     }
     assert got.openOrders == [order] and got.lifetimeVolume == 12.5  # numbers, as served
+    # Your fee rates are whole bps, the ints served (a Decimal 5 == 5 too).
+    assert {type(rate) for rates in got.applicableFees.values() for rate in rates.values()} == {int}
+    assert got.applicableFees.perps.takerFeeBps == 5
 
 
 def test_the_history_pages_and_their_iterators_serve_their_rows_as_decimals():
