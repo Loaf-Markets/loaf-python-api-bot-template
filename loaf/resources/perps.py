@@ -184,7 +184,8 @@ class PerpsResource(Resource):
           (:meth:`collateral`).
 
         Your open orders are ``portfolio.component().openOrders``, each with its
-        ``pool`` and ``reduceOnly``. Each call is a whole portfolio read: to
+        ``pool``, ``reduceOnly`` and ``feeRateCap`` (the signed cap its pool counts a
+        booked order's fee at). Each call is a whole portfolio read: to
         follow your positions, keep what
         :meth:`~loaf.ws.client.LoafWebSocketClient.on_perps_account` pushes
         (README, **Perps**).

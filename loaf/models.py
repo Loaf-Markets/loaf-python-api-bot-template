@@ -85,7 +85,8 @@ class PerpMarketL2(TypedDict):
     status: str  # "ACTIVE", or "EXPIRED": no more orders; positions leave by perps.exit()
     qem: str  # its quote extension multiplier, a decimal string (it can pass 2^53)
     # The market's own fee for each role, per 1,000,000 (100 = 1 bp): the most an order's rate for
-    # that role may be, not the rate it pays (ApplicableFees).
+    # that role may be, not the rate it pays (ApplicableFees). An order on it signs the larger as
+    # its fee-rate cap.
     takerFee: int
     makerFee: int
     risk: int  # the maintenance margin factor per 65,536 (initial margin is twice it)
@@ -346,6 +347,9 @@ class OrderHistoryItem(TypedDict, total=False):
     # always None on booked orders.
     rejectionReason: Optional[str]
     expiryMs: int  # unix ms, the signed expiry
+    # The fee-rate cap it signed (l2FeeRateCap), per 1,000,000: a booked perps order's pool counts
+    # its fee at this cap while it is open.
+    feeRateCap: int
     filledAt: Optional[int]  # booked orders only — absent on a conditional
     cancelledAt: Optional[int]
     createdAt: int

@@ -341,15 +341,20 @@ def worst_price(
     maintenance ``l2.risk`` sets) beside the pool's other open orders,
     positions valued at the mark, each order filled at its own price (so a bid
     above the mark or an ask below it counts what it loses against the mark)
-    and its fee counted at its signed cap (this one's: the price it signs,
+    and its fee counted at its signed cap (another open order's: the
+    ``feeRateCap`` of its ``openOrders`` row; this one's: the price it signs,
     which is this price unless the SDK signs the tick above an off-grid mark
-    or one tick instead, x quantity x L2_FEE_RATE_CAP / 1,000,000), or it is
-    refused ``INSUFFICIENT_BALANCE``. On a unified account (``accountMode``
-    ``"UNIFIED"``) pool 0 first draws what it lacks from your spot USDC. A
-    MARKET order is admitted without its own loss against the mark, but a fill
-    of it that would leave the pool below initial margin is not made: the rest
-    is cancelled, or with nothing filled the order is refused
-    ``INSUFFICIENT_BALANCE`` (not ``NOT_FILLED``).
+    or one tick instead, x quantity x the perp's larger fee as the orders
+    resource last read the market, ``max(l2.takerFee, l2.makerFee)``, /
+    1,000,000: the cap a perps order signs, not ``L2_FEE_RATE_CAP``; a fee cut
+    since that read is signed once
+    :meth:`~loaf.resources.orders.OrdersResource.warm` reads the market
+    again), or it is refused ``INSUFFICIENT_BALANCE``. On a unified account
+    (``accountMode`` ``"UNIFIED"``) pool 0 first draws what it lacks from your
+    spot USDC. A MARKET order is admitted without its own loss against the
+    mark, but a fill of it that would leave the pool below initial margin is
+    not made: the rest is cancelled, or with nothing filled the order is
+    refused ``INSUFFICIENT_BALANCE`` (not ``NOT_FILLED``).
 
     ``side`` is ``BUY`` or ``SELL``; ``max_slippage_bps`` a whole number from 0
     to 9999, required so your sizing cannot drift from what the client signs:

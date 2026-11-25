@@ -13,9 +13,9 @@ as exact decimal strings and your fee rates by market type (`applicableFees`
 `{spot, perps}`); an older SDK's orders are refused there
 (`INVALID_SIGNATURE`: it signs at the old scale). It also takes only an
 encrypted base URL (or one on this machine), gives an order that cannot rest a
-10-minute life, holds every derived price within your max slippage, bounds what
-a read waits for and reads, and makes `bot.py` a template you fill in one
-method of.
+10-minute life, holds every derived price within your max slippage, signs a
+perps order's fee-rate cap at its market's own fee, bounds what a read waits
+for and reads, and makes `bot.py` a template you fill in one method of.
 
 ### Breaking
 
@@ -176,13 +176,14 @@ method of.
   `l2.takerFee` and `l2.makerFee` (per 1,000,000) are the most an order's
   rates may be, not the rates it pays. A `fees_update` comes within about a
   minute of a change to a spot or a perps rate, and can come unchanged after
-  a subscribe. What every order signs is unchanged: `L2_FEE_RATE_CAP` (70
-  bps), which covers every rate of the exchange's default schedule; an order
-  whose taker or maker rate is above it is refused `FEE_RATE_CAP_TOO_LOW`, as
-  before. What to change: read `applicableFees.spot.takerFeeBps` and
-  `.makerFeeBps` where you read `applicableFees.takerFeeBps` and
-  `.makerFeeBps`; and where you priced a perps order from its market's
-  `l2.takerFee` and `l2.makerFee`, price it at
+  a subscribe. A spot order still signs `L2_FEE_RATE_CAP` (70 bps) as its
+  fee-rate cap, which covers every spot rate of the exchange's default
+  schedule, and one whose taker or maker rate is above it is refused
+  `FEE_RATE_CAP_TOO_LOW`, as before; a perps order signs its market's larger
+  fee (**Changed**, below). What to change: read
+  `applicableFees.spot.takerFeeBps` and `.makerFeeBps` where you read
+  `applicableFees.takerFeeBps` and `.makerFeeBps`; and where you priced a
+  perps order from its market's `l2.takerFee` and `l2.makerFee`, price it at
   `min(applicableFees.perps.takerFeeBps, market.l2.takerFee // 100)` for the
   taker and `min(applicableFees.perps.makerFeeBps, market.l2.makerFee // 100)`
   for the maker.
@@ -222,6 +223,10 @@ method of.
   settle it. The `Following market` line names the market's type.
 - A `LICENSE` file (MIT).
 - `history.cancelled_orders(cursor=)` and `history.iter_cancelled_orders()`.
+- `OrderHistoryItem.feeRateCap`: the fee-rate cap an order signed
+  (`l2FeeRateCap`, per 1,000,000), on each `openOrders`, `orderHistory` and
+  `history.orders()` row; a booked perps order's pool counts its fee at it
+  while it is open.
 - **The withdraw fee.** A withdrawal pays the exchange's withdraw fee on top
   of its amount (a flat amount of USDC the exchange sets, at most 5 USDC; your
   wallet receives the amount whole). `portfolio.summary().withdrawFee` serves
@@ -385,6 +390,36 @@ method of.
   where that price falls below an off-grid mark and the band and the max
   slippage admit it (see `worst_price`); one that wants a perps price farther
   than half the band from its reference gives the price exactly.
+- **A perps order signs its market's fee as its fee-rate cap.** Every order
+  on a perp, a stop, a take, a reduce-only close and a TP/SL leg alike, signs
+  as its `l2FeeRateCap` the larger of its market's `l2.takerFee` and
+  `l2.makerFee` (per 1,000,000, from the read of the market its other terms
+  come from), as the web app does, where it signed `L2_FEE_RATE_CAP` (7,000);
+  a spot order still signs `L2_FEE_RATE_CAP`. The exchange holds your perps
+  rates to the market's fee for each role, so that cap covers every rate an
+  order there can go with, and the engine counts an open perps order's fee at
+  its signed cap against its pool's margin: 0.05% of its notional at a fee of
+  500, where 7,000 counted 0.70%, so the same pool backs larger orders. As
+  they are signed now, a perp whose `takerFee` or `makerFee` is not a whole
+  number from 0 to 1,000,000 is refused (`LoafServerError`, `unusable
+  market.l2.takerFee` or `.makerFee`) before anything is reserved or signed.
+  The SDK keeps a perp's fees with the market it read, which a market update
+  can change. Raised: an order signed at the old fee is refused
+  `FEE_RATE_CAP_TOO_LOW` where your perps rate for a role, held to the
+  market's new fee, is above the cap it signed, and the next order reads the
+  market's terms again to sign the new fee (nothing is retried for you; that
+  read can lag the update by up to about ten seconds, so an order placed at
+  once may be refused again). Cut: orders go on signing the old, larger fee,
+  admitted with their fee counted at it against the pool, until the SDK reads
+  the market again (`orders.warm(ticker)`, a MARKET order without
+  `reference_price`, or a refusal that reads it again). What to change: a bot
+  that sizes a perps order against its pool counts the order's fee at the
+  larger fee as the SDK last read the market, `max(market.l2.takerFee,
+  market.l2.makerFee) / 1,000,000` of its notional, not `L2_FEE_RATE_CAP`
+  (another open order's at its row's `feeRateCap`), and calls
+  `orders.warm(ticker)` after a change to a perp's fees before it sizes to the
+  new ones; on a perps `FEE_RATE_CAP_TOO_LOW`, place the order again (a moment
+  later if it is refused again).
 - **Withdrawal refusals answer as an order's.** Each carries `e.code`
   (`loaf.OrderErrorCode`): 422 `INSUFFICIENT_BALANCE`, `BELOW_MIN_ORDER_VALUE`,
   `RATE_LIMITED` (too many withdrawals not yet settled), `ORDER_INDEX_USED`

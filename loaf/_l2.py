@@ -25,6 +25,7 @@ from .constants import (
     ENV_BASE_URL,
     ENV_TRADING_KEY,
     L2_BUFFER_MS,
+    L2_FEE_RATE_CAP,
     L2_LOGIN_TOKEN_LIFE_MS,
     L2_LOGIN_TOKEN_PREFIX,
     L2_MAX_ORDER_LIFE_MS,
@@ -75,6 +76,9 @@ _MAX_SAFE_INT = 2**53 - 1
 _KB_MODULUS = 2_130_706_433  # an L2 chain id is a KoalaBear element, below this prime
 # A perp's l2.status: K1's; an EXPIRED perp takes no more orders.
 _PERP_L2_STATUSES = ("ACTIVE", "EXPIRED")
+# K1's FEE_TICK: a perp's l2.takerFee and l2.makerFee, and an order's fee-rate cap, are per it (a
+# bp is 100); a market's fee is at most one whole tick.
+_FEE_TICK = 1_000_000
 
 _RESERVED_TOO_SOON = "l2 order_index: the account's last reservation is less than 1 s old"
 logger = logging.getLogger(__name__)
@@ -240,8 +244,9 @@ class LoginTokens:
 
 class Market(NamedTuple):
     """A market's ``marketIndex``, ``type``, ``l2`` and decimals: the vault and market every order
-    on it signs, the units it signs them in, and a perp's band, which bounds the prices the SDK
-    derives on it."""
+    on it signs, the units it signs them in, the fee-rate cap it signs, and a perp's band, which
+    bounds the prices the SDK derives on it. One read's, so an order signs its cap and its other
+    terms from the same answer."""
 
     chain_id: int
     proxy_address: str
@@ -261,6 +266,12 @@ class Market(NamedTuple):
     #: ``quantityDecimals``: a quantity on it has at most this many, a lot of 10^-this tokens,
     #: and an order signs quantity x 10^this (``l2.signedQuantityDecimals``).
     quantity_decimals: int
+    #: The fee-rate cap an order on it signs (``l2FeeRateCap``, per 1,000,000), its TP/SL legs
+    #: with it: on a perp the larger of ``l2.takerFee`` and ``l2.makerFee`` as last read, the
+    #: market's own fee for each role and so the most any rate of an order on it may be (the
+    #: exchange holds your perps rates to it), as the web app signs; on a spot market
+    #: :data:`~loaf.constants.L2_FEE_RATE_CAP`.
+    fee_rate_cap: int
     #: A perp's band, ``l2.band`` basis points as last read: the exchange holds a perps order's
     #: price within it around the market's mark, and a perps stop's, take's or leg's limit within
     #: it around its own trigger. 0 (no band) on a spot market, and on a perp whose band is 0 or
@@ -282,7 +293,8 @@ class Held(NamedTuple):
 
     Not held: the L2 chain, which the trading key names (an order on another is refused before
     it is signed); ``priceDecimals``, the tick a price is checked on, which scales nothing
-    signed; a perp's status and band, which change."""
+    signed; a perp's status, band and fees (its orders sign the larger fee as their fee-rate
+    cap), which change."""
 
     market_index: int
     quantity_decimals: int
@@ -391,7 +403,8 @@ class _Block:
 
 def market_of(detail: Any, ticker: str) -> Market:
     """The market an order on ``ticker`` signs, from its ``GET /trade/{ticker}`` answer:
-    its ``marketIndex``, its decimals and its ``l2`` (a perp's band among its terms).
+    its ``marketIndex``, its decimals and its ``l2`` (a perp's band and fees among its terms:
+    an order on it signs the larger fee as its fee-rate cap).
 
     Raises:
         LoafConfigError: the server does not run the exchange this SDK trades on.
@@ -426,12 +439,18 @@ def market_of(detail: Any, ticker: str) -> Market:
     custody = (l2["chainId"], l2["proxyAddress"], l2["l2ChainId"], market["marketIndex"])
     decimals = (market["priceDecimals"], market["quantityDecimals"])
     if market["type"] == "PERP":
+        # The market's own fee for each role, and so the most any rate of an order on it may be:
+        # the larger covers every rate the exchange can give the order (it holds your perps rates
+        # to the fee of their role), as the web app signs.
+        cap = max(l2["takerFee"], l2["makerFee"])
         # Not signed, so never refused: a band that is not a whole number bounds nothing, as in the
         # web app.
         band = l2.get("band")
         band = band if _is_int(band) and band > 0 else 0
-        return Market(*custody, 0, l2["quoteAssetId"], "PERP", l2["status"], *decimals, band)
-    return Market(*custody, l2["baseAssetId"], l2["quoteAssetId"], "SPOT", None, *decimals)
+        return Market(*custody, 0, l2["quoteAssetId"], "PERP", l2["status"], *decimals, cap, band)
+    return Market(
+        *custody, l2["baseAssetId"], l2["quoteAssetId"], "SPOT", None, *decimals, L2_FEE_RATE_CAP
+    )
 
 
 def epoch_of(answer: Any, account_index: int) -> int:
@@ -709,7 +728,8 @@ class L2State:
         ``derived`` says whether it signed a price the SDK derived within the band kept
         with the market (its own, a MARKET order's or a ``*_MARKET`` row's, or a TP/SL
         leg's limit); a MARKET order's ``reference_price`` with no slippage is a price
-        given, not derived."""
+        given, not derived. A perps order signs the fee-rate cap kept with its market
+        whatever its prices."""
         # Texts and codes count on refusals only: the 503s for an unreadable account or an
         # unchecked signature carry the l2 prefixes too, and show nothing stale.
         refusal = error.status_code < 500
@@ -727,16 +747,23 @@ class L2State:
         # (``derived``), it shows that band possibly stale (narrowed since it priced the order), so
         # the next order reads the market's terms again; a price signed as given (a LIMIT, IOC or
         # reduce-only order's, a *_LIMIT row's, a MARKET order's reference_price with no slippage)
-        # owes the band nothing, and the market is kept. A halt, the market's own state (closed,
+        # owes the band nothing, and the market is kept. Refused on a perp as a fee-rate cap below
+        # a rate it goes with (FEE_RATE_CAP_TOO_LOW), it shows the market's fees possibly stale
+        # (raised since: it signed the larger as read), so the next order reads the market's terms
+        # again, whatever its prices; a spot order signs L2_FEE_RATE_CAP, which no read changes,
+        # and the market is kept. A fee cut since shows in no refusal (the old, larger cap is
+        # admitted, its fee counted at it against the pool), so it is signed from the market's
+        # next read (OrdersResource.warm, say). A halt, the market's own state (closed,
         # reduce-only, its price stale or held) and a start not reached say what the market takes
         # now, and show nothing.
         cached = self._markets.get(ticker)
-        banded = (
-            derived and code == "PRICE_BAND" and cached is not None and cached.type == "PERP"
-        )
+        perp = cached is not None and cached.type == "PERP"
+        banded = derived and code == "PRICE_BAND" and perp
+        capped = code == "FEE_RATE_CAP_TOO_LOW" and perp
         market_stale = block is not None and (
             context
             or banded
+            or capped
             or error.status_code == 404
             or (
                 error.status_code == 403
@@ -923,9 +950,11 @@ def _unusable_market_field(market: Mapping[str, Any], ticker: str) -> str | None
     :data:`~loaf.constants.MAX_PERP_MARKET_INDEX`, a spot market's above it: K1 reads an
     order's base-asset field as a perp's pool and reduce-only bit by its market index),
     ``priceDecimals`` and ``quantityDecimals``, then its ``l2``'s: the custody, then a spot
-    market's assets, or a perp's quote asset (USDC) and status, then the decimals an order
-    signs in, which must be the market's (7 less its quantity decimals for the price, its
-    quantity decimals for the quantity). A perp's other terms are not signed."""
+    market's assets, or a perp's quote asset (USDC), status, ``takerFee`` and ``makerFee``
+    (each a whole number from 0 to 1,000,000, K1's fee tick: an order signs the larger as its
+    fee-rate cap), then the decimals an order signs in, which must be the market's (7 less its
+    quantity decimals for the price, its quantity decimals for the quantity). A perp's other
+    terms are not signed."""
     identity = _unusable_identity_field(market, ticker)
     if identity is not None:
         return identity
@@ -947,6 +976,8 @@ def _unusable_market_field(market: Mapping[str, Any], ticker: str) -> str | None
         checks += [
             ("quoteAssetId", _is_int(quote) and quote == PERPS_QUOTE_ASSET_ID),
             ("status", l2.get("status") in _PERP_L2_STATUSES),
+            ("takerFee", _whole(l2.get("takerFee"), 0, _FEE_TICK)),
+            ("makerFee", _whole(l2.get("makerFee"), 0, _FEE_TICK)),
         ]
     else:
         base = l2.get("baseAssetId")

@@ -425,7 +425,10 @@ class LoafWebSocketClient:
         """A perp's terms changed (``market_terms_update``: ``{marketIndex, ticker,
         l2}``, its ``market.get(ticker).market.l2``), while you hold
         ``perps:markets``: replace what you hold for it. A perp that expired
-        arrives this way, ``l2.status`` ``EXPIRED``."""
+        arrives this way, ``l2.status`` ``EXPIRED``. Your orders sign a perp's
+        fees as the SDK last read its market (the larger is their fee-rate cap):
+        after a change to them, call ``loaf.orders.warm(ticker)`` from your own
+        loop, not from the handler, so the next order signs the new ones."""
         return self.on(WSMessageType.MARKET_TERMS_UPDATE, handler)
 
     # private portfolio deltas

@@ -1,5 +1,6 @@
 """Perps against an in-memory exchange: the perps reads, a perps order's signed
-pool and reduce-only bit, the prices the SDK derives within a perp's band,
+pool and reduce-only bit, its fee-rate cap (the market's larger fee, a spot
+order's L2_FEE_RATE_CAP), the prices the SDK derives within a perp's band,
 allocates and exits (their bodies, signatures and nonce), their retries and
 resubmit, and the market-state refusals.
 
@@ -106,6 +107,15 @@ def perps_exchange(exchange):
     """The exchange with OPRA-PERP listed too."""
     exchange.details["OPRA-PERP"] = PERPS_DETAIL
     return exchange
+
+
+def serve_perp(exchange: Any, *, live: Any = PERPS_LIVE, **terms: Any) -> None:
+    """Serve OPRA-PERP with ``terms`` over PERP_L2's in its ``l2`` (its ``band``, its
+    ``takerFee`` and ``makerFee``) and ``live`` as its live state, its market reference (the
+    ``marketList`` price) 160."""
+    detail = market_detail("OPRA-PERP", market_index=4, l2={**PERP_L2, **terms})
+    detail["market"]["live"] = live
+    exchange.details["OPRA-PERP"] = detail
 
 
 # --------------------------------------------------------------------------- #
@@ -215,9 +225,11 @@ def test_reads_check_their_arguments_locally(exchange, trading_client, read):
 
 def test_market_of_a_perp():
     perp = market_of(PERPS_DETAIL, "OPRA-PERP")
-    assert perp == (421614, "0x" + "11" * 20, 4242, 4, 0, 3, "PERP", "ACTIVE", 2, 3, 500)
+    # Its fee-rate cap, the larger of its fees (500 and 200), then its band (500 bp).
+    assert perp == (421614, "0x" + "11" * 20, 4242, 4, 0, 3, "PERP", "ACTIVE", 2, 3, 500, 500)
     assert perp.signed_price_decimals == 4  # 7 less its 3 quantity decimals
-    assert market_of(market_detail(), "OPRA")[3:] == (2050, 6, 3, "SPOT", None, 2, 3, 0)
+    # A spot market's cap is L2_FEE_RATE_CAP, and it has no band.
+    assert market_of(market_detail(), "OPRA")[3:] == (2050, 6, 3, "SPOT", None, 2, 3, 7000, 0)
 
 
 @pytest.mark.parametrize("band", [0, -1, "500", 500.0, True, None, ...])
@@ -242,6 +254,21 @@ def test_no_band_and_a_band_not_served_as_one_bound_nothing(band):
         ({**PERP_L2, "status": "HALTED"}, "status"),
         ({**PERP_L2, "status": "active"}, "status"),
         ({k: v for k, v in PERP_L2.items() if k != "quoteAssetId"}, "quoteAssetId"),
+        # Its fees, whose larger its orders sign: whole numbers within K1's fee tick of 1,000,000.
+        ({k: v for k, v in PERP_L2.items() if k != "takerFee"}, "takerFee"),
+        ({**PERP_L2, "takerFee": -1}, "takerFee"),
+        ({**PERP_L2, "takerFee": 1_000_001}, "takerFee"),
+        ({**PERP_L2, "takerFee": 500.0}, "takerFee"),
+        ({**PERP_L2, "takerFee": "500"}, "takerFee"),
+        ({**PERP_L2, "takerFee": True}, "takerFee"),
+        ({**PERP_L2, "takerFee": None}, "takerFee"),
+        ({k: v for k, v in PERP_L2.items() if k != "makerFee"}, "makerFee"),
+        ({**PERP_L2, "makerFee": -1}, "makerFee"),
+        ({**PERP_L2, "makerFee": 1_000_001}, "makerFee"),
+        ({**PERP_L2, "makerFee": 200.0}, "makerFee"),
+        ({**PERP_L2, "makerFee": "200"}, "makerFee"),
+        ({**PERP_L2, "makerFee": True}, "makerFee"),
+        ({**PERP_L2, "makerFee": None}, "makerFee"),
     ],
 )
 def test_unusable_perp_market(exchange, trading_client, l2, field):
@@ -973,18 +1000,250 @@ def test_a_perps_market_sell_with_legs(perps_exchange, trading_client):
 
 
 # --------------------------------------------------------------------------- #
+# The fee-rate cap: a perp's larger fee, a spot market's L2_FEE_RATE_CAP
+# --------------------------------------------------------------------------- #
+
+# The exchange's refusal of an order whose taker or maker rate is above its signed cap.
+FEE_CAP_BELOW_RATE = "l2 fee: the signed fee-rate cap is below the account's fee rate"
+
+
+def signed_cap(body: dict) -> int:
+    """The fee-rate cap a posted ``body`` signs: its ``l2FeeRateCap``, once its signature and
+    each TP/SL leg's verify over it (a leg carries no cap of its own: it signs its parent's, as
+    the exchange rebuilds it)."""
+    verify_order(body)
+    for leg in ("tp", "sl"):
+        if leg in body:
+            verify_order(body, leg)
+    return body["l2FeeRateCap"]
+
+
+@pytest.mark.parametrize(
+    "path, place, legs",
+    [
+        ("/orders", lambda o: o.limit_buy("OPRA-PERP", 2, 101.5), 0),
+        ("/orders", lambda o: o.limit_sell("OPRA-PERP", 2, 101.5, pool=3), 0),
+        ("/orders", lambda o: o.limit_buy("OPRA-PERP", 2, 101.5, time_in_force="IOC"), 0),
+        ("/orders", lambda o: o.limit_sell("OPRA-PERP", 2, 101.5, time_in_force="FOK"), 0),
+        ("/orders", lambda o: o.limit_buy("OPRA-PERP", 2, 101.5, time_in_force="POST_ONLY"), 0),
+        ("/orders", lambda o: o.market_buy("OPRA-PERP", 2), 0),
+        ("/orders", lambda o: o.market_sell("OPRA-PERP", 2, reference_price=101.5), 0),
+        (
+            "/orders",
+            lambda o: o.market_buy("OPRA-PERP", 2, reference_price=101.5, max_slippage_bps=0),
+            0,
+        ),
+        ("/orders", lambda o: o.limit_sell("OPRA-PERP", 2, 104, reduce_only=True), 0),
+        ("/orders", lambda o: o.market_sell("OPRA-PERP", 2, pool=2, reduce_only=True), 0),
+        ("/orders", lambda o: o.limit_buy("OPRA-PERP", 2, 101.5, tp_price=110, sl_price=95), 2),
+        (
+            "/orders",
+            lambda o: o.market_sell("OPRA-PERP", 2, reference_price=101.5, sl_price=115),
+            1,
+        ),
+        ("/orders/conditional", lambda o: o.stop_loss("OPRA-PERP", 2, 95, reduce_only=True), 0),
+        (
+            "/orders/conditional",
+            lambda o: o.take_profit("OPRA-PERP", 2, 110, pool=1, reduce_only=True),
+            0,
+        ),
+        (
+            "/orders/conditional",
+            lambda o: o.create_conditional(
+                "OPRA-PERP", "BUY", 2, type="STOP_LIMIT", trigger_price=110, price=111
+            ),
+            0,
+        ),
+        (
+            "/orders/conditional",
+            lambda o: o.create_conditional(
+                "OPRA-PERP", "BUY", 2, type="TAKE_MARKET", trigger_price=95, pool=4
+            ),
+            0,
+        ),
+        (
+            "/orders/conditional",
+            lambda o: o.create_conditional(
+                "OPRA-PERP", "SELL", 2, type="TAKE_LIMIT", trigger_price=110, price=109,
+                reduce_only=True,
+            ),
+            0,
+        ),
+    ],
+    ids=[
+        "limit-buy",
+        "limit-sell",
+        "ioc",
+        "fok",
+        "post-only",
+        "market-off-the-mark",
+        "market",
+        "market-exact",
+        "close",
+        "market-close",
+        "legs",
+        "market-leg",
+        "stop-loss",
+        "take-profit",
+        "stop-limit",
+        "take-market",
+        "take-limit",
+    ],
+)
+def test_every_perps_order_signs_its_markets_larger_fee_as_its_cap(
+    perps_exchange, trading_client, path, place, legs
+):
+    # OPRA-PERP's fees are 500 (taker) and 200 (maker) per 1,000,000. The exchange holds your
+    # perps rates to the fee of their role, so the larger is the most any rate of an order there
+    # may be: what the order, its TP/SL legs, and a stop or take sign as their cap, as the web app
+    # signs. Not L2_FEE_RATE_CAP: the engine counts an open order's fee at its signed cap against
+    # its pool's margin, and 7,000 would count 0.70% of its notional.
+    place(trading_client().orders)
+    (body,) = perps_exchange.bodies(path)
+    assert sum(leg in body for leg in ("tp", "sl")) == legs
+    assert signed_cap(body) == 500
+
+
+@pytest.mark.parametrize(
+    "taker, maker, cap",
+    [
+        (300, 900, 900),  # the maker fee the larger
+        (900, 300, 900),
+        (0, 0, 0),  # a perp with no fee: no rate of an order there may be above 0
+        (1_000_000, 0, 1_000_000),  # K1's fee tick, the most a fee can be
+        (0, 1_000_000, 1_000_000),
+    ],
+)
+def test_a_perps_cap_is_its_larger_fee_whichever_role_it_is(
+    perps_exchange, trading_client, taker, maker, cap
+):
+    serve_perp(perps_exchange, takerFee=taker, makerFee=maker)
+    orders = trading_client().orders
+    orders.limit_buy("OPRA-PERP", 2, 101.5, tp_price=110, sl_price=95)
+    orders.stop_loss("OPRA-PERP", 2, 95, reduce_only=True)
+    (order,) = perps_exchange.bodies("/orders")
+    (stop,) = perps_exchange.bodies("/orders/conditional")
+    assert (signed_cap(order), signed_cap(stop)) == (cap, cap)
+
+
+@pytest.mark.parametrize(
+    "l2", [MARKET_L2, {**MARKET_L2, "takerFee": 500, "makerFee": 200}], ids=["served", "with-fees"]
+)
+def test_a_spot_order_signs_l2_fee_rate_cap(exchange, trading_client, l2):
+    # A spot order goes with your spot rates, which no market fee holds: every one, its legs and a
+    # stop or take, signs L2_FEE_RATE_CAP, 70 bps, whatever its market's l2 holds.
+    exchange.details["OPRA"] = market_detail(l2=l2)
+    orders = trading_client().orders
+    orders.limit_buy("OPRA", 10, 167.49, tp_price=180, sl_price=150)
+    orders.market_buy("OPRA", 10)
+    orders.limit_sell("OPRA", 10, 167.49, time_in_force="IOC")
+    orders.stop_loss("OPRA", 10, 150)
+    orders.create_conditional("OPRA", "BUY", 10, type="TAKE_LIMIT", trigger_price=150, price=151)
+    bodies = exchange.bodies("/orders") + exchange.bodies("/orders/conditional")
+    assert [signed_cap(body) for body in bodies] == [loaf.L2_FEE_RATE_CAP] * 5 == [7_000] * 5
+
+
+def test_a_perps_order_signs_the_fee_of_the_read_it_signs_its_other_terms_from(
+    perps_exchange, trading_client
+):
+    # A MARKET order without reference_price reads its market for the mark it prices off: it
+    # signs that read's fee with the rest of its terms, and the market so read is kept for the
+    # next order. A fee is no term held: raised since the first read, it is no MarketChangedError.
+    orders = trading_client().orders
+    orders.limit_buy("OPRA-PERP", 2, 101.5)  # reads the market: its fees 500 and 200
+    serve_perp(perps_exchange, takerFee=800)  # a market update raised its taker fee since
+    orders.market_buy("OPRA-PERP", 2)
+    orders.limit_buy("OPRA-PERP", 2, 101.5)
+    assert [signed_cap(body) for body in perps_exchange.bodies("/orders")] == [500, 800, 800]
+    assert len(perps_exchange.gets("/trade/OPRA-PERP")) == 2
+
+
+@pytest.mark.parametrize(
+    "path, place",
+    [
+        ("/orders", lambda o: o.limit_buy("OPRA-PERP", 2, 101.5)),
+        (
+            "/orders",
+            lambda o: o.market_sell("OPRA-PERP", 2, reference_price=101.5, max_slippage_bps=0),
+        ),
+        ("/orders", lambda o: o.market_sell("OPRA-PERP", 2, reference_price=101.5)),
+        ("/orders", lambda o: o.limit_buy("OPRA-PERP", 2, 101.5, tp_price=110, sl_price=95)),
+        ("/orders", lambda o: o.limit_sell("OPRA-PERP", 2, 104, reduce_only=True)),
+        ("/orders/conditional", lambda o: o.stop_loss("OPRA-PERP", 2, 95, reduce_only=True)),
+        (
+            "/orders/conditional",
+            lambda o: o.create_conditional(
+                "OPRA-PERP", "SELL", 2, type="STOP_LIMIT", trigger_price=95, price=94,
+                reduce_only=True,
+            ),
+        ),
+    ],
+    ids=["limit", "market-exact", "market", "legs", "close", "stop-market", "stop-limit"],
+)
+def test_a_perps_fee_cap_refusal_reads_the_markets_fees_again(
+    perps_exchange, trading_client, path, place
+):
+    # A perp's fees are read with it and kept. A market update raised its taker fee to 800 since,
+    # and the exchange holds your perps taker rate to that fee now: above the 500 the order signed,
+    # it is refused (400 FEE_RATE_CAP_TOO_LOW), once: never re-signed or re-sent. The next order
+    # reads the market's terms again and signs the new fee, whatever its prices (a price given
+    # or derived: a perps order always signs the cap kept with its market). A spot market's
+    # refusal shows nothing stale (test_order_controls).
+    orders = trading_client().orders
+    orders.warm("OPRA-PERP")  # reads the market: its fees 500 and 200
+    serve_perp(perps_exchange, takerFee=800)
+    perps_exchange.queue(path, error_reply(400, FEE_CAP_BELOW_RATE, "FEE_RATE_CAP_TOO_LOW"))
+    with pytest.raises(loaf.LoafValidationError) as info:
+        place(orders)
+    assert (info.value.code, info.value.message) == ("FEE_RATE_CAP_TOO_LOW", FEE_CAP_BELOW_RATE)
+    place(orders)
+    refused, placed = perps_exchange.bodies(path)
+    assert (signed_cap(refused), signed_cap(placed)) == (500, 800)
+    assert len(perps_exchange.gets("/trade/OPRA-PERP")) == 2
+
+
+# The engine's refusal of an order its pool cannot back at initial margin (INSUFFICIENT_BALANCE).
+POOL_BELOW_INITIAL_MARGIN = (
+    "l2 perps: the pool would be below initial margin (2 x maintenance) with its open orders "
+    "filled"
+)
+
+
+def test_a_perps_fee_cut_is_signed_once_the_market_is_read_again(perps_exchange, trading_client):
+    # A market update cut OPRA-PERP's taker fee from 1,000 to 500 since the SDK read it. No
+    # refusal shows that: the old, larger cap covers every rate the exchange can stamp, and the
+    # engine admits the order with its fee counted at that cap against the pool, so one the pool
+    # cannot back so is refused INSUFFICIENT_BALANCE, which shows nothing stale either. Orders,
+    # with a price given or derived off a reference_price, sign the old fee until orders.warm
+    # reads the market again.
+    serve_perp(perps_exchange, takerFee=1_000)
+    orders = trading_client().orders
+    orders.limit_buy("OPRA-PERP", 2, 101.5)  # reads the market: its fees 1,000 and 200
+    serve_perp(perps_exchange)  # 500 and 200
+    perps_exchange.queue(
+        "/orders", error_reply(400, POOL_BELOW_INITIAL_MARGIN, "INSUFFICIENT_BALANCE")
+    )
+    with pytest.raises(loaf.LoafValidationError) as info:
+        orders.limit_buy("OPRA-PERP", 2, 101.5)
+    assert (info.value.code, info.value.message) == (
+        "INSUFFICIENT_BALANCE",
+        POOL_BELOW_INITIAL_MARGIN,
+    )
+    orders.limit_buy("OPRA-PERP", 2, 101.5)
+    orders.market_sell("OPRA-PERP", 2, reference_price=101.5)
+    assert len(perps_exchange.gets("/trade/OPRA-PERP")) == 1
+    orders.warm("OPRA-PERP")
+    orders.limit_buy("OPRA-PERP", 2, 101.5)
+    caps = [signed_cap(body) for body in perps_exchange.bodies("/orders")]
+    assert caps == [1_000, 1_000, 1_000, 1_000, 500]
+    assert len(perps_exchange.gets("/trade/OPRA-PERP")) == 2
+
+
+# --------------------------------------------------------------------------- #
 # The perps band: the prices the SDK derives
 # --------------------------------------------------------------------------- #
 
 BAND_AROUND_TRIGGER = "l2 perps: the price is outside the market's band around its trigger price"
-
-
-def serve_perp(exchange: Any, *, band: int = PERP_L2["band"], live: Any = PERPS_LIVE) -> None:
-    """Serve OPRA-PERP with ``band`` in its terms and ``live`` as its live state, its market
-    reference (the ``marketList`` price) 160."""
-    detail = market_detail("OPRA-PERP", market_index=4, l2={**PERP_L2, "band": band})
-    detail["market"]["live"] = live
-    exchange.details["OPRA-PERP"] = detail
 
 
 def live_at(mark: int) -> dict[str, Any]:

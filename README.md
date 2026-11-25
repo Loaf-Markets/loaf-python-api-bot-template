@@ -436,7 +436,7 @@ stop means a second sell).
   rather than sign it off zero.
 - On a spot market a BUY holds
   **worst price × quantity × (1 + `L2_FEE_RATE_CAP` / 1,000,000)** of your
-  cash: `L2_FEE_RATE_CAP` is the fee-rate cap every order signs (70 bps),
+  cash: `L2_FEE_RATE_CAP` is the fee-rate cap a spot order signs (70 bps),
   whatever fee its fills are charged. Size a spot BUY with the same
   reference and max slippage you sign with (`worst_price` refuses a BUY under
   one tick by the same rule as the order):
@@ -461,13 +461,20 @@ the pool at initial margin (at least twice the maintenance `l2.risk` sets)
 beside the pool's other open orders, positions valued at the mark, each
 order filled at its own price (so a bid above the mark or an ask below it
 counts what it loses against the mark) and its fee counted at its signed cap
-(this one's: the price it signs ×
-quantity × `L2_FEE_RATE_CAP` / 1,000,000), or it is refused
-`INSUFFICIENT_BALANCE`. On a unified account (`accountMode` `"UNIFIED"`) pool
-0 first draws what it lacks from your spot USDC. A MARKET order is admitted
-without its own loss against the mark, but a fill of it that would leave the
-pool below initial margin is not made: the rest is cancelled, or with nothing
-filled the order is refused `INSUFFICIENT_BALANCE` (not `NOT_FILLED`).
+(another open order's: the `feeRateCap` of its `openOrders` row; this one's:
+the price it signs × quantity × the perp's larger fee as the SDK last read the
+market, `max(market.l2.takerFee, market.l2.makerFee)`, / 1,000,000, the
+fee-rate cap a perps order signs, not `L2_FEE_RATE_CAP`: 0.05% of its notional
+at a cap of 500), or it is refused `INSUFFICIENT_BALANCE`. A fee a market
+update cut since that read is signed only once the SDK reads the market again,
+so after a change to a perp's fees (`ws.on_market_terms`, or `market.get()`
+showing others) call `loaf.orders.warm(ticker)` before you size to the new
+ones (a raise is read again after an order it refuses, see **Perps**). On a
+unified account (`accountMode` `"UNIFIED"`) pool 0 first draws what it lacks
+from your spot USDC. A MARKET order is admitted without its own loss against
+the mark, but a fill of it that would leave the pool below initial margin is
+not made: the rest is cancelled, or with nothing filled the order is refused
+`INSUFFICIENT_BALANCE` (not `NOT_FILLED`).
 
 A few checks run server-side that the SDK cannot pre-validate, so handle their
 rejections rather than trying to avoid them. Every refusal carries a `code`
@@ -481,7 +488,7 @@ which is for people and may change.
 | `LoafValidationError` (400) | `PRICE_BAND` | **Daily price band** — a per-market band around the daily reference price, when enabled. The message carries the price, limit, reference and band width. |
 | `LoafValidationError` (400) | `PRICE_BAND` | **Perps band** — on a perp, an order of any kind whose signed price lies outside the market's band around its mark (`l2 perps: the price is outside the market's band around its mark`), and a stop, take or TP/SL leg whose limit lies outside the band around its own trigger. The SDK derives its own prices by the band's rule; a price you give is signed as given (see **Perps**). |
 | `LoafValidationError` (400) | `INSUFFICIENT_BALANCE`, `OPEN_ORDER_LIMIT` | **Balance and open-order caps** — not enough available balance for the order, or too many open orders (resting stops count too). |
-| `LoafValidationError` (400) | `FEE_RATE_CAP_TOO_LOW` | **Fee-rate cap** — either fee rate your order goes with, its taker or its maker one (both count, whatever role it fills in), is above the cap every order signs (`L2_FEE_RATE_CAP`, 70 bps): your spot rates on a spot market, on a perp your perps rates, each held to the market's fee for its role (`portfolio.component().applicableFees`, **Money & units**). |
+| `LoafValidationError` (400) | `FEE_RATE_CAP_TOO_LOW` | **Fee-rate cap** — either fee rate your order goes with (`portfolio.component().applicableFees`, **Money & units**), its taker or its maker one (both count, whatever role it fills in), is above the cap it signs: on a spot market your spot rates above `L2_FEE_RATE_CAP` (70 bps); on a perp your perps rates, each held to the market's fee for its role, above the market's larger fee as the SDK read it, which only a fee raised since makes possible: the SDK reads the market again for your next order, to sign the new fee, a read that can lag the update by up to about ten seconds, so an order placed at once may be refused again (see **Perps**). |
 
 An order that would trade with a resting order of your own is not refused: the
 exchange cancels the resting one (its `order_status` is `CANCELLED`) and the
@@ -656,15 +663,16 @@ repeat is safe.
   `cancel_all(ticker)` and `cancel_after(..., ticker=)` send no cancel off a
   detail that names another ticker, or whose `type` or `marketIndex` is not
   its ticker's.
-- **What an order signs of its market is held, not read again.** An order
-  signs bare integers: its market's index and assets, its price ×
-  10^(7 − `quantityDecimals`) and its quantity × 10^`quantityDecimals`. A
-  market's listing sets those terms for good, so a client takes them from the
-  first answer an order or `orders.warm` reads for the ticker
-  (`GET /trade/{ticker}`) and refuses any later answer that differs in one
-  (`MarketChangedError`, a `LoafServerError` with status_code 200, before
-  anything is reserved or signed; `e.field`, `e.held` and `e.served` say
-  which). In other units the same signature is the exchange's order for
+- **What an order signs of its market's listing is held, not read again.** An
+  order signs bare integers: its market's index and assets, its price ×
+  10^(7 − `quantityDecimals`) and its quantity × 10^`quantityDecimals` (a
+  perps order also signs its market's larger fee as its fee-rate cap, which is
+  read again: below). A market's listing sets those terms for good, so a
+  client takes them from the first answer an order or `orders.warm` reads for
+  the ticker (`GET /trade/{ticker}`) and refuses any later answer that differs
+  in one (`MarketChangedError`, a `LoafServerError` with status_code 200,
+  before anything is reserved or signed; `e.field`, `e.held` and `e.served`
+  say which). In other units the same signature is the exchange's order for
   another price and quantity (served one quantity decimal fewer, BUY 10 @
   163.20 is signed as BUY 1 @ 1,632.00), and under another index it is an
   order on another market at this one's price. The market held stays held: an
@@ -694,10 +702,13 @@ repeat is safe.
   is not one (a misspelt key, a value that is not a whole number) is a
   `LoafConfigError` when the client is created. A ticker the table does not
   name is held to its first read. Not held: the tick (`priceDecimals`) and a
-  perp's band and status, which scale nothing signed and can change, and the
-  market reference a MARKET order without `reference_price` is priced off,
-  which moves with the market. That reference is the API's too: where it
-  matters, pass a `reference_price` from a price of your own.
+  perp's band and status, which scale nothing signed and can change; a perp's
+  fees, whose larger its orders sign as their fee-rate cap and which a market
+  update can change (a raise is read again after an order it refuses, a cut at
+  the SDK's next read of the market: `orders.warm(ticker)`); and the market
+  reference a MARKET order without `reference_price` is priced off, which
+  moves with the market. That reference is the API's too: where it matters,
+  pass a `reference_price` from a price of your own.
 - The SDK re-sends the **exact** signed order on timeouts and server errors,
   after a short pause, so a re-send can never place it twice: the exchange
   admits one order per account and order number, and answers a repeat with
@@ -971,6 +982,22 @@ then `None` without one.
   price must lie within the band around the mark, and each leg's limit within
   the band around its own trigger (the SDK derives the legs' limits so); the
   triggers themselves may sit anywhere (**The band**, below).
+- **Fee-rate cap.** Every perps order, a stop, a take and a TP/SL leg alike,
+  signs its market's larger fee, `max(l2.takerFee, l2.makerFee)` per
+  1,000,000 as the SDK last read the market, as its fee-rate cap, as the web
+  app does; a spot order signs `L2_FEE_RATE_CAP`. The exchange holds your
+  perps rates to the market's fee for each role, so the cap covers them, and
+  the pool counts an open order's fee at its cap against its margin (its
+  `openOrders` row's `feeRateCap`; **Placing orders**). A market update can
+  change a fee after the SDK read it. A raise can have an order signed at the
+  old fee refused `FEE_RATE_CAP_TOO_LOW`, where your perps rate for a role,
+  held to the market's new fee, is above the cap it signed; the SDK then
+  reads the market again for your next order, to sign the new fee: place it
+  again. That read can lag the update by up to about ten seconds, so an order
+  placed at once may be refused again. A cut is signed only once the SDK reads
+  the market again (until then your orders sign the old fee, and the pool
+  counts their fee at it): after a change to a perp's fees
+  (`ws.on_market_terms`), call `loaf.orders.warm(ticker)`.
 - **Allocates** (`add_margin`, `return_margin`, `allocate(amount, from_side=,
   to_side=)`, a side a pool or `loaf.PERPS_SPOT_SIDE`, 255, your spot balance)
   and **exits** (`exit(market, pool=)`: closes your position in an EXPIRED
@@ -1269,7 +1296,9 @@ the perps reads too (exact `Decimal`s, below):
   the perp's own fee for that role in whole bps, `market.l2.takerFee // 100`
   and `makerFee // 100` (those are per 1,000,000, 100 = 1 bp: the most an
   order's rate may be, not the rate it pays; a fee of 550 holds a rate to 5
-  bps). An order keeps the rates it was placed with.
+  bps). An order keeps the rates it was placed with. A spot order signs
+  `L2_FEE_RATE_CAP` as its fee-rate cap, and a perps order the larger of its
+  market's two fees as the SDK last read them (**Perps**).
 - `*Percent` / `*Percentage` fields are already percentages (`5.2` = 5.2%).
 
 ---
@@ -1331,7 +1360,7 @@ Channels:
 | `markprice:{ticker}` | public | `on_mark_price` | canonical mark price (1s, on change) |
 | `volume:{ticker}` | public | `on_volume` | rolling-24h traded volume (replaces `volume24h`) |
 | `market:{ticker}` | public | `on_market_halt` | halt / resume status for that market |
-| `perps:markets` | public | `on_perps_markets_live`, `on_market_terms` | every perp's live state (each row `market.get(ticker).market.live`, with its `markPrice`), once on subscribe, then about once a second — replace what you hold; a perp's terms when they change |
+| `perps:markets` | public | `on_perps_markets_live`, `on_market_terms` | every perp's live state (each row `market.get(ticker).market.live`, with its `markPrice`), once on subscribe, then about once a second — replace what you hold; a perp's terms when they change (your orders sign a perp's fees as the SDK last read its market: after a change to them, call `loaf.orders.warm(ticker)` from your own loop) |
 | `portfolio` | **private** | `on_balances`, `on_order_status`, `on_order_update`, `on_trade`, `on_order_queue`, `on_lifetime_volume`, `on_perps_account`, `on_funding_payment`, `on_holding`, `on_transfer`, `on_fees`, `on_l2_keys`, `on_perps_leverage` | your account deltas, and your resting orders' places in their books; every fill of yours is `on_trade`, a liquidation's, a deleverage's and an exit's too (`trade.source`); your perps account as a snapshot about once a second (the beat: `on_stale`, `on_fresh`, below) |
 
 The frames of `orderbook`, `trades`, `chart`, `markprice`, `volume` and `market`

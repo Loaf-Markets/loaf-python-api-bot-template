@@ -718,14 +718,33 @@ def test_an_index_code_drops_the_block(exchange, trading_client):
 
 
 @pytest.mark.parametrize(
-    "code", ["PRICE_BAND", "BELOW_MIN_ORDER_VALUE", "OPEN_ORDER_LIMIT", "SELF_TRADE"]
+    "place",
+    # A price given and one the SDK derives alike: on spot, no read of the market moves what
+    # either is held to (a perp's band and fees: test_perps).
+    [
+        lambda o: o.limit_buy("OPRA", 10, 167.49),
+        lambda o: o.market_buy("OPRA", 10, reference_price=167.49),
+    ],
+    ids=["limit", "market"],
 )
-def test_a_pre_check_code_shows_nothing_stale(exchange, trading_client, code):
+@pytest.mark.parametrize(
+    "code",
+    # A spot order's cap is L2_FEE_RATE_CAP, which no read of its market changes (a perp's is its
+    # market's fee: test_perps).
+    [
+        "PRICE_BAND",
+        "BELOW_MIN_ORDER_VALUE",
+        "OPEN_ORDER_LIMIT",
+        "SELF_TRADE",
+        "FEE_RATE_CAP_TOO_LOW",
+    ],
+)
+def test_a_pre_check_code_shows_nothing_stale(exchange, trading_client, code, place):
     orders = trading_client().orders
     orders.limit_buy("OPRA", 10, 167.49)
     exchange.queue("/orders", error_reply(400, "refused", code))
     with pytest.raises(loaf.LoafValidationError) as info:
-        orders.limit_buy("OPRA", 10, 167.49)
+        place(orders)
     assert info.value.code == code
     sent = len(exchange.requests)
     orders.limit_buy("OPRA", 10, 167.49)

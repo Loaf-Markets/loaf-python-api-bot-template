@@ -18,12 +18,15 @@ trading key's) and its epoch (``GET /l2/keys``), and an order number reserved to
 your account (``POST /l2/order-indices``), reserved in blocks that grow from what
 your first order needs to 64. All of it is cached in memory and refreshed when a
 refusal shows it stale (a placement refused as no market, or as one that is not
-listed, or on a perp as outside its band with a price the SDK derived there,
-reads the ticker's market again). A perp's terms come with its market: its band
-bounds the prices the SDK derives there (**The perps band**). The order numbers
-of an order that was definitely not placed are reused by later orders; a
-restart leaves the unused rest of a block unused. An order on a market of
-another L2 chain than your trading key's is refused before anything is signed.
+listed, or, on a perp, as outside its band with a price the SDK derived there or
+as a fee-rate cap below your rate, reads the ticker's market again);
+:meth:`OrdersResource.warm` reads a market again too. A perp's terms come with
+its market: its band bounds the prices the SDK derives there (**The perps
+band**), and its larger fee is the fee-rate cap its orders sign (**Perps**). The
+order numbers of an order that was definitely not placed are reused by later
+orders; a restart leaves the unused rest of a block unused. An order on a market
+of another L2 chain than your trading key's is refused before anything is
+signed.
 
 **Prices and quantities.** Each market has its own tick and lot, set at its
 listing: the ``priceDecimals`` and ``quantityDecimals`` of
@@ -82,13 +85,13 @@ what it cannot fill at once is cancelled, and one that fills nothing is
 refused. On a spot market a BUY holds worst price x quantity x (1 +
 :data:`~loaf.constants.L2_FEE_RATE_CAP` / 1,000,000) of your cash while it
 matches. A perps order holds no such amount: one that can grow its pool's
-position must leave the pool at initial margin, its fee counted at the cap,
-and its fills stop where one would leave the pool below it; on a unified
-account pool 0 draws what it lacks from your spot USDC
-(:func:`loaf.worst_price` has the rule). Its life is 10 minutes unless you
-pass ``ttl_ms=`` or attach TP/SL legs (**Order life**), so its signed bytes,
-placed again as a resting limit at its worst price, could rest at most that
-long.
+position must leave the pool at initial margin, its fee counted at the cap it
+signs (its market's larger fee, **Perps**), and its fills stop where one would
+leave the pool below it; on a unified account pool 0 draws what it lacks from
+your spot USDC (:func:`loaf.worst_price` has the rule). Its life is 10 minutes
+unless you pass ``ttl_ms=`` or attach TP/SL legs (**Order life**), so its
+signed bytes, placed again as a resting limit at its worst price, could rest
+at most that long.
 
 **Time in force.** ``time_in_force=`` (:class:`~loaf.enums.TimeInForce`) on
 :meth:`OrdersResource.create`, :meth:`OrdersResource.limit_buy` and
@@ -109,7 +112,20 @@ signs both, and refuses either on a spot market. TP/SL legs attach to a perp's
 BUY or SELL (a SELL's mirrored: its take-profit below, its stop-loss above),
 never to a reduce-only one; each leg is a reduce-only order on the other side,
 in the order's pool. An expired perp takes no orders: close a position in it
-with :meth:`~loaf.resources.perps.PerpsResource.exit`.
+with :meth:`~loaf.resources.perps.PerpsResource.exit`. Every order on a perp,
+a stop, a take and a TP/SL leg alike, signs its market's larger fee,
+``max(market.l2.takerFee, market.l2.makerFee)`` per 1,000,000 as the SDK last
+read the market, as its fee-rate cap, as the web app does (a spot order signs
+:data:`~loaf.constants.L2_FEE_RATE_CAP`): the exchange holds your perps rates
+to the market's fee for each role, so the cap covers them, and the order's
+pool counts its fee at the cap against its margin while it is open (its
+``openOrders`` row's ``feeRateCap``). A fee raised since it was read (a market
+update) can have the order refused ``FEE_RATE_CAP_TOO_LOW``, where a perps
+rate of yours, held to the new fee, is above the cap it signed; the next order
+then reads the market again to sign the new one, a read that can lag the
+update by up to about ten seconds (an order placed at once may be refused
+again). A fee cut since is signed only once the SDK reads the market again:
+after a change to a perp's fees, call :meth:`OrdersResource.warm`.
 
 **The perps band.** Each perp has a band, ``market.l2.band`` basis points (0:
 none), centred on its mark (``market.live.markPrice``; a mark of 0, before the
@@ -195,11 +211,14 @@ Server-side checks reject an order the SDK cannot pre-validate for you (all 400,
   ``OPEN_ORDER_LIMIT``) — not enough available balance, or too many open
   orders (resting stops count too).
 * **Fee-rate cap** (``FEE_RATE_CAP_TOO_LOW``) — either fee rate the order
-  goes with, its taker or its maker one (both count, whatever role it fills
-  in), is above :data:`~loaf.constants.L2_FEE_RATE_CAP`, which every order
-  signs: your spot rates on a spot market, on a perp your perps rates, each
-  held to the market's fee for its role
-  (``portfolio.component().applicableFees``).
+  goes with (``portfolio.component().applicableFees``), its taker or its
+  maker one (both count, whatever role it fills in), is above the cap it
+  signs: on a spot market your spot rates above
+  :data:`~loaf.constants.L2_FEE_RATE_CAP`; on a perp your perps rates, each
+  held to the market's fee for its role, above the market's larger fee as the
+  SDK read it, which only a fee raised since makes possible: the next order
+  reads the market again to sign the new one, a read that can lag the update
+  by up to about ten seconds (**Perps**).
 * **Time in force** — an IOC or MARKET order that fills nothing
   (``NOT_FILLED``), a FOK order that cannot fill in full (``FOK_NOT_FILLED``),
   and a POST_ONLY order that would trade at once (``POST_ONLY_WOULD_TAKE``,
@@ -338,7 +357,6 @@ from ..constants import (
     ENV_BASE_URL,
     ENV_TRADING_KEY,
     L2_BUFFER_MS,
-    L2_FEE_RATE_CAP,
     MAX_ORDER_TTL_MS,
     MAX_POOL,
     MIN_ORDER_TTL_MS,
@@ -396,7 +414,8 @@ class OrdersResource(Resource):
     def __init__(self, client: LoafClient) -> None:
         super().__init__(client)
         #: The markets, account and order numbers your orders sign, refreshed on refusals;
-        #: what a market's orders sign is held, never refreshed.
+        #: what a market's listing sets of what its orders sign is held, never refreshed
+        #: (a perp's fees are read again).
         self._l2 = L2State(client)
         #: The market index a cancel's ``ticker=`` names, as last read.
         self._market_indices: dict[str, int] = {}
@@ -419,6 +438,10 @@ class OrdersResource(Resource):
     def warm(self, *tickers: str) -> None:
         """Do now what a first placement would do first: read each ticker's market and your
         account, and reserve order numbers. The next placement on them sends only the order.
+
+        A market already read is read again, so the next order on it signs its terms as they
+        are now: call it after a change to a perp's fees, whose larger its orders sign as
+        their fee-rate cap from the SDK's last read of the market.
 
         Raises what those reads raise when a placement makes them.
         """
@@ -1627,7 +1650,7 @@ class OrdersResource(Resource):
                 "l2MarketIndex": market.market_index,
                 "l2OrderIndex": first,
                 "l2Epoch": account.epoch,
-                "l2FeeRateCap": L2_FEE_RATE_CAP,
+                "l2FeeRateCap": market.fee_rate_cap,  # its legs sign it too (_signed)
                 "l2ExpiryMs": expiry_ms,
                 **market_keys,
                 "l2QuoteAssetId": market.quote_asset_id,
@@ -1930,7 +1953,8 @@ def _signed(
 ) -> dict[str, str]:
     """``l2SigS`` / ``l2SigE`` over one order's 12 signed terms: an order, a leg or a
     conditional (the order it books). ``base_field`` is its signed base-asset field
-    (:func:`_market_keys`)."""
+    (:func:`_market_keys`); its fee-rate cap is ``market``'s (a leg's is its parent's, the
+    body's one ``l2FeeRateCap``)."""
     with localcontext(_DECIMAL_CONTEXT):
         # The market's signed units, exact: on its grid, a price has fewer decimal places than its
         # signed price, and a quantity as many as its signed quantity.
@@ -1944,7 +1968,7 @@ def _signed(
             l2_quote_asset_id=market.quote_asset_id,
             is_ask=side == OrderSide.SELL,
             price=price_scaled,
-            l2_fee_rate_cap=L2_FEE_RATE_CAP,
+            l2_fee_rate_cap=market.fee_rate_cap,
             l2_account_index=account.account_index,
             l2_order_index=index,
             l2_epoch=account.epoch,

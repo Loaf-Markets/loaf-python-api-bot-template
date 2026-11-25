@@ -91,15 +91,19 @@ DEFAULT_MAX_SLIPPAGE_BPS = 200
 ORDER_PRICE_MAX = Decimal(1_000_000_000)
 ORDER_QUANTITY_MAX = Decimal(1_000_000_000)
 
-#: The highest fee rate (per million: 7,000 = 70 bps) every order signs its
-#: consent to: an order whose taker or maker rate is above it is refused
-#: (``FEE_RATE_CAP_TOO_LOW``), whatever role it fills in. A spot order's rates are your spot
-#: rates, a perps order's your perps rates, each held to the market's fee for its role
-#: (``portfolio.component().applicableFees``), so it covers spot rates up to 70 bps and any
-#: rates on a perp whose ``l2.takerFee`` and ``l2.makerFee`` are at most 7,000. It also sizes a
-#: spot BUY's hold, price x quantity x (1 + L2_FEE_RATE_CAP / 1,000,000) of the quote asset, and
-#: the fee a perps order's pool counts against its margin while the order is open, price x
-#: unfilled quantity x L2_FEE_RATE_CAP / 1,000,000, whatever fee the fills are charged.
+#: The highest fee rate (per million: 7,000 = 70 bps) a spot order signs its consent to: an
+#: order whose taker or maker rate is above its signed cap is refused (``FEE_RATE_CAP_TOO_LOW``),
+#: whatever role it fills in, and a spot order's rates are your spot rates
+#: (``portfolio.component().applicableFees.spot``), so it covers spot rates up to 70 bps. It also
+#: sizes a spot BUY's hold, price x quantity x (1 + L2_FEE_RATE_CAP / 1,000,000) of the quote
+#: asset, whatever fee the fills are charged. A perps order signs its market's own cap instead,
+#: as the web app does: the larger of the market's ``l2.takerFee`` and ``l2.makerFee`` (per
+#: 1,000,000) as the SDK last read the market, which covers your perps rates, each held to the
+#: market's fee for its role (a raise since is read again after an order it refuses, a cut at
+#: the SDK's next read of the market: ``orders.warm(ticker)``). Its pool counts the order's fee
+#: at that cap against its margin while the order is open, price x unfilled quantity x the cap /
+#: 1,000,000 (0.05% of the notional at a cap of 500, where 7,000 would count 0.70%), whatever fee
+#: the fills are charged.
 L2_FEE_RATE_CAP = 7_000
 
 # --------------------------------------------------------------------------- #

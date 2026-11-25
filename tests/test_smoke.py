@@ -285,6 +285,8 @@ def test_models_list_every_shape():
     assert models.OrderQueueEntry.__optional_keys__ == {"l2OrderIndex", "orderTag"}
     assert models.PerpsPosition.__optional_keys__ == {"adlRank"}
     assert {"l2OrderIndex", "orderTag"} <= models.OrderHistoryItem.__optional_keys__
+    # An order row's signed fee-rate cap, which a perps order's pool counts its fee at.
+    assert get_type_hints(models.OrderHistoryItem)["feeRateCap"] is int
     assert get_type_hints(models.OrderBook)["engineMs"] is int
     # cancel_after always answers its deadline; cancel_by_index has no order when it voided.
     assert models.CancelAfterResult.__required_keys__ == {"deadlineMs"}
