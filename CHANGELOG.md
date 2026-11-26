@@ -351,6 +351,9 @@ for and reads, and makes `bot.py` a template you fill in one method of.
   exit if there is none, or if its `minOrderValue` is missing), place with a
   five-minute life, and always cancel what they placed: by its order number
   (`cancel_by_index`) when even their resubmit cannot tell whether it landed.
+  `examples/03` bids 2% below the best bid, post-only (a bid further from the
+  market can be refused `PRICE_BAND`), and `examples/02` and `examples/04` show
+  the first LIVE market (a PENDING one has no book yet).
 - Dependencies have upper bounds (`httpx<1`, `websockets<18`) and floors for
   `h11`, `idna` and `certifi` that exclude versions with published
   advisories. `.gitignore` also covers `.env.*` (not `.env.example`),

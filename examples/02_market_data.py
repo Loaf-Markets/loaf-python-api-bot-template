@@ -28,7 +28,8 @@ def main() -> None:
     if not markets:
         return
 
-    ticker = markets[0].ticker
+    # A LIVE market has a book and candles to show; a PENDING one has neither yet.
+    ticker = next((m for m in markets if m.get("status") == "LIVE"), markets[0]).ticker
     print(f"\n--- detail for {ticker} ---")
     detail = client.market.get(ticker)
     book = detail.get("orderBook")

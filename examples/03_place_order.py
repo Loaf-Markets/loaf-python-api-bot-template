@@ -1,8 +1,8 @@
 """03 — Place, inspect, and cancel an order.
 
-This DOES place a real (limit) order on a spot market, priced far from the market
-so it rests on the book rather than filling, and cancels it again. Review it
-before running against a live account.
+This DOES place a real (limit) order on a spot market, priced below the best bid
+and post-only so it rests on the book rather than filling, and cancels it again.
+Review it before running against a live account.
 
 It needs your trading key (LOAF_TRADING_KEY): it signs the order, and the
 login tokens that read your trading account and cancel the order again.
@@ -55,12 +55,13 @@ def place_and_cancel(client: LoafClient) -> None:
     book = detail.get("orderBook")
     best_bid = book.bids[0].price if book and book.get("bids") else (market.marketPrice or 1.0)
 
-    # A passive limit BUY well below the best bid (unlikely to fill immediately), on the
-    # market's tick (its priceDecimals), and worth its minimum order value (minOrderValue
-    # dollars): that over the price, rounded up to the market's lot (10^-quantityDecimals
-    # tokens), in Decimal so the rounding is exact.
+    # A passive limit BUY 2% below the best bid, behind the bids above it, on the market's
+    # tick (its priceDecimals). Not much further: where the exchange bands its markets, a
+    # price too far from the market's reference is refused (PRICE_BAND). It is worth its
+    # minimum order value (minOrderValue dollars): that over the price, rounded up to the
+    # market's lot (10^-quantityDecimals tokens), in Decimal so the rounding is exact.
     places = detail.market.priceDecimals
-    price = max(round(best_bid * 0.80, places), 10**-places)  # at least one tick
+    price = max(round(best_bid * 0.98, places), 10**-places)  # at least one tick
     lot = Decimal(1).scaleb(-detail.market.quantityDecimals)
     tokens = min_order_value(detail.market) / Decimal(str(price))
     quantity = tokens.quantize(lot, rounding=ROUND_CEILING)  # at least one lot
@@ -69,9 +70,11 @@ def place_and_cancel(client: LoafClient) -> None:
     try:
         # The order methods take floats; one on the lot is sent as exactly its decimal. It
         # rests 5 minutes at most (ttl_ms; the default is 7 days), so an interrupted run
-        # leaves nothing on the book for long.
+        # leaves nothing on the book for long. Post-only: if it would trade at once (an
+        # ask at or below its price), it is refused (PostOnlyWouldTakeError), not filled.
         result = client.orders.limit_buy(
-            market.ticker, quantity=float(quantity), price=price, ttl_ms=300_000
+            market.ticker, quantity=float(quantity), price=price, ttl_ms=300_000,
+            time_in_force="POST_ONLY",
         )
     except loaf.LoafConfigError as exc:  # your trading key or account: the message says what to do
         raise SystemExit(str(exc))

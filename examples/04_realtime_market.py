@@ -23,7 +23,8 @@ def main() -> None:
     markets = client.market.list().get("markets") or []
     if not markets:
         raise SystemExit("No markets available.")
-    market = markets[0]
+    # A LIVE market streams a book, trades and a mark; a PENDING one has none of them yet.
+    market = next((m for m in markets if m.get("status") == "LIVE"), markets[0])
     print(f"Streaming {market.ticker} (index {market.marketIndex}). Ctrl-C to stop.\n")
 
     ws = client.websocket()
