@@ -341,7 +341,10 @@ def named_markets(markets: Any) -> dict[str, Held]:
                 f"({'a perp' if perp else 'a spot market'}'s terms), each a whole number, and "
                 f"nothing else, got {dict(terms) if isinstance(terms, Mapping) else terms!r}"
             )
-        assets = (0, PERPS_QUOTE_ASSET_ID) if perp else (terms[keys[2]], terms[keys[3]])
+        if perp:
+            assets = (0, PERPS_QUOTE_ASSET_ID)
+        else:
+            assets = (terms[_NAMED_KEYS[2]], terms[_NAMED_KEYS[3]])
         held[ticker] = Held(terms[keys[0]], terms[keys[1]], *assets)
     return held
 

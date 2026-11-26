@@ -118,6 +118,7 @@ def test_other_terms_after_a_refusal_sign_nothing(
 def test_the_first_term_that_differs_is_named(exchange, trading_client):
     orders = trading_client().orders
     orders.warm("OPRA")
+    change: dict[str, Any]
     for change, field in (
         ({"market_index": 2051, "decimals": (2, 1), "base": 7, "quote": 4}, "marketIndex"),
         ({"decimals": (2, 1), "base": 7, "quote": 4}, "quantityDecimals"),
@@ -178,6 +179,7 @@ def test_a_perp_is_held_by_its_index_and_units(exchange, trading_client):
     exchange.details["OPRA-PERP"] = market_detail("OPRA-PERP")
     orders = trading_client().orders
     orders.limit_buy("OPRA-PERP", 2, 101.5)
+    change: dict[str, Any]
     for change, field, served in (
         ({"market_index": 5}, "marketIndex", 5),
         ({"decimals": (2, 2)}, "quantityDecimals", 2),
