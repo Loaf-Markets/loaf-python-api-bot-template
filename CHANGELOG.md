@@ -4,7 +4,7 @@ What each release changed, and what to change in a bot. While the SDK is
 pre-1.0, a breaking change bumps the minor version (README §4). The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## 0.7.0 (unreleased)
+## 0.7.0 (2026-11-26)
 
 For each market's own tick and lot, the perps reads as actual values, the
 exchange's perps band around the mark and its coded withdrawal refusals. It
