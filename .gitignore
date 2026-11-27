@@ -1,5 +1,11 @@
-# Secrets
+# Secrets: every .env file but the template, and direnv's .envrc
 .env
+.env.*
+!.env.example
+.envrc
+
+# Logs (a bot's output can carry your account's orders and balances)
+*.log
 
 # Your own strategy (see "Copy it before you edit it" in the README)
 my_bot.py
